@@ -40,9 +40,7 @@ final class DynamicWallpaperAutoPauseManager {
     private var windowCoveragePausedScreenIDs: Set<String> = []
     /// 当前满足"窗口覆盖比例 ≥ 阈值"的屏幕 ID
     private var windowCoverageCoveredScreenIDs: Set<String> = []
-    /// 覆盖比例触发的稳定性采样
-    private var pendingWindowCoverageScreenIDs: Set<String>?
-    private var pendingWindowCoverageSampleCount = 0
+
     /// 前台应用变化观察者（用于替代 1s 轮询）
     private var appActivationObserver: Any?
     /// 前台应用切换防抖 Task，避免用户连击 Cmd-Tab 时连续触发暂停/恢复
@@ -72,7 +70,7 @@ final class DynamicWallpaperAutoPauseManager {
     private static let axCallbackLock = NSLock()
     private static var lastAXCallbackSignalTime: CFAbsoluteTime = 0
     private static let axCallbackSignalThrottle: CFTimeInterval = 0.05
-    private static let windowCoverageHysteresisGap: CGFloat = 0.05
+    private static let windowCoverageHysteresisGap: CGFloat = 0.03
 
     private let pauseWhenOtherAppKey = "pause_when_other_app_foreground"
     private let pauseWhenFullscreenKey = "pause_when_fullscreen_covers"
@@ -189,8 +187,6 @@ final class DynamicWallpaperAutoPauseManager {
         // 同理：壁纸切换后旧的 coverage 状态对新进程无意义，清掉等下一轮 checkAndApply 重建
         windowCoveragePausedScreenIDs.removeAll()
         windowCoverageCoveredScreenIDs.removeAll()
-        pendingWindowCoverageScreenIDs = nil
-        pendingWindowCoverageSampleCount = 0
 
         guard !pausedIDs.isEmpty else { return }
 
@@ -256,8 +252,6 @@ final class DynamicWallpaperAutoPauseManager {
         }
 
         if !pauseWhenWindowCoverage {
-            pendingWindowCoverageScreenIDs = nil
-            pendingWindowCoverageSampleCount = 0
             windowCoverageCoveredScreenIDs.removeAll()
 
             if !windowCoveragePausedScreenIDs.isEmpty {
@@ -328,8 +322,6 @@ final class DynamicWallpaperAutoPauseManager {
             pendingFullscreenSampleCount = 0
             windowCoveragePausedScreenIDs.removeAll()
             windowCoverageCoveredScreenIDs.removeAll()
-            pendingWindowCoverageScreenIDs = nil
-            pendingWindowCoverageSampleCount = 0
             return
         }
 
@@ -343,18 +335,10 @@ final class DynamicWallpaperAutoPauseManager {
             reevaluateForegroundCoverage()
         }
 
-        // 窗口覆盖比例检测（按屏，独立稳定性采样）
+        // 窗口覆盖比例检测（按屏）
         // 有 AX 权限时由 AXObserver 事件驱动，不走 timer 轮询
         if pauseWhenWindowCoverage && !AXIsProcessTrusted() {
-            let thresholdRatio = CGFloat(windowCoveragePauseThreshold / 100.0)
-            fullscreenDetectionQueue.async { [weak self] in
-                guard let self else { return }
-                let screens = self.getWindowCoverageCoveredScreens(threshold: thresholdRatio)
-                let ids = Set(screens.map { $0.wallpaperScreenIdentifier })
-                DispatchQueue.main.async { [weak self] in
-                    self?.applyWindowCoverageDetectionResult(newIDs: ids, screens: screens)
-                }
-            }
+            checkWindowCoverage()
         }
 
         // Timer 驱动的全屏覆盖检测
@@ -496,7 +480,7 @@ final class DynamicWallpaperAutoPauseManager {
                         self.setupAXObserver(for: pid)
                         self.checkWindowCoverageAX()
                     } else {
-                        // 无 AX 路径保持旧行为：使用网格采样和稳定确认。
+                        // 无 AX 路径使用 exact union + hysteresis 回退机制
                         self.checkWindowCoverage()
                     }
                 } else if axTrusted {
@@ -504,7 +488,7 @@ final class DynamicWallpaperAutoPauseManager {
                     self.stopAXObserver()
                     self.checkWindowCoverageAX()
                 } else {
-                    // 无 AX 路径保持旧行为：Finder/本应用前台直接清除窗口覆盖暂停。
+                    // 无 AX 路径回退：Finder/本应用前台直接清除窗口覆盖暂停。
                     self.stopAXObserver()
                     self.clearWindowCoveragePause()
                 }
@@ -691,7 +675,7 @@ final class DynamicWallpaperAutoPauseManager {
         if pauseWhenWindowCoverage && AXIsProcessTrusted() {
             checkWindowCoverageAX()
         } else if pauseWhenWindowCoverage && !pauseWhenFullscreenCovers && !pauseWhenOtherAppForeground {
-            // 无 AX 路径保持旧行为：仅在没有其它 timer 触发项时主动跑一次 fallback。
+            // 无 AX 路径回退：仅在没有其它 timer 触发项时主动跑一次 fallback。
             checkAndApply()
         }
     }
@@ -810,33 +794,7 @@ final class DynamicWallpaperAutoPauseManager {
         return WindowSnapshot(screenFrames: screenFrames, windows: windows)
     }
 
-    nonisolated private static func windowCoverageScreens(
-        in snapshot: WindowSnapshot,
-        thresholdRatio: CGFloat
-    ) -> Set<String> {
-        var coveredScreens = Set<String>()
-        let myPID = ProcessInfo.processInfo.processIdentifier
-        let thresholdSamples = Int(ceil(CGFloat(CoverageSampling.sampleCount) * thresholdRatio))
 
-        for (screenID, screenFrame) in snapshot.screenFrames {
-            let candidateRects = snapshot.windows.compactMap { window -> CGRect? in
-                guard window.isVisibleContentWindow(excluding: myPID) else { return nil }
-                let intersection = window.bounds.intersection(screenFrame)
-                guard !intersection.isNull, !intersection.isEmpty else { return nil }
-                return intersection
-            }
-
-            if isGridCoverageAtOrAboveThreshold(
-                screenFrame: screenFrame,
-                candidateRects: candidateRects,
-                thresholdSamples: thresholdSamples
-            ) {
-                coveredScreens.insert(screenID)
-            }
-        }
-
-        return coveredScreens
-    }
 
     nonisolated private static func windowCoverageRatios(in snapshot: WindowSnapshot) -> [String: CGFloat] {
         var ratios: [String: CGFloat] = [:]
@@ -924,45 +882,7 @@ final class DynamicWallpaperAutoPauseManager {
         return total
     }
 
-    nonisolated private static func isGridCoverageAtOrAboveThreshold(
-        screenFrame: CGRect,
-        candidateRects: [CGRect],
-        thresholdSamples: Int
-    ) -> Bool {
-        guard thresholdSamples > 0 else { return true }
-        guard !candidateRects.isEmpty, screenFrame.width > 0, screenFrame.height > 0 else { return false }
 
-        let gridSize = CoverageSampling.gridSize
-        let totalSamples = CoverageSampling.sampleCount
-        let stepX = screenFrame.width / CGFloat(gridSize)
-        let stepY = screenFrame.height / CGFloat(gridSize)
-        var coveredSamples = 0
-        var checkedSamples = 0
-
-        for row in 0..<gridSize {
-            let y = screenFrame.minY + (CGFloat(row) + 0.5) * stepY
-
-            for column in 0..<gridSize {
-                let x = screenFrame.minX + (CGFloat(column) + 0.5) * stepX
-                let samplePoint = CGPoint(x: x, y: y)
-                checkedSamples += 1
-
-                for rect in candidateRects where rect.contains(samplePoint) {
-                    coveredSamples += 1
-                    if coveredSamples >= thresholdSamples {
-                        return true
-                    }
-                    break
-                }
-
-                if coveredSamples + (totalSamples - checkedSamples) < thresholdSamples {
-                    return false
-                }
-            }
-        }
-
-        return false
-    }
 
     nonisolated private static func normalizedWindowBounds(_ bounds: CGRect, screens: [NSScreen], desktopFrame: CGRect) -> CGRect {
         guard !desktopFrame.isNull else { return bounds }
@@ -1293,15 +1213,13 @@ final class DynamicWallpaperAutoPauseManager {
             let screenIDs = Set(snapshot.screenFrames.keys)
 
             DispatchQueue.main.async { [weak self] in
-                self?.applyAXWindowCoverageRatios(ratios: ratios, screenIDs: screenIDs)
+                self?.applyWindowCoverageRatios(ratios: ratios, screenIDs: screenIDs)
             }
         }
     }
 
-    private func applyAXWindowCoverageRatios(ratios: [String: CGFloat], screenIDs: Set<String>) {
-        guard pauseWhenWindowCoverage && AXIsProcessTrusted() else { return }
-        pendingWindowCoverageScreenIDs = nil
-        pendingWindowCoverageSampleCount = 0
+    private func applyWindowCoverageRatios(ratios: [String: CGFloat], screenIDs: Set<String>) {
+        guard pauseWhenWindowCoverage else { return }
 
         let pauseThreshold = normalizedWindowCoverageThreshold
         let resumeThreshold = max(0.20, pauseThreshold - Self.windowCoverageHysteresisGap)
@@ -1361,16 +1279,20 @@ final class DynamicWallpaperAutoPauseManager {
         }
     }
 
-    /// 无 AX fallback 路径：检测窗口覆盖比例，保留网格采样和稳定确认。
+    /// 无 AX fallback 路径：检测窗口覆盖比例，使用 exact union 和迟滞状态机。
     private func checkWindowCoverage() {
         guard pauseWhenWindowCoverage else { return }
-        let thresholdRatio = CGFloat(windowCoveragePauseThreshold / 100.0)
-        fullscreenDetectionQueue.async { [weak self] in
+        let screenFrames = currentScreenFrames()
+        guard !screenFrames.isEmpty else { return }
+
+        fullscreenDetectionQueue.async { [weak self, screenFrames] in
             guard let self else { return }
-            let screens = self.getWindowCoverageCoveredScreens(threshold: thresholdRatio)
-            let ids = Set(screens.map { $0.wallpaperScreenIdentifier })
+            guard let snapshot = Self.captureWindowSnapshot(screenFrames: screenFrames) else { return }
+            let ratios = Self.windowCoverageRatios(in: snapshot)
+            let screenIDs = Set(snapshot.screenFrames.keys)
+
             DispatchQueue.main.async { [weak self] in
-                self?.applyWindowCoverageDetectionResult(newIDs: ids, screens: screens)
+                self?.applyWindowCoverageRatios(ratios: ratios, screenIDs: screenIDs)
             }
         }
     }
@@ -1387,8 +1309,6 @@ final class DynamicWallpaperAutoPauseManager {
         let toResume = windowCoveragePausedScreenIDs
         windowCoveragePausedScreenIDs.removeAll()
         windowCoverageCoveredScreenIDs.removeAll()
-        pendingWindowCoverageScreenIDs = nil
-        pendingWindowCoverageSampleCount = 0
         guard !hasActiveGlobalPauseReason else { return }
         let stillPaused = foregroundPausedScreenIDs.union(fullscreenAutoPausedScreenIDs)
         let canResume = toResume.subtracting(stillPaused)
@@ -1403,92 +1323,7 @@ final class DynamicWallpaperAutoPauseManager {
         }
     }
 
-    // MARK: - 窗口覆盖比例暂停（独立机制，与前台/全屏覆盖并存）
 
-    /// 扫描所有非本应用、layer 0、alpha>0 的窗口，对每屏做网格采样累计覆盖检测。
-    /// 当某屏被窗口累计覆盖的采样点数量达到阈值时，认为该屏需要按比例暂停。
-    nonisolated private func getWindowCoverageCoveredScreens(threshold: CGFloat) -> [NSScreen] {
-        let screens = NSScreen.screens
-        guard !screens.isEmpty else { return [] }
-
-        let screenFrames = screens.reduce(into: [String: CGRect]()) { result, screen in
-            result[screen.wallpaperScreenIdentifier] = screen.frame
-        }
-        guard let snapshot = Self.captureWindowSnapshot(screenFrames: screenFrames) else { return [] }
-
-        let coveredIDs = Self.windowCoverageScreens(in: snapshot, thresholdRatio: threshold)
-        return screens.filter { coveredIDs.contains($0.wallpaperScreenIdentifier) }
-    }
-
-    /// 应用窗口覆盖比例检测结果：稳定性采样 + 按屏 pause/resume
-    private func applyWindowCoverageDetectionResult(newIDs: Set<String>, screens: [NSScreen]) {
-        guard newIDs != windowCoverageCoveredScreenIDs else {
-            pendingWindowCoverageScreenIDs = nil
-            pendingWindowCoverageSampleCount = 0
-            return
-        }
-        guard isStableWindowCoverageTransition(to: newIDs) else { return }
-
-        let previous = windowCoverageCoveredScreenIDs
-        windowCoverageCoveredScreenIDs = newIDs
-
-        // 恢复：之前被本机制暂停、但现在已不在覆盖列表里的屏幕
-        let toResume = windowCoveragePausedScreenIDs.subtracting(newIDs)
-        if !toResume.isEmpty {
-            windowCoveragePausedScreenIDs.subtract(toResume)
-            // 排除仍被其他原因暂停的屏幕
-            let stillPausedByOther = foregroundPausedScreenIDs.union(fullscreenAutoPausedScreenIDs)
-            let canResume = toResume.subtracting(stillPausedByOther)
-            if !canResume.isEmpty, !hasActiveGlobalPauseReason {
-                resumeScreens(byIDs: canResume)
-                let weBridge = WallpaperEngineXBridge.shared
-                if weBridge.isControllingExternalEngine {
-                    for sid in canResume where weBridge.isManaging(screenID: sid) {
-                        weBridge.resumeWallpaper(for: sid)
-                    }
-                }
-            }
-        }
-
-        // 暂停：新进入覆盖列表的屏幕
-        let toPause = newIDs.subtracting(previous)
-        guard !toPause.isEmpty, !hasActiveGlobalPauseReason else { return }
-
-        let videoManager = VideoWallpaperManager.shared
-        let weBridge = WallpaperEngineXBridge.shared
-        let pauseScreens = screens.filter { toPause.contains($0.wallpaperScreenIdentifier) }
-
-        for screen in pauseScreens {
-            let sid = screen.wallpaperScreenIdentifier
-            if videoManager.isVideoWallpaperActive, !videoManager.isPaused(on: screen) {
-                videoManager.pauseWallpaper(for: screen)
-            }
-            if weBridge.isControllingExternalEngine, weBridge.isManaging(screenID: sid) {
-                weBridge.pauseWallpaper(for: sid)
-            }
-            windowCoveragePausedScreenIDs.insert(sid)
-        }
-    }
-
-    private func isStableWindowCoverageTransition(to ids: Set<String>) -> Bool {
-        if pendingWindowCoverageScreenIDs == ids {
-            pendingWindowCoverageSampleCount += 1
-        } else {
-            pendingWindowCoverageScreenIDs = ids
-            pendingWindowCoverageSampleCount = 1
-        }
-        guard pendingWindowCoverageSampleCount >= requiredStableFullscreenSamples else {
-            return false
-        }
-        pendingWindowCoverageScreenIDs = nil
-        pendingWindowCoverageSampleCount = 0
-        return true
-    }
-}
-
-private enum CoverageSampling {
-    static let gridSize = 50
-    static let sampleCount = gridSize * gridSize
 }
 
 private struct WindowSnapshot: @unchecked Sendable {
