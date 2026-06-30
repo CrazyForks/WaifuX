@@ -506,6 +506,7 @@ public final class LiquidGlassClockOverlayManager {
                     sceneWidth: sidecarInfo?.sceneWidth,
                     sceneHeight: sidecarInfo?.sceneHeight,
                     screenSize: screen.frame.size,
+                    screenScale: screen.backingScaleFactor,
                     dockInsets: dockInsets,
                     wallpaperPath: sidecarInfo?.wallpaperPath
                 )
@@ -611,6 +612,7 @@ private struct RendererDynamicTextOverlayView: View {
     let sceneWidth: Double?
     let sceneHeight: Double?
     let screenSize: CGSize
+    let screenScale: CGFloat
     let dockInsets: DockInfo
     let wallpaperPath: String?
 
@@ -630,6 +632,7 @@ private struct RendererDynamicTextOverlayView: View {
                     sceneWidth: sceneWidth,
                     sceneHeight: sceneHeight,
                     screenSize: screenSize,
+                    screenScale: screenScale,
                     dockInsets: dockInsets,
                     wallpaperPath: wallpaperPath
                 )
@@ -654,18 +657,19 @@ private struct RendererDynamicTextOverlayView: View {
     /// FreeType 的 ascent + descent + padding 使纹理高度大于 pixelSize。
     ///
     /// 单位推导：sceneTextHeight 是场景像素单位，screenSize 是逻辑点。
-    /// scenePx / sourceHeight × screenPt = screenPt（像素/高度×点 = 点，
-    /// 因为场景像素与屏幕点在非 Retina 下 1:1，Retina 下比例自动抵消）。
-    /// 不需要再除以 screenScale——SwiftUI 的 frame/font 都是 points。
+    /// scenePx / sourceHeight 得到场景中高度的相对比例，乘以屏幕逻辑点高度
+    /// 得到覆盖同样屏幕比例所需的 points；再除以 screenScale 以在 Retina 屏上
+    /// 获得更紧凑的 SwiftUI 渲染尺寸。
     private func computeFontSize(for entry: DynamicTextEntry) -> CGFloat {
         let sourceHeight = sceneHeight ?? Double(screenSize.height)
+        let scale = max(screenScale, 1)
 
         if let rh = entry.rasterHeight, rh > 0 {
             // rasterHeight 仅含 pixelSize × scaleY，实际 FreeType 纹理高度
             // 约为 pixelSize × 2.0（含 ascent + descent + padding×2）。
-            // 直接放大 2× 匹配 C++ 渲染尺寸。
+            // 先放大 2× 匹配 C++ 渲染尺寸，再映射到屏幕 points 并除以 screenScale。
             let sceneTextHeight = rh * 2.0
-            let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
+            let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height) / Double(scale)
             return CGFloat(screenPt)
         }
 
@@ -674,7 +678,7 @@ private struct RendererDynamicTextOverlayView: View {
                      || entry.name.contains("D a y"))
         let multiplier: Double = isDay ? 5.0 : 3.0
         let sceneTextHeight = (entry.effectiveFontSize ?? entry.fontSize ?? 32) * multiplier
-        let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
+        let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height) / Double(scale)
         return CGFloat(screenPt)
     }
 
@@ -704,6 +708,7 @@ private struct RendererImageOverlayView: View {
     let sceneWidth: Double?
     let sceneHeight: Double?
     let screenSize: CGSize
+    let screenScale: CGFloat
     let dockInsets: DockInfo
     let wallpaperPath: String?
 
@@ -718,10 +723,13 @@ private struct RendererImageOverlayView: View {
                 let availW = Double(screenSize.width) - Double(dockInsets.left) - Double(dockInsets.right)
                 let availH = Double(screenSize.height) - Double(dockInsets.bottom)
 
-                // 将场景像素尺寸映射到屏幕逻辑点尺寸
-                // （screenSize 是 points，场景是 pixels，比例自动抵消，不需要 /screenScale）
-                let imgW = (image.width ?? 100) * (image.finalScaleX ?? 1) / max(sourceWidth, 1) * availW
-                let imgH = (image.height ?? 100) * (image.finalScaleY ?? 1) / max(sourceHeight, 1) * availH
+                // 将场景像素尺寸映射到屏幕逻辑点尺寸。
+                // sceneWidth/sceneHeight 是像素，screenSize 是逻辑点；
+                // scenePx / sourceSize 为无量纲比例，乘以 availW/availH(points) 后结果即为 points，
+                // 再除以 screenScale 以在 Retina 屏上获得更紧凑的渲染尺寸。
+                let scale = max(screenScale, 1)
+                let imgW = (image.width ?? 100) * (image.finalScaleX ?? 1) / max(sourceWidth, 1) * availW / Double(scale)
+                let imgH = (image.height ?? 100) * (image.finalScaleY ?? 1) / max(sourceHeight, 1) * availH / Double(scale)
                 let _ = print("[Overlay] render: \(image.name) pos=\(screenPos) size=(\(imgW),\(imgH)) tint=\(tintColor)")
 
                 Image(nsImage: nsImage)
