@@ -71,23 +71,14 @@ clang -c -arch arm64 -arch x86_64 -mmacosx-version-min=14.4 "$ROOT/Resources/zip
 echo "[build-wallpaperengine-cli] swiftc..."
 swiftc -parse-as-library \
   -target arm64-apple-macosx14.4 \
-  -I Resources/CRenderer -I Resources -L Resources/lib \
-  -llinux-wallpaperengine-renderer \
   -Xlinker -stack_size -Xlinker 0x2000000 \
   -Xlinker -rpath -Xlinker @loader_path \
   -Xlinker -rpath -Xlinker @loader_path/Resources \
   -Xlinker -rpath -Xlinker @loader_path/../Resources \
-  -Xlinker -rpath -Xlinker @loader_path/Resources/lib \
-  -Xlinker -rpath -Xlinker @loader_path/../Resources/lib \
-  -Xlinker -rpath -Xlinker @loader_path/lib \
   -framework AppKit -framework AVFoundation -framework IOKit -framework WebKit -framework Combine \
   -o "$OUT_CLI" \
   "$SRC_MAIN" "$SRC_EMBED" \
   "$ROOT/Resources/zip_data.o" "$ROOT/Resources/zip_accessor.o"
-
-# The renderer dylib may carry an @loader_path install name from local builds,
-# but our CLI is shipped both at repo root and under Resources/.
-install_name_tool -change "@loader_path/liblinux-wallpaperengine-renderer.dylib" "@rpath/liblinux-wallpaperengine-renderer.dylib" "$OUT_CLI" 2>/dev/null || true
 
 if command -v codesign >/dev/null 2>&1; then
   echo "[build-wallpaperengine-cli] codesign (ad hoc)..."
@@ -95,62 +86,5 @@ if command -v codesign >/dev/null 2>&1; then
 fi
 
 cp "$OUT_CLI" "$ROOT/wallpaperengine-cli"
-
-# Bundle Homebrew dylibs 到 Resources/，避免用户机器上没有 Homebrew 时 dyld 报错
-echo "[build-wallpaperengine-cli] Bundling Homebrew dylibs..."
-if [[ -f "$ROOT/scripts/bundle-dylibs.py" ]]; then
-  python3 "$ROOT/scripts/bundle-dylibs.py" "$ROOT/Resources/lib/liblinux-wallpaperengine-renderer.dylib" "$ROOT/Resources/lib"
-  # 重新签名所有被修改过的 dylib
-  for f in "$ROOT"/Resources/lib/*.dylib; do
-    codesign --force -s - "$f" 2>/dev/null || true
-  done
-  # 确保 renderer dylib 的 id 是 @rpath/...，让 CLI 能跨位置解析
-  install_name_tool -id "@rpath/liblinux-wallpaperengine-renderer.dylib" "$ROOT/Resources/lib/liblinux-wallpaperengine-renderer.dylib" 2>/dev/null || true
-  codesign --force -s - "$ROOT/Resources/lib/liblinux-wallpaperengine-renderer.dylib" 2>/dev/null || true
-
-  # 复制 Homebrew Python（libvapoursynth-script 需要），若不存在则尝试从 Homebrew 复制
-  if [[ ! -f "$ROOT/Resources/lib/Python" ]]; then
-    PYTHON_CANDIDATE="/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13/Python"
-    if [[ -f "$PYTHON_CANDIDATE" ]]; then
-      cp "$PYTHON_CANDIDATE" "$ROOT/Resources/lib/Python"
-      chmod +x "$ROOT/Resources/lib/Python"
-      install_name_tool -id "@loader_path/Python" "$ROOT/Resources/lib/Python" 2>/dev/null || true
-      codesign --force -s - "$ROOT/Resources/lib/Python" 2>/dev/null || true
-      echo "[build-wallpaperengine-cli] Copied Python framework"
-    fi
-  fi
-
-  # 🔧 安全网：修复 bundle-dylibs.py 可能遗漏的 @@HOMEBREW_ 占位符
-  # 某些 Homebrew 构建的 dylib 中 CMake 变量（@@HOMEBREW_CELLAR@@ / @@HOMEBREW_PREFIX@@）
-  # 可能未被正确替换，导致 dyld 找不到依赖。这里将它们全部转成 @loader_path/ 相对路径。
-  echo "[build-wallpaperengine-cli] Fixing any remaining Homebrew placeholders..."
-  FIXED_COUNT=0
-  for f in "$ROOT"/Resources/lib/*.dylib; do
-    [[ -L "$f" ]] && continue
-    while IFS= read -r line; do
-      dep_path=$(echo "$line" | awk '{print $1}')
-      if [[ "$dep_path" == *"@@HOMEBREW_CELLAR@@"* ]] || [[ "$dep_path" == *"@@HOMEBREW_PREFIX@@"* ]]; then
-        dep_base=$(basename "$dep_path")
-        new_dep="@loader_path/$dep_base"
-        echo "    Fix: $(basename "$f") — $dep_path -> $new_dep"
-        install_name_tool -change "$dep_path" "$new_dep" "$f" 2>/dev/null || true
-        FIXED_COUNT=$((FIXED_COUNT + 1))
-      fi
-    done < <(otool -L "$f" 2>/dev/null | tail -n +2)
-  done
-
-  if [[ "$FIXED_COUNT" -gt 0 ]]; then
-    echo "[build-wallpaperengine-cli] Fixed $FIXED_COUNT placeholder reference(s), re-signing..."
-    # 重新签名所有受影响的 dylib
-    for f in "$ROOT"/Resources/lib/*.dylib; do
-      [[ -L "$f" ]] && continue
-      codesign --force -s - "$f" 2>/dev/null || true
-    done
-    # 重新签名 CLI 二进制（根目录 + Resources 内两份）
-    codesign --force -s - "$OUT_CLI" 2>/dev/null || true
-    cp "$OUT_CLI" "$ROOT/wallpaperengine-cli"
-    codesign --force -s - "$ROOT/wallpaperengine-cli" 2>/dev/null || true
-  fi
-fi
 
 echo "[build-wallpaperengine-cli] OK → $OUT_CLI"

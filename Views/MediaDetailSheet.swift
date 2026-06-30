@@ -871,7 +871,6 @@ struct MediaDetailSheet: View {
 
                         VStack(spacing: 12) {
                             sceneBakeRendererRow(renderer: .wallpaperWgpu)
-                            sceneBakeRendererRow(renderer: .legacyCLI)
                         }
                     }
                     .padding(22)
@@ -2360,7 +2359,7 @@ struct MediaDetailSheet: View {
         }
     }
 
-    /// Scene 壁纸设置：优先使用烘焙产物，无缓存时自动用 legacyCLI 烘焙后应用
+    /// Scene 壁纸设置：优先使用烘焙产物，无缓存时自动用 wallpaper-wgpu 烘焙后应用
     /// 不再使用 wallpaper-wgpu 实时渲染
     private func applySceneWallpaperPreferringBake(sceneContentRoot: URL, cliPath: String) {
         let itemID = resolvedItem.id
@@ -2392,7 +2391,7 @@ struct MediaDetailSheet: View {
             }
         }
 
-        // 2. 无烘焙产物 → 自动用 legacyCLI 烘焙后应用
+        // 2. 无烘焙产物 → 自动用 wallpaper-wgpu 烘焙后应用
         guard !isBakingScene else { return }
         isBakingScene = true
         bakeProgress = 0

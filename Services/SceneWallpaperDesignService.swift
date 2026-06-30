@@ -223,6 +223,7 @@ enum SceneWallpaperDesignService {
         return WallpaperDynamicTextsInfo(
             hasDynamicText: !mergedEntries.isEmpty,
             entries: mergedEntries,
+            images: designed.base.images,
             wallpaperPath: designed.base.wallpaperPath,
             sceneWidth: designed.base.sceneWidth,
             sceneHeight: designed.base.sceneHeight,

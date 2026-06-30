@@ -6,21 +6,26 @@ import ImageIO
 @preconcurrency import IOSurface
 
 func createSnapshotViaRuntime(currentTime: CMTime? = nil) async -> AnyObject? {
+    extLog("  [Snapshot] 开始创建 — currentTime=\(currentTime.map { "\($0.value)/\($0.timescale)" } ?? "nil")")
+
     if let image = loadSharedSnapshotImage(),
        let snapshotXPC = renderSnapshotToIOSurface(image: image) {
         extLog("  [Snapshot] Created WallpaperSnapshotXPC from shared thumbnail \(image.width)x\(image.height)")
         return snapshotXPC
     }
+    extLog("  [Snapshot] Strategy 1 (shared thumbnail) missed")
 
     if let ioSurfaceSnapshot = WallpaperState.shared.anyIOSurfaceRenderer()?.makeSnapshotXPC() {
         extLog("  [Snapshot] Created WallpaperSnapshotXPC from active IOSurface")
         return ioSurfaceSnapshot
     }
+    extLog("  [Snapshot] Strategy 2 (IOSurface renderer) missed")
 
     guard let videoURL = findVideoURL() else {
-        extLog("  [Snapshot] No video file found")
+        extLog("  [Snapshot] Strategy 3 missed: no video file found")
         return nil
     }
+    extLog("  [Snapshot] Strategy 3: found video \(videoURL.lastPathComponent)")
     let asset = AVURLAsset(url: videoURL)
     let generator = AVAssetImageGenerator(asset: asset)
     generator.appliesPreferredTrackTransform = true
@@ -160,9 +165,13 @@ private func renderSnapshotToIOSurface(image: CGImage) -> AnyObject? {
 
     guard let snapshotClass = objc_getClass("WallpaperSnapshotXPC") as? AnyClass,
           let instance = class_createInstance(snapshotClass, 0) else {
-        extLog("  [Snapshot] Failed to create WallpaperSnapshotXPC")
+        extLog("  [Snapshot] ❌ Failed to create WallpaperSnapshotXPC instance")
         return nil
     }
+
+    // 诊断：输出类信息和实例大小，帮助检测 macOS 版本间的布局变化
+    let instanceSize = class_getInstanceSize(snapshotClass)
+    extLog("  [Snapshot] WallpaperSnapshotXPC instanceSize=\(instanceSize)")
 
     let surfaceRef = Unmanaged.passRetained(surface).toOpaque()
     let instancePtr = Unmanaged.passUnretained(instance as AnyObject).toOpaque()

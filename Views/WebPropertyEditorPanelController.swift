@@ -39,6 +39,11 @@ final class WebPropertyEditorPanelController {
         present(for: wallpaperPath, type: .sceneConfig, title: "场景高级设置")
     }
 
+    /// 桌面动态元素设计弹窗（烘焙视频的文本覆盖编辑）
+    func presentSceneDesign(for wallpaperPath: String) {
+        present(for: wallpaperPath, type: .sceneDesign, title: "设计壁纸")
+    }
+
     /// 自动检测类型并呈现（兼容旧调用方式）
     func present(for wallpaperPath: String, title: String = "设计场景") {
         let type = detectType(for: wallpaperPath)
@@ -94,6 +99,8 @@ final class WebPropertyEditorPanelController {
         userContentController.add(handler, name: "resetAll")
         userContentController.add(handler, name: "selectFile")
         userContentController.add(handler, name: "editorReady")
+        userContentController.add(handler, name: "sceneDesignChanged")
+        userContentController.add(handler, name: "selectLanguage")
 
         config.userContentController = userContentController
 
@@ -128,7 +135,42 @@ final class WebPropertyEditorPanelController {
 
         let htmlContent = loadHTMLEditorContent()
 
-        // Load property data
+        // Scene design uses a completely different data model (dynamic text entries)
+        if currentType == .sceneDesign {
+            let designData = Self.loadSceneDesignData(for: wallpaperPath)
+            let designJSON = try? JSONSerialization.data(withJSONObject: designData, options: [])
+            let designJS = String(data: designJSON ?? Data(), encoding: .utf8) ?? "{}"
+
+            let escapedTitle = currentTitle.jsEscaped
+            let escapedWallpaperTitle = (designData["wallpaperTitle"] as? String ?? "").jsEscaped
+            let accentHex = NSColor.controlAccentColor.hexString
+
+            let injectScript = """
+            window.sceneDesignData = \(designJS);
+            window.wallpaperTitle = "\(escapedWallpaperTitle)";
+            window.accentColor = "\(accentHex)";
+            document.getElementById('panelTitle').textContent = "\(escapedTitle)";
+            if (typeof initSceneDesign === 'function') initSceneDesign();
+            """
+
+            pendingInject = injectScript
+            webView.loadHTMLString(htmlContent, baseURL: nil)
+
+            // Safety timeout
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            if let script = pendingInject {
+                pendingInject = nil
+                webView.evaluateJavaScript(script) { _, error in
+                    if let error = error {
+                        print("[WebPropertyEditor] JS fallback inject failed: \(error)")
+                    }
+                }
+            }
+            return
+        }
+
+        // Load property data for scene / web / sceneConfig
         let result: PropertyLoadResult
         do {
             let type = currentType
@@ -229,6 +271,8 @@ final class WebPropertyEditorPanelController {
             guard let overrideKey = SceneConfigOverrideKey(rawValue: key) else { return }
             let codableValue = Self.toAnyCodableValue(value)
             SceneConfigOverrideService.setOverride(key: overrideKey, value: codableValue, for: path)
+        case .sceneDesign:
+            break // sceneDesign uses sceneDesignChanged handler instead
         }
 
         scheduleApply()
@@ -244,6 +288,9 @@ final class WebPropertyEditorPanelController {
             handleWebReset(path: path)
         case .sceneConfig:
             SceneConfigOverrideService.resetAllOverrides(for: path)
+        case .sceneDesign:
+            SceneWallpaperDesignService.resetDocument(for: path)
+            LiquidGlassClockOverlayManager.shared.rebuildAll()
         }
 
         Task { await loadAndInjectData() }
@@ -251,8 +298,8 @@ final class WebPropertyEditorPanelController {
     }
 
     func handleSelectFile(key: String, isDirectory: Bool) {
-        // Scene config doesn't use file selection
-        guard currentType != .sceneConfig else { return }
+        // Scene config and scene design don't use file selection
+        guard currentType != .sceneConfig, currentType != .sceneDesign else { return }
         guard let path = currentPath else { return }
 
         let panel = NSOpenPanel()
@@ -269,6 +316,8 @@ final class WebPropertyEditorPanelController {
                 let webValue: WebWallpaperPropertyValue = .string(url.path)
                 handleWebPropertyChange(path: path, key: key, value: webValue)
             case .sceneConfig:
+                break
+            case .sceneDesign:
                 break
             }
             scheduleApply()
@@ -334,6 +383,11 @@ final class WebPropertyEditorPanelController {
                         for: path
                     )
                     try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(userProperties: mergedJSON)
+
+                case .sceneDesign:
+                    // Scene design changes are applied via LiquidGlassClockOverlayManager.rebuildAll()
+                    // directly in handleSceneDesignChanged, no bridge call needed
+                    break
                 }
             } catch {
                 print("[WebPropertyEditor] Apply failed: \(error.localizedDescription)")
@@ -428,6 +482,11 @@ final class WebPropertyEditorPanelController {
             // Should not reach here; sceneConfig uses loadSceneConfigData() instead
             throw NSError(domain: "WebPropertyEditor", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "sceneConfig uses loadSceneConfigData"])
+
+        case .sceneDesign:
+            // Should not reach here; sceneDesign uses loadSceneDesignData() instead
+            throw NSError(domain: "WebPropertyEditor", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "sceneDesign uses loadSceneDesignData"])
         }
 
         var items: [PropertyEditorItem] = []
@@ -573,6 +632,287 @@ final class WebPropertyEditorPanelController {
         )
     }
 
+    // MARK: - Scene Design Data Loading
+
+    /// 加载桌面动态元素设计数据（sidecar + 覆盖项），返回可序列化的字典
+    private static func loadSceneDesignData(for wallpaperPath: String) -> [String: Any] {
+        let wallpaperTitle = SceneWallpaperDesignService.wallpaperTitle(for: wallpaperPath)
+        let document = SceneWallpaperDesignService.loadDocument(for: wallpaperPath)
+
+        // 获取 sidecar 动态文本信息（需主线程访问 VideoWallpaperManager）
+        let sidecar: WallpaperDynamicTextsInfo? = VideoWallpaperManager.shared.currentVideoURL.flatMap { videoURL in
+            guard let info = WallpaperDynamicTextParser.loadSidecar(for: videoURL),
+                  let sidecarPath = info.wallpaperPath, !sidecarPath.isEmpty else { return nil }
+            let standardizedSidecar = URL(fileURLWithPath: sidecarPath).standardizedFileURL.path
+            let standardizedTarget = URL(fileURLWithPath: wallpaperPath).standardizedFileURL.path
+            return standardizedSidecar == standardizedTarget ? info : nil
+        }
+
+        guard let sidecar = sidecar, sidecar.hasDynamicText else {
+            return ["wallpaperTitle": wallpaperTitle, "groups": []]
+        }
+
+        let designed = SceneWallpaperDesignService.resolveDesignedInfo(from: sidecar, wallpaperPath: wallpaperPath)
+
+        // 按位置分组（与 SceneWallpaperDesignViewModel.groupByPosition 相同算法）
+        struct SimpleRow {
+            let id: String
+            let key: String
+            let name: String
+            let value: String
+            let source: DynamicTextEntry
+            let override: SceneDynamicTextDesignOverride
+        }
+
+        let rows: [SimpleRow] = designed.entries.map { entry in
+            SimpleRow(
+                id: entry.id,
+                key: entry.id,
+                name: entry.source.name,
+                value: entry.source.resolvedText ?? entry.source.value ?? "",
+                source: entry.source,
+                override: document.overrides[entry.id] ?? SceneDynamicTextDesignOverride()
+            )
+        }
+
+        // 按位置分组（5 scene units 以内视为同一位置的多语言版本）
+        var groups: [[String: Any]] = []
+        var used = Set<String>()
+        let rowsByParent = Dictionary(grouping: rows) { $0.source.parentID }
+
+        for row in rows {
+            guard !used.contains(row.id) else { continue }
+            if row.source.parentID != nil { continue }
+
+            let ex = row.source.finalOriginX ?? row.source.originX ?? row.source.finalX ?? row.source.x ?? 0
+            let ey = row.source.finalOriginY ?? row.source.originY ?? row.source.finalY ?? row.source.y ?? 0
+
+            let siblings = rows.filter { other in
+                guard !used.contains(other.id) else { return false }
+                guard other.source.parentID == nil else { return false }
+                let ox = other.source.finalOriginX ?? other.source.originX ?? other.source.finalX ?? other.source.x ?? 0
+                let oy = other.source.finalOriginY ?? other.source.originY ?? other.source.finalY ?? other.source.y ?? 0
+                return abs(ox - ex) < 5 && abs(oy - ey) < 5
+            }
+
+            let groupName = siblings.first(where: { !$0.name.isEmpty })?.name ?? "未命名"
+
+            // 确定选中语言索引
+            let selectedIndex: Int
+            if let explicitVisible = siblings.firstIndex(where: { $0.override.hidden == false }) {
+                selectedIndex = explicitVisible
+            } else if let sourceVisible = siblings.firstIndex(where: { $0.source.visible }) {
+                selectedIndex = sourceVisible
+            } else {
+                selectedIndex = siblings.enumerated().max(by: {
+                    ($0.element.source.renderOrder ?? 0) < ($1.element.source.renderOrder ?? 0)
+                })?.offset ?? 0
+            }
+
+            // 语言标签
+            let languageLabels: [String] = siblings.enumerated().map { idx, sib in
+                let trimmedName = sib.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let pattern = #"\(([A-Za-z]{2,8})\)"#
+                if let regex = try? NSRegularExpression(pattern: pattern),
+                   let match = regex.matches(in: trimmedName, range: NSRange(trimmedName.startIndex..., in: trimmedName)).last,
+                   match.numberOfRanges > 1,
+                   let range = Range(match.range(at: 1), in: trimmedName) {
+                    return String(trimmedName[range]).uppercased()
+                }
+                return trimmedName.isEmpty ? "语言 \(idx + 1)" : trimmedName
+            }
+
+            // 构建每个条目的 JSON 数据
+            let entriesData: [[String: Any]] = siblings.map { sib in
+                let ov = sib.override
+                let src = sib.source
+                var entry: [String: Any] = [
+                    "id": sib.id,
+                    "name": sib.name,
+                    "value": sib.value,
+                    "behavior": src.behavior,
+                    "hidden": ov.hidden ?? !src.visible,
+                    "textOverride": ov.textOverride ?? "",
+                    "alpha": ov.alpha ?? src.alpha ?? 1.0,
+                    "offsetX": ov.offsetX ?? 0,
+                    "offsetY": ov.offsetY ?? 0,
+                    "scaleMultiplier": ov.scaleMultiplier ?? 1,
+                    "fontSizeMultiplier": ov.fontSizeMultiplier ?? 1,
+                    "rotation": ov.rotationOverride ?? src.finalAngle ?? src.rotation ?? 0,
+                    "maxWidth": ov.maxWidthOverride ?? src.maxWidth ?? 500,
+                    "fontName": ov.fontFamilyOverride ?? src.fontFamily ?? "",
+                    "fontPath": ov.fontPathOverride ?? src.fontPath ?? "",
+                    "alignment": ov.alignmentOverride ?? src.alignment ?? "center center",
+                ]
+                // 颜色: [r, g, b] → hex string
+                let colorArr = ov.color ?? src.color ?? [1.0, 1.0, 1.0]
+                if colorArr.count >= 3 {
+                    let r = Int(round(colorArr[0] * 255))
+                    let g = Int(round(colorArr[1] * 255))
+                    let b = Int(round(colorArr[2] * 255))
+                    entry["color"] = String(format: "#%02x%02x%02x", r, g, b)
+                } else {
+                    entry["color"] = "#ffffff"
+                }
+                // 时钟特有选项
+                if src.behavior == "clock" {
+                    entry["use24hFormat"] = ov.use24hFormat ?? true
+                    entry["showSeconds"] = ov.showSeconds ?? false
+                    entry["delimiter"] = ov.delimiter ?? ""
+                }
+                return entry
+            }
+
+            // 收集该组所有 key（包括子条目）
+            let languageEntryKeys: [[String]] = siblings.map { sib in
+                var keys = [sib.key]
+                if let parentID = sib.source.id {
+                    keys += rowsByParent[parentID]?.map(\.key) ?? []
+                }
+                return Array(Set(keys))
+            }
+
+            var group: [String: Any] = [
+                "id": siblings.first?.id ?? row.id,
+                "displayName": groupName,
+                "entries": entriesData,
+                "selectedLanguageIndex": selectedIndex,
+                "languageLabels": languageLabels,
+                "languageEntryKeys": languageEntryKeys,
+            ]
+            groups.append(group)
+
+            for s in siblings {
+                used.insert(s.id)
+                if let parentID = s.source.id {
+                    for child in rowsByParent[parentID] ?? [] {
+                        used.insert(child.id)
+                    }
+                }
+            }
+        }
+
+        return [
+            "wallpaperTitle": wallpaperTitle,
+            "groups": groups,
+        ]
+    }
+
+    // MARK: - Scene Design Message Handlers
+
+    /// 处理场景设计属性变更（来自 JS）
+    func handleSceneDesignChanged(entryKey: String, field: String, value: Any) {
+        guard let path = currentPath else { return }
+        var document = SceneWallpaperDesignService.loadDocument(for: path)
+        document.wallpaperPath = path
+        var override = document.overrides[entryKey] ?? SceneDynamicTextDesignOverride()
+
+        switch field {
+        case "hidden":
+            if let b = value as? Bool { override.hidden = b }
+        case "textOverride":
+            let s = String(describing: value)
+            override.textOverride = s.isEmpty ? nil : s
+        case "alpha":
+            if let n = Self.toDouble(value) { override.alpha = n }
+        case "offsetX":
+            if let n = Self.toDouble(value) { override.offsetX = n }
+        case "offsetY":
+            if let n = Self.toDouble(value) { override.offsetY = n }
+        case "scaleMultiplier":
+            if let n = Self.toDouble(value) { override.scaleMultiplier = n }
+        case "fontSizeMultiplier":
+            if let n = Self.toDouble(value) { override.fontSizeMultiplier = n }
+        case "rotation":
+            if let n = Self.toDouble(value) { override.rotationOverride = n }
+        case "maxWidth":
+            if let n = Self.toDouble(value) { override.maxWidthOverride = n }
+        case "fontName":
+            let s = String(describing: value)
+            override.fontFamilyOverride = s.isEmpty ? nil : s
+        case "fontPath":
+            let s = String(describing: value)
+            override.fontPathOverride = s.isEmpty ? nil : s
+        case "alignment":
+            let s = String(describing: value)
+            override.alignmentOverride = s.isEmpty ? nil : s
+        case "color":
+            // hex string → [r, g, b] normalized
+            if let hex = value as? String {
+                override.color = Self.hexToNormalizedRGB(hex)
+            }
+        case "use24hFormat":
+            if let b = value as? Bool { override.use24hFormat = b }
+        case "showSeconds":
+            if let b = value as? Bool { override.showSeconds = b }
+        case "delimiter":
+            let s = String(describing: value)
+            override.delimiter = s.isEmpty ? nil : s
+        default:
+            break
+        }
+
+        document.overrides[entryKey] = override
+        try? SceneWallpaperDesignService.saveDocument(document, for: path)
+        scheduleSceneDesignRebuild()
+    }
+
+    /// 处理语言切换
+    func handleSelectLanguage(groupID: String, index: Int, allEntryKeys: [[String]]) {
+        guard let path = currentPath else { return }
+        var document = SceneWallpaperDesignService.loadDocument(for: path)
+        document.wallpaperPath = path
+
+        // allEntryKeys: 每个语言的 key 数组（包含子条目 key）
+        // 需要将该组所有条目的 hidden 设为 true，除了选中语言的条目
+        // 但这里我们只知道组级别的 key，需要遍历所有可能的 override key
+        // 实际上，我们从 JS 端传入该组所有条目的 id 列表
+        // 为简化，JS 端传入 groupAllKeys（该组所有条目的 key 列表）和 selectedKeys
+        // 但当前消息只传了 groupID, index, allEntryKeys
+        // allEntryKeys[index] 就是选中语言的 key 集合
+        let selectedKeys = Set(index < allEntryKeys.count ? allEntryKeys[index] : [])
+        let allKeys = Set(allEntryKeys.flatMap { $0 })
+
+        for key in allKeys {
+            var ov = document.overrides[key] ?? SceneDynamicTextDesignOverride()
+            ov.hidden = !selectedKeys.contains(key)
+            document.overrides[key] = ov
+        }
+
+        try? SceneWallpaperDesignService.saveDocument(document, for: path)
+        LiquidGlassClockOverlayManager.shared.rebuildAll()
+    }
+
+    private var rebuildTask: Task<Void, Never>?
+
+    private func scheduleSceneDesignRebuild() {
+        rebuildTask?.cancel()
+        rebuildTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 280_000_000)
+            guard !Task.isCancelled else { return }
+            LiquidGlassClockOverlayManager.shared.rebuildAll()
+        }
+    }
+
+    private static func toDouble(_ value: Any) -> Double? {
+        if let n = value as? Double { return n }
+        if let n = value as? Int { return Double(n) }
+        if let s = value as? String { return Double(s) }
+        return nil
+    }
+
+    private static func hexToNormalizedRGB(_ hex: String) -> [Double] {
+        var hexSanitized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        hexSanitized = hexSanitized.replacingOccurrences(of: "#", with: "")
+        guard hexSanitized.count == 6,
+              let r = UInt32(hexSanitized.prefix(2), radix: 16),
+              let g = UInt32(hexSanitized.dropFirst(2).prefix(2), radix: 16),
+              let b = UInt32(hexSanitized.suffix(2), radix: 16) else {
+            return [1.0, 1.0, 1.0]
+        }
+        return [Double(r) / 255.0, Double(g) / 255.0, Double(b) / 255.0]
+    }
+
     // MARK: - Static Helpers
 
     private static func resolveContentDir(for wallpaperPath: String) -> URL {
@@ -646,6 +986,7 @@ enum WallpaperEditorType {
     case scene       // 场景壁纸 → SceneWallpaperPropertiesService
     case web         // Web 壁纸 → WebWallpaperDesignService
     case sceneConfig // 场景高级设置 → SceneConfigOverrideService
+    case sceneDesign // 桌面动态元素设计 → SceneWallpaperDesignService
 }
 
 // MARK: - Property Editor Item
@@ -713,6 +1054,20 @@ private final class ScriptMessageHandlerProxy: NSObject, WKScriptMessageHandler 
                 }
             case "editorReady":
                 target.handleEditorReady()
+            case "sceneDesignChanged":
+                if let body = message.body as? [String: Any],
+                   let entryKey = body["entryKey"] as? String,
+                   let field = body["field"] as? String,
+                   let value = body["value"] {
+                    target.handleSceneDesignChanged(entryKey: entryKey, field: field, value: value)
+                }
+            case "selectLanguage":
+                if let body = message.body as? [String: Any],
+                   let groupID = body["groupID"] as? String,
+                   let index = body["index"] as? Int,
+                   let allEntryKeys = body["allEntryKeys"] as? [[String]] {
+                    target.handleSelectLanguage(groupID: groupID, index: index, allEntryKeys: allEntryKeys)
+                }
             default:
                 break
             }

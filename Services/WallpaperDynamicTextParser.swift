@@ -75,11 +75,55 @@ public struct DynamicTextEntry: Codable, Equatable, Sendable {
     }
 }
 
+/// 烘焙 sidecar 中的图片对象（印章、装饰图等），来自 Rust renderer 的 IMAGES 输出。
+public struct BakeImageEntry: Codable, Equatable, Sendable {
+    public let id: UInt32
+    public let name: String
+    public var renderOrder: Int? = nil
+
+    // Transform
+    public var originX: Double? = nil
+    public var originY: Double? = nil
+    public var scaleX: Double? = nil
+    public var scaleY: Double? = nil
+    public var rotationZ: Double? = nil
+
+    // Cumulative transform
+    public var finalOriginX: Double? = nil
+    public var finalOriginY: Double? = nil
+    public var finalScaleX: Double? = nil
+    public var finalScaleY: Double? = nil
+    public var finalAngle: Double? = nil
+
+    // Web coordinates
+    public var finalX: Double? = nil
+    public var finalY: Double? = nil
+
+    // Size
+    public var width: Double? = nil
+    public var height: Double? = nil
+
+    // Visual
+    public var color: [Double]? = nil
+    public var alpha: Double? = nil
+
+    // Texture (relative path, resolve against assetsPath)
+    public var texture: String? = nil
+
+    // Visibility
+    public var visible: Bool = true
+
+    // Hierarchy
+    public var parentId: UInt32? = nil
+}
+
 public struct WallpaperDynamicTextsInfo: Codable, Equatable, Sendable {
     /// 是否包含时钟/日期/星期行为
     public let hasDynamicText: Bool
     /// 具体行为列表
     public let entries: [DynamicTextEntry]
+    /// 图片对象列表（印章、装饰图等）
+    public var images: [BakeImageEntry] = []
     /// 原始场景壁纸路径（legacy renderer sidecar 会带出）
     public var wallpaperPath: String? = nil
     /// renderer sidecar 的场景尺寸，用于将 scene 坐标映射到当前屏幕。
@@ -91,6 +135,7 @@ public struct WallpaperDynamicTextsInfo: Codable, Equatable, Sendable {
     public static let empty = WallpaperDynamicTextsInfo(
         hasDynamicText: false,
         entries: [],
+        images: [],
         extractedAt: Date()
     )
 }
@@ -202,9 +247,11 @@ public enum WallpaperDynamicTextParser {
         else { return nil }
 
         if let info = try? JSONDecoder().decode(WallpaperDynamicTextsInfo.self, from: data) {
+            print("[Sidecar] JSONDecoder direct decode: texts=\(info.entries.count) images=\(info.images.count) hasDynamicText=\(info.hasDynamicText)")
             return info
         }
 
+        print("[Sidecar] falling through to loadLegacyRendererSidecar")
         return loadLegacyRendererSidecar(from: data)
     }
 
@@ -232,13 +279,16 @@ private extension WallpaperDynamicTextParser {
         let isRendererDynamicTextList: Bool
         let sceneWidth: Double?
         let sceneHeight: Double?
+        let images: [BakeImageEntry]
         if let dict = json as? [String: Any] {
             sceneWidth = legacyDouble(dict["sceneWidth"])
             sceneHeight = legacyDouble(dict["sceneHeight"])
+            images = legacyImages(from: dict["images"])
             if let explicitHasDynamicText = dict["hasDynamicText"] as? Bool {
                 return WallpaperDynamicTextsInfo(
                     hasDynamicText: explicitHasDynamicText,
                     entries: legacyEntries(from: dict["entries"] ?? dict["texts"] ?? dict["dynamicTexts"]),
+                    images: images,
                     wallpaperPath: legacyString(dict["wallpaperPath"]),
                     sceneWidth: sceneWidth,
                     sceneHeight: sceneHeight,
@@ -251,6 +301,7 @@ private extension WallpaperDynamicTextParser {
         } else {
             sceneWidth = nil
             sceneHeight = nil
+            images = []
             isRendererDynamicTextList = true
             textObjects = legacyTextObjects(from: json)
         }
@@ -258,9 +309,11 @@ private extension WallpaperDynamicTextParser {
         let entries = textObjects.compactMap(legacyEntry(from:))
         // 后处理：对同名的 clock 条目推断格式（hh/mm/ss）
         let inferredEntries = inferLegacyClockFormats(entries: entries)
+        print("[Sidecar] parsed: texts=\(inferredEntries.count) images=\(images.count) sceneW=\(sceneWidth ?? 0) sceneH=\(sceneHeight ?? 0)")
         return WallpaperDynamicTextsInfo(
             hasDynamicText: !inferredEntries.isEmpty || (isRendererDynamicTextList && !textObjects.isEmpty),
             entries: inferredEntries,
+            images: images,
             wallpaperPath: legacyString((json as? [String: Any])?["wallpaperPath"]),
             sceneWidth: sceneWidth,
             sceneHeight: sceneHeight,
@@ -275,6 +328,38 @@ private extension WallpaperDynamicTextParser {
 
     static func legacyEntries(from value: Any?) -> [DynamicTextEntry] {
         legacyTextObjects(from: value).compactMap(legacyEntry(from:))
+    }
+
+    static func legacyImages(from value: Any?) -> [BakeImageEntry] {
+        legacyTextObjects(from: value).compactMap(legacyImage(from:))
+    }
+
+    static func legacyImage(from object: [String: Any]) -> BakeImageEntry? {
+        guard let id = legacyDouble(object["id"]).map({ UInt32($0) }),
+              let name = legacyString(object["name"]) else { return nil }
+
+        var entry = BakeImageEntry(id: id, name: name)
+        entry.renderOrder = legacyDouble(object["renderOrder"]).map { Int($0) }
+        entry.originX = legacyDouble(object["originX"])
+        entry.originY = legacyDouble(object["originY"])
+        entry.scaleX = legacyDouble(object["scaleX"])
+        entry.scaleY = legacyDouble(object["scaleY"])
+        entry.rotationZ = legacyDouble(object["rotationZ"])
+        entry.finalOriginX = legacyDouble(object["finalOriginX"])
+        entry.finalOriginY = legacyDouble(object["finalOriginY"])
+        entry.finalScaleX = legacyDouble(object["finalScaleX"])
+        entry.finalScaleY = legacyDouble(object["finalScaleY"])
+        entry.finalAngle = legacyDouble(object["finalAngle"])
+        entry.finalX = legacyDouble(object["finalX"])
+        entry.finalY = legacyDouble(object["finalY"])
+        entry.width = legacyDouble(object["width"])
+        entry.height = legacyDouble(object["height"])
+        entry.color = legacyDoubleArray(object["color"])
+        entry.alpha = legacyDouble(object["alpha"])
+        entry.texture = legacyString(object["texture"])
+        entry.visible = legacyBool(object["visible"]) ?? true
+        entry.parentId = legacyDouble(object["parentId"]).map { UInt32($0) }
+        return entry
     }
 
     static func legacyEntry(from object: [String: Any]) -> DynamicTextEntry? {

@@ -336,6 +336,265 @@
     transition: background 0.15s;
   }
   .u-close-btn:hover { background: rgba(255,255,255,0.12); }
+
+  /* Scene Design specific styles */
+  .design-empty {
+    padding: 40px 20px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+  .design-group {
+    background: var(--bg-card);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .design-group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .design-group-header:hover {
+    background: rgba(255,255,255,0.03);
+  }
+  .design-group-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.6;
+    flex-shrink: 0;
+  }
+  .design-group-name {
+    font-size: 13px;
+    font-weight: 600;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .design-group-chevron {
+    width: 16px; height: 16px;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+  .design-group.collapsed .design-group-chevron {
+    transform: rotate(-90deg);
+  }
+  .design-group-body {
+    border-top: 1px solid var(--border);
+  }
+  .design-group.collapsed .design-group-body {
+    display: none;
+  }
+
+  /* Language tabs */
+  .lang-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 6px 12px 0;
+    background: rgba(0,0,0,0.15);
+  }
+  .lang-tab {
+    padding: 5px 12px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: all 0.15s;
+    border-radius: 6px 6px 0 0;
+  }
+  .lang-tab:hover {
+    color: var(--text-primary);
+    background: rgba(255,255,255,0.04);
+  }
+  .lang-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    background: rgba(255,255,255,0.04);
+  }
+
+  /* Design card sections */
+  .design-card {
+    margin: 8px 12px;
+    padding: 10px 12px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+  }
+  .design-card + .design-card {
+    margin-top: 6px;
+  }
+  .design-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 0;
+  }
+  .design-row + .design-row {
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+  .design-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-primary);
+    width: 72px;
+    flex-shrink: 0;
+  }
+  .design-control {
+    flex: 1;
+    min-width: 0;
+  }
+
+  /* Design inputs */
+  .design-input {
+    width: 100%;
+    padding: 5px 8px;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .design-input:focus {
+    border-color: var(--accent);
+  }
+  .design-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  /* Design slider */
+  .design-slider-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .design-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--slider-track);
+    outline: none;
+  }
+  .design-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    border: 2px solid var(--bg-card);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .design-slider-value {
+    font-size: 10px;
+    font-weight: 600;
+    font-family: 'SF Mono', monospace;
+    color: var(--accent);
+    background: var(--accent-dim);
+    padding: 2px 6px;
+    border-radius: 4px;
+    min-width: 40px;
+    text-align: center;
+  }
+
+  /* Design select */
+  .design-select {
+    width: 100%;
+    padding: 5px 8px;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    outline: none;
+    cursor: pointer;
+  }
+  .design-select:focus {
+    border-color: var(--accent);
+  }
+
+  /* Design color swatch */
+  .design-color-swatch {
+    width: 32px;
+    height: 24px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+  }
+  .design-color-swatch input[type="color"] {
+    position: absolute;
+    top: -4px;
+    left: -4px;
+    width: calc(100% + 8px);
+    height: calc(100% + 8px);
+    border: none;
+    cursor: pointer;
+    opacity: 0;
+  }
+
+  /* Design toggle */
+  .design-toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+  .design-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+  .design-toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--toggle-off);
+    border-radius: 10px;
+    transition: 0.2s;
+  }
+  .design-toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 16px;
+    width: 16px;
+    left: 2px;
+    bottom: 2px;
+    background: white;
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  .design-toggle input:checked + .design-toggle-slider {
+    background: var(--accent);
+  }
+  .design-toggle input:checked + .design-toggle-slider:before {
+    transform: translateX(16px);
+  }
+
+  .design-value-preview {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    padding: 0 0 4px 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -917,6 +1176,12 @@ function notifyChange(key, value) {
 }
 
 function handleReset() {
+  if (sceneDesignData) {
+    // Scene design mode: Swift handles the reset, just re-render after
+    window.webkit.messageHandlers.resetAll.postMessage(null);
+    // Data will be reloaded via loadAndInjectData in Swift
+    return;
+  }
   for (const prop of properties) {
     if (prop.defaultValue !== undefined && prop.defaultValue !== null) {
       currentValues[prop.key] = prop.defaultValue;
@@ -957,6 +1222,362 @@ function initFromData() {
     applyAccentColor(window.accentColor);
   }
   renderProperties();
+}
+
+// ==================== Scene Design Mode ====================
+
+let sceneDesignData = null;
+
+function initSceneDesign() {
+  if (typeof window.sceneDesignData !== 'undefined') sceneDesignData = window.sceneDesignData;
+  if (typeof window.wallpaperTitle !== 'undefined') {
+    document.getElementById('wallpaperName').textContent = window.wallpaperTitle;
+  }
+  if (typeof window.accentColor !== 'undefined') {
+    applyAccentColor(window.accentColor);
+  }
+  renderSceneDesign();
+}
+
+function renderSceneDesign() {
+  const container = document.getElementById('propertyList');
+  container.innerHTML = '';
+
+  if (!sceneDesignData || !sceneDesignData.groups || sceneDesignData.groups.length === 0) {
+    container.innerHTML = '<div class="design-empty">没有可编辑的动态文本元素</div>';
+    return;
+  }
+
+  for (const group of sceneDesignData.groups) {
+    container.appendChild(renderDesignGroup(group));
+  }
+}
+
+function renderDesignGroup(group) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'design-group';
+  wrapper.dataset.groupId = group.id;
+
+  // Header (clickable to collapse/expand)
+  const header = document.createElement('div');
+  header.className = 'design-group-header';
+  header.innerHTML = '<div class="design-group-dot"></div>' +
+    '<div class="design-group-name">' + escHtml(group.displayName) + '</div>' +
+    '<svg class="design-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+  header.onclick = function() { wrapper.classList.toggle('collapsed'); };
+  wrapper.appendChild(header);
+
+  // Body
+  const body = document.createElement('div');
+  body.className = 'design-group-body';
+
+  const isMultiLang = group.entries.length > 1;
+  let selectedIdx = group.selectedLanguageIndex || 0;
+
+  // Language tabs (if multi-language)
+  if (isMultiLang && group.languageLabels && group.languageLabels.length > 1) {
+    const tabs = document.createElement('div');
+    tabs.className = 'lang-tabs';
+    group.languageLabels.forEach(function(label, idx) {
+      const tab = document.createElement('button');
+      tab.className = 'lang-tab' + (idx === selectedIdx ? ' active' : '');
+      tab.textContent = label;
+      tab.onclick = function(e) {
+        e.stopPropagation();
+        // Update tabs
+        tabs.querySelectorAll('.lang-tab').forEach(function(t) { t.classList.remove('active'); });
+        tab.classList.add('active');
+        selectedIdx = idx;
+        // Show/hide entry editors
+        body.querySelectorAll('.design-entry-editor').forEach(function(editor, eIdx) {
+          editor.style.display = eIdx === idx ? '' : 'none';
+        });
+        // Notify Swift of language switch
+        try {
+          window.webkit.messageHandlers.selectLanguage.postMessage({
+            groupID: group.id,
+            index: idx,
+            allEntryKeys: group.languageEntryKeys
+          });
+        } catch(e) {}
+      };
+      tabs.appendChild(tab);
+    });
+    body.appendChild(tabs);
+  }
+
+  // Entry editors (one per language, show only selected)
+  group.entries.forEach(function(entry, idx) {
+    const editor = document.createElement('div');
+    editor.className = 'design-entry-editor';
+    editor.style.display = (isMultiLang && idx !== selectedIdx) ? 'none' : '';
+    editor.appendChild(renderDesignEntry(entry, isMultiLang));
+    body.appendChild(editor);
+  });
+
+  wrapper.appendChild(body);
+  return wrapper;
+}
+
+function renderDesignEntry(entry, showHideToggle) {
+  const frag = document.createDocumentFragment();
+
+  // Value preview
+  if (entry.value) {
+    const preview = document.createElement('div');
+    preview.className = 'design-value-preview';
+    preview.textContent = entry.value;
+    frag.appendChild(preview);
+  }
+
+  // Card 1: Visibility & Text
+  const card1 = document.createElement('div');
+  card1.className = 'design-card';
+
+  if (showHideToggle) {
+    card1.appendChild(makeToggleRow('隐藏', entry.hidden, function(val) {
+      entry.hidden = val;
+      notifyDesignChange(entry.id, 'hidden', val);
+    }));
+  }
+
+  card1.appendChild(makeInputRow('文本覆盖', entry.textOverride || '', function(val) {
+    entry.textOverride = val;
+    notifyDesignChange(entry.id, 'textOverride', val);
+  }, '留空使用原始文本'));
+
+  // Clock-specific options
+  if (entry.behavior === 'clock') {
+    card1.appendChild(makeToggleRow('24小时制', entry.use24hFormat !== false, function(val) {
+      entry.use24hFormat = val;
+      notifyDesignChange(entry.id, 'use24hFormat', val);
+    }));
+    card1.appendChild(makeToggleRow('显示秒', entry.showSeconds || false, function(val) {
+      entry.showSeconds = val;
+      notifyDesignChange(entry.id, 'showSeconds', val);
+    }));
+    card1.appendChild(makeInputRow('分隔符', entry.delimiter || '', function(val) {
+      entry.delimiter = val;
+      notifyDesignChange(entry.id, 'delimiter', val);
+    }, ':'));
+  }
+  frag.appendChild(card1);
+
+  // Card 2: Sliders
+  const card2 = document.createElement('div');
+  card2.className = 'design-card';
+
+  card2.appendChild(makeSliderRow('不透明度', entry.alpha, 0, 1, 0.05, function(val) {
+    entry.alpha = val;
+    notifyDesignChange(entry.id, 'alpha', val);
+  }, 2));
+
+  card2.appendChild(makeSliderRow('X 偏移', entry.offsetX, -400, 400, 1, function(val) {
+    entry.offsetX = val;
+    notifyDesignChange(entry.id, 'offsetX', val);
+  }, 0));
+
+  card2.appendChild(makeSliderRow('Y 偏移', entry.offsetY, -400, 400, 1, function(val) {
+    entry.offsetY = val;
+    notifyDesignChange(entry.id, 'offsetY', val);
+  }, 0));
+
+  card2.appendChild(makeSliderRow('缩放', entry.scaleMultiplier, 0.2, 3, 0.05, function(val) {
+    entry.scaleMultiplier = val;
+    notifyDesignChange(entry.id, 'scaleMultiplier', val);
+  }, 2));
+
+  card2.appendChild(makeSliderRow('字号倍率', entry.fontSizeMultiplier, 0.2, 3, 0.05, function(val) {
+    entry.fontSizeMultiplier = val;
+    notifyDesignChange(entry.id, 'fontSizeMultiplier', val);
+  }, 2));
+
+  card2.appendChild(makeSliderRow('旋转', entry.rotation, -3.14, 3.14, 0.01, function(val) {
+    entry.rotation = val;
+    notifyDesignChange(entry.id, 'rotation', val);
+  }, 2));
+
+  card2.appendChild(makeSliderRow('最大宽度', entry.maxWidth, 50, 3000, 10, function(val) {
+    entry.maxWidth = val;
+    notifyDesignChange(entry.id, 'maxWidth', val);
+  }, 0));
+
+  frag.appendChild(card2);
+
+  // Card 3: Font & Color
+  const card3 = document.createElement('div');
+  card3.className = 'design-card';
+
+  card3.appendChild(makeInputRow('字体名称', entry.fontName || '', function(val) {
+    entry.fontName = val;
+    notifyDesignChange(entry.id, 'fontName', val);
+  }, '系统字体'));
+
+  card3.appendChild(makeInputRow('字体路径', entry.fontPath || '', function(val) {
+    entry.fontPath = val;
+    notifyDesignChange(entry.id, 'fontPath', val);
+  }, '/path/to/font.ttf'));
+
+  // Alignment select
+  var alignRow = document.createElement('div');
+  alignRow.className = 'design-row';
+  alignRow.innerHTML = '<div class="design-label">对齐方式</div><div class="design-control"></div>';
+  var alignSelect = document.createElement('select');
+  alignSelect.className = 'design-select';
+  var alignOpts = [['left center', '左对齐'], ['center center', '居中'], ['right center', '右对齐']];
+  alignOpts.forEach(function(opt) {
+    var option = document.createElement('option');
+    option.value = opt[0];
+    option.textContent = opt[1];
+    if ((entry.alignment || 'center center') === opt[0]) option.selected = true;
+    alignSelect.appendChild(option);
+  });
+  alignSelect.onchange = function() {
+    entry.alignment = alignSelect.value;
+    notifyDesignChange(entry.id, 'alignment', alignSelect.value);
+  };
+  alignRow.querySelector('.design-control').appendChild(alignSelect);
+  card3.appendChild(alignRow);
+
+  // Color picker
+  var colorRow = document.createElement('div');
+  colorRow.className = 'design-row';
+  colorRow.innerHTML = '<div class="design-label">颜色</div><div class="design-control" style="display:flex;align-items:center;gap:8px;"></div>';
+  var swatch = document.createElement('div');
+  swatch.className = 'design-color-swatch';
+  swatch.style.background = entry.color || '#ffffff';
+  var colorInput = document.createElement('input');
+  colorInput.type = 'color';
+  colorInput.value = entry.color || '#ffffff';
+  colorInput.oninput = function() {
+    swatch.style.background = colorInput.value;
+    entry.color = colorInput.value;
+    notifyDesignChange(entry.id, 'color', colorInput.value);
+  };
+  swatch.appendChild(colorInput);
+  var colorLabel = document.createElement('span');
+  colorLabel.style.fontSize = '11px';
+  colorLabel.style.color = 'var(--text-secondary)';
+  colorLabel.style.fontFamily = "'SF Mono', monospace";
+  colorLabel.textContent = (entry.color || '#ffffff').toUpperCase();
+  colorInput.oninput = function() {
+    swatch.style.background = colorInput.value;
+    entry.color = colorInput.value;
+    colorLabel.textContent = colorInput.value.toUpperCase();
+    notifyDesignChange(entry.id, 'color', colorInput.value);
+  };
+  colorRow.querySelector('.design-control').appendChild(swatch);
+  colorRow.querySelector('.design-control').appendChild(colorLabel);
+  card3.appendChild(colorRow);
+
+  frag.appendChild(card3);
+  return frag;
+}
+
+function notifyDesignChange(entryKey, field, value) {
+  try {
+    window.webkit.messageHandlers.sceneDesignChanged.postMessage({
+      entryKey: entryKey,
+      field: field,
+      value: value
+    });
+  } catch(e) {}
+}
+
+// ---- Design UI helper functions ----
+
+function makeToggleRow(label, checked, onChange) {
+  var row = document.createElement('div');
+  row.className = 'design-row';
+  row.innerHTML = '<div class="design-label">' + label + '</div><div class="design-control" style="display:flex;justify-content:flex-end;"></div>';
+  var toggle = document.createElement('label');
+  toggle.className = 'design-toggle';
+  var input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = !!checked;
+  input.onchange = function() { onChange(input.checked); };
+  var slider = document.createElement('span');
+  slider.className = 'design-toggle-slider';
+  toggle.appendChild(input);
+  toggle.appendChild(slider);
+  row.querySelector('.design-control').appendChild(toggle);
+  return row;
+}
+
+function makeInputRow(label, value, onChange, placeholder) {
+  var row = document.createElement('div');
+  row.className = 'design-row';
+  row.innerHTML = '<div class="design-label">' + label + '</div><div class="design-control"></div>';
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'design-input';
+  input.value = value || '';
+  if (placeholder) input.placeholder = placeholder;
+  var debounceTimer = null;
+  input.oninput = function() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function() { onChange(input.value); }, 200);
+  };
+  row.querySelector('.design-control').appendChild(input);
+  return row;
+}
+
+function makeSliderRow(label, value, min, max, step, onChange, precision) {
+  var row = document.createElement('div');
+  row.className = 'design-row';
+  row.style.flexDirection = 'column';
+  row.style.alignItems = 'stretch';
+  row.style.gap = '6px';
+
+  var headerRow = document.createElement('div');
+  headerRow.style.display = 'flex';
+  headerRow.style.alignItems = 'center';
+  headerRow.style.gap = '10px';
+
+  var labelEl = document.createElement('div');
+  labelEl.className = 'design-label';
+  labelEl.textContent = label;
+
+  var valueDisplay = document.createElement('div');
+  valueDisplay.className = 'design-slider-value';
+  valueDisplay.textContent = formatDesignNum(value, precision);
+
+  headerRow.appendChild(labelEl);
+  var spacer = document.createElement('div');
+  spacer.style.flex = '1';
+  headerRow.appendChild(spacer);
+  headerRow.appendChild(valueDisplay);
+  row.appendChild(headerRow);
+
+  var sliderRow = document.createElement('div');
+  sliderRow.className = 'design-slider-row';
+  var slider = document.createElement('input');
+  slider.type = 'range';
+  slider.className = 'design-slider';
+  slider.min = min;
+  slider.max = max;
+  slider.step = step;
+  slider.value = value;
+  slider.oninput = function() {
+    var v = parseFloat(slider.value);
+    valueDisplay.textContent = formatDesignNum(v, precision);
+    onChange(v);
+  };
+  sliderRow.appendChild(slider);
+  row.appendChild(sliderRow);
+
+  return row;
+}
+
+function formatDesignNum(val, precision) {
+  if (precision > 0) return Number(val).toFixed(precision);
+  return String(Math.round(val));
+}
+
+function escHtml(str) {
+  var div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
 }
 
 // Signal Swift that DOM is ready for data injection

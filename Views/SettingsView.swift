@@ -1158,7 +1158,7 @@ private struct AboutSettingsTab: View {
                 // 链接组
                 MacSettingsSection(header: t("links")) {
                     MacLinkRow(title: t("visitWebsite"), action: {
-                        if let url = URL(string: "https://github.com/jipika/WaifuX") {
+                        if let url = URL(string: "https://jipika.github.io/WaifuX") {
                             NSWorkspace.shared.open(url)
                         }
                     })
@@ -1523,13 +1523,18 @@ private struct WorkshopSettingsTab: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
-                    HStack {
+                    HStack(alignment: .top) {
                         if isVerifyingSteamLogin {
                             ProgressView()
                                 .scaleEffect(0.8)
-                            Text("正在验证账号并连接 SteamCMD…")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("正在验证账号并连接 SteamCMD…")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                Text(t("steamLoginMobileConfirmHint"))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.tertiary)
+                            }
                         } else if let steamLoginStatusText {
                             Text(steamLoginStatusText)
                                 .font(.system(size: 11))

@@ -102,6 +102,7 @@ class SettingsViewModel: ObservableObject {
     /// 动态锁屏壁纸开关（仅 macOS 26+ 可用，关闭后走旧逻辑）
     @Published var dynamicLockScreenEnabled = false {
         didSet {
+            guard !isBatchUpdating else { return }
             // 非 macOS 26+ 系统强制关闭，不允许开启
             if #available(macOS 26.0, *) { } else {
                 if dynamicLockScreenEnabled {
@@ -110,6 +111,10 @@ class SettingsViewModel: ObservableObject {
                 }
             }
             UserDefaults.standard.set(dynamicLockScreenEnabled, forKey: "dynamic_lock_screen_enabled")
+            // 开启时立即同步显示器实例到共享容器，使系统锁屏设置能发现 WaifuX 实例
+            if dynamicLockScreenEnabled {
+                LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
+            }
         }
     }
 

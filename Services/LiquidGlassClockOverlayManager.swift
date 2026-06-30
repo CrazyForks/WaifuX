@@ -223,12 +223,20 @@ public final class LiquidGlassClockOverlayManager {
     }
 
     private func shouldShowClock(config: LiquidGlassClockConfiguration) -> Bool {
-        guard config.enabled else { return false }
+        guard config.enabled else {
+            print("[Overlay] shouldShowClock: config.enabled=false")
+            return false
+        }
         // 仅在有视频壁纸且关联 sidecar 有时钟文本时才显示 overlay
         guard VideoWallpaperManager.shared.isVideoWallpaperActive,
               let videoURL = VideoWallpaperManager.shared.currentVideoURL
-        else { return false }
-        return WallpaperDynamicTextParser.hasDynamicText(for: videoURL)
+        else {
+            print("[Overlay] shouldShowClock: no active video wallpaper")
+            return false
+        }
+        let hasText = WallpaperDynamicTextParser.hasDynamicText(for: videoURL)
+        print("[Overlay] shouldShowClock: videoActive=true hasDynamicText=\(hasText) url=\(videoURL.lastPathComponent)")
+        return hasText
     }
 
     // MARK: - 定时器管理
@@ -483,14 +491,23 @@ public final class LiquidGlassClockOverlayManager {
         // 按位置去重：多语言壁纸同一位置有多个语言版本的文本，只保留一个
         let rendererEntries = Self.deduplicateByPosition(rawEntries)
 
-        if !rendererEntries.isEmpty {
+        // 图片覆盖层（印章等装饰图）
+        let images = sidecarInfo?.images.filter { $0.visible } ?? []
+        print("[Overlay] makeClockView: texts=\(rendererEntries.count) images=\(images.count) wallpaperPath=\(sidecarInfo?.wallpaperPath ?? "nil")")
+        for img in images {
+            print("[Overlay]   image: id=\(img.id) name=\(img.name) texture=\(img.texture ?? "nil") color=\(img.color ?? []) finalOrigin=(\(img.finalOriginX ?? 0), \(img.finalOriginY ?? 0)) size=(\(img.width ?? 0)x\(img.height ?? 0))")
+        }
+
+        if !rendererEntries.isEmpty || !images.isEmpty {
             return AnyView(
                 RendererDynamicTextOverlayView(
                     entries: rendererEntries,
+                    images: images,
                     sceneWidth: sidecarInfo?.sceneWidth,
                     sceneHeight: sidecarInfo?.sceneHeight,
                     screenSize: screen.frame.size,
-                    dockInsets: dockInsets
+                    dockInsets: dockInsets,
+                    wallpaperPath: sidecarInfo?.wallpaperPath
                 )
             )
         }
@@ -590,18 +607,34 @@ private struct DockInfo: Equatable {
 
 private struct RendererDynamicTextOverlayView: View {
     let entries: [DynamicTextEntry]
+    let images: [BakeImageEntry]
     let sceneWidth: Double?
     let sceneHeight: Double?
     let screenSize: CGSize
     let dockInsets: DockInfo
+    let wallpaperPath: String?
 
     @State private var now = Date()
 
     private let timer = Timer.publish(every: 1, tolerance: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
+        let _ = print("[Overlay] overlayView body: entries=\(entries.count) images=\(images.count)")
         ZStack(alignment: .topLeading) {
             Color.clear.ignoresSafeArea()
+            // 图片覆盖层（印章等），先渲染图片再渲染文字（文字在上层）
+            ForEach(Array(images.enumerated()), id: \.offset) { idx, image in
+                let _ = print("[Overlay] overlayView ForEach image: idx=\(idx) name=\(image.name)")
+                RendererImageOverlayView(
+                    image: image,
+                    sceneWidth: sceneWidth,
+                    sceneHeight: sceneHeight,
+                    screenSize: screenSize,
+                    dockInsets: dockInsets,
+                    wallpaperPath: wallpaperPath
+                )
+                .zIndex(Double(image.renderOrder ?? 0) - 0.5) // 图片在同 renderOrder 的文字下层
+            }
             ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
                 RendererDynamicTextView(
                     entry: entry,
@@ -619,17 +652,21 @@ private struct RendererDynamicTextOverlayView: View {
     /// 按 C++ FreeType 实际渲染尺寸计算 SwiftUI pt 字号
     /// 基于 rasterHeight（pixelSize × scaleY），经验修正因子 2.0 补偿
     /// FreeType 的 ascent + descent + padding 使纹理高度大于 pixelSize。
+    ///
+    /// 单位推导：sceneTextHeight 是场景像素单位，screenSize 是逻辑点。
+    /// scenePx / sourceHeight × screenPt = screenPt（像素/高度×点 = 点，
+    /// 因为场景像素与屏幕点在非 Retina 下 1:1，Retina 下比例自动抵消）。
+    /// 不需要再除以 screenScale——SwiftUI 的 frame/font 都是 points。
     private func computeFontSize(for entry: DynamicTextEntry) -> CGFloat {
         let sourceHeight = sceneHeight ?? Double(screenSize.height)
-        let screenScale = NSScreen.main?.backingScaleFactor ?? 2.0
 
         if let rh = entry.rasterHeight, rh > 0 {
             // rasterHeight 仅含 pixelSize × scaleY，实际 FreeType 纹理高度
             // 约为 pixelSize × 2.0（含 ascent + descent + padding×2）。
             // 直接放大 2× 匹配 C++ 渲染尺寸。
             let sceneTextHeight = rh * 2.0
-            let screenPx = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
-            return CGFloat(screenPx / Double(screenScale))
+            let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
+            return CGFloat(screenPt)
         }
 
         // 保底：用 effectiveFontSize × multiplier
@@ -637,8 +674,8 @@ private struct RendererDynamicTextOverlayView: View {
                      || entry.name.contains("D a y"))
         let multiplier: Double = isDay ? 5.0 : 3.0
         let sceneTextHeight = (entry.effectiveFontSize ?? entry.fontSize ?? 32) * multiplier
-        let screenPx = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
-        return CGFloat(screenPx / Double(screenScale))
+        let screenPt = sceneTextHeight / max(sourceHeight, 1) * Double(screenSize.height)
+        return CGFloat(screenPt)
     }
 
     private func position(for entry: DynamicTextEntry) -> CGPoint {
@@ -657,6 +694,150 @@ private struct RendererDynamicTextOverlayView: View {
         let x = Double(dockInsets.left) + rawX / max(sourceWidth, 1) * availW
         let y = (1 - rawY / max(sourceHeight, 1)) * availH
         return CGPoint(x: x, y: y)
+    }
+}
+
+// MARK: - 图片覆盖层渲染（印章等装饰图）
+
+private struct RendererImageOverlayView: View {
+    let image: BakeImageEntry
+    let sceneWidth: Double?
+    let sceneHeight: Double?
+    let screenSize: CGSize
+    let dockInsets: DockInfo
+    let wallpaperPath: String?
+
+    @State private var nsImage: NSImage?
+
+    var body: some View {
+        Group {
+            if let nsImage = nsImage {
+                let screenPos = position(for: image)
+                let sourceWidth = sceneWidth ?? Double(screenSize.width)
+                let sourceHeight = sceneHeight ?? Double(screenSize.height)
+                let availW = Double(screenSize.width) - Double(dockInsets.left) - Double(dockInsets.right)
+                let availH = Double(screenSize.height) - Double(dockInsets.bottom)
+
+                // 将场景像素尺寸映射到屏幕逻辑点尺寸
+                // （screenSize 是 points，场景是 pixels，比例自动抵消，不需要 /screenScale）
+                let imgW = (image.width ?? 100) * (image.finalScaleX ?? 1) / max(sourceWidth, 1) * availW
+                let imgH = (image.height ?? 100) * (image.finalScaleY ?? 1) / max(sourceHeight, 1) * availH
+                let _ = print("[Overlay] render: \(image.name) pos=\(screenPos) size=(\(imgW),\(imgH)) tint=\(tintColor)")
+
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: CGFloat(imgW), height: CGFloat(imgH))
+                    .foregroundStyle(tintColor)
+                    .opacity(image.alpha ?? 1)
+                    .rotationEffect(.radians(image.finalAngle ?? image.rotationZ ?? 0))
+                    .position(screenPos)
+                    .allowsHitTesting(false)
+            } else {
+                Color.clear
+            }
+        }
+        .task { loadImage() }
+    }
+
+    /// 颜色 tint（对应 shader 的 g_Color4）
+    private var tintColor: Color {
+        if let c = image.color, c.count >= 3 {
+            return Color(red: c[0], green: c[1], blue: c[2])
+        }
+        return .white
+    }
+
+    /// 场景坐标 → 屏幕坐标（与文本 position(for:) 相同映射）
+    private func position(for img: BakeImageEntry) -> CGPoint {
+        let sourceWidth = sceneWidth ?? Double(screenSize.width)
+        let sourceHeight = sceneHeight ?? Double(screenSize.height)
+        let rawX = img.finalOriginX ?? img.originX ?? img.finalX ?? 0
+        let rawY = img.finalOriginY ?? img.originY ?? img.finalY ?? 0
+        let availW = Double(screenSize.width) - Double(dockInsets.left) - Double(dockInsets.right)
+        let availH = Double(screenSize.height) - Double(dockInsets.bottom)
+        let x = Double(dockInsets.left) + rawX / max(sourceWidth, 1) * availW
+        let y = (1 - rawY / max(sourceHeight, 1)) * availH
+        return CGPoint(x: x, y: y)
+    }
+
+    /// 从 .tex 文件加载图片：提取内嵌 PNG 数据
+    private func loadImage() {
+        guard let texPath = image.texture, !texPath.isEmpty else {
+            print("[Overlay] loadImage: no texture path for image \(image.name)")
+            return
+        }
+        print("[Overlay] loadImage: name=\(image.name) texPath=\(texPath)")
+
+        // 如果路径已经是绝对路径且文件存在，直接使用
+        let resolvedPath: String
+        if texPath.hasPrefix("/") {
+            resolvedPath = texPath
+        } else if let wp = wallpaperPath {
+            // 相对路径：尝试 wallpaperPath 下的多种位置
+            let candidates = [
+                wp + "/scene.pkg_extracted/materials/" + texPath + ".tex",
+                wp + "/materials/" + texPath + ".tex",
+                wp + "/" + texPath + ".tex",
+                wp + "/scene.pkg_extracted/materials/" + texPath,
+                wp + "/materials/" + texPath,
+            ]
+            resolvedPath = candidates.first { FileManager.default.fileExists(atPath: $0) } ?? (wp + "/materials/" + texPath + ".tex")
+        } else {
+            resolvedPath = texPath
+        }
+
+        print("[Overlay] loadImage: resolvedPath=\(resolvedPath) exists=\(FileManager.default.fileExists(atPath: resolvedPath))")
+        let url = URL(fileURLWithPath: resolvedPath)
+        guard let data = try? Data(contentsOf: url) else {
+            print("[Overlay] 无法读取纹理文件: \(resolvedPath)")
+            return
+        }
+        print("[Overlay] loadImage: data size=\(data.count) bytes")
+
+        // 从 .tex 容器提取内嵌 PNG
+        if let pngData = Self.extractPNG(from: data) {
+            print("[Overlay] loadImage: extracted PNG size=\(pngData.count) bytes")
+            nsImage = NSImage(data: pngData)
+            print("[Overlay] loadImage: nsImage=\(nsImage != nil ? "\(nsImage!.size)" : "nil")")
+        } else if let img = NSImage(data: data) {
+            // 不是 .tex 格式，直接作为图片加载
+            print("[Overlay] loadImage: loaded directly as image size=\(img.size)")
+            nsImage = img
+        } else {
+            print("[Overlay] 无法解码纹理: \(resolvedPath)")
+        }
+    }
+
+    /// 从 TEX 容器二进制中提取内嵌 PNG 数据。
+    /// TEX 格式：TEXV header → TEXI info → TEXB body（内含 PNG 以 89 50 4E 47 开头）
+    static func extractPNG(from texData: Data) -> Data? {
+        // 检查 TEX 魔数
+        guard texData.count > 8 else { return nil }
+        let header = texData.subdata(in: 0..<4)
+        guard header == Data([0x54, 0x45, 0x58, 0x56]) else { // "TEXV"
+            return nil
+        }
+
+        // 搜索 PNG 签名: 89 50 4E 47 0D 0A 1A 0A
+        let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        guard let pngStart = texData.range(of: pngSignature)?.lowerBound else {
+            return nil
+        }
+
+        // 从 PNG 签名开始到文件末尾就是 PNG 数据
+        // （TEX 容器中 PNG 通常是最后一个 chunk）
+        let pngData = texData.subdata(in: pngStart..<texData.endIndex)
+
+        // 验证 PNG 末尾有 IEND chunk
+        let iendMarker = Data([0x49, 0x45, 0x4E, 0x44]) // "IEND"
+        guard let iendPos = pngData.range(of: iendMarker)?.lowerBound else {
+            return pngData // 没有 IEND，仍然返回尝试解码
+        }
+
+        // IEND 后面还有 4 字节 CRC
+        let pngEnd = min(iendPos + 4 + 4, pngData.count)
+        return pngData.subdata(in: 0..<pngEnd)
     }
 }
 

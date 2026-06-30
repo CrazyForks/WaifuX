@@ -54,6 +54,8 @@ struct TopNavigationBar: View {
     @State private var showHelpPopover = false
     private let controlHeight: CGFloat = 34
 
+    private static let lastTutorialVersionKey = "lastShownTutorialVersion"
+
     var body: some View {
         HStack(alignment: .center, spacing: 0) {
             // 左侧红绿灯 - 固定宽高，内容居中
@@ -101,6 +103,22 @@ struct TopNavigationBar: View {
         .simultaneousGesture(
             TapGesture(count: 2).onEnded { _ in onZoom() }
         )
+        .onAppear {
+            checkAndShowTutorialOnNewVersion()
+        }
+    }
+
+    /// 新版本首次启动时自动弹出使用教程
+    private func checkAndShowTutorialOnNewVersion() {
+        let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let lastVersion = UserDefaults.standard.string(forKey: Self.lastTutorialVersionKey) ?? ""
+        guard !currentVersion.isEmpty else { return }
+        if currentVersion != lastVersion {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                showHelpPopover = true
+            }
+            UserDefaults.standard.set(currentVersion, forKey: Self.lastTutorialVersionKey)
+        }
     }
 }
 
@@ -265,7 +283,9 @@ struct HelpPopoverView: View {
                             t("tutorial.network.l1"),
                             t("tutorial.network.l2"),
                             t("tutorial.network.l3"),
-                            t("tutorial.network.l4")
+                            t("tutorial.network.l4"),
+                            t("tutorial.network.l5"),
+                            t("tutorial.network.l6")
                         ]
                     )
 
@@ -275,7 +295,8 @@ struct HelpPopoverView: View {
                         title: t("tutorial.we.title"),
                         lines: [
                             t("tutorial.we.l1"),
-                            t("tutorial.we.l2")
+                            t("tutorial.we.l2"),
+                            t("tutorial.we.l3")
                         ]
                     )
 
@@ -299,7 +320,10 @@ struct HelpPopoverView: View {
                             t("tutorial.library.l3"),
                             t("tutorial.library.l4"),
                             t("tutorial.library.l5"),
-                            t("tutorial.library.l6")
+                            t("tutorial.library.l6"),
+                            t("tutorial.library.l7"),
+                            t("tutorial.library.l8"),
+                            t("tutorial.library.l9")
                         ]
                     )
 
@@ -323,7 +347,9 @@ struct HelpPopoverView: View {
                         lines: [
                             t("tutorial.sceneWeb.l1"),
                             t("tutorial.sceneWeb.l2"),
-                            t("tutorial.sceneWeb.l3")
+                            t("tutorial.sceneWeb.l3"),
+                            t("tutorial.sceneWeb.l4"),
+                            t("tutorial.sceneWeb.l5")
                         ]
                     )
 
@@ -335,7 +361,9 @@ struct HelpPopoverView: View {
                             t("tutorial.lockScreen.l1"),
                             t("tutorial.lockScreen.l2"),
                             t("tutorial.lockScreen.l3"),
-                            t("tutorial.lockScreen.l4")
+                            t("tutorial.lockScreen.l4"),
+                            t("tutorial.lockScreen.l5"),
+                            t("tutorial.lockScreen.l6")
                         ]
                     )
                 }

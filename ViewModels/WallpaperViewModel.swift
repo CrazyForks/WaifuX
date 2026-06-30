@@ -1176,6 +1176,8 @@ class WallpaperViewModel: ObservableObject {
             }
             try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: displayIDs)
             StaticWallpaperGrainManager.shared.updateOverlay()
+            // 互斥：清除可能残留的静态图 overlay
+            StaticImageWallpaperOverlayManager.shared.clearState()
             print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将静态图同步到 WaifuX 锁屏/桌面实例")
             return
         }
@@ -1243,6 +1245,8 @@ class WallpaperViewModel: ObservableObject {
                 if let displayID = (targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value {
                     try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: [displayID])
                     StaticWallpaperGrainManager.shared.updateOverlay()
+                    // 互斥：清除可能残留的静态图 overlay
+                    StaticImageWallpaperOverlayManager.shared.clearState()
                     print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将单屏静态图同步到 WaifuX 实例")
                 }
                 return

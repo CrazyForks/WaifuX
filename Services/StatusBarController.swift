@@ -779,10 +779,13 @@ final class StatusBarController: NSObject {
             return
         }
 
-        // macOS 26+：扩展控制模式下停止所有壁纸
+        // macOS 26+：扩展控制模式下停止视频壁纸，但仍需保留 WE 恢复链
         if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
-            videoWallpaperManager.stopWallpaper()
-            return
+            if videoWallpaperManager.isVideoWallpaperActive {
+                videoWallpaperManager.stopWallpaper()
+                return
+            }
+            // 视频壁纸未播放时，走正常恢复链（WE → 视频 → 静态 overlay）
         }
 
         if videoWallpaperManager.isVideoWallpaperActive {
@@ -858,7 +861,7 @@ final class StatusBarController: NSObject {
 
     @objc private func openWebWallpaperDesignPanel() {
         if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
-            SceneWallpaperDesignPanelController.shared.present(for: sceneWallpaperPath)
+            WebPropertyEditorPanelController.shared.presentSceneDesign(for: sceneWallpaperPath)
             return
         }
 
@@ -875,7 +878,7 @@ final class StatusBarController: NSObject {
             if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
                 WebPropertyEditorPanelController.shared.presentScene(for: wallpaperPath)
             } else {
-                SceneWallpaperDesignPanelController.shared.present(for: wallpaperPath)
+                WebPropertyEditorPanelController.shared.presentSceneDesign(for: wallpaperPath)
             }
             return
         }

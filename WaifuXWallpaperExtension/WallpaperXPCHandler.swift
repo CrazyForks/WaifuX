@@ -954,25 +954,21 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
         Task {
             if let snapshotXPC = await createSnapshotViaRuntime(currentTime: currentTime) {
-                // 验证 XPC 编码可行性：尝试 NSKeyedArchiver 测试编码
-                let canEncode: Bool
+                // 诊断性 XPC 编码测试：在 macOS 26+ 上验证 WallpaperSnapshotXPC 可编码
+                // 但不再因测试失败而丢弃快照——系统自身会处理编码异常
                 if #available(macOS 26.0, *) {
-                    canEncode = (try? NSKeyedArchiver.archivedData(withRootObject: snapshotXPC, requiringSecureCoding: false)) != nil
-                } else {
-                    canEncode = true
+                    do {
+                        _ = try NSKeyedArchiver.archivedData(withRootObject: snapshotXPC, requiringSecureCoding: false)
+                        extLog("  Snapshot XPC encode test passed")
+                    } catch {
+                        extLog("  ⚠️ Snapshot XPC encode test failed: \(error.localizedDescription) — 仍然发送快照让系统处理")
+                    }
                 }
-                if canEncode {
-                    reply(snapshotXPC, nil)
-                    extLog("  Snapshot replied (IOSurface)")
-                } else {
-                    // XPC 编码会失败（WallpaperSnapshotXPC 缺少 encodeWithCoder:），
-                    // 返回 nil 防止 XPC 异常阻断壁纸系统
-                    extLog("  ⚠️ Snapshot XPC encode would fail, replying nil to avoid XPC exception")
-                    reply(nil, nil)
-                }
+                reply(snapshotXPC, nil)
+                extLog("  Snapshot replied (IOSurface)")
             } else {
                 reply(nil, nil)
-                extLog("  Snapshot replied nil")
+                extLog("  Snapshot replied nil — 所有策略均未命中")
             }
         }
     }
@@ -1005,6 +1001,18 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
 
         // 先清除缓存，确保证 SettingsProvider 扫描到最新文件
         WallpaperState.shared.clearCaches()
+
+        // 检查实例文件是否被清理 — 如果 App 执行了「清理锁屏实例」，
+        // 实例 JSON 已删除，扩展应停止渲染旧内容并释放 contexts。
+        let instancesGone = !Self.displayInstancesFileExists()
+        if instancesGone {
+            let removed = WallpaperState.shared.removeAllContexts()
+            if !removed.isEmpty {
+                extLog("[XPCHandler] 🧹 实例文件已删除，清理 \(removed.count) 个活跃上下文")
+            }
+            WallpaperPrefs.shared.setActive(false)
+        }
+
         // 与其它 drain 入口共用同一串行后台队列，避免并发竞争且不阻塞主线程。
         wallpaperCommandQueue.async {
             WaifuXWallpaperExtension.drainPendingSocketCommands(reason: "xpcPrefsChanged")
@@ -1033,6 +1041,15 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 extLog("[XPCHandler] ❌ updateSettingsViewModels 失败: \(error)")
             }
         }
+    }
+
+    /// 检查显示器实例 JSON 文件是否存在于共享容器中。
+    private static func displayInstancesFileExists() -> Bool {
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.waifux.app") else {
+            return false
+        }
+        let url = container.appendingPathComponent("waifux-display-instances.json")
+        return FileManager.default.fileExists(atPath: url.path)
     }
 
     // MARK: - Stubs

@@ -568,7 +568,9 @@ final class WallpaperEngineXBridge: ObservableObject {
                 }
 
                 // 新壁纸 canvas 尺寸可能不同，等真实尺寸写出后更新 crop
-                if let ccURL = existingInfo.cropControlURL,
+                // autoFill 模式不需要写 crop-control，Rust 端默认 Cover 即可
+                if cropSettings.shouldApplyCrop,
+                   let ccURL = existingInfo.cropControlURL,
                    let csURL = existingInfo.canvasSizeURL {
                     let cropSettingsCopy = cropSettings
                     let cropControlURLCopy = ccURL
@@ -1385,7 +1387,7 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 这些命令仅作为 IPC 客户端，向 daemon 发完消息就退出；真正的 web 渲染由 daemon 持有。
     @discardableResult
     private static func runLegacyCLIClientCommand(_ arguments: [String]) async throws -> Int32 {
-        guard let cli = SceneOfflineBakeService.resolvedLegacyCLIExecutableURL() else {
+        guard let cli = Self.resolvedLegacyCLIExecutableURL() else {
             throw WallpaperEngineError.cliNotFound
         }
         let env = legacyCLILaunchEnvironment(for: cli)
@@ -1413,7 +1415,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    /// 给旧 CLI 客户端进程拼装 DYLD 路径，复用 `bakeWithLegacyCLI` 的搜索策略。
+    /// 给旧 CLI 客户端进程拼装环境变量（仅 web 壁纸 daemon 使用）。
     private static func legacyCLILaunchEnvironment(for cli: URL) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["LSUIElement"] = "1"
@@ -1421,28 +1423,6 @@ final class WallpaperEngineXBridge: ObservableObject {
             env["WAIFUX_DYNAMIC_LOCK_SCREEN_ENABLED"] = VideoWallpaperManager.shared.isLockScreenEnabled ? "1" : "0"
         } else {
             env["WAIFUX_DYNAMIC_LOCK_SCREEN_ENABLED"] = "0"
-        }
-        let execDir = cli.deletingLastPathComponent()
-        let dylibCandidates = [
-            execDir.path,
-            execDir.appendingPathComponent("lib").path,
-            execDir.appendingPathComponent("Resources").path,
-            execDir.appendingPathComponent("Resources/lib").path,
-            execDir.deletingLastPathComponent().appendingPathComponent("Resources/lib").path,
-            execDir.deletingLastPathComponent().appendingPathComponent("Frameworks").path
-        ]
-        var libPaths: [String] = []
-        if let existing = env["DYLD_LIBRARY_PATH"], !existing.isEmpty {
-            libPaths.append(existing)
-        }
-        for candidate in dylibCandidates {
-            let p = candidate + "/liblinux-wallpaperengine-renderer.dylib"
-            if FileManager.default.fileExists(atPath: p) {
-                libPaths.append(candidate)
-            }
-        }
-        if !libPaths.isEmpty {
-            env["DYLD_LIBRARY_PATH"] = libPaths.joined(separator: ":")
         }
         return env
     }
@@ -2307,6 +2287,35 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         print("[WallpaperEngineXBridge] ❌ wallpaper-wgpu 在所有路径中均未找到")
+        return nil
+    }
+
+    /// 解析 `wallpaperengine-cli` 可执行文件路径（web 壁纸 daemon）
+    nonisolated static func resolvedLegacyCLIExecutableURL() -> URL? {
+        // 1. Bundle 内
+        if let url = Bundle.main.url(forResource: "wallpaperengine-cli", withExtension: nil) {
+            return url
+        }
+        // 2. Contents/Resources/wallpaperengine-cli
+        let bundleResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/wallpaperengine-cli")
+        if FileManager.default.fileExists(atPath: bundleResources.path) {
+            return bundleResources
+        }
+        // 3. bundle 同级目录（开发/调试）
+        let siblingPath = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("wallpaperengine-cli")
+        if FileManager.default.fileExists(atPath: siblingPath.path) {
+            return siblingPath
+        }
+        // 4. 项目开发路径
+        let projectPaths = [
+            "/Volumes/mac/CodeLibrary/Claude/WallHaven/wallpaperengine-cli",
+            "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/wallpaperengine-cli"
+        ]
+        for path in projectPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+        }
         return nil
     }
 
@@ -3578,12 +3587,15 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private func applyCaptureAsDesktopWallpaper() {
         guard FileManager.default.fileExists(atPath: webPrimaryCapturePath) else { return }
+
+        // 始终递增 slot，保证下次截帧不会覆盖同一个文件（锁屏关闭后需要拿到新鲜截图）
+        desktopCaptureSlot = 1 - desktopCaptureSlot
+
         if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             print("[WebRendererBridge] 🔒 动态锁屏已启用，跳过 Web 捕获静态桌面写入")
             return
         }
 
-        desktopCaptureSlot = 1 - desktopCaptureSlot
         let dstPath = desktopCaptureSlot == 0 ? webDeskCapturePath0 : webDeskCapturePath1
         let src = URL(fileURLWithPath: webPrimaryCapturePath)
         let dst = URL(fileURLWithPath: dstPath)

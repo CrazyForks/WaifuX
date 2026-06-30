@@ -126,6 +126,19 @@ final class VideoRenderer: @unchecked Sendable {
         CMTimebaseSetTime(timebase, time: .zero)
         CMTimebaseSetRate(timebase, rate: 0.0)
         displayLayer.controlTimebase = timebase
+
+        // 即时同步底图：如果 BMP 缓存为空（首次启动 / 清理后），同步提取视频首帧
+        // 作为 backgroundFrameLayer 内容，避免锁屏 acquire 后黑屏。
+        // 异步 generateBackgroundFrame 完成后会用更高质量封面覆盖。
+        if backgroundFrameLayer.contents == nil {
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            if let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil) {
+                backgroundFrameLayer.contents = cgImage
+                backgroundFrameLayer.opacity = 1
+                extLog("  [Renderer] 同步首帧底图已设置: \(asset.url.lastPathComponent)")
+            }
+        }
         generateBackgroundFrame(for: asset)
     }
 

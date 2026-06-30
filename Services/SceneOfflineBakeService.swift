@@ -25,12 +25,10 @@ enum SceneOfflineBakeError: LocalizedError {
 
 enum SceneBakeRenderer: String, CaseIterable, Codable, Hashable, Sendable {
     case wallpaperWgpu
-    case legacyCLI
 
     var displayName: String {
         switch self {
         case .wallpaperWgpu: return "1. wallpaper-wgpu"
-        case .legacyCLI: return "2. wallpaperengine-cli"
         }
     }
 }
@@ -310,8 +308,6 @@ enum SceneOfflineBakeService {
         switch renderer {
         case .wallpaperWgpu:
             return WallpaperEngineXBridge.resolvedCLIExecutableURL() != nil
-        case .legacyCLI:
-            return resolvedLegacyCLIExecutableURL() != nil
         }
     }
 
@@ -358,23 +354,6 @@ enum SceneOfflineBakeService {
             try ScenePreviewProcessController.shared.launch(
                 executableURL: cli,
                 arguments: args,
-                renderer: renderer
-            )
-        case .legacyCLI:
-            guard let cli = resolvedLegacyCLIExecutableURL() else {
-                throw SceneOfflineBakeError.bakeProcessFailed("未找到 wallpaperengine-cli，无法预览渲染器 2")
-            }
-            let screen = NSScreen.main?.frame ?? .init(x: 0, y: 0, width: 1920, height: 1080)
-            let width = max(64, Int(screen.width))
-            let height = max(64, Int(screen.height))
-            try ScenePreviewProcessController.shared.launch(
-                executableURL: cli,
-                arguments: [
-                    "preview",
-                    contentRoot.path,
-                    String(width),
-                    String(height)
-                ],
                 renderer: renderer
             )
         }
@@ -511,7 +490,7 @@ enum SceneOfflineBakeService {
         let sceneBakesRoot = await MainActor.run {
             DownloadPathManager.shared.sceneBakesFolderURL
         }
-        let cacheDurationSeconds = renderer == .legacyCLI ? 0 : durationSeconds
+        let cacheDurationSeconds = durationSeconds
         let outURL = cacheVideoURL(
             baseDir: sceneBakesRoot,
             itemID: cacheItemID,
@@ -529,8 +508,6 @@ enum SceneOfflineBakeService {
             switch renderer {
             case .wallpaperWgpu:
                 return await inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH)
-            case .legacyCLI:
-                return await inspectBakedVideo(at: outURL)
             }
         }()
         if let cachedInspection,
@@ -541,7 +518,7 @@ enum SceneOfflineBakeService {
                 width: cachedInspection.width,
                 height: cachedInspection.height,
                 fps: Int(fps),
-                durationSeconds: renderer == .legacyCLI ? cachedInspection.duration : durationSeconds,
+                durationSeconds: durationSeconds,
                 bakedAt: (attrs[.creationDate] as? Date) ?? .now,
                 renderer: renderer
             )
@@ -565,14 +542,6 @@ enum SceneOfflineBakeService {
             try? FileManager.default.removeItem(at: outURL)
         }
 
-        if renderer == .legacyCLI {
-            await MainActor.run {
-                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
-            }
-            // 与 stop 子进程错开
-            try await Task.sleep(nanoseconds: 250_000_000)
-        }
-
         let artifact: SceneBakeArtifact
         switch renderer {
         case .wallpaperWgpu:
@@ -586,18 +555,6 @@ enum SceneOfflineBakeService {
                 durationSeconds: durationSeconds,
                 progress: progress
             )
-        case .legacyCLI:
-            // legacyCLI 通过 stderr 的 BAKE_PROGRESS: 行上报真实进度
-            artifact = try await bakeWithLegacyCLI(
-                contentRoot: contentRoot,
-                outURL: outURL,
-                eligibility: eligibility,
-                width: evenW,
-                height: evenH,
-                fps: fps,
-                progress: progress
-            )
-            await MainActor.run { progress?(1.0) }
         }
         if let itemID = persistArtifactToItemID {
             await MainActor.run {
@@ -666,8 +623,9 @@ enum SceneOfflineBakeService {
         process.environment = env
 
         let stderrPipe = Pipe()
+        let stdoutPipe = Pipe()
         process.standardError = stderrPipe
-        process.standardOutput = FileHandle.nullDevice
+        process.standardOutput = stdoutPipe
 
         try process.run()
 
@@ -697,6 +655,39 @@ enum SceneOfflineBakeService {
             }
         }
         let stderrCapture = StderrCapture()
+
+        // stdout 捕获：收集 DYNAMIC_TEXTS / IMAGES / AUDIO_SPECTRUM / AUDIO_VISUALIZERS JSON
+        final class StdoutCapture: @unchecked Sendable {
+            var data = Data()
+            func append(_ chunk: Data) {
+                data.append(chunk)
+            }
+            /// 解析 DYNAMIC_TEXTS: 行并返回 JSON Data
+            func dynamicTextsJSON() -> Data? {
+                guard let text = String(data: data, encoding: .utf8) else { return nil }
+                for line in text.components(separatedBy: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.hasPrefix("DYNAMIC_TEXTS:") {
+                        let jsonStr = String(trimmed.dropFirst(14))
+                        return jsonStr.data(using: .utf8)
+                    }
+                }
+                return nil
+            }
+            /// 解析 IMAGES: 行并返回 JSON Data
+            func imagesJSON() -> Data? {
+                guard let text = String(data: data, encoding: .utf8) else { return nil }
+                for line in text.components(separatedBy: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.hasPrefix("IMAGES:") {
+                        let jsonStr = String(trimmed.dropFirst(7))
+                        return jsonStr.data(using: .utf8)
+                    }
+                }
+                return nil
+            }
+        }
+        let stdoutCapture = StdoutCapture()
 
         final class WallpaperWgpuBakeProgressParser: @unchecked Sendable {
             private let phaseFramePattern = try? NSRegularExpression(
@@ -832,6 +823,7 @@ enum SceneOfflineBakeService {
 
         // 监控 stderr 中的进度信息。兼容旧版阶段内百分比和新版全局百分比。
         let stderrHandle = stderrPipe.fileHandleForReading
+        let stdoutHandle = stdoutPipe.fileHandleForReading
         let progressTask = Task.detached(priority: .utility) {
             let progressParser = WallpaperWgpuBakeProgressParser()
             var buffer = ""
@@ -856,11 +848,21 @@ enum SceneOfflineBakeService {
             }
         }
 
+        // 读取 stdout（DYNAMIC_TEXTS 等 JSON 数据）
+        let stdoutTask = Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                let data = stdoutHandle.availableData
+                if data.isEmpty { break }
+                stdoutCapture.append(data)
+            }
+        }
+
         // 用轮询替代 waitUntilExit，避免阻塞 cooperative thread pool
         while process.isRunning {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         await progressTask.value
+        await stdoutTask.value
         stderrCapture.close()
 
         guard process.terminationStatus == 0 else {
@@ -892,6 +894,23 @@ enum SceneOfflineBakeService {
         try? FileManager.default.removeItem(at: outURL)
         try FileManager.default.moveItem(at: tempURL, to: outURL)
 
+        // 写入 sidecar JSON（动态文本 + 图片数据）
+        let sidecarURL = outURL.deletingPathExtension().appendingPathExtension("json")
+        if var sidecarDict = stdoutCapture.dynamicTextsJSON().flatMap({
+            try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+        }) {
+            // 合并 IMAGES 数据到 sidecar
+            if let imagesData = stdoutCapture.imagesJSON(),
+               let imagesDict = try? JSONSerialization.jsonObject(with: imagesData) as? [String: Any],
+               let images = imagesDict["images"] {
+                sidecarDict["images"] = images
+            }
+            if let mergedData = try? JSONSerialization.data(withJSONObject: sidecarDict, options: [.sortedKeys, .withoutEscapingSlashes]) {
+                try? mergedData.write(to: sidecarURL, options: .atomic)
+                print("[SceneOfflineBake] wallpaper-wgpu sidecar JSON 已写入: \(sidecarURL.lastPathComponent)")
+            }
+        }
+
         await MainActor.run { progress?(1.0) }
 
         return SceneBakeArtifact(
@@ -904,192 +923,6 @@ enum SceneOfflineBakeService {
             bakedAt: .now,
             renderer: .wallpaperWgpu
         )
-    }
-
-    private static func bakeWithLegacyCLI(
-        contentRoot: URL,
-        outURL: URL,
-        eligibility: SceneBakeEligibilitySnapshot,
-        width: Int,
-        height: Int,
-        fps: Int32,
-        progress: (@MainActor (Double) -> Void)? = nil
-    ) async throws -> SceneBakeArtifact {
-        guard let cli = resolvedLegacyCLIExecutableURL() else {
-            throw SceneOfflineBakeError.bakeProcessFailed("未找到 wallpaperengine-cli，无法使用渲染器 2 烘焙")
-        }
-
-        let task = Process()
-        task.executableURL = cli
-        task.arguments = [
-            "bake",
-            contentRoot.path,
-            outURL.path,
-            String(width),
-            String(height),
-            String(fps),
-            "--no-dynamic-text"
-        ]
-        var env = ProcessInfo.processInfo.environment
-        env["LSUIElement"] = "1"
-        let execDir = cli.deletingLastPathComponent()
-        let dylibCandidates = [
-            execDir.path,
-            execDir.appendingPathComponent("lib").path,
-            execDir.appendingPathComponent("Resources").path,
-            execDir.appendingPathComponent("Resources/lib").path,
-            execDir.deletingLastPathComponent().appendingPathComponent("Resources/lib").path,
-            execDir.deletingLastPathComponent().appendingPathComponent("Frameworks").path
-        ]
-        var libPaths: [String] = []
-        if let existing = env["DYLD_LIBRARY_PATH"], !existing.isEmpty {
-            libPaths.append(existing)
-        }
-        for candidate in dylibCandidates {
-            let p = candidate + "/liblinux-wallpaperengine-renderer.dylib"
-            if FileManager.default.fileExists(atPath: p) {
-                libPaths.append(candidate)
-            }
-        }
-        if !libPaths.isEmpty {
-            env["DYLD_LIBRARY_PATH"] = libPaths.joined(separator: ":")
-        }
-        task.environment = env
-
-        // 收集 stdout/stderr，同时从 stderr 解析 BAKE_PROGRESS: 行获取真实进度
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        task.standardOutput = outPipe
-        task.standardError = errPipe
-
-        // 使用 @unchecked Sendable 包装器来安全地在并发闭包中共享可变数据
-        final class MutableBox<T>: @unchecked Sendable {
-            var value: T
-            init(_ value: T) { self.value = value }
-        }
-
-        let stderrData = MutableBox(Data())
-        let stdoutData = MutableBox(Data())
-        let latestProgress = MutableBox(0.0)
-
-        // 读取 stdout，捕获 DYNAMIC_TEXTS: 行
-        outPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            stdoutData.value.append(data)
-        }
-
-        // BAKE_PROGRESS: 行解析：wallpaperengine-cli Swift 版会从 dylib 转发真实烘焙进度。
-        errPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            stderrData.value.append(data)
-            if let chunk = String(data: data, encoding: .utf8) {
-                for line in chunk.components(separatedBy: "\n") {
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.hasPrefix("BAKE_PROGRESS:") {
-                        let valueStr = trimmed.dropFirst(14)
-                        if let value = Double(valueStr) {
-                            let clamped = min(max(value, 0.0), 0.99)
-                            let monotonic = max(latestProgress.value, clamped)
-                            guard monotonic > latestProgress.value else { continue }
-                            latestProgress.value = monotonic
-                            Task { @MainActor in
-                                progress?(monotonic)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SceneBakeArtifact, Error>) in
-            task.terminationHandler = { process in
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                outPipe.fileHandleForReading.readabilityHandler = nil
-
-                let termStatus = process.terminationStatus
-                let termReason: Process.TerminationReason
-                if #available(macOS 10.15, *) {
-                    termReason = process.terminationReason
-                } else {
-                    termReason = .exit
-                }
-
-                // 组装完整输出字符串（不含 BAKE_PROGRESS 行）
-                let stderrString = String(data: stderrData.value, encoding: .utf8) ?? ""
-                let cleanStderr = stderrString
-                    .components(separatedBy: "\n")
-                    .filter { !$0.hasPrefix("BAKE_PROGRESS:") }
-                    .joined(separator: "\n")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-
-                if termStatus == 0 {
-                    // 等待文件落盘
-                    for attempt in 0 ..< 15 {
-                        if FileManager.default.fileExists(atPath: outURL.path),
-                           let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path),
-                           let sz = attrs[.size] as? NSNumber, sz.intValue > 10_000 {
-                            break
-                        }
-                        if attempt == 14 { break }
-                        Thread.sleep(forTimeInterval: 0.08)
-                    }
-
-                    let bakedInspection = inspectBakedVideoSync(at: outURL)
-                    if let bakedInspection {
-                        // wallpaperengine-cli 内部已直接将动态文本 JSON 写入 sidecar 文件
-                        continuation.resume(returning: SceneBakeArtifact(
-                            analysisId: eligibility.analysisId,
-                            videoPath: outURL.path,
-                            width: bakedInspection.width,
-                            height: bakedInspection.height,
-                            fps: Int(fps),
-                            durationSeconds: bakedInspection.duration,
-                            bakedAt: .now,
-                            renderer: .legacyCLI
-                        ))
-                    } else {
-                        continuation.resume(throwing: SceneOfflineBakeError.bakeProcessFailed(
-                            cleanStderr.isEmpty ? "CLI 退出码 0 但输出文件不可播放" : cleanStderr
-                        ))
-                    }
-                } else {
-                    var hint = ""
-                    if termReason == .uncaughtSignal, termStatus == 9 {
-                        hint = "（退出码 9 多为 SIGKILL：内存压力或系统终止子进程；可关闭其它占用 GPU/内存的应用后重试）"
-                    } else if termStatus == 9 {
-                        hint = "（若 stderr 无明确错误，退出码 9 常为 SIGKILL）"
-                    }
-                    let base = cleanStderr.isEmpty ? "wallpaperengine-cli bake 退出码 \(termStatus)\(hint)" : cleanStderr + (hint.isEmpty ? "" : "\n\(hint)")
-                    try? FileManager.default.removeItem(at: outURL)
-                    continuation.resume(throwing: SceneOfflineBakeError.bakeProcessFailed(base))
-                }
-            }
-
-            do {
-                try task.run()
-            } catch {
-                continuation.resume(throwing: SceneOfflineBakeError.bakeProcessFailed("启动 CLI 失败: \(error.localizedDescription)"))
-            }
-        }
-    }
-
-    static func resolvedLegacyCLIExecutableURL() -> URL? {
-        let fm = FileManager.default
-        let candidates = [
-            Bundle.main.url(forResource: "wallpaperengine-cli", withExtension: nil),
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/wallpaperengine-cli"),
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Resources/wallpaperengine-cli"),
-            Bundle.main.resourceURL?.appendingPathComponent("wallpaperengine-cli"),
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("wallpaperengine-cli"),
-            // linux-wallpaperengine-cli（C++ 独立版）支持 BAKE_PROGRESS: 原生进度输出
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/linux-wallpaperengine-cli"),
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/linux-wallpaperengine-cli"),
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/wallpaperengine-cli"),
-            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/wallpaperengine-cli")
-        ].compactMap { $0 }
-        return candidates.first { fm.isExecutableFile(atPath: $0.path) || fm.fileExists(atPath: $0.path) }
     }
 
     /// 检查是否有缓存（不触发实际烘焙）

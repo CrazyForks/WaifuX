@@ -13,6 +13,13 @@ func buildSettingsViewModelsXPC() async -> AnyObject? {
     let bundleID = Bundle.main.bundleIdentifier ?? "com.waifux.app.wallpaperextension"
     let groupID = GroupID(id: "waifux-display-wallpapers")
     let instances = loadDisplayInstances()
+
+    // 清理后无实例 → 返回空分组，让系统移除旧的实例卡片
+    guard !instances.isEmpty else {
+        extLog("[SettingsProvider] 无显示器实例，返回空分组")
+        return makeEmptyGroupsResponse()
+    }
+
     var items = [SettingsItem]()
 
     for instance in instances {
