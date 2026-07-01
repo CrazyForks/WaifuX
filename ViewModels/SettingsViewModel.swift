@@ -47,6 +47,13 @@ class SettingsViewModel: ObservableObject {
     @Published var pauseWhenWindowCoverage = false { didSet { UserDefaults.standard.set(pauseWhenWindowCoverage, forKey: "pause_when_window_coverage") } }
     @Published var windowCoveragePauseThreshold: Double = 50 { didSet { UserDefaults.standard.set(windowCoveragePauseThreshold, forKey: "window_coverage_pause_threshold") } }
     @Published var hdrEnabled = true { didSet { UserDefaults.standard.set(hdrEnabled, forKey: "hdr_enabled") } }
+    @Published var autoRemoveVideoLetterbox = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
+            VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
+        }
+    }
     @Published var showAllWorkshopContent = false { didSet { UserDefaults.standard.set(showAllWorkshopContent, forKey: "show_all_workshop_content") } }
     /// 场景壁纸实时渲染模式开关
     /// 开启后，设置场景壁纸将使用 wallpaper-wgpu 实时渲染桌面，而非烘焙视频
@@ -209,6 +216,7 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(grainTextureEnabled, forKey: "grain_texture_enabled")
         UserDefaults.standard.set(grainIntensity, forKey: "arc_grain_intensity")
         UserDefaults.standard.set(hideNotch, forKey: "hide_notch")
+        UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
         UserDefaults.standard.set(sceneRealtimeRenderingEnabled, forKey: "scene_realtime_rendering_enabled")
         UserDefaults.standard.set(proxyEnabled, forKey: "proxy_enabled")
         UserDefaults.standard.set(proxyHost, forKey: "proxy_host")
@@ -218,6 +226,7 @@ class SettingsViewModel: ObservableObject {
         ArcBackgroundSettings.shared.grainTextureEnabled = grainTextureEnabled
         ArcBackgroundSettings.shared.grainIntensity = grainIntensity
         VideoWallpaperManager.shared.refreshGrainOverlay()
+        VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
         NotchOverlayManager.shared.setEnabled(hideNotch)
         if sceneRealtimeRenderingEnabled {
             LiquidGlassClockSettings.shared.update { $0.enabled = false }
@@ -305,6 +314,7 @@ class SettingsViewModel: ObservableObject {
             let savedThreshold = defaults.double(forKey: "window_coverage_pause_threshold")
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50
             hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
+            autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
             sceneRealtimeRenderingEnabled = defaults.bool(forKey: "scene_realtime_rendering_enabled")
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true

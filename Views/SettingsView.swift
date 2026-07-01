@@ -490,6 +490,14 @@ private struct GeneralSettingsTab: View {
                     MacToggle(isOn: $viewModel.hdrEnabled)
                 }
 
+                MacSettingsRow(
+                    title: t("autoRemoveVideoLetterbox"),
+                    subtitle: t("autoRemoveVideoLetterboxDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
+                }
+
                 // 动态锁屏壁纸开关（仅 macOS 26+ 可用）
                 if #available(macOS 26.0, *) {
                     MacSettingsRow(
