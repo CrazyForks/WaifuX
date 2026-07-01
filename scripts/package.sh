@@ -99,8 +99,7 @@ require_packaged_file "$PROJECT_DIR/Resources/zip_accessor.o" "wallpaper-wgpu em
 fix_ffmpeg_install_names "$PROJECT_DIR/Resources/ffmpeg" "$PROJECT_DIR/Resources/lib"
 verify_packaged_ffmpeg "$PROJECT_DIR/Resources/ffmpeg"
 
-# 旧 wallpaperengine-cli 仅作为 web 壁纸 daemon 保留。
-# 实时设置壁纸仍走 wallpaper-wgpu。
+# wallpaperengine-cli 仅作为 web 壁纸 daemon 保留（不嵌入 assets，体积约 640KB）。
 CLI_BIN="$PROJECT_DIR/Resources/wallpaperengine-cli"
 CLI_REBUILD_REASON=""
 
@@ -113,18 +112,10 @@ elif [[ -n "${WAIFUX_FORCE_CLI_REBUILD:-}" ]]; then
   CLI_REBUILD_REASON="WAIFUX_FORCE_CLI_REBUILD"
 elif [[ "$PROJECT_DIR/wallpaperengine-cli.swift" -nt "$CLI_BIN" ]]; then
   CLI_REBUILD_REASON="wallpaperengine-cli.swift changed"
-elif [[ "$PROJECT_DIR/WallpaperEngineEmbeddedAssets.swift" -nt "$CLI_BIN" ]]; then
-  CLI_REBUILD_REASON="WallpaperEngineEmbeddedAssets.swift changed"
-elif [[ -d "$PROJECT_DIR/Resources/assets" ]] && [[ -n "$(find "$PROJECT_DIR/Resources/assets" -type f -newer "$CLI_BIN" -print -quit 2>/dev/null)" ]]; then
-  CLI_REBUILD_REASON="Resources/assets changed"
 fi
 
 if [[ -n "$CLI_REBUILD_REASON" ]]; then
   echo "🔧 构建 wallpaperengine-cli（web 壁纸 daemon 用，原因：$CLI_REBUILD_REASON）..."
-  if [[ -f "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh" ]]; then
-    chmod +x "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh"
-    "$PROJECT_DIR/scripts/ensure-wallpaperengine-assets.sh"
-  fi
   if [[ -f "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh" ]]; then
     echo "🔧 构建 wallpaperengine-cli（web 壁纸 daemon 用）..."
     chmod +x "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh"
