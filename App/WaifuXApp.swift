@@ -1136,7 +1136,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settingsWindow.standardWindowButton(.closeButton)?.isHidden = true
         settingsWindow.standardWindowButton(.miniaturizeButton)?.isHidden = true
         settingsWindow.standardWindowButton(.zoomButton)?.isHidden = true
-        settingsWindow.isMovableByWindowBackground = true
+        settingsWindow.isMovableByWindowBackground = false
         settingsWindow.backgroundColor = NSColor(Color(hex: "1C1C1E"))
         settingsWindow.setContentSize(NSSize(width: 680, height: 520))
         settingsWindow.minSize = NSSize(width: 680, height: 520)

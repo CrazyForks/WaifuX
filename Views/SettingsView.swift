@@ -19,6 +19,22 @@ private struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+private struct WindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> DragHandleView {
+        DragHandleView()
+    }
+
+    func updateNSView(_ nsView: DragHandleView, context: Context) {}
+}
+
+private final class DragHandleView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
 // MARK: - 设置标签
 private enum SettingsTab: String, CaseIterable, Identifiable {
     case general
@@ -120,7 +136,8 @@ struct SettingsView: View {
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(0.9))
 
-                    Spacer()
+                    WindowDragHandle()
+                        .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24)
 
                     Button {
                         (NSApp.keyWindow ?? NSApp.mainWindow)?.performClose(nil)
