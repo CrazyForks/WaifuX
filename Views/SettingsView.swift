@@ -25,7 +25,9 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     case modules
     case download
     case workshop
+    case pixiv
     case scheduler
+    case sync
     case about
 
     var id: Self { self }
@@ -36,7 +38,9 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .modules: return t("settings.modules")
         case .download: return t("download")
         case .workshop: return t("wallpaperEngine")
+        case .pixiv: return "Pixiv"
         case .scheduler: return t("scheduler")
+        case .sync: return t("cloudSync")
         case .about: return t("about")
         }
     }
@@ -47,7 +51,9 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .modules: return "square.grid.2x2"
         case .download: return "arrow.down.circle"
         case .workshop: return "gearshape.2" // Steam/Workshop 风格
+        case .pixiv: return "p.circle"
         case .scheduler: return "clock.arrow.circlepath"
+        case .sync: return "icloud"
         case .about: return "info.circle"
         }
     }
@@ -150,8 +156,12 @@ struct SettingsView: View {
                         DownloadSettingsTab(viewModel: viewModel)
                     case .workshop:
                         WorkshopSettingsTab(viewModel: viewModel)
+                    case .pixiv:
+                        PixivSettingsTab()
                     case .scheduler:
                         SchedulerSettingsTab(viewModel: viewModel)
+                    case .sync:
+                        SyncSettingsTab()
                     case .about:
                         AboutSettingsTab(viewModel: viewModel)
                     }
@@ -166,7 +176,7 @@ struct SettingsView: View {
     // MARK: 左侧导航栏
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(SettingsTab.allCases, id: \.self) { tab in
+            ForEach(SettingsTab.allCases.filter { $0 != .sync }, id: \.self) { tab in
                 SidebarItem(
                     tab: tab,
                     isSelected: selectedTab == tab,
