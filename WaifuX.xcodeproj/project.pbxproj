@@ -1357,7 +1357,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 38.0.126;
+				CURRENT_PROJECT_VERSION = 38.0.127;
 				DEVELOPMENT_TEAM = SRHKTRJ83W;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = App/Info.plist;
@@ -1366,7 +1366,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 38.0.126;
+				MARKETING_VERSION = 38.0.127;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"$(SRCROOT)/Resources/zip_data.o",
@@ -1453,7 +1453,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 38.0.126;
+				CURRENT_PROJECT_VERSION = 38.0.127;
 				DEVELOPMENT_TEAM = SRHKTRJ83W;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = WaifuXWallpaperExtension/Info.plist;
@@ -1463,7 +1463,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 38.0.126;
+				MARKETING_VERSION = 38.0.127;
 				PRODUCT_BUNDLE_IDENTIFIER = com.waifux.app.wallpaperextension;
 				PRODUCT_NAME = WaifuXWallpaperExtension;
 				SDKROOT = macosx;
@@ -1479,7 +1479,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 38.0.126;
+				CURRENT_PROJECT_VERSION = 38.0.127;
 				DEVELOPMENT_TEAM = SRHKTRJ83W;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = WaifuXWallpaperExtension/Info.plist;
@@ -1489,7 +1489,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 38.0.126;
+				MARKETING_VERSION = 38.0.127;
 				PRODUCT_BUNDLE_IDENTIFIER = com.waifux.app.wallpaperextension;
 				PRODUCT_NAME = WaifuXWallpaperExtension;
 				SDKROOT = macosx;
@@ -1566,7 +1566,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 38.0.126;
+				CURRENT_PROJECT_VERSION = 38.0.127;
 				DEVELOPMENT_TEAM = SRHKTRJ83W;
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = App/Info.plist;
@@ -1575,7 +1575,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 38.0.126;
+				MARKETING_VERSION = 38.0.127;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"$(SRCROOT)/Resources/zip_data.o",

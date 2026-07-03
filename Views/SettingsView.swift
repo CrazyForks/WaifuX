@@ -1319,22 +1319,6 @@ private struct WorkshopSettingsTab: View {
                 // SteamCMD 登录
                 steamCMDLoginSection
 
-                // 桌面动态元素（时钟、音频柱状图等）
-                MacSettingsSection {
-                    MacSettingsRow(title: t("workshop.desktopDynamicElements"), subtitle: t("workshop.desktopDynamicElementsDesc"), showDivider: false) {
-                        MacToggle(isOn: Binding(
-                            get: { clockSettings.config.enabled },
-                            set: { newValue in
-                                clockSettings.update { $0.enabled = newValue }
-                                // 与场景壁纸实时渲染互斥
-                                if newValue && viewModel.sceneRealtimeRenderingEnabled {
-                                    viewModel.sceneRealtimeRenderingEnabled = false
-                                }
-                            }
-                        ))
-                    }
-                }
-
                 // 场景壁纸实时渲染模式
                 MacSettingsSection {
                     MacSettingsRow(title: t("workshop.sceneRealtimeRendering"), subtitle: t("workshop.sceneRealtimeRenderingDesc"), showDivider: false) {
@@ -1401,6 +1385,22 @@ private struct WorkshopSettingsTab: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary.opacity(0.75))
                         .padding(.leading, 2)
+                }
+
+                // 桌面动态元素（时钟、音频柱状图等）
+                MacSettingsSection {
+                    MacSettingsRow(title: t("workshop.desktopDynamicElements"), subtitle: t("workshop.desktopDynamicElementsDesc"), showDivider: false) {
+                        MacToggle(isOn: Binding(
+                            get: { clockSettings.config.enabled },
+                            set: { newValue in
+                                clockSettings.update { $0.enabled = newValue }
+                                // 与场景壁纸实时渲染互斥
+                                if newValue && viewModel.sceneRealtimeRenderingEnabled {
+                                    viewModel.sceneRealtimeRenderingEnabled = false
+                                }
+                            }
+                        ))
+                    }
                 }
 
                 // 烘焙帧率
