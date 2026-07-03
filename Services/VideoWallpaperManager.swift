@@ -69,6 +69,11 @@ final class VideoWallpaperManager: ObservableObject {
     private var loopers: [String: AVPlayerLooper] = [:]
     /// 每屏视频真实尺寸缓存（naturalSize），供 crop 计算用。设置壁纸时填充。
     private var videoSizes: [String: CGSize] = [:]
+    /// 每屏视频源文件自带黑边的内容裁切框。只在全屏自动铺满模式下叠加。
+    private var videoLetterboxContentCrops: [String: VideoLetterboxCrop] = [:]
+    private var videoLetterboxAnalysisTasks: [String: Task<VideoLetterboxCrop?, Never>] = [:]
+    private var videoLetterboxCropCache: [String: VideoLetterboxCrop] = [:]
+    private var videoLetterboxNoCropCache = Set<String>()
     /// 延迟释放的工作项，用于取消上一次未执行的清理，避免快速切换时多组 AVPlayer 并发驻留
     private var pendingPlayerCleanups: [DispatchWorkItem] = []
     private var pendingWindowCleanups: [DispatchWorkItem] = []
@@ -132,6 +137,10 @@ final class VideoWallpaperManager: ObservableObject {
     /// App 不再写入系统桌面/锁屏静态壁纸；mp4/场景/web 动态壁纸引擎不受影响。
     var isSystemWallpaperSyncEnabled: Bool {
         UserDefaults.standard.object(forKey: "system_wallpaper_sync_enabled") as? Bool ?? true
+    }
+
+    private var autoRemoveVideoLetterboxEnabled: Bool {
+        UserDefaults.standard.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
     }
 
     /// 动态锁屏启用后，任何静态 poster 写入都会通过 macOS 桌面壁纸接口覆盖用户手动选择的锁屏实例。
@@ -712,15 +721,19 @@ final class VideoWallpaperManager: ObservableObject {
         currentVideoURL = localFileURL
         // 按屏幕记录 poster，防止多屏自动更换时互相覆盖
         if let targetScreen {
-            posterURLByScreen[targetScreen.wallpaperScreenIdentifier] = posterURL
+            let screenID = targetScreen.wallpaperScreenIdentifier
+            resetVideoLetterboxState(for: screenID)
+            posterURLByScreen[screenID] = posterURL
             posterURLByScreenFingerprint[targetScreen.wallpaperScreenFingerprint] = posterURL
-            videoURLByScreen[targetScreen.wallpaperScreenIdentifier] = localFileURL
+            videoURLByScreen[screenID] = localFileURL
             videoURLByScreenFingerprint[targetScreen.wallpaperScreenFingerprint] = localFileURL
         } else {
             for screen in NSScreen.screens {
-                posterURLByScreen[screen.wallpaperScreenIdentifier] = posterURL
+                let screenID = screen.wallpaperScreenIdentifier
+                resetVideoLetterboxState(for: screenID)
+                posterURLByScreen[screenID] = posterURL
                 posterURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = posterURL
-                videoURLByScreen[screen.wallpaperScreenIdentifier] = localFileURL
+                videoURLByScreen[screenID] = localFileURL
                 videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = localFileURL
             }
         }
@@ -869,8 +882,18 @@ final class VideoWallpaperManager: ObservableObject {
 
         let settings = DisplayCropSettingsStore.shared.settings(for: screen)
         guard settings.shouldApplyCrop else {
-            containerView.applyCropLayout(nil)
             window.backgroundColor = .black
+            if autoRemoveVideoLetterboxEnabled,
+               let contentCrop = videoLetterboxContentCrops[screenID] {
+                let layout = CropLayout(
+                    wallpaperCropRect: contentCrop.cropRect,
+                    viewportRect: .full,
+                    letterboxColor: CGColor(gray: 0, alpha: 1)
+                )
+                containerView.applyCropLayout(layout)
+            } else {
+                containerView.applyCropLayout(nil)
+            }
             return
         }
         // wallpaperSize 用视频真实 naturalSize（取不到 fallback 屏尺寸，保证不崩）。
@@ -883,6 +906,27 @@ final class VideoWallpaperManager: ObservableObject {
         window.backgroundColor = NSColor(cgColor: layout.letterboxColor) ?? .black
     }
 
+    func refreshAutoRemoveVideoLetterbox() {
+        guard autoRemoveVideoLetterboxEnabled else {
+            for task in videoLetterboxAnalysisTasks.values { task.cancel() }
+            videoLetterboxAnalysisTasks.removeAll()
+            videoLetterboxContentCrops.removeAll()
+            for screen in activeScreens {
+                applyCropToScreen(screen)
+            }
+            return
+        }
+
+        for screen in activeScreens {
+            let screenID = screen.wallpaperScreenIdentifier
+            guard let videoURL = videoURLByScreen[screenID]
+                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint] else {
+                continue
+            }
+            scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: videoURL)
+        }
+    }
+
     @objc private func handleCropDidChange(_ note: Notification) {
         guard let screenID = note.userInfo?["screenID"] as? String,
               let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else { return }
@@ -892,6 +936,79 @@ final class VideoWallpaperManager: ObservableObject {
     /// 供 overlay 预览取视频真实尺寸（naturalSize）。
     func videoSize(for screen: NSScreen) -> CGSize? {
         videoSizes[screen.wallpaperScreenIdentifier]
+    }
+
+    private func scheduleVideoLetterboxAnalysis(screenID: String, videoURL: URL) {
+        guard autoRemoveVideoLetterboxEnabled else { return }
+        guard videoLetterboxAnalysisTasks[screenID] == nil else { return }
+
+        let cacheKey = videoLetterboxCacheKey(for: videoURL)
+        if let cached = videoLetterboxCropCache[cacheKey] {
+            videoLetterboxContentCrops[screenID] = cached
+            if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
+                applyCropToScreen(screen)
+            }
+            return
+        }
+        if videoLetterboxNoCropCache.contains(cacheKey) {
+            videoLetterboxContentCrops.removeValue(forKey: screenID)
+            if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
+                applyCropToScreen(screen)
+            }
+            return
+        }
+
+        let task = Task.detached(priority: .utility) {
+            await VideoLetterboxAnalyzer.analyze(url: videoURL)
+        }
+        videoLetterboxAnalysisTasks[screenID] = task
+
+        Task { @MainActor [weak self] in
+            let crop = await task.value
+            guard let self else { return }
+            self.videoLetterboxAnalysisTasks.removeValue(forKey: screenID)
+            guard self.autoRemoveVideoLetterboxEnabled else { return }
+            let currentScreen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID })
+            let currentVideoURL = self.videoURLByScreen[screenID]
+                ?? currentScreen.flatMap { self.videoURLByScreenFingerprint[$0.wallpaperScreenFingerprint] }
+            guard currentVideoURL?.standardizedFileURL == videoURL.standardizedFileURL else {
+                return
+            }
+
+            if let crop {
+                self.videoLetterboxCropCache[cacheKey] = crop
+                self.videoLetterboxContentCrops[screenID] = crop
+            } else {
+                self.videoLetterboxNoCropCache.insert(cacheKey)
+                self.videoLetterboxContentCrops.removeValue(forKey: screenID)
+            }
+
+            if let screen = currentScreen {
+                self.applyCropToScreen(screen)
+            }
+        }
+    }
+
+    private func videoLetterboxCacheKey(for url: URL) -> String {
+        guard url.isFileURL,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return url.standardizedFileURL.path
+        }
+        let size = attrs[.size] as? UInt64 ?? 0
+        let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(url.standardizedFileURL.path)|\(size)|\(modified)"
+    }
+
+    private func clearVideoLetterboxState() {
+        for task in videoLetterboxAnalysisTasks.values { task.cancel() }
+        videoLetterboxAnalysisTasks.removeAll()
+        videoLetterboxContentCrops.removeAll()
+    }
+
+    private func resetVideoLetterboxState(for screenID: String) {
+        videoLetterboxAnalysisTasks[screenID]?.cancel()
+        videoLetterboxAnalysisTasks.removeValue(forKey: screenID)
+        videoLetterboxContentCrops.removeValue(forKey: screenID)
     }
 
     /// 检测指定屏幕当前是否处于暂停状态。
@@ -1108,6 +1225,7 @@ final class VideoWallpaperManager: ObservableObject {
         players.removeAll()
         loopers.removeAll()
         videoSizes.removeAll()
+        clearVideoLetterboxState()
         lastAppliedScreenConfigurations.removeAll()
     }
 
@@ -1271,6 +1389,9 @@ final class VideoWallpaperManager: ObservableObject {
             loopers.removeValue(forKey: screenID)
         }
         videoSizes.removeValue(forKey: screenID)
+        videoLetterboxContentCrops.removeValue(forKey: screenID)
+        videoLetterboxAnalysisTasks[screenID]?.cancel()
+        videoLetterboxAnalysisTasks.removeValue(forKey: screenID)
         playerItemObservers[screenID]?.invalidate()
         playerItemObservers.removeValue(forKey: screenID)
         playerItemObserverTokens.removeValue(forKey: screenID)
@@ -2061,6 +2182,7 @@ final class VideoWallpaperManager: ObservableObject {
                     containerView.playerLayer.player = components.player
                     containerView.playerLayer.videoGravity = .resizeAspectFill
                     self.applyCropToScreen(targetScreen)
+                    self.scheduleVideoLetterboxAnalysis(screenID: targetScreenID, videoURL: videoURL)
 
                     if let oldLooper {
                         oldLooper.disableLooping()
@@ -2439,7 +2561,6 @@ final class VideoWallpaperManager: ObservableObject {
 
         containerView.playerLayer.player = components.player
         containerView.playerLayer.videoGravity = .resizeAspectFill
-        applyCropToScreen(screen)
 
         // 异步加载视频真实尺寸并缓存，加载完后重算 crop（首次用 fallback 屏尺寸）。
         Task { [weak self, videoURL] in
@@ -2462,6 +2583,8 @@ final class VideoWallpaperManager: ObservableObject {
 
         windows[screenID] = window
         players[screenID] = components.player
+        applyCropToScreen(screen)
+        scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: videoURL)
 
         // 先隐藏窗口，等视频首帧就绪后再淡入，避免启动时闪黑
         window.alphaValue = 0
@@ -2612,6 +2735,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
         players.removeAll()
         videoSizes.removeAll()
+        clearVideoLetterboxState()
 
         // 延迟释放 player，让 MediaToolbox 后台线程完成 FigNotificationCenter 清理。
         // 延迟完成后必须移除 work item，否则闭包会继续持有旧 player。
@@ -2793,6 +2917,209 @@ private struct SavedVideoWallpaperState: Codable {
 private final class WallpaperVideoWindow: NSWindow {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+}
+
+private struct VideoLetterboxCrop {
+    let cropRect: UnitRect
+    let horizontalBlackRatio: Double
+    let verticalBlackRatio: Double
+
+    /// 去黑边的额外放大倍率。上下黑边按行数占比算，左右黑边按列数占比算。
+    var zoomMultiplier: Double {
+        let dominantRatio = max(horizontalBlackRatio, verticalBlackRatio)
+        guard dominantRatio > 0, dominantRatio < 1 else { return 1 }
+        return 1.0 / (1.0 - dominantRatio)
+    }
+}
+
+private enum VideoLetterboxAnalyzer {
+    private static let blackLumaThreshold: UInt8 = 28
+    private static let edgeBlackRatioThreshold = 0.94
+    private static let maxRemovedArea = 0.20
+    private static let minRemovedArea = 0.01
+    private static let minPairInsetRatio = 0.012
+    private static let overscanPixels = 2
+
+    static func analyze(url: URL) async -> VideoLetterboxCrop? {
+        await Task.detached(priority: .utility) {
+            let asset = AVURLAsset(url: url)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 640, height: 640)
+            generator.requestedTimeToleranceBefore = .zero
+            generator.requestedTimeToleranceAfter = .zero
+
+            let duration = (try? await asset.load(.duration)) ?? .zero
+            let seconds = duration.seconds.isFinite && duration.seconds > 1 ? duration.seconds : 1
+            let times = [0.25, 0.5, 0.75].map {
+                CMTime(seconds: max(0.1, seconds * $0), preferredTimescale: 600)
+            }
+
+            var candidates: [VideoLetterboxCrop] = []
+            for time in times {
+                guard !Task.isCancelled,
+                      let image = try? generator.copyCGImage(at: time, actualTime: nil),
+                      let rect = detectCropRect(in: image) else {
+                    continue
+                }
+                candidates.append(rect)
+            }
+
+            guard !candidates.isEmpty else { return nil }
+            if candidates.count == 1 { return candidates[0] }
+            return medianRect(candidates)
+        }.value
+    }
+
+    private static func detectCropRect(in image: CGImage) -> VideoLetterboxCrop? {
+        let width = image.width
+        let height = image.height
+        guard width > 16, height > 16 else { return nil }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+        let didDraw = pixels.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let ctx = CGContext(
+                    data: baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard didDraw else { return nil }
+
+        let top = edgeInset(limit: height / 2) { y in
+            blackRatioInRow(y, width: width, bytesPerRow: bytesPerRow, pixels: pixels)
+        }
+        let bottom = edgeInset(limit: height / 2) { offset in
+            blackRatioInRow(height - 1 - offset, width: width, bytesPerRow: bytesPerRow, pixels: pixels)
+        }
+        let left = edgeInset(limit: width / 2) { x in
+            blackRatioInColumn(x, height: height, bytesPerRow: bytesPerRow, pixels: pixels)
+        }
+        let right = edgeInset(limit: width / 2) { offset in
+            blackRatioInColumn(width - 1 - offset, height: height, bytesPerRow: bytesPerRow, pixels: pixels)
+        }
+
+        let horizontalPair = Double(top + bottom) / Double(height) >= minPairInsetRatio
+            && top > 0 && bottom > 0
+        let verticalPair = Double(left + right) / Double(width) >= minPairInsetRatio
+            && left > 0 && right > 0
+
+        guard horizontalPair || verticalPair else { return nil }
+
+        let rawCropTop = horizontalPair ? top : 0
+        let rawCropBottom = horizontalPair ? bottom : 0
+        let rawCropLeft = verticalPair ? left : 0
+        let rawCropRight = verticalPair ? right : 0
+
+        let rawCropW = max(1, width - rawCropLeft - rawCropRight)
+        let rawCropH = max(1, height - rawCropTop - rawCropBottom)
+        let removedArea = 1.0 - (Double(rawCropW * rawCropH) / Double(width * height))
+        guard removedArea >= minRemovedArea, removedArea <= maxRemovedArea else { return nil }
+
+        let cropTop = horizontalPair ? min(height - 1, rawCropTop + overscanPixels) : 0
+        let cropBottom = horizontalPair ? min(height - cropTop - 1, rawCropBottom + overscanPixels) : 0
+        let cropLeft = verticalPair ? min(width - 1, rawCropLeft + overscanPixels) : 0
+        let cropRight = verticalPair ? min(width - cropLeft - 1, rawCropRight + overscanPixels) : 0
+
+        let cropW = max(1, width - cropLeft - cropRight)
+        let cropH = max(1, height - cropTop - cropBottom)
+        let horizontalBlackRatio = horizontalPair ? Double(rawCropTop + rawCropBottom) / Double(height) : 0
+        let verticalBlackRatio = verticalPair ? Double(rawCropLeft + rawCropRight) / Double(width) : 0
+
+        // 按黑边像素占比反推倍率：zoom = 1 / (1 - 黑边占比)。
+        // cropRect 的宽/高就是该倍率的倒数；overscan 只用于多吃掉边缘 1-2 行残留黑线。
+        let cropRect = UnitRect(
+            x: Double(cropLeft) / Double(width),
+            y: Double(cropTop) / Double(height),
+            w: Double(cropW) / Double(width),
+            h: Double(cropH) / Double(height)
+        )
+
+        return VideoLetterboxCrop(
+            cropRect: cropRect,
+            horizontalBlackRatio: horizontalBlackRatio,
+            verticalBlackRatio: verticalBlackRatio
+        )
+    }
+
+    private static func edgeInset(limit: Int, ratioAt: (Int) -> Double) -> Int {
+        var inset = 0
+        for i in 0..<limit {
+            if ratioAt(i) >= edgeBlackRatioThreshold {
+                inset += 1
+            } else {
+                break
+            }
+        }
+        return inset
+    }
+
+    private static func blackRatioInRow(_ y: Int, width: Int, bytesPerRow: Int, pixels: [UInt8]) -> Double {
+        let step = max(1, width / 360)
+        var black = 0
+        var total = 0
+        let row = y * bytesPerRow
+        var x = 0
+        while x < width {
+            let offset = row + x * 4
+            if isBlack(r: pixels[offset], g: pixels[offset + 1], b: pixels[offset + 2]) {
+                black += 1
+            }
+            total += 1
+            x += step
+        }
+        return total > 0 ? Double(black) / Double(total) : 0
+    }
+
+    private static func blackRatioInColumn(_ x: Int, height: Int, bytesPerRow: Int, pixels: [UInt8]) -> Double {
+        let step = max(1, height / 360)
+        var black = 0
+        var total = 0
+        var y = 0
+        while y < height {
+            let offset = y * bytesPerRow + x * 4
+            if isBlack(r: pixels[offset], g: pixels[offset + 1], b: pixels[offset + 2]) {
+                black += 1
+            }
+            total += 1
+            y += step
+        }
+        return total > 0 ? Double(black) / Double(total) : 0
+    }
+
+    private static func isBlack(r: UInt8, g: UInt8, b: UInt8) -> Bool {
+        let luma = (UInt16(r) * 77 + UInt16(g) * 150 + UInt16(b) * 29) >> 8
+        return luma <= blackLumaThreshold
+    }
+
+    private static func medianRect(_ crops: [VideoLetterboxCrop]) -> VideoLetterboxCrop? {
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        let x = median(crops.map(\.cropRect.x))
+        let y = median(crops.map(\.cropRect.y))
+        let w = median(crops.map(\.cropRect.w))
+        let h = median(crops.map(\.cropRect.h))
+        let horizontalBlackRatio = median(crops.map(\.horizontalBlackRatio))
+        let verticalBlackRatio = median(crops.map(\.verticalBlackRatio))
+        let removedArea = 1.0 - max(0, min(1, (1.0 - horizontalBlackRatio) * (1.0 - verticalBlackRatio)))
+        guard removedArea >= minRemovedArea, removedArea <= maxRemovedArea else { return nil }
+        return VideoLetterboxCrop(
+            cropRect: UnitRect(x: x, y: y, w: w, h: h),
+            horizontalBlackRatio: horizontalBlackRatio,
+            verticalBlackRatio: verticalBlackRatio
+        )
+    }
 }
 
 private final class WallpaperVideoContainerView: NSView {

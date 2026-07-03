@@ -19,6 +19,22 @@ private struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+private struct WindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> DragHandleView {
+        DragHandleView()
+    }
+
+    func updateNSView(_ nsView: DragHandleView, context: Context) {}
+}
+
+private final class DragHandleView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
 // MARK: - 设置标签
 private enum SettingsTab: String, CaseIterable, Identifiable {
     case general
@@ -126,7 +142,8 @@ struct SettingsView: View {
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(0.9))
 
-                    Spacer()
+                    WindowDragHandle()
+                        .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24)
 
                     Button {
                         (NSApp.keyWindow ?? NSApp.mainWindow)?.performClose(nil)
@@ -500,6 +517,14 @@ private struct GeneralSettingsTab: View {
                     MacToggle(isOn: $viewModel.hdrEnabled)
                 }
 
+                MacSettingsRow(
+                    title: t("autoRemoveVideoLetterbox"),
+                    subtitle: t("autoRemoveVideoLetterboxDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
+                }
+
                 // 动态锁屏壁纸开关（仅 macOS 26+ 可用）
                 if #available(macOS 26.0, *) {
                     MacSettingsRow(
@@ -606,14 +631,14 @@ private struct GeneralSettingsTab: View {
                     ))
                 }
 
-//                MacSettingsRow(
-//                    title: t("hideNotch"),
-//                    subtitle: t("hideNotchDesc"),
-//                    showDivider: true
-//                ) {
-//                    MacToggle(isOn: $viewModel.hideNotch)
-//                }
-//
+                MacSettingsRow(
+                    title: t("hideNotch"),
+                    subtitle: t("hideNotchDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.hideNotch)
+                }
+
                 MacSettingsRow(
                     title: t("saveToDownloadsFolder"),
                     subtitle: nil,
