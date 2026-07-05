@@ -57,44 +57,46 @@ struct TopNavigationBar: View {
     private static let lastTutorialVersionKey = "lastShownTutorialVersion"
 
     var body: some View {
-        HStack(alignment: .center, spacing: 0) {
-            // 左侧红绿灯 - 固定宽高，内容居中
-            CustomWindowControls(
-                onClose: onClose,
-                onMinimize: onMinimize,
-                onMaximize: onMaximize
-            )
-            .frame(width: 80, height: controlHeight, alignment: .center)
+        ZStack {
+            // 底层：左右按钮各自靠边
+            HStack(alignment: .center, spacing: 0) {
+                // 左侧红绿灯 - 固定宽高，内容居中
+                CustomWindowControls(
+                    onClose: onClose,
+                    onMinimize: onMinimize,
+                    onMaximize: onMaximize
+                )
+                .frame(width: 80, height: controlHeight, alignment: .center)
 
-            Spacer()
+                Spacer()
 
-            // 中间 Tabs - 固定高度，垂直居中
+                // 右侧按钮组
+                HStack(spacing: 8) {
+                    // 猜你喜欢按钮
+                    GuessYouLikeNavButton(action: onGuessYouLike)
+
+                    // 帮助按钮（操作手册）
+                    TopBarCircleButton(icon: "questionmark", size: controlHeight) {
+                        showHelpPopover.toggle()
+                    }
+                    .popover(isPresented: $showHelpPopover, arrowEdge: .bottom) {
+                        HelpPopoverView(isPresented: $showHelpPopover)
+                    }
+
+                    // 设置按钮
+                    TopBarCircleButton(icon: "gearshape", size: controlHeight) {
+                        onOpenSettings()
+                    }
+                }
+            }
+
+            // 顶层：Tabs 绝对居中于整个顶栏宽度
+            // （不受左侧红绿灯 80pt 与右侧按钮组约 180pt 宽度不对称的影响）
             TopBarSegmentedControl(
                 selectedTab: $selectedTab,
                 controlHeight: controlHeight
             )
             .frame(height: controlHeight, alignment: .center)
-
-            Spacer()
-
-            // 右侧按钮组
-            HStack(spacing: 8) {
-                // 猜你喜欢按钮
-                GuessYouLikeNavButton(action: onGuessYouLike)
-
-                // 帮助按钮（操作手册）
-                TopBarCircleButton(icon: "questionmark", size: controlHeight) {
-                    showHelpPopover.toggle()
-                }
-                .popover(isPresented: $showHelpPopover, arrowEdge: .bottom) {
-                    HelpPopoverView(isPresented: $showHelpPopover)
-                }
-
-                // 设置按钮
-                TopBarCircleButton(icon: "gearshape", size: controlHeight) {
-                    onOpenSettings()
-                }
-            }
         }
         .padding(.leading, 12)
         .padding(.trailing, 12)

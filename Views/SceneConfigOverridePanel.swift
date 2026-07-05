@@ -96,6 +96,8 @@ final class SceneConfigOverrideViewModel: ObservableObject {
     let wallpaperPath: String
     private let onClose: () -> Void
     private var applyTask: Task<Void, Never>?
+    /// 从 scene.json 读取的真实默认值缓存（避免每次 reset 重新解析 scene.pkg）
+    var sceneDefaults: [SceneConfigOverrideKey: AnyCodableValue] = [:]
 
     init(wallpaperPath: String, onClose: @escaping () -> Void) {
         self.wallpaperPath = wallpaperPath
@@ -107,8 +109,11 @@ final class SceneConfigOverrideViewModel: ObservableObject {
     func load() {
         wallpaperName = SceneWallpaperDesignService.wallpaperTitle(for: wallpaperPath)
         let overrides = SceneConfigOverrideService.loadOverrides(for: wallpaperPath)
+        // 从 scene.json 读取真实默认值（此前用写死值，导致视差等回显错误）
+        sceneDefaults = SceneConfigOverrideService.loadSceneDefaults(for: wallpaperPath)
         rows = SceneConfigOverrideKey.allCases.map { key in
-            let value = overrides[key] ?? defaultCodableValue(for: key)
+            // 用户 override > scene.json 真实默认值 > 写死兜底
+            let value = overrides[key] ?? sceneDefaults[key] ?? defaultCodableValue(for: key)
             return ConfigRow(
                 id: key.rawValue,
                 key: key,
@@ -135,7 +140,7 @@ final class SceneConfigOverrideViewModel: ObservableObject {
     func reset(key: SceneConfigOverrideKey) {
         SceneConfigOverrideService.resetOverride(key: key, for: wallpaperPath)
         if let index = rows.firstIndex(where: { $0.key == key }) {
-            let defaultVal = defaultCodableValue(for: key)
+            let defaultVal = sceneDefaults[key] ?? defaultCodableValue(for: key)
             rows[index].currentValue = defaultVal
         }
         scheduleApply()
@@ -162,7 +167,7 @@ final class SceneConfigOverrideViewModel: ObservableObject {
         onClose()
     }
 
-    private func defaultCodableValue(for key: SceneConfigOverrideKey) -> AnyCodableValue {
+    func defaultCodableValue(for key: SceneConfigOverrideKey) -> AnyCodableValue {
         if key.isBool {
             return .bool(key.rawValue == "__parallax_enabled" ? false : true)
         }
@@ -433,7 +438,11 @@ struct SceneConfigOverridePanel: View {
             let binding = Binding<Bool>(
                 get: {
                     if case .bool(let b) = row.currentValue { return b }
-                    return key.rawValue == "__parallax_enabled" ? false : true
+                    // 兜底：用 scene.json 真实默认值，避免视差等回显错误
+                    if case .bool(let b) = viewModel.sceneDefaults[key] ?? viewModel.defaultCodableValue(for: key) {
+                        return b
+                    }
+                    return true
                 },
                 set: { viewModel.updateValue(key: key, value: .bool($0)) }
             )

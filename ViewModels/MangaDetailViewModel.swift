@@ -238,6 +238,16 @@ final class MangaDetailViewModel: ObservableObject {
         prefetchPages()
     }
 
+    /// 滚动模式专用：根据当前可视页索引更新 currentPageIndex 并触发预加载。
+    /// 与 nextPage/previousPage 不同，它只更新索引用于预加载，不会 force 取消旧任务。
+    /// - Parameter index: 当前可视页索引
+    func updateCurrentPageForScroll(_ index: Int) {
+        guard currentPages.indices.contains(index) else { return }
+        guard index != currentPageIndex else { return }
+        currentPageIndex = index
+        prefetchPages(ahead: 4)
+    }
+
     // MARK: - 预加载
     /// 触发预加载：当前章后 N 张 + 下一章前 2 张
     /// - Parameters:

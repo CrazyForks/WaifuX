@@ -15,7 +15,10 @@ if [[ ! -f "$SRC_MAIN" ]]; then
 fi
 
 echo "[build-wallpaperengine-cli] swiftc..."
+# -O -whole-module-optimization：Release 优化，避免 swiftc 默认 -Onone 产出
+# 40M+ 的未优化二进制（曾导致发行版 DMG 体积异常膨胀）。
 swiftc -parse-as-library \
+  -O -whole-module-optimization \
   -target arm64-apple-macosx14.4 \
   -Xlinker -stack_size -Xlinker 0x2000000 \
   -Xlinker -rpath -Xlinker @loader_path \
@@ -24,6 +27,9 @@ swiftc -parse-as-library \
   -framework AppKit -framework AVFoundation -framework IOKit -framework WebKit -framework Combine \
   -o "$OUT_CLI" \
   "$SRC_MAIN"
+
+# strip 调试与本地符号，进一步减小体积（与仓库已提交的优化版对齐）
+strip -x -S "$OUT_CLI" 2>/dev/null || true
 
 if command -v codesign >/dev/null 2>&1; then
   echo "[build-wallpaperengine-cli] codesign (ad hoc)..."

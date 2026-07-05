@@ -274,11 +274,13 @@ private struct MangaReaderView: View {
             }
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
 
-            // 底部翻页条
-            VStack {
-                Spacer()
-                pageNavBar
-                    .padding(.bottom, 14)
+            // 底部翻页条：仅单页模式显示（滚动模式靠手势滚动，不需要翻页）
+            if viewModel.readerMode == .singlePage {
+                VStack {
+                    Spacer()
+                    pageNavBar
+                        .padding(.bottom, 14)
+                }
             }
         }
         .onAppear { installWheelMonitor() }
@@ -320,6 +322,7 @@ private struct MangaReaderView: View {
     // 纵向卷轴模式
     private var verticalScrollReader: some View {
         GeometryReader { outer in
+            let pageH = outer.size.height   // 每页行高 = 可视高度
             ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(spacing: 2) {
                     ForEach(viewModel.currentPages) { page in
@@ -342,7 +345,7 @@ private struct MangaReaderView: View {
                             // 竖长图受高度限制 → 实际显示宽度 < 容器宽度、左右留白。
                             // 滚动模式给每一页一个"可视高度"的行高，同样用 .fit，
                             // 即可得到与翻页模式一致的显示宽度，且能纵向滚动逐页查看。
-                            .frame(width: outer.size.width - 16, height: outer.size.height)
+                            .frame(width: outer.size.width - 16, height: pageH)
                             .frame(maxWidth: .infinity) // 水平居中（左右留白对齐翻页模式）
                             .id(page.id)
                     }
@@ -359,6 +362,15 @@ private struct MangaReaderView: View {
                         )
                 }
                 .padding(8)
+                // 读取整个 LazyVStack 在滚动坐标空间中的偏移，推算当前可视页
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: MangaScrollOffsetKey.self,
+                            value: -proxy.frame(in: .named("mangaScroll")).minY
+                        )
+                    }
+                )
             }
             .coordinateSpace(name: "mangaScroll")
             .onPreferenceChange(MangaContentHeightKey.self) { h in
@@ -375,9 +387,17 @@ private struct MangaReaderView: View {
             .onPreferenceChange(MangaVisibleHeightKey.self) { h in
                 self.cachedVisibleHeight = h
             }
+            // 真实滚动偏移 → 推算当前可视页索引 → 触发预加载
+            // 比原来基于滚轮累加的 estimatedScrollOffset 更可靠（不受惯性/触控板动量影响）
+            .onPreferenceChange(MangaScrollOffsetKey.self) { offset in
+                guard pageH > 0 else { return }
+                // 当前可视页 = floor(offset / pageH)，clamp 到合法范围
+                let visibleIndex = max(0, min(Int(offset / pageH), max(0, viewModel.currentPages.count - 1)))
+                viewModel.updateCurrentPageForScroll(visibleIndex)
+            }
             .onReceive(wheelPublisher) { deltaY in
+                // 保留滚轮监听作为接近底部时的额外预加载兜底
                 guard viewModel.readerMode == .verticalScroll else { return }
-                // deltaY: 滚轮增量（向上滚为正）
                 estimatedScrollOffset -= deltaY
                 estimatedScrollOffset = max(0, min(estimatedScrollOffset, max(0, cachedContentHeight - cachedVisibleHeight)))
                 let distanceToBottom = cachedContentHeight - (estimatedScrollOffset + cachedVisibleHeight)
@@ -666,6 +686,14 @@ private struct MangaContentHeightKey: PreferenceKey {
 }
 
 private struct MangaVisibleHeightKey: PreferenceKey {
+    static nonisolated(unsafe) var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// 滚动模式：整个内容在滚动坐标空间中的纵向偏移（用于推算当前可视页索引）
+private struct MangaScrollOffsetKey: PreferenceKey {
     static nonisolated(unsafe) var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()

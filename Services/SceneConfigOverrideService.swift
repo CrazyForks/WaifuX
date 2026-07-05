@@ -242,4 +242,237 @@ enum SceneConfigOverrideService {
             .replacingOccurrences(of: ":", with: "_")
         return defaultsKeyPrefix + safeName
     }
+
+    // MARK: - 从 scene.json 读取真实默认值
+
+    /// 从壁纸的 scene.pkg 解析 scene.json 的 `general` 段，读取每个配置项的真实默认值。
+    ///
+    /// 此前面板回显用写死值（如 `__parallax_enabled` 恒为 false），与 scene.json 中
+    /// `general.cameraparallax` 的实际值不符，导致首次打开面板时回显错误。
+    /// 读不到时回退到 `SceneConfigOverrideKey.defaultValue` / isBool 写死值。
+    static func loadSceneDefaults(for wallpaperPath: String) -> [SceneConfigOverrideKey: AnyCodableValue] {
+        guard let general = loadSceneGeneralDict(for: wallpaperPath) else {
+            return [:]
+        }
+
+        var result: [SceneConfigOverrideKey: AnyCodableValue] = [:]
+        for key in SceneConfigOverrideKey.allCases {
+            if let value = sceneDefaultValue(for: key, from: general) {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    /// 定位壁纸目录下的 scene.pkg 并解析其中 scene.json 的 `general` 段。
+    private static func loadSceneGeneralDict(for wallpaperPath: String) -> [String: Any]? {
+        let rootURL = resolveSceneRoot(for: wallpaperPath)
+        guard let sceneJSONData = extractSceneJSONData(rootURL: rootURL) else {
+            return nil
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: sceneJSONData) as? [String: Any],
+              let general = obj["general"] as? [String: Any] else {
+            return nil
+        }
+        return general
+    }
+
+    /// 解析壁纸路径到包含 scene.pkg 的项目根目录。
+    private static func resolveSceneRoot(for wallpaperPath: String) -> URL {
+        let url = URL(fileURLWithPath: wallpaperPath)
+        if url.pathExtension.lowercased() == "pkg" {
+            // wallpaperPath 本身就是 .pkg
+            return url.deletingLastPathComponent()
+        }
+        // 复用 WorkshopService 的项目根定位逻辑（处理多层嵌套目录）
+        return WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: url)
+    }
+
+    /// 从项目根目录提取 scene.json 的原始 JSON Data。
+    /// PKG 是 WE 自定义二进制归档格式：[u32 skinLen][skin][u32 nfiles][entries...][blob]。
+    private static func extractSceneJSONData(rootURL: URL) -> Data? {
+        let fm = FileManager.default
+
+        // 1. 优先读 project.json 的 "file" 字段确定场景文件名（如 gifscene.pkg）
+        let projectURL = rootURL.appendingPathComponent("project.json")
+        var preferredSceneFileName: String? = nil
+        if let data = try? Data(contentsOf: projectURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let file = json["file"] as? String {
+            preferredSceneFileName = file
+        }
+
+        // 候选 .pkg 文件：scene.pkg > project.json 指定的 > 目录下任意 .pkg
+        let scenePkg = rootURL.appendingPathComponent("scene.pkg")
+        let candidatePKGs: [URL] = {
+            if fm.fileExists(atPath: scenePkg.path) {
+                return [scenePkg]
+            }
+            if let preferred = preferredSceneFileName,
+               !preferred.isEmpty {
+                let preferredURL = rootURL.appendingPathComponent(preferred)
+                if fm.fileExists(atPath: preferredURL.path) {
+                    return [preferredURL]
+                }
+            }
+            // 任意 .pkg
+            if let entries = try? fm.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
+                if let anyPkg = entries.first(where: { $0.pathExtension.lowercased() == "pkg" }) {
+                    return [anyPkg]
+                }
+            }
+            return []
+        }()
+
+        guard let pkgURL = candidatePKGs.first,
+              let data = try? Data(contentsOf: pkgURL) else {
+            return nil
+        }
+        return extractSceneJSONFromPKGData(data, fallbackName: pkgURL.deletingPathExtension().lastPathComponent + ".json")
+    }
+
+    /// 从 PKG 二进制 Data 中提取 scene.json 内容。
+    private static func extractSceneJSONFromPKGData(_ data: Data, fallbackName: String) -> Data? {
+        var o = 0
+        // [u32 skinLen][skin bytes][u32 nfiles][entries...][blob]
+        guard o + 4 <= data.count else { return nil }
+        let skinLen = Int(readU32LE(data, o)); o += 4
+        guard o + skinLen <= data.count else { return nil }
+        o += skinLen
+        guard o + 4 <= data.count else { return nil }
+        let nfiles = Int(readU32LE(data, o)); o += 4
+
+        var entries: [(name: String, offset: Int, length: Int)] = []
+        for _ in 0..<nfiles {
+            guard o + 4 <= data.count else { return nil }
+            let entrySize = Int(readU32LE(data, o)); o += 4
+            guard o + entrySize <= data.count else { return nil }
+            let nameData = data.subdata(in: o..<o + entrySize)
+            o += entrySize
+            let name = String(data: nameData, encoding: .utf8) ?? ""
+            guard o + 8 <= data.count else { return nil }
+            let fileOff = Int(readU32LE(data, o)); o += 4
+            let fileLen = Int(readU32LE(data, o)); o += 4
+            entries.append((name, fileOff, fileLen))
+        }
+        let base = o
+
+        let candidates = ["scene.json", fallbackName].compactMap { $0?.lowercased() }
+        func entryMatches(_ entryName: String, candidate: String) -> Bool {
+            let normalized = entryName.lowercased()
+            return normalized == candidate || normalized.hasSuffix("/" + candidate)
+        }
+        for candidate in candidates {
+            if let entry = entries.first(where: { entryMatches($0.name, candidate: candidate) }) {
+                let start = base + entry.offset
+                let end = start + entry.length
+                guard end <= data.count else { return nil }
+                return data.subdata(in: start..<end)
+            }
+        }
+        // 兼容：包根下任意 .json（排除 materials/models 等子目录）
+        if let entry = entries.first(where: {
+            let n = $0.name.lowercased()
+            return n.hasSuffix(".json")
+                && !n.contains("/materials/") && !n.contains("/models/")
+                && !n.contains("/effects/") && !n.contains("/particles/")
+                && !n.contains("/shaders/") && !n.contains("/fonts/")
+        }) {
+            let start = base + entry.offset
+            let end = start + entry.length
+            guard end <= data.count else { return nil }
+            return data.subdata(in: start..<end)
+        }
+        return nil
+    }
+
+    private static func readU32LE(_ data: Data, _ o: Int) -> UInt32 {
+        guard o + 4 <= data.count else { return 0 }
+        return UInt32(data[o])
+            | (UInt32(data[o + 1]) << 8)
+            | (UInt32(data[o + 2]) << 16)
+            | (UInt32(data[o + 3]) << 24)
+    }
+
+    /// 把 scene.json `general` 段的字段映射到 `SceneConfigOverrideKey` 的真实默认值。
+    /// 字段名与 wallpaper-wgpu `config/scene_json.rs` 的 `SceneJsonGeneral` 对齐。
+    private static func sceneDefaultValue(for key: SceneConfigOverrideKey, from general: [String: Any]) -> AnyCodableValue? {
+        switch key {
+        // ── Bool（scene.json 里是 true/false，也可能是 "0"/"1" 字符串或 user-bound）──
+        case .parallaxEnabled:
+            return boolValue(from: general, key: "cameraparallax", fallback: false)
+        case .clearEnabled:
+            return boolValue(from: general, key: "clearenabled", fallback: true)
+        case .cameraFade:
+            return boolValue(from: general, key: "camerafade", fallback: true)
+
+        // ── 颜色 "r g b" 字符串 ──
+        case .clearColor:
+            return stringValue(from: general, key: "clearcolor")
+        case .ambientColor:
+            return stringValue(from: general, key: "ambientcolor")
+        case .skylightColor:
+            return stringValue(from: general, key: "skylightcolor")
+
+        // ── 数值 ──
+        case .cameraZoom:
+            return numberValue(from: general, key: "zoom", fallback: 1.0)
+        case .cameraFov:
+            return numberValue(from: general, key: "fov", fallback: 50.0)
+        case .cameraNearz:
+            return numberValue(from: general, key: "nearz", fallback: 0.01)
+        case .cameraFarz:
+            return numberValue(from: general, key: "farz", fallback: 10000.0)
+        case .parallaxAmount:
+            return numberValue(from: general, key: "cameraparallaxamount", fallback: 0.5)
+        case .parallaxDelay:
+            return numberValue(from: general, key: "cameraparallaxdelay", fallback: 0.1)
+        case .parallaxMouseInfluence:
+            return numberValue(from: general, key: "cameraparallaxmouseinfluence", fallback: 0.5)
+        case .textureReduction:
+            // texturereduction 在 scene.json 里是 u32（不是 user-bound）
+            if let n = general["texturereduction"] as? Int { return .number(Double(n)) }
+            if let n = general["texturereduction"] as? Double { return .number(n) }
+            return .number(1.0)
+        case .orthoWidth:
+            if let ortho = general["orthogonalprojection"] as? [String: Any] {
+                return numberValue(from: ortho, key: "width", fallback: 1920.0)
+            }
+            return .number(1920.0)
+        case .orthoHeight:
+            if let ortho = general["orthogonalprojection"] as? [String: Any] {
+                return numberValue(from: ortho, key: "height", fallback: 1080.0)
+            }
+            return .number(1080.0)
+        }
+    }
+
+    /// 从 dict 读 bool 字段，兼容 Bool / Int(0,1) / "true","false" / "0","1" 字符串。
+    private static func boolValue(from dict: [String: Any], key: String, fallback: Bool) -> AnyCodableValue {
+        let b: Bool
+        if let v = dict[key] as? Bool {
+            b = v
+        } else if let n = dict[key] as? Int {
+            b = n != 0
+        } else if let n = dict[key] as? Double {
+            b = n != 0
+        } else if let s = dict[key] as? String {
+            b = s == "1" || s.lowercased() == "true"
+        } else {
+            b = fallback
+        }
+        return .bool(b)
+    }
+
+    private static func numberValue(from dict: [String: Any], key: String, fallback: Double) -> AnyCodableValue {
+        if let n = dict[key] as? Double { return .number(n) }
+        if let n = dict[key] as? Int { return .number(Double(n)) }
+        if let s = dict[key] as? String, let d = Double(s) { return .number(d) }
+        return .number(fallback)
+    }
+
+    private static func stringValue(from dict: [String: Any], key: String) -> AnyCodableValue {
+        if let s = dict[key] as? String { return .string(s) }
+        return .string("")
+    }
 }

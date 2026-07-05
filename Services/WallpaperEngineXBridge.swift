@@ -1388,7 +1388,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     @discardableResult
     private static func runLegacyCLIClientCommand(_ arguments: [String]) async throws -> Int32 {
         guard let cli = Self.resolvedLegacyCLIExecutableURL() else {
-            throw WallpaperEngineError.cliNotFound
+            print("[WallpaperEngineXBridge] ❌ wallpaperengine-cli 二进制未找到，已搜索所有路径")
+            throw WallpaperEngineError.legacyCliNotFound
         }
         let env = legacyCLILaunchEnvironment(for: cli)
         let processTask = Task.detached(priority: .userInitiated) { () throws -> Int32 in
@@ -2292,30 +2293,67 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 解析 `wallpaperengine-cli` 可执行文件路径（web 壁纸 daemon）
     nonisolated static func resolvedLegacyCLIExecutableURL() -> URL? {
-        // 1. Bundle 内
+        // 1. Bundle 内（folder reference 场景）
         if let url = Bundle.main.url(forResource: "wallpaperengine-cli", withExtension: nil) {
+            print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: Bundle.main.url")
             return url
         }
+
         // 2. Contents/Resources/wallpaperengine-cli
         let bundleResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/wallpaperengine-cli")
         if FileManager.default.fileExists(atPath: bundleResources.path) {
+            print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: Contents/Resources")
             return bundleResources
+        } else {
+            print("[WallpaperEngineXBridge] 未找到: \(bundleResources.path)")
         }
-        // 3. bundle 同级目录（开发/调试）
+
+        // 3. Contents/Resources/Resources/wallpaperengine-cli（folder reference 嵌套）
+        // 与 resolvedCLIExecutableURL() 对齐：Xcode folder reference 实际会把 Resources/
+        // 整目录复制到 .app/Contents/Resources/Resources/，少了这一级会导致用户机器找不到二进制。
+        let nestedResources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Resources/wallpaperengine-cli")
+        if FileManager.default.fileExists(atPath: nestedResources.path) {
+            print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: Resources/Resources")
+            return nestedResources
+        } else {
+            print("[WallpaperEngineXBridge] 未找到: \(nestedResources.path)")
+        }
+
+        // 4. resourceURL
+        if let resourceURL = Bundle.main.resourceURL {
+            let resourcePath = resourceURL.appendingPathComponent("wallpaperengine-cli")
+            if FileManager.default.fileExists(atPath: resourcePath.path) {
+                print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: resourceURL")
+                return resourcePath
+            } else {
+                print("[WallpaperEngineXBridge] 未找到: \(resourcePath.path)")
+            }
+        }
+
+        // 5. bundle 同级目录（开发/调试）
         let siblingPath = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("wallpaperengine-cli")
         if FileManager.default.fileExists(atPath: siblingPath.path) {
+            print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: bundle 同级")
             return siblingPath
+        } else {
+            print("[WallpaperEngineXBridge] 未找到: \(siblingPath.path)")
         }
-        // 4. 项目开发路径
+
+        // 6. 项目开发路径
         let projectPaths = [
             "/Volumes/mac/CodeLibrary/Claude/WallHaven/wallpaperengine-cli",
             "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/wallpaperengine-cli"
         ]
         for path in projectPaths {
             if FileManager.default.fileExists(atPath: path) {
+                print("[WallpaperEngineXBridge] 找到 wallpaperengine-cli: \(path)")
                 return URL(fileURLWithPath: path)
+            } else {
+                print("[WallpaperEngineXBridge] 未找到: \(path)")
             }
         }
+
+        print("[WallpaperEngineXBridge] ❌ wallpaperengine-cli 在所有路径中均未找到")
         return nil
     }
 
@@ -3623,6 +3661,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 enum WallpaperEngineError: LocalizedError {
     case notInstalled
     case cliNotFound
+    case legacyCliNotFound
     case screenCaptureDenied
     case executionFailed(String)
 
@@ -3630,6 +3669,7 @@ enum WallpaperEngineError: LocalizedError {
         switch self {
         case .notInstalled: return "Wallpaper Engine 未安装"
         case .cliNotFound: return "未找到 wallpaper-wgpu 二进制文件"
+        case .legacyCliNotFound: return "未找到 wallpaperengine-cli 二进制文件"
         case .screenCaptureDenied: return "屏幕录制权限被拒绝，请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许本应用后重试"
         case .executionFailed(let msg): return msg
         }
