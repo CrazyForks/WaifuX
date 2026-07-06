@@ -523,6 +523,32 @@ jobs:
                     sleep 30
                   done
 
+            # Sign & Notarize 成功后自动推送版本 tag，触发 release.yml 发版。
+            # 仅在 push main 且 tag 不存在时执行；构建/签名/公证任一步失败都走不到这里。
+            - name: Push version tag to trigger release
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+              run: |
+                  set -e
+                  VERSION=$(cat VERSION | tr -d '[:space:]')
+                  TAG="v${VERSION}"
+
+                  # 幂等保护 1：tag 已存在则跳过（与 check_tag 步骤双保险，防并发 push）
+                  if git rev-parse "$TAG" >/dev/null 2>&1; then
+                    echo "✅ Tag $TAG 已存在，跳过"
+                    exit 0
+                  fi
+
+                  # 幂等保护 2：VERSION 为空或格式异常（非 X.Y.Z）则跳过
+                  if [ -z "$VERSION" ] || ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                    echo "⚠️ VERSION 内容异常: '$VERSION'，跳过打 tag"
+                    exit 0
+                  fi
+
+                  # tag 指向当前 commit（HEAD），即刚通过构建+签名+公证的版本
+                  git tag "$TAG"
+                  git push origin "$TAG"
+                  echo "✅ 已推送 $TAG，将触发 release.yml 发版"
+
             - name: Build (PRs)
               if: github.event_name == 'pull_request'
               run: |
