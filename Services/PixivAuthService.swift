@@ -154,9 +154,27 @@ class PixivAuthService: ObservableObject {
             }
         }
 
-        // 清除 WKWebsiteDataStore 中的 Pixiv cookie（等待完成）
+        // 清除 WKWebsiteDataStore 中的 Pixiv cookie
+        // 注意：不能用 fetchDataRecords + displayName 过滤来删 cookie——
+        // WKWebsiteDataRecord 对 cookie 记录的 displayName 通常为域名形式，
+        // removeData(ofTypes:for:) 配合 records 删 httpCookieStore 里的 cookie 不可靠，
+        // 会残留 PHPSESSID / device_token，导致后续 checkWKWebViewCookies() 误判为已登录。
+        // 这里直接通过 httpCookieStore.deleteCookie 逐条删除并 await 完成。
         let dataStore = WKWebsiteDataStore.default()
-        await withCheckedContinuation { continuation in
+        let cookieStore = dataStore.httpCookieStore
+        let allWkCookies = await cookieStore.allCookies()
+        for cookie in allWkCookies {
+            if cookieDomains.contains(where: { cookie.domain.hasSuffix($0) || cookie.domain == $0 }) {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    cookieStore.delete(cookie) {
+                        continuation.resume()
+                    }
+                }
+            }
+        }
+
+        // 兜底：再用 fetchDataRecords 清一遍其他网站数据（localStorage / cache 等）
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             dataStore.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
                 let pixivRecords = records.filter { record in
                     record.displayName.lowercased().contains("pixiv")

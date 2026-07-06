@@ -136,6 +136,7 @@ final class StatusBarController: NSObject {
     private lazy var desktopIconsItem = NSMenuItem(title: t("statusbar.hideDesktopIcons"), action: #selector(toggleDesktopIcons), keyEquivalent: "")
     private lazy var designWallpaperItem = NSMenuItem(title: t("design.designWallpaper"), action: #selector(openWebWallpaperDesignPanel), keyEquivalent: "")
     private lazy var sceneConfigItem = NSMenuItem(title: t("statusbar.sceneAdvancedSettings"), action: #selector(openSceneConfigPanel), keyEquivalent: "")
+    private lazy var checkUpdateItem = NSMenuItem(title: t("checkForUpdates"), action: #selector(checkForUpdates), keyEquivalent: "")
     private lazy var quitItem = NSMenuItem(title: t("statusbar.quit"), action: #selector(quitApplication), keyEquivalent: "q")
 
     private let videoWallpaperManager = VideoWallpaperManager.shared
@@ -222,6 +223,7 @@ final class StatusBarController: NSObject {
         desktopIconsItem.target = self
         designWallpaperItem.target = self
         sceneConfigItem.target = self
+        checkUpdateItem.target = self
         quitItem.target = self
 
         menu.addItem(openWindowItem)
@@ -235,6 +237,7 @@ final class StatusBarController: NSObject {
         // toggleWallpaperItem 和 playPauseItem 在 refreshMenuState 中动态构建
         menu.addItem(muteItem)
         menu.addItem(.separator())
+        menu.addItem(checkUpdateItem)
         menu.addItem(quitItem)
 
         statusItem.menu = menu
@@ -679,6 +682,7 @@ final class StatusBarController: NSObject {
         muteItem.title = videoWallpaperManager.isMuted ? t("statusbar.unmuteWallpaper") : t("statusbar.muteWallpaper")
         designWallpaperItem.title = t("design.designWallpaper")
         sceneConfigItem.title = t("statusbar.sceneAdvancedSettings")
+        checkUpdateItem.title = t("checkForUpdates")
         quitItem.title = t("statusbar.quit")
     }
 
@@ -972,6 +976,11 @@ final class StatusBarController: NSObject {
 
     @objc private func quitApplication() {
         quitHandler?()
+    }
+
+    /// 触发 Sparkle 检查更新（UI 反馈由 Sparkle 内置弹窗处理）
+    @objc private func checkForUpdates() {
+        AppDelegate.shared?.checkForUpdates()
     }
 
     /// 从 NSScreen 获取 CGDirectDisplayID（用于 per-display prefs 的 key）
