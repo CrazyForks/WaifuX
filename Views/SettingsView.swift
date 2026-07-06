@@ -392,9 +392,17 @@ private struct GeneralSettingsTab: View {
                 MacSettingsRow(
                     title: t("compactMode"),
                     subtitle: t("compactModeDesc"),
-                    showDivider: false
+                    showDivider: true
                 ) {
                     MacToggle(isOn: $arcSettings.compactMode)
+                }
+
+                MacSettingsRow(
+                    title: t("autoRemoveVideoLetterbox"),
+                    subtitle: t("autoRemoveVideoLetterboxDesc"),
+                    showDivider: false
+                ) {
+                    MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
                 }
             }
 
@@ -512,19 +520,50 @@ private struct GeneralSettingsTab: View {
                 MacSettingsRow(
                     title: t("hdrEnabled"),
                     subtitle: t("hdrEnabledDesc"),
-                    showDivider: true
+                    showDivider: false
                 ) {
                     MacToggle(isOn: $viewModel.hdrEnabled)
                 }
 
+            }
+
+            // 动态壁纸补帧设置组
+            MacSettingsSection(header: t("frameInterpolationSection")) {
                 MacSettingsRow(
-                    title: t("autoRemoveVideoLetterbox"),
-                    subtitle: t("autoRemoveVideoLetterboxDesc"),
-                    showDivider: true
+                    title: t("frameInterpolation"),
+                    subtitle: t("frameInterpolationDesc"),
+                    showDivider: viewModel.frameInterpolationEnabled
                 ) {
-                    MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
+                    MacToggle(isOn: $viewModel.frameInterpolationEnabled)
                 }
 
+                if viewModel.frameInterpolationEnabled {
+                    MacSettingsRow(
+                        title: t("frameInterpolationAutoEnqueue"),
+                        subtitle: t("frameInterpolationAutoEnqueueDesc"),
+                        showDivider: true
+                    ) {
+                        MacToggle(isOn: $viewModel.frameInterpolationAutoEnqueue)
+                    }
+
+                    MacSettingsRow(
+                        title: t("frameInterpolationTargetFPS"),
+                        subtitle: nil,
+                        showDivider: false
+                    ) {
+                        Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
+                            ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
+                                Text("\(fps)")
+                                    .tag(Double(fps))
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+                    }
+                }
+            }
+
+            MacSettingsSection(header: t("dynamicLockScreen")) {
                 // 动态锁屏壁纸开关（仅 macOS 26+ 可用）
                 if #available(macOS 26.0, *) {
                     MacSettingsRow(
@@ -560,15 +599,10 @@ private struct GeneralSettingsTab: View {
                 }
 
                 if viewModel.proxyEnabled {
-                    Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
-
-                    HStack(spacing: 12) {
-                        Text(t("proxyHost"))
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.9))
-
-                        Spacer()
-
+                    MacSettingsRow(
+                        title: t("proxyHost"),
+                        showDivider: true
+                    ) {
                         TextField(t("proxyHostPlaceholder"), text: $viewModel.proxyHost)
                             .font(.system(size: 12, weight: .regular))
                             .textFieldStyle(.plain)
@@ -585,18 +619,11 @@ private struct GeneralSettingsTab: View {
                             )
                             .foregroundStyle(Color.white.opacity(0.85))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
 
-                    Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
-
-                    HStack(spacing: 12) {
-                        Text(t("proxyPort"))
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.9))
-
-                        Spacer()
-
+                    MacSettingsRow(
+                        title: t("proxyPort"),
+                        showDivider: false
+                    ) {
                         TextField(t("proxyPortPlaceholder"), text: $viewModel.proxyPort)
                             .font(.system(size: 12, weight: .regular))
                             .textFieldStyle(.plain)
@@ -613,8 +640,6 @@ private struct GeneralSettingsTab: View {
                             )
                             .foregroundStyle(Color.white.opacity(0.85))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
                 }
             }
 
@@ -731,6 +756,7 @@ private struct GeneralSettingsTab: View {
             Text(t("clearLockScreenInstancesConfirm"))
         }
     }
+
 }
 
 // MARK: - 下载设置标签
@@ -879,7 +905,7 @@ private struct SchedulerSettingsTab: View {
             MacSettingsSection(header: t("scheduleConfig")) {
                 ForEach(Array(screens.enumerated()), id: \.element.wallpaperScreenIdentifier) { (index: Int, screen: NSScreen) in
                     let screenID = screen.wallpaperScreenIdentifier
-                    let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screenID)
+                    let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screen)
 
                     VStack(spacing: 0) {
                         HStack(spacing: 12) {
@@ -899,6 +925,30 @@ private struct SchedulerSettingsTab: View {
 
                         if displayConfig.isEnabled {
                             dividerLine
+
+                            if !screen.isBuiltInDisplay {
+                                HStack(spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(t("externalDisplay.autoSwitchOnConnect"))
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundStyle(Color.white.opacity(0.9))
+                                        Text(t("externalDisplay.autoSwitchOnConnectDesc"))
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(Color.white.opacity(0.48))
+                                    }
+
+                                    Spacer()
+
+                                    MacToggle(isOn: Binding(
+                                        get: { viewModel.schedulerViewModel.displayConfig(for: screen).autoChangeOnExternalConnect },
+                                        set: { viewModel.schedulerViewModel.updateDisplayAutoChangeOnExternalConnect($0, for: screen) }
+                                    ))
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 12)
+
+                                dividerLine
+                            }
 
                             // 检查当前壁纸是否是 Web 壁纸
                             let isWebWallpaper: Bool = {
@@ -925,6 +975,9 @@ private struct SchedulerSettingsTab: View {
                                     Divider()
                                     Button(intervalLabel(for: SchedulerConfig.intervalOnEndMinutes)) {
                                         viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnEndMinutes, for: screenID)
+                                    }
+                                    Button(intervalLabel(for: SchedulerConfig.intervalOnUnlockMinutes)) {
+                                        viewModel.schedulerViewModel.updateDisplayInterval(SchedulerConfig.intervalOnUnlockMinutes, for: screenID)
                                     }
                                 } label: {
                                     Text(intervalLabel(for: displayConfig.intervalMinutes))
@@ -1155,6 +1208,9 @@ private struct SchedulerSettingsTab: View {
     private func intervalLabel(for minutes: Int) -> String {
         if minutes == SchedulerConfig.intervalOnEndMinutes {
             return t("intervalOnEnd")
+        }
+        if minutes == SchedulerConfig.intervalOnUnlockMinutes {
+            return t("intervalOnUnlock")
         }
         switch minutes {
         case 1: return "1 \(t("minutes"))"

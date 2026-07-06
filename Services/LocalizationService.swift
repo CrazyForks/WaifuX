@@ -8,6 +8,7 @@ class LocalizationService: ObservableObject {
     @Published var currentLanguage: Language {
         didSet {
             UserDefaults.standard.set(currentLanguage.rawValue, forKey: "app_language")
+            NotificationCenter.default.post(name: .appLanguageDidChange, object: nil)
         }
     }
 
@@ -204,6 +205,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "go": "GO",
         "searching": "SEARCHING...",
         "no.results": "NO RESULTS",
+        "explore.noResults": "No wallpapers found",
         "filter.all": "ALL",
         "filter.general": "GENERAL",
         "filter.anime": "ANIME",
@@ -252,6 +254,9 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.disableWallpaper": "Disable Dynamic Wallpaper",
         "statusbar.pauseWallpaper": "Pause Wallpaper",
         "statusbar.resumeWallpaper": "Resume Wallpaper",
+        "statusbar.enableAutoSwitch": "Enable Auto-switch",
+        "statusbar.disableAutoSwitch": "Disable Auto-switch",
+        "statusbar.nextWallpaper": "Next Wallpaper",
         "statusbar.muteWallpaper": "Mute Wallpaper",
         "statusbar.unmuteWallpaper": "Unmute Wallpaper",
         "statusbar.autoPauseFullscreen": "Auto-pause on Fullscreen",
@@ -268,6 +273,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.cropReset": "Reset Crop Region",
         "statusbar.cropUnsupported": "Web wallpapers do not support crop adjustment",
         "statusbar.cropStaticUnsupported": "Static image wallpapers do not support crop adjustment",
+        "statusbar.sceneAdvancedSettings": "Advanced Scene Settings",
         // Tabs
         "tab.all": "ALL",
         "tab.nature": "NATURE",
@@ -566,7 +572,13 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "hdrEnabled": "HDR Video",
         "hdrEnabledDesc": "Apply per-frame HDR display metadata when supported. This keeps video playback on the native player path.",
         "autoRemoveVideoLetterbox": "Auto Remove Black Bars",
-        "autoRemoveVideoLetterboxDesc": "For video files that already contain black bars, crop them during fullscreen auto fill only.",
+        "autoRemoveVideoLetterboxDesc": "For image or video source files that already contain black bars, crop them during fullscreen auto fill only.",
+        "frameInterpolationSection": "VIDEO WALLPAPER INTERPOLATION",
+        "frameInterpolation": "Enable Video Interpolation",
+        "frameInterpolationDesc": "When a native video wallpaper is below the target FPS, export an interpolated version and replace the original file.",
+        "frameInterpolationTargetFPS": "Target Frame Rate",
+        "frameInterpolationAutoEnqueue": "Auto Interpolate on Wallpaper Change",
+        "frameInterpolationAutoEnqueueDesc": "When the current native video needs interpolation, automatically process it in the background.",
         "systemWallpaperSync": "System Wallpaper Sync",
         "systemWallpaperSyncDesc": "When on, the app writes static wallpapers to the system desktop/lock screen. Turn off to use only the in-app dynamic wallpaper engine (mp4/scene/web) without touching system wallpaper.",
         "dynamicLockScreen": "Dynamic Lock Screen",
@@ -674,6 +686,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "replaceRhythmDesc": "Set rotation interval, playback order, and wallpaper source.",
         "replaceInterval": "REPLACE INTERVAL",
         "intervalOnEnd": "Play to End",
+        "intervalOnUnlock": "Change on Unlock",
         "webSceneSwitchInterval": "Web/Scene Switch Interval",
         "intervalDesc": "Determines auto-switch frequency.",
         "interval": "INTERVAL",
@@ -1341,6 +1354,14 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "settings.modules.closePending.message": "Restart now, apply later, or discard changes?",
         "settings.modules.closePending.later": "Later",
         "settings.modules.closePending.discard": "Discard Changes",
+        // External displays
+        "externalDisplay.connected.title": "New External Display Detected",
+        "externalDisplay.connected.message": "%@ is connected. Do you want to set a dynamic wallpaper for this display?",
+        "externalDisplay.useRandomWallpaper": "Use Random Wallpaper",
+        "externalDisplay.chooseWallpaper": "Choose Wallpaper",
+        "externalDisplay.doNotUseWallpaper": "Do Not Use Wallpaper",
+        "externalDisplay.autoSwitchOnConnect": "Auto-switch when this display connects",
+        "externalDisplay.autoSwitchOnConnectDesc": "When this external display connects, randomly pick one wallpaper from its own auto-switch range.",
         // Source switch hint
         "sourceSwitchHint": "Click to switch between different data sources",
         // Error network troubleshoot
@@ -1580,6 +1601,9 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.disableWallpaper": "关闭动态壁纸",
         "statusbar.pauseWallpaper": "暂停动态壁纸",
         "statusbar.resumeWallpaper": "继续动态壁纸",
+        "statusbar.enableAutoSwitch": "开启壁纸自动切换",
+        "statusbar.disableAutoSwitch": "关闭壁纸自动切换",
+        "statusbar.nextWallpaper": "切换下一张壁纸",
         "statusbar.muteWallpaper": "静音动态壁纸",
         "statusbar.unmuteWallpaper": "取消静音",
         "statusbar.autoPauseFullscreen": "全屏时自动暂停",
@@ -1595,6 +1619,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.cropReset": "重置可视区域",
         "statusbar.cropUnsupported": "Web 壁纸暂不支持可视区域调节",
         "statusbar.cropStaticUnsupported": "静态图片壁纸暂不支持可视区域调节",
+        "statusbar.sceneAdvancedSettings": "场景高级设置",
         "statusbar.quit": "退出",
         // Tabs
         "tab.all": "全部",
@@ -1894,7 +1919,13 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "hdrEnabled": "HDR 视频",
         "hdrEnabledDesc": "支持时应用逐帧 HDR 显示元数据。视频播放仍保持原生播放器直出。",
         "autoRemoveVideoLetterbox": "自动去除黑边",
-        "autoRemoveVideoLetterboxDesc": "对本身含黑边的视频原文件，进行黑边去除，仅对全屏自动生效。",
+        "autoRemoveVideoLetterboxDesc": "对本身含黑边的图片或视频原文件，进行黑边去除，仅对全屏自动生效。",
+        "frameInterpolationSection": "动态壁纸补帧",
+        "frameInterpolation": "启用视频补帧",
+        "frameInterpolationDesc": "原生视频壁纸低于目标帧率时，离线补帧并直接替换原视频文件。",
+        "frameInterpolationTargetFPS": "目标帧率",
+        "frameInterpolationAutoEnqueue": "切换壁纸时自动补帧",
+        "frameInterpolationAutoEnqueueDesc": "当前原生视频需要补帧时，自动在后台补帧。",
         "systemWallpaperSync": "系统壁纸同步",
         "systemWallpaperSyncDesc": "开启时 App 会将静态壁纸设为系统桌面/锁屏；关闭后仅使用 App 内部动态壁纸引擎（mp4/场景/web），不再修改系统壁纸。",
         "dynamicLockScreen": "动态锁屏",
@@ -2002,6 +2033,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "replaceRhythmDesc": "设置轮换间隔、播放顺序和壁纸来源。",
         "replaceInterval": "更换间隔",
         "intervalOnEnd": "播完即换",
+        "intervalOnUnlock": "解锁即换",
         "webSceneSwitchInterval": "Web/Scene 切换间隔",
         "intervalDesc": "决定自动切换的频率。",
         "interval": "间隔",
@@ -2670,6 +2702,14 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "settings.modules.closePending.message": "立即重启、稍后应用，还是放弃更改？",
         "settings.modules.closePending.later": "稍后",
         "settings.modules.closePending.discard": "放弃更改",
+        // 外接显示器
+        "externalDisplay.connected.title": "检测到新外接显示器",
+        "externalDisplay.connected.message": "%@ 已连接。要为这块显示器设置动态壁纸吗？",
+        "externalDisplay.useRandomWallpaper": "使用随机壁纸",
+        "externalDisplay.chooseWallpaper": "去挑选壁纸",
+        "externalDisplay.doNotUseWallpaper": "不使用壁纸",
+        "externalDisplay.autoSwitchOnConnect": "此显示器连接后自动切换",
+        "externalDisplay.autoSwitchOnConnectDesc": "这块外接屏接入时，从它自己的自动更换范围里随机挑选一张。",
         // Source switch hint
         "sourceSwitchHint": "点击切换不同的数据源",
         // Error network troubleshoot
@@ -2852,6 +2892,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "source.official": "公式ソース",
         "source.fallback": "フォールバック",
         "source.konachan": "Konachan",
+        "source.pixiv": "Pixivイラスト",
         "startup": "起動設定",
         "clearCache": "キャッシュをクリア",
         "status": "状態",
@@ -2907,6 +2948,9 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.releaseMemory": "ブラウズメモリを解放",
         "statusbar.pauseWallpaper": "動的壁紙を一時停止",
         "statusbar.resumeWallpaper": "動的壁紙を再開",
+        "statusbar.enableAutoSwitch": "自動切り替えを有効にする",
+        "statusbar.disableAutoSwitch": "自動切り替えを無効にする",
+        "statusbar.nextWallpaper": "次の壁紙に切り替え",
         "statusbar.muteWallpaper": "動的壁紙をミュート",
         "statusbar.unmuteWallpaper": "ミュートを解除",
         "statusbar.autoPauseFullscreen": "全画面時に自動一時停止",
@@ -2916,6 +2960,16 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.hideDesktopIcons": "デスクトップアイコンを隠す",
         "statusbar.showDesktopIcons": "デスクトップアイコンを表示",
         "statusbar.quit": "終了",
+        "statusbar.displays": "ディスプレイ",
+        "statusbar.cropAdjust": "表示範囲を調整…",
+        "statusbar.cropExit": "表示範囲調整を終了",
+        "statusbar.cropAspect": "アスペクト比",
+        "statusbar.cropAspectAutoFill": "自動（塗りつぶし）",
+        "statusbar.cropAspectCustom": "カスタム…",
+        "statusbar.cropReset": "表示範囲をリセット",
+        "statusbar.cropUnsupported": "Web壁紙は表示範囲調整に対応していません",
+        "statusbar.cropStaticUnsupported": "静止画壁紙は表示範囲調整に対応していません",
+        "statusbar.sceneAdvancedSettings": "シーン詳細設定",
         // Tabs
         "tab.all": "すべて",
         "tab.nature": "自然",
@@ -2932,6 +2986,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "player.speed": "速度",
         "player.favorite": "お気に入り",
         "player.unfavorite": "お気に入り解除",
+        "player.backToSearch": "戻る",
         // Loading
         "loading": "読み込み中...",
         "loading.simple": "読み込み中",
@@ -3221,7 +3276,13 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "hdrEnabled": "HDR ビデオ",
         "hdrEnabledDesc": "対応する場合、フレームごとの HDR 表示メタデータを適用します。再生はネイティブプレイヤー経路のままです。",
         "autoRemoveVideoLetterbox": "黒帯を自動削除",
-        "autoRemoveVideoLetterboxDesc": "元ファイル自体に黒帯がある動画のみ、フルスクリーン自動表示時に黒帯を除去します。",
+        "autoRemoveVideoLetterboxDesc": "元ファイル自体に黒帯がある画像または動画を、フルスクリーン自動表示時に黒帯除去します。",
+        "frameInterpolationSection": "動的壁紙フレーム補間",
+        "frameInterpolation": "動画補間を有効化",
+        "frameInterpolationDesc": "ネイティブ動画壁紙が目標 FPS を下回る場合、オフライン補間を書き出して元の動画ファイルを置き換えます。",
+        "frameInterpolationTargetFPS": "目標フレームレート",
+        "frameInterpolationAutoEnqueue": "壁紙切替時に自動補間",
+        "frameInterpolationAutoEnqueueDesc": "現在のネイティブ動画に補間が必要な場合、バックグラウンドで自動補間します。",
         "grainTextureEffect": "颗粒テクスチャ",
         "grainTextureEffectDesc": "デスクトップ壁紙にフィルム颗粒テクスチャを適用し、映画のような質感を演出します。",
         "grainTextureSubtitle": "フィルム颗粒効果で質感のある壁紙",
@@ -3321,6 +3382,7 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "replaceRhythmDesc": "ローテーション間隔、再生順序、壁紙ソースを設定。",
         "replaceInterval": "切り替え間隔",
         "intervalOnEnd": "再生終了時に切り替え",
+        "intervalOnUnlock": "ロック解除時に切り替え",
         "webSceneSwitchInterval": "Web/Scene 切り替え間隔",
         "intervalDesc": "自動切り替えの頻度を決定。",
         "interval": "間隔",
@@ -3988,6 +4050,14 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "settings.modules.closePending.message": "今すぐ再起動しますか？後で適用しますか？変更を破棄しますか？",
         "settings.modules.closePending.later": "後で",
         "settings.modules.closePending.discard": "変更を破棄",
+        // 外部ディスプレイ
+        "externalDisplay.connected.title": "新しい外部ディスプレイを検出",
+        "externalDisplay.connected.message": "%@ が接続されました。このディスプレイに動的壁紙を設定しますか？",
+        "externalDisplay.useRandomWallpaper": "ランダム壁紙を使用",
+        "externalDisplay.chooseWallpaper": "壁紙を選ぶ",
+        "externalDisplay.doNotUseWallpaper": "壁紙を使用しない",
+        "externalDisplay.autoSwitchOnConnect": "このディスプレイ接続時に自動切替",
+        "externalDisplay.autoSwitchOnConnectDesc": "この外部ディスプレイが接続されたとき、専用の自動切替範囲からランダムに選択します。",
         // Source switch hint
         "sourceSwitchHint": "クリックしてデータソースを切り替えます",
         // Error network troubleshoot
@@ -4060,6 +4130,10 @@ private let translations: [LocalizationService.Language: [String: String]] = [
 // MARK: - 本地化字符串获取
 func t(_ key: String) -> String {
     LocalizationService.shared.t(key)
+}
+
+extension Notification.Name {
+    static let appLanguageDidChange = Notification.Name("appLanguageDidChange")
 }
 
 // MARK: - View Extensions

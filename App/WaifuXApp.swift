@@ -7,6 +7,97 @@ import WebKit
 import Darwin
 import Sparkle
 
+func frameInterpolationDebugPrint(_ message: String) {
+    NSLog("[VideoWallpaperManager] [FrameInterpolation] \(message)")
+    AppLogger.debug(.wallpaper, "FrameInterpolation", metadata: [
+        "message": message
+    ])
+}
+
+private func waifuxSignalHandler(_ signo: Int32) {
+    AppExitDiagnostics.recordSignal(signo)
+    signal(signo, SIG_DFL)
+    raise(signo)
+}
+
+private func waifuxAtExitHandler() {
+    AppExitDiagnostics.record("atexit")
+}
+
+enum AppExitDiagnostics {
+    nonisolated(unsafe) private static var fd: Int32 = -1
+
+    static func install() {
+        openLogIfNeeded()
+        record("install", metadata: [
+            "pid": getpid(),
+            "bundle": Bundle.main.bundleURL.path
+        ])
+
+        atexit(waifuxAtExitHandler)
+        signal(SIGTERM, waifuxSignalHandler)
+        signal(SIGINT, waifuxSignalHandler)
+        signal(SIGQUIT, waifuxSignalHandler)
+        signal(SIGABRT, waifuxSignalHandler)
+        signal(SIGILL, waifuxSignalHandler)
+        signal(SIGBUS, waifuxSignalHandler)
+        signal(SIGSEGV, waifuxSignalHandler)
+    }
+
+    static func record(_ message: String, metadata: [String: Any] = [:]) {
+        var parts = metadata.map { "\($0.key)=\($0.value)" }.sorted()
+        parts.insert("pid=\(getpid())", at: 0)
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message) | \(parts.joined(separator: ", "))\n"
+        write(line)
+        AppLogger.error(.general, "Exit diagnostics: \(message)", metadata: metadata)
+    }
+
+    nonisolated static func recordSignal(_ signo: Int32) {
+        switch signo {
+        case SIGTERM:
+            writeStatic("signal SIGTERM\n")
+        case SIGINT:
+            writeStatic("signal SIGINT\n")
+        case SIGQUIT:
+            writeStatic("signal SIGQUIT\n")
+        case SIGABRT:
+            writeStatic("signal SIGABRT\n")
+        case SIGILL:
+            writeStatic("signal SIGILL\n")
+        case SIGBUS:
+            writeStatic("signal SIGBUS\n")
+        case SIGSEGV:
+            writeStatic("signal SIGSEGV\n")
+        default:
+            writeStatic("signal unknown\n")
+        }
+    }
+
+    private static func openLogIfNeeded() {
+        guard fd < 0 else { return }
+        let supportURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let dirURL = supportURL.appendingPathComponent("WaifuX", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        let path = dirURL.appendingPathComponent("waifux-exit.log").path
+        fd = Darwin.open(path, O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+    }
+
+    private static func write(_ line: String) {
+        openLogIfNeeded()
+        guard fd >= 0 else { return }
+        line.withCString { pointer in
+            _ = Darwin.write(fd, pointer, strlen(pointer))
+        }
+        _ = Darwin.fsync(fd)
+    }
+
+    nonisolated private static func writeStatic(_ message: StaticString) {
+        guard fd >= 0 else { return }
+        _ = Darwin.write(fd, message.utf8Start, message.utf8CodeUnitCount)
+    }
+}
+
 final class EdgeToEdgeHostingView<Content: View>: NSHostingView<Content> {
     private let edgeToEdgeLayoutGuide = NSLayoutGuide()
 
@@ -63,6 +154,7 @@ struct WaifuXApp {
     #endif
 
     static func main() {
+        AppExitDiagnostics.install()
         // 全局忽略 SIGPIPE：AVFoundation 内部管道在快速切换视频壁纸时可能写入已关闭的 pipe，
         // 若不加此保护会导致信号 13 (SIGPIPE) 传递到 NSEventThread 崩溃。
         // 所有自定义 socket 已通过 SO_NOSIGPIPE 独立防护，全局忽略是安全的。
@@ -201,6 +293,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var delayedReleaseTask: Task<Void, Never>?
     /// Sparkle 自动更新控制器（检测 + 内置弹窗 + 自动安装）
     private var updaterController: SPUStandardUpdaterController!
+    /// 仅手动退出/显式重启路径会设置；用于拦截外部工具误发的 Quit AppleEvent。
+    private var intentionalTerminationReason: String?
+    private var intentionalTerminationDeadline: Date?
     /// 静态访问器，供 Settings 等外部触发更新检查
     static var shared: AppDelegate?
 
@@ -412,6 +507,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             PlaybackProgressCache.shared.restoreSavedData()
                             DownloadTaskService.shared.restoreSavedTasks()
                             WallpaperSchedulerService.shared.restoreSavedConfig()
+                            ExternalDisplayConnectionCoordinator.shared.start()
 
                             // 启动锁屏扩展 Socket IPC 服务端（仅 macOS 26+）
                             if #available(macOS 26.0, *) {
@@ -501,6 +597,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // 最后一个窗口关闭时不退出应用，保持在后台运行（无 Dock 图标）
         return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let now = Date()
+        let intentional = intentionalTerminationReason != nil
+            && (intentionalTerminationDeadline.map { now <= $0 } ?? false)
+        let dynamicRendering = isDynamicWallpaperRendering
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        var metadata: [String: Any] = [
+            "intentional": intentional,
+            "intentionalReason": intentionalTerminationReason ?? "nil",
+            "dynamicRendering": dynamicRendering,
+            "frontmostApp": frontmost?.localizedName ?? "nil",
+            "frontmostBundle": frontmost?.bundleIdentifier ?? "nil",
+            "appActive": NSApp.isActive,
+            "appHidden": NSApp.isHidden,
+            "mainWindowVisible": window?.isVisible ?? false,
+            "settingsWindowVisible": settingsWindowController?.window?.isVisible ?? false
+        ]
+
+        if intentional || !dynamicRendering {
+            metadata["decision"] = "allow"
+            AppExitDiagnostics.record("applicationShouldTerminate", metadata: metadata)
+            return .terminateNow
+        }
+
+        metadata["decision"] = "cancelExternalQuit"
+        AppExitDiagnostics.record("applicationShouldTerminate", metadata: metadata)
+        return .terminateCancel
     }
 
     func showMainWindow() {
@@ -719,10 +844,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func quitApplication() {
+        markIntentionalTermination(reason: "quitApplication")
+        AppExitDiagnostics.record("quitApplication")
         NSApp.terminate(nil)
     }
 
+    func markIntentionalTermination(reason: String) {
+        intentionalTerminationReason = reason
+        intentionalTerminationDeadline = Date().addingTimeInterval(20)
+        AppExitDiagnostics.record("intentionalTerminationMarked", metadata: [
+            "reason": reason
+        ])
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        AppExitDiagnostics.record("applicationWillTerminate")
         // 只清理动态壁纸窗口，不回退到旧静态壁纸
         VideoWallpaperManager.shared.prepareForAppTermination()
 
@@ -747,6 +883,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func setupLayoutExceptionHandler() {
         // 设置未捕获异常处理器，仅用于日志记录
         NSSetUncaughtExceptionHandler { exception in
+            AppExitDiagnostics.record("uncaughtException", metadata: [
+                "name": exception.name.rawValue,
+                "reason": exception.reason ?? "nil"
+            ])
             if exception.name.rawValue == "NSGenericException",
                let reason = exception.reason,
                reason.contains("Layout Window") {
@@ -772,7 +912,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appMenu.addItem(NSMenuItem(title: "About WaifuX", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "Hide WaifuX", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Quit WaifuX", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit WaifuX", action: #selector(quitApplicationFromMainMenu(_:)), keyEquivalent: "q")
+        quitItem.target = self
+        appMenu.addItem(quitItem)
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
@@ -798,6 +940,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(windowMenuItem)
 
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func quitApplicationFromMainMenu(_ sender: Any?) {
+        quitApplication()
     }
 
     @available(macOS 26.0, *)

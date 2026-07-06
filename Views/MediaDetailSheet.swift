@@ -17,6 +17,7 @@ struct MediaDetailSheet: View {
     @ObservedObject private var mediaLibrary = MediaLibraryService.shared
     @ObservedObject private var loopService = VideoLoopPreprocessingService.shared
     @ObservedObject private var displaySelectorManager = DisplaySelectorManager.shared
+    @ObservedObject private var frameInterpolationQueue = FrameInterpolationQueueService.shared
     @State private var resolvedItem: MediaItem
     @State private var isDownloading = false
     @State private var isSettingWallpaper = false
@@ -74,7 +75,15 @@ struct MediaDetailSheet: View {
     @State private var showCopyLinkToast = false
     @State private var showMoreOptionsPopover = false
     @State private var showDeleteBakeConfirm = false
+    @State private var showDeleteFrameInterpolationConfirm = false
+    @State private var showRemoveFrameInterpolationBlacklistConfirm = false
+    @State private var pendingDeleteFrameInterpolationURL: URL?
+    @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
     @State private var isDeletingBake = false
+    @State private var isDeletingFrameInterpolation = false
+    @State private var frameInterpolationNeedCheckKey: String?
+    @State private var frameInterpolationNeedsInterpolation: Bool?
+    @State private var frameInterpolationNeedCheckTask: Task<Void, Never>?
     @State private var isTranscodingVideo = false
     @State private var transcodeVideoProgress: Double = 0
 
@@ -300,20 +309,25 @@ struct MediaDetailSheet: View {
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showCopyLinkToast)
                 }
-                if isTranscodingVideo {
-                    Text("转码中 \(Int(transcodeVideoProgress * 100))%")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule()
-                                .fill(.ultraThinMaterial)
-                                .overlay(Capsule().stroke(.white.opacity(0.12), lineWidth: 0.5))
+                VStack(spacing: 8) {
+                    if isTranscodingVideo {
+                        MediaProcessingToast(
+                            title: "转码中 \(Int(transcodeVideoProgress * 100))%",
+                            detail: nil,
+                            progress: transcodeVideoProgress
                         )
-                        .padding(.bottom, 48)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+
+                    if let activeItem = frameInterpolationQueue.activeProcessingItem {
+                        MediaProcessingToast(
+                            title: "补帧中 \(Int((activeItem.progress * 100).rounded()))%",
+                            detail: frameInterpolationRemainingDetail,
+                            progress: activeItem.progress
+                        )
+                    }
                 }
+                .padding(.bottom, 48)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .ignoresSafeArea()
@@ -348,6 +362,31 @@ struct MediaDetailSheet: View {
             Button(t("cancel"), role: .cancel) {}
         } message: {
             Text("将删除该壁纸的离线烘焙视频，静态预览图保留。删除后会立即用静态图替换正在显示的锁屏/桌面壁纸。")
+        }
+        .alert("删除补帧文件？", isPresented: $showDeleteFrameInterpolationConfirm) {
+            Button("删除", role: .destructive) {
+                guard let url = pendingDeleteFrameInterpolationURL else { return }
+                Task { await deleteFrameInterpolationFileAndRedownload(videoURL: url) }
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingDeleteFrameInterpolationURL = nil
+            }
+        } message: {
+            Text("删除补帧文件后需要重新下载该视频文件，同时该视频将不再自动补帧")
+        }
+        .alert("是否移出黑名单？", isPresented: $showRemoveFrameInterpolationBlacklistConfirm) {
+            Button("移出", role: .destructive) {
+                if let url = pendingRemoveFrameInterpolationBlacklistURL {
+                    frameInterpolationQueue.removeBlacklisted(videoURL: url)
+                    refreshFrameInterpolationNeedCheck(force: true)
+                }
+                pendingRemoveFrameInterpolationBlacklistURL = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingRemoveFrameInterpolationBlacklistURL = nil
+            }
+        } message: {
+            Text("移出黑名单后，该视频可以再次手动添加到补帧队列。")
         }
         .overlay {
             authorSheetOverlay
@@ -397,6 +436,13 @@ struct MediaDetailSheet: View {
             // 避免下载完成后对已关闭的 sheet 执行壁纸应用造成竞态
             autoDownloadTask?.cancel()
             autoDownloadTask = nil
+            frameInterpolationNeedCheckTask?.cancel()
+            frameInterpolationNeedCheckTask = nil
+        }
+        .onChange(of: showMoreOptionsPopover) { _, isShown in
+            if isShown {
+                refreshFrameInterpolationNeedCheck()
+            }
         }
     }
 
@@ -1472,6 +1518,179 @@ struct MediaDetailSheet: View {
                 .disabled(isTranscodingVideo)
             }
 
+            if frameInterpolationSettingsEnabled,
+               let interpolationVideoURL = currentFrameInterpolationVideoURL {
+                let targetFPS = currentFrameInterpolationTargetFPS
+                if frameInterpolationQueue.hasActiveInterpolation(videoURL: interpolationVideoURL, satisfying: targetFPS) {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "clock")
+                            Text("补帧队列处理中")
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL, satisfying: targetFPS) != nil {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "checkmark.circle")
+                            Text("已完成补帧")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color.white.opacity(0.46))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+
+                    Button {
+                        showMoreOptionsPopover = false
+                        pendingDeleteFrameInterpolationURL = interpolationVideoURL
+                        showDeleteFrameInterpolationConfirm = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "trash")
+                            Text("删除补帧文件")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color(hex: "FF453A"))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isDeletingFrameInterpolation)
+                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL) != nil {
+                    if frameInterpolationNeedsInterpolation == false {
+                        Button {} label: {
+                            HStack {
+                                Image(systemName: "checkmark.circle")
+                                Text("无需补帧")
+                                Spacer()
+                            }
+                            .foregroundStyle(Color.white.opacity(0.46))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(true)
+                    } else if frameInterpolationNeedsInterpolation == nil {
+                        Button {} label: {
+                            HStack {
+                                Image(systemName: "hourglass")
+                                Text("检测补帧需求")
+                                Spacer()
+                            }
+                            .foregroundStyle(Color.white.opacity(0.46))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(true)
+                    } else {
+                        Button {
+                            showMoreOptionsPopover = false
+                            frameInterpolationQueue.enqueue(
+                                videoURL: interpolationVideoURL,
+                                title: resolvedItem.title,
+                                targetFPS: targetFPS,
+                                source: .manual
+                            )
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.up.forward.circle")
+                                Text("提高补帧帧率")
+                                Spacer()
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button {
+                        showMoreOptionsPopover = false
+                        pendingDeleteFrameInterpolationURL = interpolationVideoURL
+                        showDeleteFrameInterpolationConfirm = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "trash")
+                            Text("删除补帧文件")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color(hex: "FF453A"))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isDeletingFrameInterpolation)
+                } else if frameInterpolationQueue.isBlacklisted(videoURL: interpolationVideoURL) {
+                    Button {
+                        showMoreOptionsPopover = false
+                        pendingRemoveFrameInterpolationBlacklistURL = interpolationVideoURL
+                        showRemoveFrameInterpolationBlacklistConfirm = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "nosign")
+                            Text("已加入补帧黑名单")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color.white.opacity(0.46))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                } else if frameInterpolationNeedsInterpolation == false {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "checkmark.circle")
+                            Text("无需补帧")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color.white.opacity(0.46))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+                } else if frameInterpolationNeedsInterpolation == nil {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "hourglass")
+                            Text("检测补帧需求")
+                            Spacer()
+                        }
+                        .foregroundStyle(Color.white.opacity(0.46))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+                } else {
+                    Button {
+                        showMoreOptionsPopover = false
+                        frameInterpolationQueue.enqueue(
+                            videoURL: interpolationVideoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS,
+                            source: .manual
+                        )
+                    } label: {
+                        HStack {
+                            Image(systemName: "rectangle.stack.badge.play")
+                            Text("添加到补帧队列")
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             // 复制静态图片
             if isAlreadyDownloaded || WallpaperEngineXBridge.shared.isControllingExternalEngine {
                 Button {
@@ -1490,6 +1709,82 @@ struct MediaDetailSheet: View {
             }
         }
         .frame(width: 192)
+    }
+
+    private var currentFrameInterpolationVideoURL: URL? {
+        guard isAlreadyDownloaded else { return nil }
+        if let localURL = currentDownloadRecord?.localFileURL,
+           let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) {
+            return videoURL
+        }
+        return findLocalWorkshopFile()
+    }
+
+    private var frameInterpolationSettingsEnabled: Bool {
+        UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+    }
+
+    private var currentFrameInterpolationTargetFPS: Int {
+        FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+    }
+
+    private var frameInterpolationRemainingDetail: String? {
+        let count = frameInterpolationQueue.remainingWorkCount
+        return count > 0 ? "还有 \(count) 个" : nil
+    }
+
+    private func refreshFrameInterpolationNeedCheck(force: Bool = false) {
+        guard frameInterpolationSettingsEnabled,
+              let videoURL = currentFrameInterpolationVideoURL else {
+            clearFrameInterpolationNeedCheck()
+            return
+        }
+
+        let targetFPS = currentFrameInterpolationTargetFPS
+        if frameInterpolationQueue.hasActiveInterpolation(videoURL: videoURL, satisfying: targetFPS)
+            || frameInterpolationQueue.isBlacklisted(videoURL: videoURL) {
+            clearFrameInterpolationNeedCheck()
+            return
+        }
+        if frameInterpolationQueue.completedRecord(videoURL: videoURL, satisfying: targetFPS) != nil {
+            clearFrameInterpolationNeedCheck()
+            return
+        }
+
+        let key = "\(videoURL.standardizedFileURL.path)#\(targetFPS)"
+        guard force || frameInterpolationNeedCheckKey != key else { return }
+
+        frameInterpolationNeedCheckTask?.cancel()
+        frameInterpolationNeedCheckKey = key
+        frameInterpolationNeedsInterpolation = nil
+        frameInterpolationNeedCheckTask = Task {
+            let needsInterpolation = await FrameInterpolationQueueService.shared.needsInterpolation(
+                videoURL: videoURL,
+                targetFPS: targetFPS
+            )
+            await MainActor.run {
+                guard frameInterpolationNeedCheckKey == key else { return }
+                if !needsInterpolation,
+                   frameInterpolationQueue.completedRecord(videoURL: videoURL) != nil {
+                    frameInterpolationQueue.markCompleted(
+                        videoURL: videoURL,
+                        title: resolvedItem.title,
+                        targetFPS: targetFPS
+                    )
+                    clearFrameInterpolationNeedCheck()
+                    return
+                }
+                frameInterpolationNeedsInterpolation = needsInterpolation
+                frameInterpolationNeedCheckTask = nil
+            }
+        }
+    }
+
+    private func clearFrameInterpolationNeedCheck() {
+        frameInterpolationNeedCheckTask?.cancel()
+        frameInterpolationNeedCheckTask = nil
+        frameInterpolationNeedCheckKey = nil
+        frameInterpolationNeedsInterpolation = nil
     }
 
     private func detailInfoBubble(width: CGFloat) -> some View {
@@ -2082,6 +2377,49 @@ struct MediaDetailSheet: View {
                     ["id": resolvedItem.id, "error": error.localizedDescription,
                      "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
             }
+        }
+    }
+
+    private func deleteFrameInterpolationFileAndRedownload(videoURL: URL) async {
+        guard !isDeletingFrameInterpolation else { return }
+        isDeletingFrameInterpolation = true
+        isDownloading = true
+        errorMessage = ""
+        defer {
+            isDeletingFrameInterpolation = false
+            isDownloading = false
+            pendingDeleteFrameInterpolationURL = nil
+        }
+
+        let targetFPS = currentFrameInterpolationTargetFPS
+        frameInterpolationQueue.removeCompleted(videoURL: videoURL)
+        frameInterpolationQueue.markBlacklisted(videoURL: videoURL, title: resolvedItem.title, targetFPS: targetFPS)
+
+        do {
+            if FileManager.default.fileExists(atPath: videoURL.path) {
+                try FileManager.default.removeItem(at: videoURL)
+            }
+
+            if resolvedItem.id.hasPrefix("workshop_") {
+                try await viewModel.downloadWorkshopWallpaper(resolvedItem)
+            } else {
+                try await viewModel.download(resolvedItem)
+            }
+
+            VideoWallpaperManager.shared.restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: videoURL, targetFPSs: [targetFPS])
+            sceneBakeStatusFlash = "已重新下载原文件"
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                sceneBakeStatusFlash = nil
+            }
+        } catch {
+            errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+            showError = true
+            AppLogger.error(.download, "删除补帧文件后重新下载失败", metadata: [
+                "id": resolvedItem.id,
+                "video": videoURL.path,
+                "error": error.localizedDescription
+            ])
         }
     }
 
@@ -3434,12 +3772,13 @@ struct MediaDetailSheet: View {
                         // 系统壁纸同步关闭时走独立静态图 overlay，不写系统壁纸
                         if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
                             for screen in targetScreens {
-                                StaticImageWallpaperOverlayManager.shared.show(imageURL: imageURL, for: screen)
+                                await StaticImageWallpaperOverlayManager.shared.showPrepared(imageURL: imageURL, for: screen)
                             }
                         } else {
+                            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
                             for screen in targetScreens {
-                                try NSWorkspace.shared.setDesktopImageURLForAllSpaces(imageURL, for: screen)
-                                DesktopWallpaperSyncManager.shared.registerWallpaperSet(imageURL, for: screen)
+                                try NSWorkspace.shared.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: screen)
+                                DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: screen)
                             }
                             // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
                             StaticImageWallpaperOverlayManager.shared.clearState()
@@ -3462,10 +3801,11 @@ struct MediaDetailSheet: View {
                     if let mainScreen = screens.first {
                         // 系统壁纸同步关闭时走独立静态图 overlay，不写系统壁纸
                         if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
-                            StaticImageWallpaperOverlayManager.shared.show(imageURL: imageURL, for: mainScreen)
+                            await StaticImageWallpaperOverlayManager.shared.showPrepared(imageURL: imageURL, for: mainScreen)
                         } else {
-                            try NSWorkspace.shared.setDesktopImageURLForAllSpaces(imageURL, for: mainScreen)
-                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(imageURL, for: mainScreen)
+                            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
+                            try NSWorkspace.shared.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: mainScreen)
+                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: mainScreen)
                             // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
                             StaticImageWallpaperOverlayManager.shared.clearState()
                         }
@@ -4351,6 +4691,47 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
         }
 
         return nil
+    }
+}
+
+private struct MediaProcessingToast: View {
+    let title: String
+    let detail: String?
+    let progress: Double
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .frame(minWidth: 92, alignment: .leading)
+
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 92, height: 5)
+
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.78))
+                    .frame(width: 92 * min(1, max(0, progress)), height: 5)
+            }
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .monospacedDigit()
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .liquidGlassSurface(.prominent, tint: Color.white.opacity(0.06), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
     }
 }
 

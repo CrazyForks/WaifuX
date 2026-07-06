@@ -2225,6 +2225,38 @@ final class WallpaperEngineXBridge: ObservableObject {
             && UserDefaults.standard.string(forKey: lastWallpaperPathKey) != nil
     }
 
+    func hasPersistedRestoreState(for screen: NSScreen) -> Bool {
+        let screenID = screen.wallpaperScreenIdentifier
+        let fingerprint = screen.wallpaperScreenFingerprint
+        if let data = UserDefaults.standard.data(forKey: screenRenderStatesKey),
+           let states = try? JSONDecoder().decode([ScreenRenderState].self, from: data),
+           states.contains(where: { $0.screenID == screenID || $0.screenFingerprint == fingerprint }) {
+            return true
+        }
+
+        guard UserDefaults.standard.bool(forKey: controllingExternalKey),
+              UserDefaults.standard.string(forKey: lastWallpaperPathKey) != nil else {
+            return false
+        }
+        let targetIDs = Set(UserDefaults.standard.stringArray(forKey: targetScreenIDsKey) ?? [])
+        let targetFingerprints = Set(UserDefaults.standard.stringArray(forKey: targetScreenFingerprintsKey) ?? [])
+        return targetIDs.contains(screenID) || targetFingerprints.contains(fingerprint)
+    }
+
+    func restorePreviousWallpaperIfAvailable(for screen: NSScreen) async -> Bool {
+        guard hasPersistedRestoreState(for: screen) || isManaging(screen: screen) else {
+            return false
+        }
+        if !isManaging(screen: screen) {
+            await restoreIfNeeded()
+        }
+        let restored = isManaging(screen: screen)
+        if restored {
+            print("[WallpaperEngineXBridge] Restored previous live wallpaper for reconnected display: \(screen.localizedName)")
+        }
+        return restored
+    }
+
     // MARK: - 二进制查找
 
     /// 解析 bundled `wallpaper-wgpu` 可执行文件路径
@@ -2606,6 +2638,13 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     private func handleScreenParametersChanged() {
         guard isControllingExternalEngine else { return }
+        AppLogger.error(.wallpaper, "WallpaperEngineX screen parameters changed", metadata: [
+            "isSettingWallpaper": isSettingWallpaper,
+            "processScreens": screenProcesses.keys.sorted().joined(separator: ","),
+            "stateScreens": screenRenderStates.keys.sorted().joined(separator: ","),
+            "targetIDs": targetScreenIDs.sorted().joined(separator: ","),
+            "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
+        ])
         guard !isSettingWallpaper else {
             print("[WallpaperEngineXBridge] 忽略屏幕参数通知：壁纸正在设置中")
             return
@@ -2630,6 +2669,11 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
 
             let screens = self.activeTargetScreens()
+            AppLogger.error(.wallpaper, "WallpaperEngineX restarting after screen change", metadata: [
+                "screens": screens.map(\.wallpaperScreenIdentifier).joined(separator: ","),
+                "statesBeforeRestart": statesBeforeRestart.keys.sorted().joined(separator: ","),
+                "hasLastPath": self.lastWallpaperPath != nil
+            ])
             Task {
                 print("[WallpaperEngineXBridge] 屏幕参数已变更，重启渲染进程")
                 if !statesBeforeRestart.isEmpty {

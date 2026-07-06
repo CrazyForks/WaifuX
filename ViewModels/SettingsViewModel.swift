@@ -52,6 +52,36 @@ class SettingsViewModel: ObservableObject {
             guard !isBatchUpdating else { return }
             UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
             VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
+            StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
+        }
+    }
+    @Published var frameInterpolationEnabled = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            if !frameInterpolationEnabled, frameInterpolationAutoEnqueue {
+                frameInterpolationAutoEnqueue = false
+            }
+            UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
+            VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+        }
+    }
+    @Published var frameInterpolationTargetFPS: Double = 60 {
+        didSet {
+            guard !isBatchUpdating else { return }
+            let normalized = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int(frameInterpolationTargetFPS.rounded())))
+            if frameInterpolationTargetFPS != normalized {
+                frameInterpolationTargetFPS = normalized
+                return
+            }
+            UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
+            VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+        }
+    }
+    @Published var frameInterpolationAutoEnqueue = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_enqueue")
+            FrameInterpolationQueueService.shared.autoEnqueueEnabled = frameInterpolationAutoEnqueue
         }
     }
     @Published var showAllWorkshopContent = false { didSet { UserDefaults.standard.set(showAllWorkshopContent, forKey: "show_all_workshop_content") } }
@@ -217,6 +247,11 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(grainIntensity, forKey: "arc_grain_intensity")
         UserDefaults.standard.set(hideNotch, forKey: "hide_notch")
         UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
+        UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
+        UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
+        let effectiveFrameInterpolationAutoEnqueue = frameInterpolationEnabled && frameInterpolationAutoEnqueue
+        frameInterpolationAutoEnqueue = effectiveFrameInterpolationAutoEnqueue
+        UserDefaults.standard.set(effectiveFrameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_enqueue")
         UserDefaults.standard.set(sceneRealtimeRenderingEnabled, forKey: "scene_realtime_rendering_enabled")
         UserDefaults.standard.set(proxyEnabled, forKey: "proxy_enabled")
         UserDefaults.standard.set(proxyHost, forKey: "proxy_host")
@@ -227,6 +262,9 @@ class SettingsViewModel: ObservableObject {
         ArcBackgroundSettings.shared.grainIntensity = grainIntensity
         VideoWallpaperManager.shared.refreshGrainOverlay()
         VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
+        StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
+        VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+        FrameInterpolationQueueService.shared.autoEnqueueEnabled = effectiveFrameInterpolationAutoEnqueue
         NotchOverlayManager.shared.setEnabled(hideNotch)
         if sceneRealtimeRenderingEnabled {
             LiquidGlassClockSettings.shared.update { $0.enabled = false }
@@ -315,6 +353,9 @@ class SettingsViewModel: ObservableObject {
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50
             hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
             autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
+            frameInterpolationEnabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+            frameInterpolationTargetFPS = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int((defaults.object(forKey: "frame_interpolation_target_fps") as? Double ?? 60.0).rounded())))
+            frameInterpolationAutoEnqueue = frameInterpolationEnabled && (defaults.object(forKey: "frame_interpolation_auto_enqueue") as? Bool ?? false)
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
             sceneRealtimeRenderingEnabled = defaults.bool(forKey: "scene_realtime_rendering_enabled")
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true
@@ -429,7 +470,7 @@ class SettingsViewModel: ObservableObject {
             cacheProgress = 0
             return
         }
-        let urlCacheURL = cacheURL.appendingPathComponent("com.waifux.app/WaifuXCache")
+        let urlCacheURL = cacheURL.appendingPathComponent("WaifuXImageCache")
         var urlCacheBytes = 0
         if let enumerator = FileManager.default.enumerator(at: urlCacheURL, includingPropertiesForKeys: [.fileSizeKey]) {
             while let fileURL = enumerator.nextObject() as? URL {
@@ -457,9 +498,8 @@ class SettingsViewModel: ObservableObject {
             await updateCacheSize()
             return
         }
-        let urlCacheURL = cacheURL.appendingPathComponent("com.waifux.app/WaifuXCache")
+        let urlCacheURL = cacheURL.appendingPathComponent("WaifuXImageCache")
         try? FileManager.default.removeItem(at: urlCacheURL)
-        try? FileManager.default.createDirectory(at: cacheURL.appendingPathComponent("com.wallhaven.app"), withIntermediateDirectories: true)
 
         await updateCacheSize()
     }
@@ -480,9 +520,7 @@ class SettingsViewModel: ObservableObject {
         URLCache.shared.removeAllCachedResponses()
         if let cacheURL = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
             let targets = [
-                cacheURL.appendingPathComponent("com.waifux.app/WaifuXCache"),
-                cacheURL.appendingPathComponent("WallHaven/ImageCache"),
-                cacheURL.appendingPathComponent("com.waifux.app"),
+                cacheURL.appendingPathComponent("WaifuXImageCache"),
                 cacheURL.appendingPathComponent("org.onevcat.Kingfisher.ImageCache.default")
             ]
             for url in targets {

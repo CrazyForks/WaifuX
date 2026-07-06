@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import AppKit
 
 @MainActor
 class WallpaperSchedulerViewModel: ObservableObject {
@@ -95,6 +96,10 @@ class WallpaperSchedulerViewModel: ObservableObject {
         config.resolvedDisplayConfig(for: screenID)
     }
 
+    func displayConfig(for screen: NSScreen) -> DisplaySchedulerConfig {
+        schedulerService.resolvedDisplayConfig(for: screen)
+    }
+
     func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
         schedulerService.updateDisplayEnabled(enabled, for: screenID)
     }
@@ -123,6 +128,14 @@ class WallpaperSchedulerViewModel: ObservableObject {
         schedulerService.updateDisplayWebSceneSwitchSeconds(seconds, for: screenID)
     }
 
+    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
+        schedulerService.updateDisplayAutoChangeOnExternalConnect(enabled, for: screenID)
+    }
+
+    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
+        schedulerService.updateDisplayAutoChangeOnExternalConnect(enabled, for: screen)
+    }
+
     // MARK: - Computed Properties
 
     var intervalLabel: String {
@@ -130,6 +143,12 @@ class WallpaperSchedulerViewModel: ObservableObject {
     }
 
     func intervalLabel(for minutes: Int) -> String {
+        if minutes == SchedulerConfig.intervalOnEndMinutes {
+            return "Play to End"
+        }
+        if minutes == SchedulerConfig.intervalOnUnlockMinutes {
+            return "Change on Unlock"
+        }
         switch minutes {
         case 1: return "1 min"
         case 3: return "3 min"

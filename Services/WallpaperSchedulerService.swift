@@ -25,6 +25,7 @@ class WallpaperSchedulerService: ObservableObject {
     private let displayFingerprintsKey = "wallpaper_scheduler_display_fingerprints_v1"
     private let logTag = "[WallpaperScheduler]"
     private var isScreenLocked = false
+    private var lastUnlockSwitchTime: Date?
 
     /// Persists screenID → fingerprint mapping so that display configs can be
     /// relinked after sleep/wake when CGDirectDisplayID may change on external monitors.
@@ -73,23 +74,86 @@ class WallpaperSchedulerService: ObservableObject {
 
     /// 为指定屏幕触发下一次壁纸更换（用于"播完即换"模式）
     private func triggerNextWallpaper(for screenID: String) {
+        applyNextWallpaper(for: screenID, requiredMode: .onEnd)
+    }
+
+    /// 手动为指定屏幕切换下一张壁纸。即使该屏幕暂时关闭自动切换，也允许使用
+    /// 已保存的轮换范围、顺序和文件夹过滤来选取下一张。
+    func triggerNextWallpaperNow(for screenID: String) {
+        applyNextWallpaper(for: screenID, requiredMode: nil)
+    }
+
+    func triggerRandomWallpaperNow(for screenID: String) {
+        applyNextWallpaper(for: screenID, requiredMode: nil, overrideOrder: .random)
+    }
+
+    func hasSchedulableItems(for screenID: String) -> Bool {
+        let displayConfig = config.resolvedDisplayConfig(for: screenID)
+        return !getSchedulableItems(for: displayConfig, screenID: screenID).isEmpty
+    }
+
+    func resolvedDisplayConfig(for screen: NSScreen) -> DisplaySchedulerConfig {
+        let screenID = screen.wallpaperScreenIdentifier
+        if let displayConfig = config.displayConfigs[screenID] {
+            return displayConfig
+        }
+
+        if let oldScreenID = existingConfigScreenID(for: screen),
+           let displayConfig = config.displayConfigs[oldScreenID] {
+            return displayConfig
+        }
+
+        return config.resolvedDisplayConfig(for: screenID)
+    }
+
+    func displayConfigScreenID(for screen: NSScreen) -> String {
+        if let existingScreenID = existingConfigScreenID(for: screen),
+           config.displayConfigs[existingScreenID] != nil {
+            migrateDisplayConfig(from: existingScreenID, to: screen)
+        }
+        displayFingerprints[screen.wallpaperScreenIdentifier] = screen.schedulerConfigFingerprint
+        saveDisplayFingerprints()
+        return screen.wallpaperScreenIdentifier
+    }
+
+    func relinkDisplayConfigsForCurrentScreens() {
+        let previousFingerprints = displayFingerprints
+        relinkDisplayConfigsByFingerprint()
+        relinkSchedulerStateByFingerprint(using: previousFingerprints)
+    }
+
+    private enum RequiredSwitchMode {
+        case onEnd
+    }
+
+    private func applyNextWallpaper(
+        for screenID: String,
+        requiredMode: RequiredSwitchMode?,
+        overrideOrder: ScheduleOrder? = nil
+    ) {
         guard !isScreenLocked else { return }
         guard NSScreen.screens.contains(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             return
         }
         let displayConfig = config.resolvedDisplayConfig(for: screenID)
-        guard displayConfig.isEnabled && displayConfig.isOnEndMode else { return }
+        switch requiredMode {
+        case .onEnd:
+            guard displayConfig.isEnabled && displayConfig.isOnEndMode else { return }
+        case nil:
+            break
+        }
 
-        let items = getSchedulableItems(for: displayConfig)
+        let items = getSchedulableItems(for: displayConfig, screenID: screenID)
         guard !items.isEmpty else {
-            print("\(logTag) Screen \(screenID): no schedulable items for on-end mode")
+            print("\(logTag) Screen \(screenID): no schedulable items for next-wallpaper request")
             return
         }
 
         let now = Date()
         let lastChangedItemID = lastChangedItemIDs[screenID]
 
-        guard let item = selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: displayConfig.order) else {
+        let order = overrideOrder ?? displayConfig.order
+        guard let item = selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: order) else {
             print("\(logTag) Screen \(screenID): item selection returned nil for on-end mode")
             return
         }
@@ -100,25 +164,25 @@ class WallpaperSchedulerService: ObservableObject {
                 self.lastChangeTimes[screenID] = now
                 self.lastChangedItemIDs[screenID] = item.id
                 self.persistSchedulerState()
-                print("\(logTag) On-end mode: applied '\(item.title)' to screen \(screenID)")
+                print("\(logTag) Applied next wallpaper '\(item.title)' to screen \(screenID)")
             } else {
-                print("\(logTag) On-end mode: failed to apply '\(item.title)' to screen \(screenID), trying next item")
+                print("\(logTag) Failed to apply next wallpaper '\(item.title)' to screen \(screenID), trying next item")
                 // 尝试其他可用项，避免因选中不支持的壁纸类型导致黑屏
                 var remaining = items.filter { $0.id != item.id }
                 while !remaining.isEmpty {
-                    guard let retryItem = selectNextItem(from: remaining, lastID: lastChangedItemID, screenID: screenID, order: displayConfig.order) else { break }
+                    guard let retryItem = selectNextItem(from: remaining, lastID: lastChangedItemID, screenID: screenID, order: order) else { break }
                     remaining.removeAll { $0.id == retryItem.id }
                     let retrySuccess = await applyItem(retryItem, toScreenID: screenID)
                     if retrySuccess {
                         self.lastChangeTimes[screenID] = now
                         self.lastChangedItemIDs[screenID] = retryItem.id
                         self.persistSchedulerState()
-                        print("\(logTag) On-end mode: retry applied '\(retryItem.title)' to screen \(screenID)")
+                        print("\(logTag) Retry applied next wallpaper '\(retryItem.title)' to screen \(screenID)")
                         return
                     }
-                    print("\(logTag) On-end mode: retry failed for '\(retryItem.title)', trying next")
+                    print("\(logTag) Retry failed for next wallpaper '\(retryItem.title)', trying next")
                 }
-                print("\(logTag) On-end mode: all items exhausted for screen \(screenID), no wallpaper applied")
+                print("\(logTag) All next-wallpaper candidates exhausted for screen \(screenID), no wallpaper applied")
             }
         }
     }
@@ -137,6 +201,7 @@ class WallpaperSchedulerService: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isScreenLocked = false
+            self.changeUnlockWallpapersIfNeeded()
             if self.isRunning {
                 self.scheduleNextChange()
                 print("\(self.logTag) Screen unlocked, resuming scheduler")
@@ -207,6 +272,7 @@ class WallpaperSchedulerService: ObservableObject {
         // Build fingerprint → current screenID map
         var fingerprintToScreenID: [String: String] = [:]
         for screen in currentScreens {
+            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
             fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
         }
 
@@ -232,6 +298,38 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    private func existingConfigScreenID(for screen: NSScreen) -> String? {
+        let currentID = screen.wallpaperScreenIdentifier
+        if config.displayConfigs[currentID] != nil {
+            return currentID
+        }
+
+        let fingerprints = Set([
+            screen.schedulerConfigFingerprint,
+            screen.wallpaperScreenFingerprint,
+        ])
+        return displayFingerprints.first { _, fingerprint in
+            fingerprints.contains(fingerprint)
+        }?.key
+    }
+
+    private func migrateDisplayConfig(from oldScreenID: String, to screen: NSScreen) {
+        let newScreenID = screen.wallpaperScreenIdentifier
+        guard oldScreenID != newScreenID,
+              let oldConfig = config.displayConfigs[oldScreenID],
+              config.displayConfigs[newScreenID] == nil else {
+            return
+        }
+
+        config.displayConfigs[newScreenID] = oldConfig
+        config.displayConfigs.removeValue(forKey: oldScreenID)
+        displayFingerprints.removeValue(forKey: oldScreenID)
+        displayFingerprints[newScreenID] = screen.schedulerConfigFingerprint
+        saveConfig()
+        saveDisplayFingerprints()
+        print("\(logTag) Migrated display config from \(oldScreenID) to \(newScreenID) for \(screen.localizedName)")
+    }
+
     /// Re-maps per-screen scheduler state using the saved display fingerprint.
     private func relinkSchedulerStateByFingerprint(using previousFingerprints: [String: String]) {
         let currentScreens = NSScreen.screens
@@ -239,6 +337,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         var fingerprintToScreenID: [String: String] = [:]
         for screen in currentScreens {
+            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
             fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
         }
 
@@ -292,7 +391,7 @@ class WallpaperSchedulerService: ObservableObject {
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
             if config.displayConfigs.keys.contains(screenID) {
-                displayFingerprints[screenID] = screen.wallpaperScreenFingerprint
+                displayFingerprints[screenID] = screen.schedulerConfigFingerprint
             }
         }
     }
@@ -559,10 +658,27 @@ class WallpaperSchedulerService: ObservableObject {
         updateConfig(newConfig)
     }
 
+    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
+        var newConfig = config
+        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
+        displayConfig.autoChangeOnExternalConnect = enabled
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+    }
+
+    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
+        let screenID = displayConfigScreenID(for: screen)
+        var newConfig = config
+        var displayConfig = resolvedDisplayConfig(for: screen)
+        displayConfig.autoChangeOnExternalConnect = enabled
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+    }
+
     // MARK: - Scheduling
 
     /// Returns the smallest interval among enabled timed displays.
-    /// 注意："播完即换"模式的屏幕（intervalMinutes < 0）不参与定时器调度；
+    /// 注意：特殊模式（intervalMinutes < 0）不参与定时器调度；
     /// 但如果设置了 webSceneSwitchSeconds（Web/Scene 壁纸切换间隔），则仍需定时器。
     private func effectiveCheckInterval() -> TimeInterval {
         let screens = NSScreen.screens
@@ -570,6 +686,7 @@ class WallpaperSchedulerService: ObservableObject {
             let screenID = screen.wallpaperScreenIdentifier
             let displayConfig = config.resolvedDisplayConfig(for: screenID)
             guard displayConfig.isEnabled else { return nil }
+            guard !displayConfig.isOnUnlockMode else { return nil }
             // "播完即换"模式的屏幕：仅当设置了 Web/Scene 切换间隔时才纳入定时器
             guard !displayConfig.isOnEndMode else {
                 if let wsSec = displayConfig.webSceneSwitchSeconds {
@@ -587,9 +704,9 @@ class WallpaperSchedulerService: ObservableObject {
         dispatchTimer = nil
 
         let interval = effectiveCheckInterval()
-        // interval 为 0 表示所有启用的显示器都使用"播完即换"模式，不需要定时器
+        // interval 为 0 表示所有启用的显示器都使用事件触发模式，不需要定时器
         guard interval > 0 else {
-            print("\(logTag) All enabled displays use on-end mode, no timer needed")
+            print("\(logTag) All enabled displays use event-driven modes, no timer needed")
             return
         }
 
@@ -620,6 +737,7 @@ class WallpaperSchedulerService: ObservableObject {
             let screenID = screen.wallpaperScreenIdentifier
             let displayConfig = config.resolvedDisplayConfig(for: screenID)
             guard displayConfig.isEnabled else { continue }
+            guard !displayConfig.isOnUnlockMode else { continue }
 
             // "播完即换"模式的屏幕：设置了 webSceneSwitchSeconds 时由定时器调度（仅 Web/Scene 壁纸）
             // 视频壁纸仍由播放完成通知触发，不走定时器
@@ -667,7 +785,8 @@ class WallpaperSchedulerService: ObservableObject {
         guard !pending.isEmpty else { return }
 
         Task { @MainActor in
-            for change in pending {
+            for (index, change) in pending.enumerated() {
+                await self.waitBeforeApplyingBatchedWallpaper(index: index)
                 let (screenID, item, _) = change
                 let bakeStatus: String
                 if item.bakedVideoPath != nil { bakeStatus = "mp4" }
@@ -687,7 +806,71 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    private func changeUnlockWallpapersIfNeeded() {
+        guard !isScreenLocked else { return }
+        guard !WallpaperEngineXBridge.shared.isSettingWallpaper else {
+            print("\(logTag) Skipping unlock switch: manual wallpaper setting in progress")
+            return
+        }
+
+        let now = Date()
+        if let lastUnlockSwitchTime,
+           now.timeIntervalSince(lastUnlockSwitchTime) < 2.0 {
+            print("\(logTag) Skipping duplicate unlock switch")
+            return
+        }
+
+        typealias PendingChange = (screenID: String, item: SchedulableItem)
+        var pending: [PendingChange] = []
+
+        for screen in NSScreen.screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            guard displayConfig.isEnabled && displayConfig.isOnUnlockMode else { continue }
+
+            let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+            if items.isEmpty {
+                print("\(logTag) Screen \(screenID): no schedulable items for unlock mode")
+                continue
+            }
+
+            guard let item = selectNextItem(from: items, lastID: lastChangedItemIDs[screenID], screenID: screenID, order: displayConfig.order) else {
+                print("\(logTag) Screen \(screenID): item selection returned nil for unlock mode")
+                continue
+            }
+
+            pending.append((screenID, item))
+        }
+
+        guard !pending.isEmpty else { return }
+        lastUnlockSwitchTime = now
+
+        Task { @MainActor in
+            for (index, change) in pending.enumerated() {
+                await self.waitBeforeApplyingBatchedWallpaper(index: index)
+                let (screenID, item) = change
+                print("\(logTag) Unlock applying '\(item.title)' to screen \(screenID)")
+
+                let success = await applyItem(item, toScreenID: screenID)
+                if success {
+                    self.lastChangeTimes[screenID] = now
+                    self.lastChangedItemIDs[screenID] = item.id
+                    self.persistSchedulerState()
+                    print("\(logTag) Unlock successfully applied '\(item.title)' to screen \(screenID)")
+                } else {
+                    print("\(logTag) Unlock failed to apply '\(item.title)' to screen \(screenID)")
+                }
+            }
+        }
+    }
+
     // MARK: - Item Application
+
+    private func waitBeforeApplyingBatchedWallpaper(index: Int) async {
+        guard index > 0 else { return }
+        let delayNanoseconds = UInt64(index) * 1_200_000_000
+        try? await Task.sleep(nanoseconds: delayNanoseconds)
+    }
 
     private func applyItem(_ item: SchedulableItem, toScreenID screenID: String) async -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {

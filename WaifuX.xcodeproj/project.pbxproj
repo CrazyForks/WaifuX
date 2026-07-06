@@ -19,6 +19,8 @@
 		07C5293E5586A5A150C248E2 /* CloudSyncSettingsRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = F951D243F05FA45D5EDB4F60 /* CloudSyncSettingsRegistry.swift */; };
 		07C90ED5BCAD970E5FF0AA8C /* SceneWallpaperPropertiesPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49D07F6F44CB59BB826B491E /* SceneWallpaperPropertiesPanel.swift */; };
 		0863B78CDAC1E93E1DEAFECC /* LiquidGlassMetalRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A57F1B7402811BEA53CACDC /* LiquidGlassMetalRenderer.swift */; };
+		08FA9B44D1C442F09112AF01 /* FrameInterpolationMetalInterpolator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08FA9B43D1C442F09112AF01 /* FrameInterpolationMetalInterpolator.swift */; };
+		091A2B3C4D5E6F708192A3B4 /* PixivLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4E5F60718293A4B5C6D7E8F /* PixivLoginView.swift */; };
 		08DB34C96094F5F0DEE97744 /* CloudSyncWebDAVClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA8D96EADBCE058B7A28C68A /* CloudSyncWebDAVClient.swift */; };
 		096533F7CEAED68394886EA2 /* ContentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE3727E57F3F09F93DF5B40C /* ContentModels.swift */; };
 		09B152328D1774208B7A5FF3 /* GuessYouLikeCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6F0547CAC2D1D59D8496AB8 /* GuessYouLikeCardView.swift */; };
@@ -74,6 +76,7 @@
 		3DD89BB65FFA167D9DD45A63 /* AppResponsivenessMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29773250D8CDB408A5BDDE64 /* AppResponsivenessMonitor.swift */; };
 		3EF6D3DF49463965BCF990D4 /* RuleLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CF588585C18394E4A84E4F3 /* RuleLoader.swift */; };
 		40A3D5E135088A4FE039D8B3 /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4DDC7B4B549EF77A606796C /* SettingsViewModel.swift */; };
+		41A7C23E9B0D4F1A8C6E5123 /* ExternalDisplayConnectionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A7C23D9B0D4F1A8C6E5123 /* ExternalDisplayConnectionCoordinator.swift */; };
 		41F00B8D505B630076617E4A /* AnimeParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7DFAADB0F65F41C1AA267F3 /* AnimeParser.swift */; };
 		420CB38A1A877EF234AD3161 /* PixivLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06198F4D5DEBE75F002ACBC6 /* PixivLoginView.swift */; };
 		438583888A0BC621F4B6C456 /* DownloadTask.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14BB8E1BFAE51ADF8979365C /* DownloadTask.swift */; };
@@ -337,6 +340,7 @@
 		2978B14ED6BFAD86B3DF4324 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		2B48D0B0A573FA14F04F81C6 /* TMDBService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TMDBService.swift; sourceTree = "<group>"; };
 		2B4FD55B46C90758093AF3D8 /* LiquidGlassClockShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = LiquidGlassClockShaders.metal; sourceTree = "<group>"; };
+		08FA9B43D1C442F09112AF01 /* FrameInterpolationMetalInterpolator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameInterpolationMetalInterpolator.swift; sourceTree = "<group>"; };
 		2D02D76F3DC7DB2F623B5A75 /* MediaLibraryService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaLibraryService.swift; sourceTree = "<group>"; };
 		2D1389F0298F3722D15EA40A /* ExtensionCropSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionCropSupport.swift; sourceTree = "<group>"; };
 		2D9714C3DBCF062B148341C8 /* VideoToolboxProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoToolboxProcessor.swift; sourceTree = "<group>"; };
@@ -362,6 +366,7 @@
 		3EF268EC8CBE8BF9D9FFCDF0 /* CropLayoutEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CropLayoutEngine.swift; sourceTree = "<group>"; };
 		404E1B6C897DB662F6D35134 /* AnimeProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimeProgressStore.swift; sourceTree = "<group>"; };
 		40B45046169B42DA3C7D81AE /* VideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoRenderer.swift; sourceTree = "<group>"; };
+		41A7C23D9B0D4F1A8C6E5123 /* ExternalDisplayConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalDisplayConnectionCoordinator.swift; sourceTree = "<group>"; };
 		41B90FB7E5E929B342AD6FB7 /* WebWallpaperDesignService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebWallpaperDesignService.swift; sourceTree = "<group>"; };
 		4327334BCEFE99F8F0378880 /* MediaService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaService.swift; sourceTree = "<group>"; };
 		43498E7A9DF3A409E2F15E14 /* LiquidGlassClockConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassClockConfiguration.swift; sourceTree = "<group>"; };
@@ -632,6 +637,7 @@
 		1EE83ECA069707C970EB8CE5 /* Metal */ = {
 			isa = PBXGroup;
 			children = (
+				08FA9B43D1C442F09112AF01 /* FrameInterpolationMetalInterpolator.swift */,
 				2B4FD55B46C90758093AF3D8 /* LiquidGlassClockShaders.metal */,
 				5A57F1B7402811BEA53CACDC /* LiquidGlassMetalRenderer.swift */,
 			);
@@ -723,6 +729,7 @@
 				6E21497D08143F54A2DF436D /* DownloadTaskService.swift */,
 				DF90DB2136AE18C3077FA9DD /* DynamicWallpaperAutoPauseManager.swift */,
 				67C8922986259825170C5975 /* DynamicWallpaperService.swift */,
+				41A7C23D9B0D4F1A8C6E5123 /* ExternalDisplayConnectionCoordinator.swift */,
 				A0F07B20C9C531E4461BAA1B /* FolderLockService.swift */,
 				C7E5EA68B40F08C0C4032C1D /* FourKWallpapersParser.swift */,
 				94A1E8E7D55E0BF7960198BE /* FourKWallpapersService.swift */,
@@ -1188,6 +1195,7 @@
 				962166D6810D9DBABAE8C167 /* DynamicWallpaperItem.swift in Sources */,
 				F0448F711A615AC3653D7D60 /* DynamicWallpaperService.swift in Sources */,
 				232BCC08D5E1BF5521A51688 /* ErrorStateView.swift in Sources */,
+				41A7C23E9B0D4F1A8C6E5123 /* ExternalDisplayConnectionCoordinator.swift in Sources */,
 				E2E777395B775DE3457A9092 /* ExploreAtmosphere.swift in Sources */,
 				0682731ADB738739A846FDBF /* ExploreChips.swift in Sources */,
 				FE7918F419971479AD53A5DD /* ExploreComponents.swift in Sources */,
@@ -1233,6 +1241,7 @@
 				A4949135BDE7BF0CFC36DD08 /* LiquidGlassControls.swift in Sources */,
 				1F21A7ECABA2636B4FC373C1 /* LiquidGlassDesignSystem.swift in Sources */,
 				0863B78CDAC1E93E1DEAFECC /* LiquidGlassMetalRenderer.swift in Sources */,
+				08FA9B44D1C442F09112AF01 /* FrameInterpolationMetalInterpolator.swift in Sources */,
 				D35A0942D440550F4240FCE8 /* LiquidGlassModifier.swift in Sources */,
 				2F8FAC5827D126A92C65B483 /* LiquidGlassNextItemToast.swift in Sources */,
 				7D439B9CC297E0893336CDFE /* LiquidGlassWallpaperCard.swift in Sources */,
