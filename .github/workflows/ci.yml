@@ -523,31 +523,69 @@ jobs:
                     sleep 30
                   done
 
-            # Sign & Notarize 成功后自动推送版本 tag，触发 release.yml 发版。
-            # 仅在 push main 且 tag 不存在时执行；构建/签名/公证任一步失败都走不到这里。
-            - name: Push version tag to trigger release
+            - name: Generate Changelog
               if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+              id: changelog
               run: |
-                  set -e
-                  VERSION=$(cat VERSION | tr -d '[:space:]')
-                  TAG="v${VERSION}"
+                  # 获取上一个 tag（用于生成变更日志）
+                  PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
-                  # 幂等保护 1：tag 已存在则跳过（与 check_tag 步骤双保险，防并发 push）
-                  if git rev-parse "$TAG" >/dev/null 2>&1; then
-                    echo "✅ Tag $TAG 已存在，跳过"
-                    exit 0
+                  if [ -n "$PREV_TAG" ]; then
+                    # 从上一个 tag 到当前提交的 commit messages 生成日志
+                    CHANGELOG=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges | head -30)
+                    echo "Generated changelog from $PREV_TAG to HEAD:"
+                    echo "$CHANGELOG"
+                  else
+                    CHANGELOG="- Initial release"
+                    echo "No previous tag found, using default changelog"
                   fi
 
-                  # 幂等保护 2：VERSION 为空或格式异常（非 X.Y.Z）则跳过
-                  if [ -z "$VERSION" ] || ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-                    echo "⚠️ VERSION 内容异常: '$VERSION'，跳过打 tag"
-                    exit 0
-                  fi
+                  # 写入 GITHUB_OUTPUT 供后续 step 使用
+                  {
+                    echo "changelog<<EOF"
+                    echo "$CHANGELOG"
+                    echo "EOF"
+                  } >> "$GITHUB_OUTPUT"
 
-                  # tag 指向当前 commit（HEAD），即刚通过构建+签名+公证的版本
-                  git tag "$TAG"
-                  git push origin "$TAG"
-                  echo "✅ 已推送 $TAG，将触发 release.yml 发版"
+            # 构建+签名+公证全部成功后创建 Release 并上传 DMG。
+            # softprops/action-gh-release 会自动创建 tag（tag_name）+ Release，
+            # 用 GITHUB_TOKEN 即可，无需 PAT，也不依赖 release.yml 被触发。
+            - name: Create Release & Upload Asset
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ steps.version.outputs.tag }}
+                  name: WaifuX ${{ steps.version.outputs.version }}
+                  body: |
+                      ## 更新内容
+
+                      ${{ steps.changelog.outputs.changelog }}
+
+                      ## 版本信息
+
+                      - 版本号: ${{ steps.version.outputs.version }}
+                      - Commit: ${{ github.sha }}
+
+                      ---
+
+                      ## ☕ 支持开源
+
+                      如果你觉得 WaifuX 对你有帮助，欢迎通过以下方式支持项目的持续发展：
+
+                      - **WaifuX 用户交流群**: [点击加入](https://qm.qq.com/q/SRCj8msygq) 👈 971414910
+
+                      <p align="left">
+                        <img src="https://raw.githubusercontent.com/jipika/WaifuX/main/reward.jpg" height="280" alt="微信赞赏码" />
+                        &nbsp;&nbsp;&nbsp;&nbsp;
+                        <img src="https://raw.githubusercontent.com/jipika/WaifuX/main/afdian_reward.jpg" height="280" alt="爱发电赞助码" />
+                      </p>
+
+                      **给项目点个 Star ⭐️** 同样是对开发者最大的鼓励！每一份支持都是我继续维护和迭代这款应用的动力。感谢使用 WaifuX 💜
+                  files: build/WaifuX.dmg
+                  draft: false
+                  prerelease: false
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Build (PRs)
               if: github.event_name == 'pull_request'
