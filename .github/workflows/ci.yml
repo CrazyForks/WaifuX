@@ -587,6 +587,55 @@ jobs:
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+            # Release 创建后同步更新 homebrew tap 仓库的 Casks/waifux.rb。
+            # 跨仓库写入需要 PAT（GITHUB_TOKEN 无权写 homebrew-waifux），
+            # 故使用 TAP_REPO_TOKEN。GITHUB_TOKEN 创建的 release 事件不会触发
+            # update-homebrew-tap.yml，因此必须在此内联执行。
+            - name: Update Homebrew Tap
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+              env:
+                  TAP_REPO_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
+              run: |
+                  VERSION="${{ steps.version.outputs.version }}"
+                  DMG_URL="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX.dmg"
+
+                  # 等待 Release 资产可下载（刚创建的 Release 偶尔有几秒传播延迟）
+                  echo "等待 DMG 可下载: $DMG_URL"
+                  for i in {1..6}; do
+                    if curl -sL -o /tmp/WaifuX.dmg "$DMG_URL" && [ -s /tmp/WaifuX.dmg ]; then
+                      echo "✅ DMG 下载成功"
+                      break
+                    fi
+                    echo "attempt $i: 尚未就绪，10s 后重试..."
+                    sleep 10
+                  done
+                  if [ ! -s /tmp/WaifuX.dmg ]; then
+                    echo "❌ DMG 下载失败，跳过 tap 更新"
+                    exit 0
+                  fi
+
+                  SHA256=$(shasum -a 256 /tmp/WaifuX.dmg | cut -d' ' -f1)
+                  echo "版本: $VERSION  SHA256: $SHA256"
+
+                  # 克隆 tap 仓库（用 PAT 认证）
+                  git clone --depth 1 "https://x-access-token:${TAP_REPO_TOKEN}@github.com/jipika/homebrew-waifux.git" /tmp/tap
+                  cd /tmp/tap
+
+                  # 用 base64 模板避免 YAML/Shell 引号转义问题（与 update-homebrew-tap.yml 一致）
+                  echo "Y2FzayAid2FpZnV4IiBkbwogIHZlcnNpb24gIiN7VkVSU0lPTn0iCiAgc2hhMjU2ICIje1NIQTI1Nn0iCgogIHVybCAiaHR0cHM6Ly9naXRodWIuY29tL2ppcGlrYS9XYWlmdVgvcmVsZWFzZXMvZG93bmxvYWQvdiN7VkVSU0lPTn0vV2FpZnVYLmRtZyIKICBuYW1lICJXYWlmdVgiCiAgZGVzYyAiQmVhdXRpZnVsIGFuaW1lIHdhbGxwYXBlciBhbmQgY29udGVudCBicm93c2VyIgogIGhvbWVwYWdlICJodHRwczovL2dpdGh1Yi5jb20vamlwaWthL1dhaWZ1WCIKCiAgbGl2ZWNoZWNrIGRvCiAgICB1cmwgOnVybAogICAgcmVnZXgoL152PyhcZCsoPzpcLlxkKykrKSQvaSkKICBlbmQKCiAgYXV0b191cGRhdGVzIHRydWUKCiAgYXBwICJXYWlmdVguYXBwIgoKICAjIGJyZXcg5pu05paw5piv5YWI5Yig5penIGJ1bmRsZSDlho3mi7fmlrAgYnVuZGxl77yMbWFjT1Mg5Lya6YeN572u5omp5bGV5ZCv55So54q25oCB44CCCiAgIyBsc3JlZ2lzdGVyIC1mIOmHjeaWsOazqOWGjCBBcHAgYnVuZGxl77yI5ZCr5YaF5bWMIC5hcHBleO+8ie+8jAogICMgcGx1Z2lua2l0IC1lIHVzZSDmmL7lvI/lkK/nlKjmianlsZXvvIwKICAjIOacgOWQjumHjeWQryBXYWxscGFwZXJBZ2VudCDkvb/lhbbph43mlrDliqDovb3mianlsZXliJfooajvvIjmuIXpmaTlhoXlrZjnvJPlrZjvvInjgIIKICBwb3N0ZmxpZ2h0IGRvCiAgICBzeXN0ZW1fY29tbWFuZCAiL1N5c3RlbS9MaWJyYXJ5L0ZyYW1ld29ya3MvQ29yZVNlcnZpY2VzLmZyYW1ld29ya3MvRnJhbWV3b3Jrcy9MYXVuY2hTZXJ2aWNlcy5mcmFtZXdvcmsvU3VwcG9ydC9sc3JlZ2lzdGVyIiwKICAgICAgYXJnczogWyItZiIsICIje3N0YWdlZF9wYXRofS9XYWlmdVguYXBwIl0KICAgIHN5c3RlbV9jb21tYW5kICIvdXNyL2Jpbi9wbHVnaW5raXQiLAogICAgICBhcmdzOiBbIi1lIiwgInVzZSIsICItaSIsICJjb20ud2FpZnV4LmFwcC53YWxscGFwZXJleHRlbnNpb24iXQogICAgc3lzdGVtX2NvbW1hbmQgIi91c3IvYmluL2tpbGxhbGwiLAogICAgICBhcmdzOiBbIldhbGxwYXBlckFnZW50Il0sCiAgICAgIHByaW50X3N0ZGVycjogZmFsc2UKICBlbmQKCiAgemFwIHRyYXNoOiBbCiAgICAifi9MaWJyYXJ5L0FwcGxpY2F0aW9uIFN1cHBvcnQvV2FpZnV4IiwKICAgICJ+L0xpYnJhcnkvQ2FjaGVzL2NvbS53YWlmdXguYXBwIiwKICAgICJ+L0xpYnJhcnkvUHJlZmVyZW5jZXMvY29tLndhaWZ1eC5hcHAucGxpc3QiLAogICAgIn4vTGlicmFyeS9TYXZlZCBBcHBsaWNhdGlvbiBTdGF0ZS9jb20ud2FpZnV4LmFwcC5zYXZlZFN0YXRlIiwKICBdCmVuZAo=" | base64 -d > Casks/waifux.rb
+                  sed -i '' "s/#{VERSION}/$VERSION/g; s/#{SHA256}/$SHA256/" Casks/waifux.rb
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add Casks/waifux.rb
+                  if git diff --cached --quiet; then
+                    echo "无变更，跳过"
+                  else
+                    git commit -m "Bump waifux to v${VERSION}"
+                    git push
+                    echo "✅ homebrew tap 已更新到 v${VERSION}"
+                  fi
+
             - name: Build (PRs)
               if: github.event_name == 'pull_request'
               run: |
