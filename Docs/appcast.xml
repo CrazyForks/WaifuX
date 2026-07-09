@@ -6,28 +6,19 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.128</title>
-      <sparkle:version>38.0.128</sparkle:version>
-      <sparkle:shortVersionString>38.0.128</sparkle:shortVersionString>
-      <pubDate>Mon, 06 Jul 2026 13:52:34 +0800</pubDate>
+      <title>Version 38.0.129</title>
+      <sparkle:version>38.0.129</sparkle:version>
+      <sparkle:shortVersionString>38.0.129</sparkle:shortVersionString>
+      <pubDate>Thu, 09 Jul 2026 19:04:23 +0800</pubDate>
       <description><![CDATA[
-        <h3>WaifuX 38.0.128</h3>
+        <h3>WaifuX 38.0.129</h3>
         <ul>
-          <li>fix: Pixiv cookie 逐条删除清理 + 状态栏菜单新增检查更新 (13b5c22)</li>
-          <li>fix: 补帧 UI 文案三语本地化 + 状态栏菜单调整 + pbxproj 清理 (#59) (057c08e)</li>
-          <li>Add dynamic wallpaper frame interpolation workflow (#58) (d06dda6)</li>
-          <li>feat: Wallpaper Engine 配置面板真实默认值 + 漫画阅读滚动模式优化 + CLI 构建体积优化 (9791f9b)</li>
-          <li>feat: 漫画阅读体验升级 + Pixiv 搜索稳定性优化 (30a5920)</li>
-          <li>云同步功能（未完成） (c40752a)</li>
-          <li>feat: 新增 Pixiv 壁纸源集成，提升内容分级与数据加载体验 (7e49132)</li>
-          <li>Restore hide notch setting (0865919)</li>
-          <li>Fix settings slider window drag (afd53f3)</li>
-          <li>feat: auto remove video letterbox bars (28eb27e)</li>
-          <li>feat: 分离 assets 嵌入与 CLI 构建流程 (ccde374)</li>
+          <li>feat: 库视图"正在使用"角标 + 外接屏壁纸记忆 + 交互体验优化 (0000564)</li>
+          <li>feat(ci): 发版后自动更新 homebrew tap (010d3f0)</li>
         </ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.128/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.129/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
