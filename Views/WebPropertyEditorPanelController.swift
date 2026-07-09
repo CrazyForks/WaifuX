@@ -425,9 +425,11 @@ final class WebPropertyEditorPanelController {
     // MARK: - Value Conversion Helpers
 
     private static func toAnyCodableValue(_ value: Any) -> AnyCodableValue {
-        if let b = value as? Bool { return .bool(b) }
+        // NSNumber(0) 来自 JavaScript 可以转成 Bool(false) 或 Double(0.0)，
+        // 先判数字类型避免 0/1 被错误转成 bool
         if let n = value as? Double { return .number(n) }
         if let n = value as? Int { return .number(Double(n)) }
+        if let b = value as? Bool { return .bool(b) }
         if let s = value as? String { return .string(s) }
         return .string(String(describing: value))
     }

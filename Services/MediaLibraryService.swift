@@ -1093,6 +1093,14 @@ final class WallpaperLibraryService: ObservableObject {
         downloadRecords.first { $0.localFilePath == path && $0.isActive }
     }
 
+    /// 通过壁纸的远程 URL（path 字段）反查下载记录
+    func downloadRecord(forRemoteURL url: URL) -> WallpaperDownloadRecord? {
+        let urlString = url.absoluteString
+        return downloadRecords.first { record in
+            record.isActive && record.wallpaper.path == urlString
+        }
+    }
+
     func markAsLooped(localFilePath path: String) {
         guard let index = downloadRecords.firstIndex(where: { $0.localFilePath == path }) else { return }
         downloadRecords[index].isLooped = true

@@ -281,6 +281,11 @@ final class WallpaperEngineXBridge: ObservableObject {
         lastWallpaperPath ?? screenRenderStates.values.first?.path
     }
 
+    /// 返回指定屏幕上正在渲染的壁纸文件路径（scene/web）
+    func currentWallpaperPath(for screen: NSScreen) -> String? {
+        renderState(for: screen)?.path
+    }
+
     func reloadCurrentSceneWallpaperForDesign() {
         guard isCurrentWallpaperScene, let path = currentWallpaperPathForDesign else { return }
         Task { @MainActor in

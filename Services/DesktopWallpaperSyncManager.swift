@@ -36,6 +36,10 @@ final class DesktopWallpaperSyncManager {
     /// 仅在显示器参数变化/系统唤醒等场景置为 true，避免普通前后台切换也去重写桌面壁纸。
     private var requiresActivationRecoverySync = false
 
+    /// 持久化键：`{fingerprint: imageURLString}` JSON。
+    /// 用于外接屏断开重连（App 可能已被系统杀掉重启）后判断该屏是否曾由 App 设过壁纸。
+    private static let fingerprintStateKey = "desktop_wallpaper_sync_fingerprint_state_v1"
+
     private init() {
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -62,6 +66,9 @@ final class DesktopWallpaperSyncManager {
             name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
+
+        // 恢复持久化的指纹 -> 壁纸 URL 映射，供外接屏重连后判断是否曾由 App 设过壁纸
+        loadFingerprintState()
     }
 
     /// 注册一次静态壁纸设置，后续 Space 切换时会自动同步
@@ -91,6 +98,14 @@ final class DesktopWallpaperSyncManager {
             lastOptionsByScreen[screenID] = options
             lastOptionsByFingerprint[fingerprint] = options
         }
+        persistFingerprintState()
+    }
+
+    /// 返回指定屏幕最后通过 App 设置的静态壁纸 URL（无记录时返回 nil）
+    func imageURL(for screen: NSScreen) -> URL? {
+        let screenID = screen.wallpaperScreenIdentifier
+        let fingerprint = screen.wallpaperScreenFingerprint
+        return lastSetImageURLByScreen[screenID] ?? lastSetImageURLByFingerprint[fingerprint]
     }
 
     /// 清除静态壁纸注册（例如用户手动在系统设置里改了壁纸）
@@ -109,6 +124,7 @@ final class DesktopWallpaperSyncManager {
             lastOptionsByScreen.removeAll()
             lastOptionsByFingerprint.removeAll()
         }
+        persistFingerprintState()
     }
 
     /// 应用变为活跃时的备用同步入口（处理 activeSpaceDidChangeNotification 丢失的情况）
@@ -222,6 +238,41 @@ final class DesktopWallpaperSyncManager {
         }
         if relinkedCount > 0 {
             print("[DesktopWallpaperSyncManager] Relinked wallpaper registration for \(relinkedCount) reconnected screen(s)")
+        }
+    }
+
+    // MARK: - 持久化（指纹维度）
+
+    /// 查询某块外接屏（按物理指纹）是否曾由 App 设过壁纸，用于外接屏重连时抑制"显示器接入"弹窗。
+    /// 校验持久化的壁纸文件仍存在于磁盘，并跳过运行时临时 capture 路径。
+    func hasPersistedWallpaperForFingerprint(_ fingerprint: String) -> Bool {
+        guard let url = lastSetImageURLByFingerprint[fingerprint] else { return false }
+        let path = url.path
+        // 跳过 wallpaper-wgpu / wallpaperengine-cli 运行时 capture 路径，应用重启后不存在
+        if path.contains("wallpaper-wgpu-capture") || path.contains("wallpaperengine-cli-capture") {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    private func persistFingerprintState() {
+        let fpDict = lastSetImageURLByFingerprint.mapValues { $0.absoluteString }
+        if fpDict.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.fingerprintStateKey)
+        } else if let data = try? JSONSerialization.data(withJSONObject: fpDict),
+                  let str = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(str, forKey: Self.fingerprintStateKey)
+        }
+    }
+
+    private func loadFingerprintState() {
+        guard let str = UserDefaults.standard.string(forKey: Self.fingerprintStateKey),
+              let data = str.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            return
+        }
+        for (fingerprint, urlString) in dict {
+            lastSetImageURLByFingerprint[fingerprint] = URL(string: urlString)
         }
     }
 

@@ -30,6 +30,9 @@ final class StaticImageWallpaperOverlayManager {
     /// 按物理显示器指纹索引的静态图 URL，用于外接屏重插后 screenID 变化时恢复。
     private var imageByScreenFingerprint: [String: URL] = [:]
 
+    /// 状态变化信号，供外部 Combine 订阅（每次 show/hide/clear 时递增）
+    @Published private(set) var stateChangeSignal: Int = 0
+
     /// 每个屏幕的图片原始像素尺寸（用于 CropLayoutEngine 计算）
     private var imageSizes: [String: CGSize] = [:]
     /// 每屏静态图源文件自带黑边的内容裁切框。只在全屏自动铺满模式下叠加。
@@ -166,6 +169,7 @@ final class StaticImageWallpaperOverlayManager {
             createWindow(for: screen, imageURL: imageURL)
         }
         persistState()
+        stateChangeSignal &+= 1
     }
 
     /// 隐藏指定屏幕的 overlay（保留持久化记录，供下次 restoreIfNeeded 恢复）。
@@ -175,6 +179,7 @@ final class StaticImageWallpaperOverlayManager {
             window.orderOut(nil)
             window.contentView = nil
         }
+        stateChangeSignal &+= 1
     }
 
     /// 隐藏所有屏幕的 overlay（保留持久化记录）。
@@ -184,6 +189,7 @@ final class StaticImageWallpaperOverlayManager {
             window.contentView = nil
         }
         imageWindows.removeAll()
+        stateChangeSignal &+= 1
     }
 
     /// 彻底清除持久化状态（切到视频/场景/web 或系统壁纸时调用）。
@@ -197,6 +203,14 @@ final class StaticImageWallpaperOverlayManager {
         hideAll()
         UserDefaults.standard.removeObject(forKey: Self.stateKey)
         UserDefaults.standard.removeObject(forKey: Self.fingerprintStateKey)
+        stateChangeSignal &+= 1
+    }
+
+    /// 返回指定屏幕当前显示的静态图 URL（无 overlay 时返回 nil）
+    func imageURL(for screen: NSScreen) -> URL? {
+        let screenID = screen.wallpaperScreenIdentifier
+        let fingerprint = screen.wallpaperScreenFingerprint
+        return imageByScreen[screenID] ?? imageByScreenFingerprint[fingerprint]
     }
 
     /// 返回指定屏幕的静态图原始像素尺寸（供 CropAdjustOverlayController 预览使用）。

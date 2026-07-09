@@ -1292,22 +1292,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func createAndShowSettingsWindow() {
         let settingsWindow = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         settingsWindow.title = "设置"
         settingsWindow.titlebarAppearsTransparent = true
         settingsWindow.titleVisibility = .hidden
-        settingsWindow.standardWindowButton(.closeButton)?.isHidden = true
-        settingsWindow.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        settingsWindow.standardWindowButton(.zoomButton)?.isHidden = true
         settingsWindow.isMovableByWindowBackground = false
         settingsWindow.backgroundColor = NSColor(Color(hex: "1C1C1E"))
         settingsWindow.setContentSize(NSSize(width: 680, height: 520))
         settingsWindow.minSize = NSSize(width: 680, height: 520)
         settingsWindow.maxSize = NSSize(width: 680, height: 520)
         settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.level = .floating
         centerWindow(settingsWindow, relativeTo: window)
         settingsWindow.tabbingMode = .disallowed
         // 设置窗口复用 AppDelegate 作为 delegate，windowShouldClose 据此区分处理

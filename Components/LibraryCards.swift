@@ -155,6 +155,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
     var shouldProbeAnimatedThumbnail: Bool = true
     var resolvedVideoFileURL: URL? = nil
     var isVisible: Bool = true
+    /// 当前壁纸是否在任意屏幕上使用中（由父视图计算传入，供 Equatable.== 感知切换）
+    var isCurrentWallpaper: Bool = false
     let action: () -> Void
 
     @State private var isHovered = false
@@ -177,7 +179,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         lhs.isEditing == rhs.isEditing &&
         lhs.isSelected == rhs.isSelected &&
         lhs.cardWidth == rhs.cardWidth &&
-        lhs.localMediaFileURL == rhs.localMediaFileURL
+        lhs.localMediaFileURL == rhs.localMediaFileURL &&
+        lhs.isCurrentWallpaper == rhs.isCurrentWallpaper
     }
 
     private var thumbnailHeight: CGFloat {
@@ -293,6 +296,25 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             .overlay {
                 if isEditing && isSelected {
                     Color.black.opacity(0.3)
+                }
+            }
+            // 当前使用中的壁纸标记
+            .overlay(alignment: .bottomLeading) {
+                if !isEditing && isCurrentWallpaper {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 10, weight: .bold))
+                        Text(t("wallpaper.currentlyActive"))
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .foregroundStyle(.white.opacity(0.95))
+                    .padding(.horizontal, 8)
+                    .frame(height: 22)
+                    .background(
+                        Capsule(style: .continuous).fill(Color.green.opacity(0.78))
+                    )
+                    .padding(12)
+                    .transition(.opacity)
                 }
             }
     }
@@ -501,6 +523,11 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
     var progressTint: Color? = nil
     var progressLabel: String? = nil
     var cardWidth: CGFloat = LibraryCardMetrics.cardWidth
+    /// 当前壁纸是否在任意屏幕上使用中。
+    /// 作为存储属性由父视图计算后传入，确保 .equatable() 的 == 能正确感知
+    /// 壁纸切换（若用计算属性读 @EnvironmentObject，== 比较时新旧值读到的是
+    /// 同一份当前环境，恒相等，标记永不刷新）。
+    var isCurrentWallpaper: Bool = false
     let action: () -> Void
 
     @State private var isHovered = false
@@ -510,7 +537,9 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
         lhs.isEditing == rhs.isEditing &&
         lhs.isSelected == rhs.isSelected &&
         lhs.cardWidth == rhs.cardWidth &&
-        lhs.localFileURL == rhs.localFileURL
+        lhs.localFileURL == rhs.localFileURL &&
+        // 纳入"当前使用中"状态：壁纸切换后 .equatable() 才会重算 body、刷新标记
+        lhs.isCurrentWallpaper == rhs.isCurrentWallpaper
     }
 
     private var thumbnailHeight: CGFloat {
@@ -584,6 +613,25 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
                     if isEditing && isSelected {
                         Color.black.opacity(0.3)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+
+                    // 当前使用中的壁纸标记
+                    if !isEditing && isCurrentWallpaper {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(t("wallpaper.currentlyActive"))
+                                .font(.system(size: 10, weight: .bold))
+                        }
+                        .foregroundStyle(.white.opacity(0.95))
+                        .padding(.horizontal, 8)
+                        .frame(height: 22)
+                        .background(
+                            Capsule(style: .continuous).fill(Color.green.opacity(0.78))
+                        )
+                        .padding(12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .transition(.opacity)
                     }
                 }
 

@@ -136,7 +136,7 @@ struct SettingsView: View {
 
             // === 右侧内容区 ===
             VStack(spacing: 0) {
-                // 标题行（标题 + 关闭按钮）
+                // 标题行（标题 + 拖拽区域，原生红绿灯在左侧）
                 HStack {
                     Text(selectedTab.title)
                         .font(.system(size: 18, weight: .semibold))
@@ -144,19 +144,9 @@ struct SettingsView: View {
 
                     WindowDragHandle()
                         .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24)
-
-                    Button {
-                        (NSApp.keyWindow ?? NSApp.mainWindow)?.performClose(nil)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.45))
-                            .frame(width: 24, height: 24)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
                 }
-                .padding(.horizontal, 28)
+                .padding(.leading, 20)
+                .padding(.trailing, 28)
                 .padding(.vertical, 16)
 
                 Divider()
@@ -207,7 +197,7 @@ struct SettingsView: View {
 
             Spacer()
         }
-        .padding(.top, 16)
+        .padding(.top, 42)
         .padding(.horizontal, 10)
         .frame(width: sidebarWidth)
         .background(

@@ -108,6 +108,13 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
             return true
         }
 
+        // 兜底：系统原生静态壁纸（含视频 poster）。macOS 自己记得该屏壁纸，
+        // 只要 App 曾为该屏（按指纹）注册过壁纸且文件仍在，就静默恢复不弹窗。
+        // 实际 re-apply 由 performSync 在 screenParametersChanged 时按指纹 relink 完成。
+        if DesktopWallpaperSyncManager.shared.hasPersistedWallpaperForFingerprint(screen.wallpaperScreenFingerprint) {
+            return true
+        }
+
         return false
     }
 
