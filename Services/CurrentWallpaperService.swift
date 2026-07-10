@@ -43,6 +43,12 @@ final class CurrentWallpaperService: ObservableObject {
             .sink { [weak self] _ in self?.rebuildActivePaths() }
             .store(in: &cancellables)
 
+        // 动态锁屏扩展中的静态图变化
+        LockScreenWallpaperService.shared.$staticImageSourceChangeSignal
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.rebuildActivePaths() }
+            .store(in: &cancellables)
+
         // 屏幕配置变化（外接显示器插拔）
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
             .receive(on: DispatchQueue.main)
@@ -98,6 +104,7 @@ final class CurrentWallpaperService: ObservableObject {
 
         let videoMgr = VideoWallpaperManager.shared
         let weBridge = WallpaperEngineXBridge.shared
+        let lockScreen = LockScreenWallpaperService.shared
         let staticOverlay = StaticImageWallpaperOverlayManager.shared
         let desktopSync = DesktopWallpaperSyncManager.shared
 
@@ -123,7 +130,17 @@ final class CurrentWallpaperService: ObservableObject {
                 found = true
             }
 
-            // 3. 静态图片 overlay（系统壁纸同步关闭时）
+            // 3. 动态锁屏扩展中的静态图。扩展渲染的是副本，使用原始来源反查资料库。
+            if !found, let imageURL = lockScreen.staticImageSourceURL(for: screen) {
+                if imageURL.isFileURL {
+                    filePaths.insert(imageURL.standardizedFileURL.path)
+                }
+                urlStrings.insert(imageURL.absoluteString)
+                byScreen[screenID] = imageURL
+                found = true
+            }
+
+            // 4. 静态图片 overlay（系统壁纸同步关闭时）
             if !found, let imageURL = staticOverlay.imageURL(for: screen) {
                 let p = imageURL.standardizedFileURL.path
                 filePaths.insert(p)
@@ -132,7 +149,7 @@ final class CurrentWallpaperService: ObservableObject {
                 found = true
             }
 
-            // 4. DesktopWallpaperSyncManager（系统壁纸同步开启时的静态图片）
+            // 5. DesktopWallpaperSyncManager（系统壁纸同步开启时的静态图片）
             // 与 2/3 一致受 found 守卫保护：该屏已有更高优先级的活跃壁纸时，
             // 不再把 sync 历史路径混入活跃集合，避免已被覆盖的旧壁纸被误判为"当前使用中"。
             if !found, let syncURL = desktopSync.imageURL(for: screen) {

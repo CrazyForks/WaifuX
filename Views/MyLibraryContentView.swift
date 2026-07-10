@@ -962,7 +962,12 @@ struct MyLibraryContentView: View {
                 guard let record = WallpaperLibraryService.shared.favoriteRecord(for: wallpaper.id) else { return false }
                 return record.folderID == folderID
             }
-            baseItems = filtered.map { AnyWallpaperItem(wallpaper: $0) }
+            baseItems = filtered.map {
+                AnyWallpaperItem(
+                    wallpaper: $0,
+                    localFileURL: viewModel.localFileURLIfAvailable(for: $0)
+                )
+            }
         case .downloads:
             let allLocal = viewModel.allLocalWallpapers
             let folderID = currentWallpaperFolderID
@@ -3295,10 +3300,10 @@ private struct AnyWallpaperItem: Identifiable {
     let localFileURL: URL?
     let downloadDate: Date?
 
-    init(wallpaper: Wallpaper) {
+    init(wallpaper: Wallpaper, localFileURL: URL? = nil) {
         self.id = wallpaper.id
         self.wallpaper = wallpaper
-        self.localFileURL = nil
+        self.localFileURL = localFileURL
         self.downloadDate = nil
     }
 

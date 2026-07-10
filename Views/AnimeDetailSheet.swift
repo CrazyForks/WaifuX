@@ -188,6 +188,8 @@ struct AnimeDetailSheet: View {
     private func setupKeyboardMonitor() {
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
             guard NSApp.isActive, let window = event.window, window.isKeyWindow else { return event }
+            // 动漫播放器是独立窗口；详情页仍在后台时不能截获它的播放快捷键。
+            guard !(window.windowController is AnimePlayerWindowController) else { return event }
             guard self.isVisible else { return event }
             switch event.keyCode {
             case 49: // 空格键：显示/隐藏信息区域
