@@ -2362,16 +2362,14 @@ struct MediaDetailSheet: View {
                     AppLogger.error(.download, "Workshop 会话过期，已清除凭据", metadata:
                         ["id": resolvedItem.id])
                 default:
-                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                    showError = true
+                    presentWorkshopDownloadError(error.localizedDescription)
                     isDownloading = false
                     AppLogger.error(.download, "Workshop 下载失败", metadata:
                         ["id": resolvedItem.id, "error": error.localizedDescription,
                          "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
                 }
             } catch {
-                errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                showError = true
+                presentWorkshopDownloadError(error.localizedDescription)
                 isDownloading = false
                 AppLogger.error(.download, "Workshop 下载失败", metadata:
                     ["id": resolvedItem.id, "error": error.localizedDescription,
@@ -2429,9 +2427,15 @@ struct MediaDetailSheet: View {
         return String(message[..<endIndex]) + "\n\n[日志已截断，完整错误请查看控制台]"
     }
 
+    private func presentWorkshopDownloadError(_ message: String) {
+        errorMessage = "\(t("workshopDownloadTroubleshooting"))\n\n\(Self.truncateErrorMessage(message))"
+        showError = true
+    }
+
     private func setAsDesktopWallpaper() {
         // Wallpaper Engine 类内容：Workshop 与本地入库（同一套路径解析）
         if let localURL = findLocalWorkshopFile(for: resolvedItem) {
+            viewModel.ensureMediaIsInLibrary(resolvedItem, localFileURL: localURL)
             let contentRoot = sceneEngineContentRoot(for: localURL)
 
             // 检查并自动下载 Workshop 依赖项（预设壁纸的母壁纸）
@@ -2461,14 +2465,12 @@ struct MediaDetailSheet: View {
                             default:
                                 msg = "依赖项下载失败: \(error.localizedDescription)"
                             }
-                            self.errorMessage = msg
-                            self.showError = true
+                            self.presentWorkshopDownloadError(msg)
                             self.isSettingWallpaper = false
                         }
                     } catch {
                         await MainActor.run {
-                            self.errorMessage = "依赖项下载失败: \(error.localizedDescription)"
-                            self.showError = true
+                            self.presentWorkshopDownloadError("依赖项下载失败: \(error.localizedDescription)")
                             self.isSettingWallpaper = false
                         }
                     }
@@ -2517,13 +2519,11 @@ struct MediaDetailSheet: View {
                     case .sessionExpired:
                         showSessionExpiredAlert = true
                     default:
-                        errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                        showError = true
+                        presentWorkshopDownloadError(error.localizedDescription)
                     }
                 } catch {
                     isSettingWallpaper = false
-                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                    showError = true
+                    presentWorkshopDownloadError(error.localizedDescription)
                 }
             }
             return

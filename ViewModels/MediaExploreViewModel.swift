@@ -1113,6 +1113,7 @@ final class MediaExploreViewModel: ObservableObject {
         if item.id.hasPrefix("workshop_"),
            let localVideoURL = findLocalWorkshopVideo(for: item) {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
+            mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
             try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
             return
@@ -1123,6 +1124,7 @@ final class MediaExploreViewModel: ObservableObject {
             let localURL = item.previewVideoURL ?? item.pageURL
             if localURL.isFileURL && FileManager.default.fileExists(atPath: localURL.path) {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
+                mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
                 let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
                 try videoWallpaperManager.applyVideoWallpaper(from: localURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
                 return
@@ -1133,10 +1135,20 @@ final class MediaExploreViewModel: ObservableObject {
         let localVideoURL = try await ensureLocalVideoFile(
             for: item,
             preferredOption: preferredWallpaperOption(for: item),
-            saveToDownloads: false
+            saveToDownloads: true
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
         try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+    }
+
+    /// Registers an already-local item before it is applied from the detail sheet.
+    /// This covers Workshop folders that were downloaded by an earlier build or restored from disk.
+    func ensureMediaIsInLibrary(_ item: MediaItem, localFileURL: URL) {
+        guard localFileURL.isFileURL,
+              FileManager.default.fileExists(atPath: localFileURL.path) else {
+            return
+        }
+        mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localFileURL)
     }
 
     /// Workshop 内容类型
@@ -1410,9 +1422,8 @@ final class MediaExploreViewModel: ObservableObject {
                 updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
             }
 
-            // 如果在旧位置找到，更新下载记录的路径
-            if fileLocation.foundIn == .legacyRootFolder && saveToDownloads {
-                mediaLibrary.updateDownloadPath(for: resolvedItem.id, newURL: fileLocation.url)
+            if saveToDownloads {
+                mediaLibrary.ensureDownloadRecord(item: resolvedItem, localFileURL: fileLocation.url)
             }
 
             return fileLocation.url

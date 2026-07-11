@@ -42,6 +42,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     case download
     case workshop
     case pixiv
+    case konachan
     case scheduler
     case sync
     case about
@@ -55,6 +56,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .download: return t("download")
         case .workshop: return t("wallpaperEngine")
         case .pixiv: return "Pixiv"
+        case .konachan: return "Konachan"
         case .scheduler: return t("scheduler")
         case .sync: return t("cloudSync")
         case .about: return t("about")
@@ -68,6 +70,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .download: return "arrow.down.circle"
         case .workshop: return "gearshape.2" // Steam/Workshop 风格
         case .pixiv: return "p.circle"
+        case .konachan: return "k.circle"
         case .scheduler: return "clock.arrow.circlepath"
         case .sync: return "icloud"
         case .about: return "info.circle"
@@ -165,6 +168,8 @@ struct SettingsView: View {
                         WorkshopSettingsTab(viewModel: viewModel)
                     case .pixiv:
                         PixivSettingsTab()
+                    case .konachan:
+                        KonachanSettingsTab()
                     case .scheduler:
                         SchedulerSettingsTab(viewModel: viewModel)
                     case .sync:
