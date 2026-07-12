@@ -2,6 +2,22 @@ import SwiftUI
 import AppKit
 import ApplicationServices
 
+private let settingsSliderTint = Color(hex: "30D158")
+
+private func snappedSliderBinding(
+    _ binding: Binding<Double>,
+    in range: ClosedRange<Double>,
+    step: Double
+) -> Binding<Double> {
+    Binding(
+        get: { binding.wrappedValue },
+        set: { newValue in
+            let snappedValue = ((newValue - range.lowerBound) / step).rounded() * step + range.lowerBound
+            binding.wrappedValue = min(max(snappedValue, range.lowerBound), range.upperBound)
+        }
+    )
+}
+
 // MARK: - 毛玻璃背景视图
 private struct VisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
@@ -371,9 +387,13 @@ private struct GeneralSettingsTab: View {
 
                         Spacer()
 
-                        Slider(value: $viewModel.grainIntensity, in: 0...1, step: 0.05)
-                            .frame(width: 160)
-                            .tint(Color(hex: "30D158"))
+                        Slider(
+                            value: snappedSliderBinding($viewModel.grainIntensity, in: 0...1, step: 0.05),
+                            in: 0...1
+                        )
+                        .tint(settingsSliderTint)
+                        .accessibilityLabel(t("grainIntensity"))
+                        .frame(width: 160)
 
                         Text("\(Int(viewModel.grainIntensity * 100))%")
                             .font(.system(size: 12, weight: .regular, design: .monospaced))
@@ -480,15 +500,19 @@ private struct GeneralSettingsTab: View {
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 36, alignment: .trailing)
                             Slider(
-                                value: $viewModel.windowCoveragePauseThreshold,
+                                value: snappedSliderBinding(
+                                    $viewModel.windowCoveragePauseThreshold,
+                                    in: 30...100,
+                                    step: 5
+                                ),
                                 in: 30...100,
-                                step: 5,
                                 onEditingChanged: { editing in
                                     if !editing { viewModel.syncAutoPauseSettings() }
                                 }
                             )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("windowCoverageThreshold"))
                             .frame(width: 120)
-                            .tint(Color(hex: "30D158"))
                         }
                     }
 
@@ -1009,17 +1033,21 @@ private struct SchedulerSettingsTab: View {
                                     }
 
                                     Slider(
-                                        value: Binding(
-                                            get: { Double(displayConfig.webSceneSwitchSeconds ?? 0) },
-                                            set: { newValue in
-                                                let intVal = Int(newValue)
-                                                viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds(intVal == 0 ? nil : intVal, for: screenID)
-                                            }
+                                        value: snappedSliderBinding(
+                                            Binding(
+                                                get: { Double(displayConfig.webSceneSwitchSeconds ?? 0) },
+                                                set: { newValue in
+                                                    let intVal = Int(newValue)
+                                                    viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds(intVal == 0 ? nil : intVal, for: screenID)
+                                                }
+                                            ),
+                                            in: 0...3600,
+                                            step: 10
                                         ),
-                                        in: 0...3600,
-                                        step: 10
+                                        in: 0...3600
                                     )
-                                    .accentColor(.blue)
+                                    .tint(settingsSliderTint)
+                                    .accessibilityLabel(t("webSceneSwitchInterval"))
                                 }
                                 .padding(.horizontal, 16)
                                 .padding(.vertical, 12)
@@ -1427,9 +1455,13 @@ private struct WorkshopSettingsTab: View {
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 36, alignment: .trailing)
-                                Slider(value: $viewModel.upscalingPercent, in: 30...100, step: 5)
-                                    .frame(width: 120)
-                                    .tint(Color(hex: "30D158"))
+                                Slider(
+                                    value: snappedSliderBinding($viewModel.upscalingPercent, in: 30...100, step: 5),
+                                    in: 30...100
+                                )
+                                .tint(settingsSliderTint)
+                                .accessibilityLabel(t("workshop.upscalingRatio"))
+                                .frame(width: 120)
                             }
                         }
 
@@ -1451,9 +1483,17 @@ private struct WorkshopSettingsTab: View {
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundStyle(.secondary)
                                     .frame(minWidth: 52, alignment: .trailing)
-                                Slider(value: $viewModel.wallpaperEngineFPS, in: 30...maxSliderFPS, step: 1)
-                                    .frame(width: 120)
-                                    .tint(Color(hex: "30D158"))
+                                Slider(
+                                    value: snappedSliderBinding(
+                                        $viewModel.wallpaperEngineFPS,
+                                        in: 30...maxSliderFPS,
+                                        step: 5
+                                    ),
+                                    in: 30...maxSliderFPS
+                                )
+                                .tint(settingsSliderTint)
+                                .accessibilityLabel(t("workshop.fps"))
+                                .frame(width: 120)
                             }
                         }
                     }
@@ -1487,9 +1527,13 @@ private struct WorkshopSettingsTab: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 52, alignment: .trailing)
-                            Slider(value: $viewModel.sceneBakeFPS, in: 15...60, step: 5)
-                                .frame(width: 120)
-                                .tint(Color(hex: "30D158"))
+                            Slider(
+                                value: snappedSliderBinding($viewModel.sceneBakeFPS, in: 15...60, step: 5),
+                                in: 15...60
+                            )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("workshop.bakeFps"))
+                            .frame(width: 120)
                         }
                     }
 
@@ -1499,9 +1543,13 @@ private struct WorkshopSettingsTab: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .frame(minWidth: 36, alignment: .trailing)
-                            Slider(value: $viewModel.sceneBakeDuration, in: 5...60, step: 5)
-                                .frame(width: 120)
-                                .tint(Color(hex: "30D158"))
+                            Slider(
+                                value: snappedSliderBinding($viewModel.sceneBakeDuration, in: 5...60, step: 5),
+                                in: 5...60
+                            )
+                            .tint(settingsSliderTint)
+                            .accessibilityLabel(t("workshop.bakeDuration"))
+                            .frame(width: 120)
                         }
                     }
 

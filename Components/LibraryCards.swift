@@ -131,6 +131,39 @@ extension MediaItem {
         }
         return coverImageURL
     }
+
+    /// 文件夹卡片只读取已存在的封面，不扫描 Workshop 目录或触发视频抽帧。
+    /// 打开文件夹后，由可见的媒体卡片按需生成缺失的海报。
+    @MainActor
+    func libraryFolderThumbnailURL(localFileURL: URL?) -> URL {
+        let fileCache = FileExistenceCache.shared
+        if let record = MediaLibraryService.shared.downloadRecords.first(where: {
+            $0.item.id == id && $0.isActive
+        }),
+        let bakedPath = record.sceneBakeArtifact?.videoPath,
+        SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)),
+        let extracted = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: id) {
+            return extracted
+        }
+
+        if let local = localFileURL,
+           local.isFileURL,
+           fileCache.fileExists(atPath: local.path) {
+            let ext = local.pathExtension.lowercased()
+            if Self.libraryLocalRasterExtensions.contains(ext) {
+                return local
+            }
+            if Self.videoFileExtensions.contains(ext),
+               let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) {
+                return extracted
+            }
+        }
+
+        if let poster = posterURL, poster.isFileURL, fileCache.fileExists(atPath: poster.path) {
+            return poster
+        }
+        return coverImageURL
+    }
 }
 
 // MARK: - Card Metrics

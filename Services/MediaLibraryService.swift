@@ -256,9 +256,8 @@ final class MediaLibraryService: ObservableObject {
     /// Ensure an existing local media file has a persistent library record.
     /// Applying a wallpaper is an explicit user action, so it must not remain cache-only.
     func ensureDownloadRecord(item: MediaItem, localFileURL: URL) {
-        let normalizedPath = (localFileURL.path as NSString).standardizingPath
         if let existing = downloadRecords.first(where: { $0.item.id == item.id && $0.isActive }),
-           (existing.localFilePath as NSString).standardizingPath == normalizedPath {
+           existing.hasSameLocalContent(as: localFileURL) {
             return
         }
         recordDownload(item: item, localFileURL: localFileURL)
@@ -537,8 +536,19 @@ final class MediaLibraryService: ObservableObject {
         guard let index = downloadRecords.firstIndex(where: { $0.item.id == itemID && $0.isActive }) else {
             return
         }
-        if let art = downloadRecords[index].sceneBakeArtifact, art.analysisId != snapshot.analysisId {
-            downloadRecords[index].sceneBakeArtifact = nil
+        let record = downloadRecords[index]
+        if let artifact = record.sceneBakeArtifact, artifact.analysisId != snapshot.analysisId {
+            let isRecoveringLegacyAssociation = record.sceneBakeEligibility == nil
+                && record.hasSameLocalContent(as: URL(fileURLWithPath: snapshot.contentRootPath))
+                && SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath))
+            if isRecoveringLegacyAssociation {
+                var reboundArtifact = artifact
+                reboundArtifact.analysisId = snapshot.analysisId
+                downloadRecords[index].sceneBakeArtifact = reboundArtifact
+                print("[MediaLibraryService] Rebound recovered scene bake artifact for \(itemID)")
+            } else {
+                downloadRecords[index].sceneBakeArtifact = nil
+            }
         }
         downloadRecords[index].sceneBakeEligibility = snapshot
         saveDlToCache(downloadRecords[index])
