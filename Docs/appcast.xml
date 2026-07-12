@@ -6,19 +6,18 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.130</title>
-      <sparkle:version>38.0.130</sparkle:version>
-      <sparkle:shortVersionString>38.0.130</sparkle:shortVersionString>
-      <pubDate>Sat, 11 Jul 2026 17:11:01 +0800</pubDate>
+      <title>Version 38.0.131</title>
+      <sparkle:version>38.0.131</sparkle:version>
+      <sparkle:shortVersionString>38.0.131</sparkle:shortVersionString>
+      <pubDate>Sun, 12 Jul 2026 18:45:52 +0800</pubDate>
       <description><![CDATA[
-        <h3>WaifuX 38.0.130</h3>
+        <h3>WaifuX 38.0.131</h3>
         <ul>
-          <li>eat: Konachan 登录验证、媒体库自动恢复、壁纸扩展稳定性提升 (a33f6fa)</li>
-          <li>fix: 修复动漫播放器快捷键误拦截 + 锁屏壁纸正在使用状态识别 (7e22c53)</li>
+          <li>feat: 完善壁纸设计与媒体体验 (4be8686)</li>
         </ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.130/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.131/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
