@@ -1633,6 +1633,7 @@ struct WallpaperDetailSheet: View {
                 contentTitle: t("authorWallpapers"),
                 wallpapers: authorWallpapers,
                 isLoading: isLoadingAuthorWallpapers,
+                hasMore: hasMoreAuthorWallpapers,
                 activeWallpaperID: wallpaper.id,
                 onSelectWallpaper: { selectedWallpaper in
                     navigateToAuthorWallpaper(selectedWallpaper)
@@ -1671,23 +1672,23 @@ struct WallpaperDetailSheet: View {
 
         Task {
             do {
-                let results: [Wallpaper]
+                let page: WallpaperViewModel.AuthorPageResult
                 if isPixivAuthor {
-                    results = try await viewModel.fetchPixivWallpapersByAuthor(
+                    page = try await viewModel.fetchPixivWallpapersByAuthor(
                         userID: identifier,
                         page: 1,
                         limit: 24
                     )
                 } else {
-                    results = try await viewModel.fetchWallpapersByAuthor(
+                    page = try await viewModel.fetchWallpapersByAuthor(
                         username: uploader.username,
                         page: 1,
                         limit: 24
                     )
                 }
                 await MainActor.run {
-                    authorWallpapers = results
-                    hasMoreAuthorWallpapers = results.count >= 24
+                    authorWallpapers = page.items
+                    hasMoreAuthorWallpapers = page.hasMore
                     isLoadingAuthorWallpapers = false
                 }
             } catch {
@@ -1829,24 +1830,28 @@ struct WallpaperDetailSheet: View {
 
         Task {
             do {
-                let results: [Wallpaper]
+                let page: WallpaperViewModel.AuthorPageResult
                 if isPixivAuthor {
-                    results = try await viewModel.fetchPixivWallpapersByAuthor(
+                    page = try await viewModel.fetchPixivWallpapersByAuthor(
                         userID: identifier,
                         page: nextPage,
                         limit: 24
                     )
                 } else {
-                    results = try await viewModel.fetchWallpapersByAuthor(
+                    page = try await viewModel.fetchWallpapersByAuthor(
                         username: uploader.username,
                         page: nextPage,
                         limit: 24
                     )
                 }
                 await MainActor.run {
-                    authorWallpapers.append(contentsOf: results)
+                    // 去重追加，避免跨页重复项
+                    let existingIDs = Set(authorWallpapers.map(\.id))
+                    let fresh = page.items.filter { !existingIDs.contains($0.id) }
+                    authorWallpapers.append(contentsOf: fresh)
                     authorWallpapersPage = nextPage
-                    hasMoreAuthorWallpapers = results.count >= 24
+                    // 无新增时停止，避免重复页 + sentinel 重建形成死循环
+                    hasMoreAuthorWallpapers = page.hasMore && !fresh.isEmpty
                     isLoadingAuthorWallpapers = false
                 }
             } catch {

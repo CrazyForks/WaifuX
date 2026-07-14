@@ -3982,6 +3982,7 @@ struct MediaDetailSheet: View {
                 authorAvatarURL: resolvedItem.authorAvatarURL,
                 items: authorMediaItems,
                 isLoading: isLoadingAuthorItems,
+                hasMore: hasMoreAuthorItems,
                 activeItemID: resolvedItem.id,
                 onSelectItem: { selectedItem in
                     navigateToAuthorMedia(selectedItem)
@@ -4016,19 +4017,19 @@ struct MediaDetailSheet: View {
 
         Task {
             do {
-                let results = try await viewModel.fetchMediaByAuthor(
+                let page = try await viewModel.fetchMediaByAuthor(
                     steamID: steamID,
                     page: 1
                 )
                 await MainActor.run {
-                    if let authorItem = results.first(where: {
+                    if let authorItem = page.items.first(where: {
                         $0.authorName != nil || $0.authorSteamID != nil || $0.authorAvatarURL != nil
                     }) {
                         resolvedItem = mediaItemByMergingAuthorMetadata(resolvedItem, fallback: authorItem)
                     }
-                    // 过滤掉当前正在查看的项
-                    authorMediaItems = results.filter { $0.id != resolvedItem.id }
-                    hasMoreAuthorItems = results.count >= 30
+                    // 作者列表保留当前项，不排除自己；当前项用 activeItemID 高亮
+                    authorMediaItems = page.items
+                    hasMoreAuthorItems = page.hasMore
                     isLoadingAuthorItems = false
                 }
             } catch {
@@ -4158,15 +4159,17 @@ struct MediaDetailSheet: View {
 
         Task {
             do {
-                let results = try await viewModel.fetchMediaByAuthor(
+                let page = try await viewModel.fetchMediaByAuthor(
                     steamID: steamID,
                     page: nextPage
                 )
                 await MainActor.run {
-                    let newItems = results.filter { $0.id != resolvedItem.id }
+                    let existingIDs = Set(authorMediaItems.map(\.id))
+                    let newItems = page.items.filter { !existingIDs.contains($0.id) }
                     authorMediaItems.append(contentsOf: newItems)
                     authorItemsPage = nextPage
-                    hasMoreAuthorItems = results.count >= 30
+                    // 服务端 hasMore + 本页确实有新增；重复页/空增量时停
+                    hasMoreAuthorItems = page.hasMore && !newItems.isEmpty
                     isLoadingAuthorItems = false
                 }
             } catch {

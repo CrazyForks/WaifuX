@@ -697,18 +697,26 @@ class WallpaperViewModel: ObservableObject {
     /// - Parameters:
     ///   - username: 作者用户名
     ///   - page: 页码，从 1 开始
-    ///   - limit: 每页数量，默认 20
-    /// - Returns: 壁纸列表
-    func fetchWallpapersByAuthor(username: String, page: Int = 1, limit: Int = 24) async throws -> [Wallpaper] {
+    /// 作者列表分页结果。hasMore 由服务端/切片语义决定，避免转换过滤后误判。
+    struct AuthorPageResult {
+        let items: [Wallpaper]
+        let hasMore: Bool
+    }
+
+    ///   - limit: 每页数量，默认 24
+    /// - Returns: 本页壁纸 + 是否还有下一页
+    func fetchWallpapersByAuthor(username: String, page: Int = 1, limit: Int = 24) async throws -> AuthorPageResult {
         let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedUsername.isEmpty else { return [] }
+        guard !trimmedUsername.isEmpty else {
+            return AuthorPageResult(items: [], hasMore: false)
+        }
 
         let parameters = WallhavenAPI.SearchParameters(
             query: "@\(trimmedUsername)",
             page: page,
             perPage: limit,
             categories: "111",      // 不限分类，查全量
-            purity: "1100",         // SFW + Sketchy，排除 NSFW
+            purity: "111",          // 作者列表不过滤内容分级（SFW + Sketchy + NSFW）
             sorting: SortingOption.dateAdded.rawValue,
             order: "desc",
             topRange: nil,
@@ -718,30 +726,56 @@ class WallpaperViewModel: ObservableObject {
             colors: []              // 不限颜色
         )
 
-        let response = try await fetchWallpapers(parameters: parameters)
+        // 作者列表固定走 Wallhaven，不受探索页 activeSource 影响
+        let response = try await fetchFromWallhaven(parameters: parameters)
         wallpaperLibrary.upsertBatch(response.data)
-        return response.data
+        // 优先用 API lastPage；异常源没有可靠 meta 时回退到满页启发式。
+        let hasMore = response.meta.lastPage > 0
+            ? page < response.meta.lastPage
+            : response.data.count >= limit
+        return AuthorPageResult(items: response.data, hasMore: hasMore)
     }
 
-    /// 获取指定 Pixiv 作者的插画作品。Pixiv 先返回用户的全部插画 ID，再批量补齐当前页的作品信息。
-    func fetchPixivWallpapersByAuthor(userID: String, page: Int = 1, limit: Int = 24) async throws -> [Wallpaper] {
-        let trimmedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedUserID.isEmpty, page > 0, limit > 0 else { return [] }
+    /// Pixiv 作者作品 ID 列表缓存，避免每页重复请求 profile/all。
+    private var pixivAuthorIllustIDCache: [String: [String]] = [:]
 
-        let profile = try await PixivService.shared.userAllIllusts(userId: trimmedUserID)
-        // 漫画由 MangaDetailSheet 的独立路由处理，不能在当前壁纸详情面板内原地切换。
-        let artworkIDs = Array((profile.illusts ?? [:]).keys)
-        let orderedIDs = Array(Set(artworkIDs)).sorted {
-            (Int64($0) ?? 0) > (Int64($1) ?? 0)
+    /// 获取指定 Pixiv 作者的插画作品。Pixiv 先返回用户的全部插画 ID，再批量补齐当前页的作品信息。
+    func fetchPixivWallpapersByAuthor(userID: String, page: Int = 1, limit: Int = 24) async throws -> AuthorPageResult {
+        let trimmedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUserID.isEmpty, page > 0, limit > 0 else {
+            return AuthorPageResult(items: [], hasMore: false)
         }
 
-        let startIndex = (page - 1) * limit
-        guard startIndex < orderedIDs.count else { return [] }
+        // Pixiv /profile/illusts 单次最多 24 个 ids[]
+        let pageLimit = min(limit, 24)
 
-        let pageIDs = Array(orderedIDs[startIndex..<min(startIndex + limit, orderedIDs.count)])
+        let orderedIDs: [String]
+        if let cached = pixivAuthorIllustIDCache[trimmedUserID] {
+            orderedIDs = cached
+        } else {
+            let profile = try await PixivService.shared.userAllIllusts(userId: trimmedUserID)
+            // 漫画由 MangaDetailSheet 的独立路由处理，不能在当前壁纸详情面板内原地切换。
+            let artworkIDs = Array((profile.illusts ?? [:]).keys)
+            orderedIDs = Array(Set(artworkIDs)).sorted {
+                (Int64($0) ?? 0) > (Int64($1) ?? 0)
+            }
+            pixivAuthorIllustIDCache[trimmedUserID] = orderedIDs
+        }
+
+        let startIndex = (page - 1) * pageLimit
+        guard startIndex < orderedIDs.count else {
+            return AuthorPageResult(items: [], hasMore: false)
+        }
+
+        let endIndex = min(startIndex + pageLimit, orderedIDs.count)
+        let pageIDs = Array(orderedIDs[startIndex..<endIndex])
+        // hasMore 按 ID 切片判断，不依赖转换后数量（部分 ID 可能解析失败）
+        let hasMore = endIndex < orderedIDs.count
+
         let works = try await PixivService.shared.userIllusts(userId: trimmedUserID, illustIDs: pageIDs)
         let worksByID = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
-        return pageIDs.compactMap { worksByID[$0]?.toWallpaper() }
+        let items = pageIDs.compactMap { worksByID[$0]?.toWallpaper() }
+        return AuthorPageResult(items: items, hasMore: hasMore)
     }
 
     // MARK: - 加载更多（支持 Task Cancellation + 预加载）

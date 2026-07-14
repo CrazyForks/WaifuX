@@ -271,6 +271,7 @@ struct MangaDetailSheet: View {
                 contentTitle: "作者漫画",
                 wallpapers: authorMangaItems,
                 isLoading: isLoadingAuthorManga,
+                hasMore: hasMoreAuthorManga,
                 activeWallpaperID: "pixiv_\(route.illustId)",
                 onSelectWallpaper: navigateToAuthorManga,
                 onDismiss: dismissAuthorMangaSheet,
@@ -299,12 +300,12 @@ struct MangaDetailSheet: View {
 
         Task {
             do {
-                let results = try await viewModel.fetchAuthorManga(page: 1, limit: 24)
+                let page = try await viewModel.fetchAuthorManga(page: 1, limit: 24)
                 guard viewModel.authorID == authorID else { return }
-                authorMangaItems = results
-                hasMoreAuthorManga = results.count >= 24
+                authorMangaItems = page.items
+                hasMoreAuthorManga = page.hasMore
                 isLoadingAuthorManga = false
-                if let uploader = results.first?.uploader {
+                if let uploader = page.items.first?.uploader {
                     cachedAuthorMangaUploader = uploader
                 }
             } catch {
@@ -324,10 +325,13 @@ struct MangaDetailSheet: View {
 
         Task {
             do {
-                let results = try await viewModel.fetchAuthorManga(page: nextPage, limit: 24)
-                authorMangaItems.append(contentsOf: results)
+                let page = try await viewModel.fetchAuthorManga(page: nextPage, limit: 24)
+                let existingIDs = Set(authorMangaItems.map(\.id))
+                let fresh = page.items.filter { !existingIDs.contains($0.id) }
+                authorMangaItems.append(contentsOf: fresh)
                 authorMangaPage = nextPage
-                hasMoreAuthorManga = results.count >= 24
+                // 无新增时停止，避免重复页 + sentinel 重建形成死循环
+                hasMoreAuthorManga = page.hasMore && !fresh.isEmpty
                 isLoadingAuthorManga = false
             } catch {
                 AppLogger.error(.wallpaper, "加载更多作者漫画失败", metadata: [

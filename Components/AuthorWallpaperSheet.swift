@@ -8,6 +8,8 @@ struct AuthorWallpaperSheet: View {
     let contentTitle: String
     let wallpapers: [Wallpaper]
     let isLoading: Bool
+    /// 是否还有更多页；为 false 时不再触发 onLoadMore
+    var hasMore: Bool = true
     let activeWallpaperID: String?
     let onSelectWallpaper: (Wallpaper) -> Void
     let onDismiss: () -> Void
@@ -16,10 +18,15 @@ struct AuthorWallpaperSheet: View {
 
     @State private var isVisible = false
     @Binding var isDownloadingAll: Bool
+    /// 滚动几何分页：距底进入阈值后触发一次，离开后再允许下一次
+    @State private var wasNearBottom = false
+    @State private var loadMoreCooldownUntil: Date?
 
     private let panelWidth: CGFloat = 360
     private let cardSpacing: CGFloat = 12
     private let cornerRadius: CGFloat = 22
+    private static let scrollCoordinateSpaceName = "author-wallpaper-sheet-scroll"
+    private static let loadMoreTriggerThreshold: CGFloat = 80
 
     var body: some View {
         GeometryReader { geometry in
@@ -173,47 +180,82 @@ struct AuthorWallpaperSheet: View {
 
     // MARK: - 壁纸网格（固定 2 列）
     private var wallpaperGrid: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            if wallpapers.isEmpty && !isLoading {
-                emptyState
-            } else {
-                LazyVGrid(
-                    columns: [
-                        GridItem(.fixed(cardWidth), spacing: cardSpacing),
-                        GridItem(.fixed(cardWidth), spacing: cardSpacing)
-                    ],
-                    spacing: cardSpacing
-                ) {
-                    ForEach(wallpapers) { wallpaper in
-                        AuthorWallpaperCard(
-                            wallpaper: wallpaper,
-                            cardWidth: cardWidth,
-                            cardImageHeight: cardImageHeight,
-                            isActive: wallpaper.id == activeWallpaperID,
-                            onTap: {
-                                onSelectWallpaper(wallpaper)
-                            }
-                        )
+        GeometryReader { viewport in
+            ScrollView(.vertical, showsIndicators: false) {
+                if wallpapers.isEmpty && !isLoading {
+                    emptyState
+                } else {
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.fixed(cardWidth), spacing: cardSpacing),
+                            GridItem(.fixed(cardWidth), spacing: cardSpacing)
+                        ],
+                        spacing: cardSpacing
+                    ) {
+                        ForEach(wallpapers) { wallpaper in
+                            AuthorWallpaperCard(
+                                wallpaper: wallpaper,
+                                cardWidth: cardWidth,
+                                cardImageHeight: cardImageHeight,
+                                isActive: wallpaper.id == activeWallpaperID,
+                                onTap: {
+                                    onSelectWallpaper(wallpaper)
+                                }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 20)
+
+                    // 滚动几何哨兵：滚近底部时才加载更多（与探索页同思路）
+                    if onLoadMore != nil, !wallpapers.isEmpty, hasMore {
+                        ScrollBottomSentinel(coordinateSpaceName: Self.scrollCoordinateSpaceName)
+                            .padding(.bottom, 12)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 20)
 
-                // 加载更多触发器
-                if let onLoadMore = onLoadMore, !wallpapers.isEmpty {
-                    Color.clear
-                        .frame(height: 1)
-                        .onAppear {
-                            onLoadMore()
-                        }
+                Color.clear
+                    .frame(height: 12)
+            }
+            .coordinateSpace(name: Self.scrollCoordinateSpaceName)
+            .iosSmoothScroll()
+            .onScrollBottomSentinelChange { sentinelMinY in
+                handleLoadMoreSentinel(
+                    sentinelMinY: sentinelMinY,
+                    viewportHeight: viewport.size.height
+                )
+            }
+            // 加载结束且列表增长后，允许再次靠近底部触发（避免 wasNearBottom 卡死）
+            .onChange(of: isLoading) { _, loading in
+                if !loading {
+                    wasNearBottom = false
                 }
             }
-
-            // 底部安全区
-            Color.clear
-                .frame(height: 12)
+            .onChange(of: wallpapers.count) { _, _ in
+                wasNearBottom = false
+            }
         }
-        .iosSmoothScroll()
+    }
+
+    private func handleLoadMoreSentinel(sentinelMinY: CGFloat, viewportHeight: CGFloat) {
+        guard let onLoadMore,
+              hasMore,
+              !isLoading,
+              !wallpapers.isEmpty,
+              viewportHeight > 0,
+              sentinelMinY.isFinite else { return }
+
+        if let cooldown = loadMoreCooldownUntil, Date() < cooldown { return }
+
+        let isNearBottom = sentinelMinY <= viewportHeight + Self.loadMoreTriggerThreshold
+        if isNearBottom {
+            guard !wasNearBottom else { return }
+            wasNearBottom = true
+            loadMoreCooldownUntil = Date().addingTimeInterval(0.8)
+            onLoadMore()
+        } else {
+            wasNearBottom = false
+        }
     }
 
     // MARK: - 空状态

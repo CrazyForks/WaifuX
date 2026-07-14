@@ -101,7 +101,10 @@ class WorkshopService: ObservableObject {
         var components = URLComponents(string: "https://steamcommunity.com\(profilePath)/myworkshopfiles/")
         components?.queryItems = [
             URLQueryItem(name: "appid", value: wallpaperEngineAppID),
-            URLQueryItem(name: "p", value: String(page)),
+            // 显式 myfiles + mostrecent，避免默认视图/排序导致翻页异常
+            URLQueryItem(name: "browsefilter", value: "myfiles"),
+            URLQueryItem(name: "sort", value: "mostrecent"),
+            URLQueryItem(name: "p", value: String(max(page, 1))),
             // Steam 作者页使用 numperpage，不是 Workshop 搜索页的 num_per_page。
             URLQueryItem(name: "numperpage", value: String(authorPageSize))
         ]
