@@ -34,8 +34,40 @@ final class MangaDetailViewModel: ObservableObject {
 
     var seriesTitle: String { series?.title ?? "漫画" }
     var authorName: String { series?.author ?? "" }
+    var authorID: String? {
+        guard let authorID = series?.authorId.trimmingCharacters(in: .whitespacesAndNewlines),
+              !authorID.isEmpty else { return nil }
+        return authorID
+    }
     var seriesDescription: String { series?.description ?? "" }
     var seriesTags: [String] { series?.tags ?? [] }
+
+    /// 获取当前作者的 Pixiv 漫画。漫画使用独立阅读器，不能混入壁纸作者列表。
+    func fetchAuthorManga(page: Int = 1, limit: Int = 24) async throws -> [Wallpaper] {
+        guard route.source == .pixiv,
+              let authorID,
+              page > 0,
+              limit > 0 else {
+            return []
+        }
+
+        let profile = try await pixiv.userAllIllusts(userId: authorID)
+        let orderedIDs = Array((profile.manga ?? [:]).keys).sorted {
+            (Int64($0) ?? 0) > (Int64($1) ?? 0)
+        }
+
+        let startIndex = (page - 1) * limit
+        guard startIndex < orderedIDs.count else { return [] }
+
+        let pageIDs = Array(orderedIDs[startIndex..<min(startIndex + limit, orderedIDs.count)])
+        let works = try await pixiv.userIllusts(
+            userId: authorID,
+            illustIDs: pageIDs,
+            workCategory: "manga"
+        )
+        let worksByID = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
+        return pageIDs.compactMap { worksByID[$0]?.toWallpaper() }.filter(\.isPixivManga)
+    }
 
     // MARK: - Load
     func load() async {

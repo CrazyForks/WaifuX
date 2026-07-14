@@ -742,7 +742,14 @@ final class StatusBarController: NSObject {
 
     @objc private func nextWallpaperForScreen(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else { return }
-        WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
+        let screenID = screen.wallpaperScreenIdentifier
+        let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screenID)
+        print("[StatusBar] nextWallpaperForScreen screen=\(screen.localizedName) id=\(screenID) hasItems=\(hasItems)")
+        guard hasItems else {
+            print("[StatusBar] nextWallpaper ignored: no schedulable items for \(screenID)")
+            return
+        }
+        WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screenID)
     }
 
     @objc private func perScreenTogglePlayback(_ sender: NSMenuItem) {

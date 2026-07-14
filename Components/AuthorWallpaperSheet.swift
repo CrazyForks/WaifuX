@@ -1,9 +1,11 @@
 import SwiftUI
 import Kingfisher
 
-// MARK: - 作者壁纸右侧滑出面板（Wallhaven 源）
+// MARK: - 作者壁纸右侧滑出面板
 struct AuthorWallpaperSheet: View {
     let uploader: Wallpaper.Uploader
+    let sourceName: String
+    let contentTitle: String
     let wallpapers: [Wallpaper]
     let isLoading: Bool
     let activeWallpaperID: String?
@@ -39,7 +41,7 @@ struct AuthorWallpaperSheet: View {
                     .padding(.horizontal, 20)
 
                 HStack {
-                    Text(t("authorWallpapers"))
+                    Text(contentTitle)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(LiquidGlassColors.textSecondary)
                     Spacer()
@@ -96,7 +98,7 @@ struct AuthorWallpaperSheet: View {
                     .foregroundStyle(LiquidGlassColors.textPrimary)
                     .lineLimit(1)
 
-                Label("wallhaven", systemImage: "photo.stack")
+                Label(sourceName, systemImage: sourceName.caseInsensitiveCompare("pixiv") == .orderedSame ? "paintpalette" : "photo.stack")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(LiquidGlassColors.textTertiary)
             }
@@ -289,6 +291,16 @@ private struct AuthorWallpaperCard: View {
                 .frame(width: cardWidth, height: cardImageHeight)
                 .clipped()
 
+            if let title = wallpaper.title, !title.isEmpty {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 7)
+            }
+
             // 底部信息
             HStack(spacing: 6) {
                 if !wallpaper.category.isEmpty {
@@ -313,7 +325,8 @@ private struct AuthorWallpaperCard: View {
                 }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 7)
+            .padding(.top, wallpaper.title?.isEmpty == false ? 4 : 7)
+            .padding(.bottom, 7)
         }
         .frame(width: cardWidth)
         .background(

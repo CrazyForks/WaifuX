@@ -443,6 +443,76 @@ class WallpaperViewModel: ObservableObject {
         wallpaperLibrary.removeWallpaperDownloads(withIDs: ids)
     }
 
+    /// 详情页删除本地壁纸：同时覆盖下载记录与纯本地扫描文件。
+    /// 纯 `local_*` 扫描项没有 download record，仅靠 `removeWallpaperDownloads` 会删不掉。
+    @discardableResult
+    func deleteLocalWallpaper(_ wallpaper: Wallpaper) -> Bool {
+        var idsToRemove = Set<String>()
+        var pathsToDelete = Set<String>()
+
+        // 1) 按 ID 命中下载记录（含导入的 local_import_*）
+        if let record = wallpaperLibrary.downloadRecord(for: wallpaper.id) {
+            idsToRemove.insert(record.wallpaper.id)
+            pathsToDelete.insert((record.localFilePath as NSString).standardizingPath as String)
+        }
+
+        // 2) 解析本地文件路径：下载缓存 / fullImageURL / path 字段
+        var candidateURLs: [URL] = []
+        if let u = wallpaperLibrary.localFileURLIfAvailable(for: wallpaper) {
+            candidateURLs.append(u)
+        }
+        if let u = wallpaper.fullImageURL, u.isFileURL {
+            candidateURLs.append(u)
+        }
+        if let u = URL(string: wallpaper.path), u.isFileURL {
+            candidateURLs.append(u)
+        } else if wallpaper.path.hasPrefix("/") {
+            candidateURLs.append(URL(fileURLWithPath: wallpaper.path))
+        }
+
+        for url in candidateURLs where url.isFileURL {
+            let path = (url.path as NSString).standardizingPath as String
+            guard !path.isEmpty else { continue }
+            pathsToDelete.insert(path)
+
+            // 扫描 ID 与导入 ID 可能不一致，再按路径反查下载记录
+            if let byPath = wallpaperLibrary.downloadRecord(forLocalFilePath: path)
+                ?? wallpaperLibrary.downloadRecords.first(where: {
+                    $0.isActive && (($0.localFilePath as NSString).standardizingPath as String) == path
+                }) {
+                idsToRemove.insert(byPath.wallpaper.id)
+                pathsToDelete.insert((byPath.localFilePath as NSString).standardizingPath as String)
+            }
+        }
+
+        // 3) 软删下载记录（内部会尽量删物理文件）
+        if !idsToRemove.isEmpty {
+            wallpaperLibrary.removeWallpaperDownloads(withIDs: idsToRemove)
+        }
+
+        // 4) 兜底删物理文件（纯 local_* 扫描项 / 记录删完文件仍在）
+        var deletedFile = false
+        for path in pathsToDelete {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            do {
+                try FileManager.default.removeItem(atPath: path)
+                print("[WallpaperViewModel] ✅ Deleted local wallpaper file: \(path)")
+                deletedFile = true
+            } catch {
+                print("[WallpaperViewModel] ⚠️ Failed to delete local wallpaper file \(path): \(error)")
+            }
+        }
+
+        let didSomething = !idsToRemove.isEmpty || deletedFile
+        if didSomething {
+            Task { @MainActor in
+                await LocalWallpaperScanner.shared.forceRescan()
+                scheduleLocalWallpaperCacheRebuild(delayNanoseconds: 0)
+            }
+        }
+        return didSomething
+    }
+
     // MARK: - 通过 URL 解析壁纸
 
     /// 提取 Wallhaven 壁纸 ID（支持 wallhaven.cc/w/{id} 和 wallhaven.cc/wallpaper/{id}）
@@ -651,6 +721,27 @@ class WallpaperViewModel: ObservableObject {
         let response = try await fetchWallpapers(parameters: parameters)
         wallpaperLibrary.upsertBatch(response.data)
         return response.data
+    }
+
+    /// 获取指定 Pixiv 作者的插画作品。Pixiv 先返回用户的全部插画 ID，再批量补齐当前页的作品信息。
+    func fetchPixivWallpapersByAuthor(userID: String, page: Int = 1, limit: Int = 24) async throws -> [Wallpaper] {
+        let trimmedUserID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUserID.isEmpty, page > 0, limit > 0 else { return [] }
+
+        let profile = try await PixivService.shared.userAllIllusts(userId: trimmedUserID)
+        // 漫画由 MangaDetailSheet 的独立路由处理，不能在当前壁纸详情面板内原地切换。
+        let artworkIDs = Array((profile.illusts ?? [:]).keys)
+        let orderedIDs = Array(Set(artworkIDs)).sorted {
+            (Int64($0) ?? 0) > (Int64($1) ?? 0)
+        }
+
+        let startIndex = (page - 1) * limit
+        guard startIndex < orderedIDs.count else { return [] }
+
+        let pageIDs = Array(orderedIDs[startIndex..<min(startIndex + limit, orderedIDs.count)])
+        let works = try await PixivService.shared.userIllusts(userId: trimmedUserID, illustIDs: pageIDs)
+        let worksByID = Dictionary(uniqueKeysWithValues: works.map { ($0.id, $0) })
+        return pageIDs.compactMap { worksByID[$0]?.toWallpaper() }
     }
 
     // MARK: - 加载更多（支持 Task Cancellation + 预加载）
