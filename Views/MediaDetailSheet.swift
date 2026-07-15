@@ -73,6 +73,7 @@ struct MediaDetailSheet: View {
     @State private var applyingWallpaperStatusKey = "applyingWallpaper"
     @State private var sharePickerAnchorView: NSView?
     @State private var showCopyLinkToast = false
+    @State private var copyToastMessage = "链接已复制"
     @State private var showMoreOptionsPopover = false
     @State private var showDeleteBakeConfirm = false
     @State private var showDeleteFrameInterpolationConfirm = false
@@ -299,7 +300,7 @@ struct MediaDetailSheet: View {
             }
             .overlay(alignment: .bottom) {
                 if showCopyLinkToast {
-                    Text("链接已复制")
+                    Text(copyToastMessage)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 20)
@@ -1460,6 +1461,23 @@ struct MediaDetailSheet: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!hasValidSteamPageURL)
+            }
+
+            // 仅在存在可用的 Scene 烘焙 MP4 时展示。
+            if let bakedVideoURL = cachedSceneBakeVideoURL {
+                Button {
+                    showMoreOptionsPopover = false
+                    copyBakedSceneVideoToPasteboard(bakedVideoURL)
+                } label: {
+                    HStack {
+                        Image(systemName: "doc.on.doc")
+                        Text("复制烘焙资源")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
             }
 
             // 重新烘焙（仅 Scene 类型已下载壁纸）
@@ -2839,6 +2857,27 @@ struct MediaDetailSheet: View {
         guard let url else { return }
         let items = SystemShareSupport.itemsForLocalFile(at: url)
         SystemShareSupport.presentPicker(items: items, anchorView: sharePickerAnchorView)
+    }
+
+    /// 将离线烘焙 MP4 作为文件引用写入剪贴板，供 Finder 等应用直接粘贴。
+    @MainActor
+    private func copyBakedSceneVideoToPasteboard(_ videoURL: URL) {
+        guard SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.writeObjects([videoURL as NSURL]) else {
+            print("[MediaDetailSheet] ⚠️ 无法复制烘焙视频到剪贴板: \(videoURL.path)")
+            return
+        }
+
+        copyToastMessage = "烘焙视频已复制"
+        showCopyLinkToast = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            showCopyLinkToast = false
+        }
+        print("[MediaDetailSheet] 已复制烘焙视频到剪贴板: \(videoURL.lastPathComponent)")
     }
 
     /// 复制当前壁纸的静态图片到剪贴板
