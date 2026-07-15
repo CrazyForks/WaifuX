@@ -1267,7 +1267,7 @@ struct MyLibraryContentView: View {
                     Label(t("videoOptimizationAnalyzeLoop"), systemImage: "point.3.connected.trianglepath.dotted")
                 }
                 Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopAnalysisThenInterpolation(
+                    VideoOptimizationQueueService.shared.enqueueFrameInterpolation(
                         videoURL: videoURL,
                         title: item.wallpaper.title
                     )
@@ -1466,7 +1466,7 @@ struct MyLibraryContentView: View {
                     Label(t("videoOptimizationAnalyzeLoop"), systemImage: "point.3.connected.trianglepath.dotted")
                 }
                 Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopAnalysisThenInterpolation(
+                    VideoOptimizationQueueService.shared.enqueueFrameInterpolation(
                         videoURL: videoURL,
                         title: item.mediaItem.title
                     )

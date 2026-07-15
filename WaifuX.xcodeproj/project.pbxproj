@@ -68,6 +68,10 @@
 		37F59B1CD348D187E96DCD3E /* SceneConfigOverrideService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F844D3946D7D634FFBE47D3 /* SceneConfigOverrideService.swift */; };
 		3AB9CA4DC78C3EE5C05B81F2 /* VideoWallpaperManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */; };
 		A8E9D11D0A7B4C5294A7F001 /* VideoOptimizationQueueService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E9D11D0A7B4C5294A7F002 /* VideoOptimizationQueueService.swift */; };
+		A8E9D11D0A7B4C5294A7F003 /* VideoLoopAnalysisService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E9D11D0A7B4C5294A7F004 /* VideoLoopAnalysisService.swift */; };
+		A8E9D11D0A7B4C5294A7F005 /* VideoOptimizationRecordStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E9D11D0A7B4C5294A7F006 /* VideoOptimizationRecordStore.swift */; };
+		A8E9D11D0A7B4C5294A7F007 /* VideoOptimizationAutomationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E9D11D0A7B4C5294A7F008 /* VideoOptimizationAutomationService.swift */; };
+		A8E9D11D0A7B4C5294A7F009 /* VideoOptimizationQueueCheckpointStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E9D11D0A7B4C5294A7F00A /* VideoOptimizationQueueCheckpointStore.swift */; };
 		3BCAAE449E23F411D5BCFEB7 /* Danmaku.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1909660C314E363CB12A5857 /* Danmaku.swift */; };
 		3C167FEA842C4C6D02F8CE64 /* WallpaperViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0420F76E4897B34782FAF6 /* WallpaperViewModel.swift */; };
 		3C3D1D709E6DD0518BC81253 /* WallpaperGridCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8B4DF44A83DE72A33A8BE3F /* WallpaperGridCell.swift */; };
@@ -449,6 +453,10 @@
 		92360DB7D61D511F712E8CC6 /* DownloadError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadError.swift; sourceTree = "<group>"; };
 		9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoWallpaperManager.swift; sourceTree = "<group>"; };
 		A8E9D11D0A7B4C5294A7F002 /* VideoOptimizationQueueService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoOptimizationQueueService.swift; sourceTree = "<group>"; };
+		A8E9D11D0A7B4C5294A7F004 /* VideoLoopAnalysisService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoLoopAnalysisService.swift; sourceTree = "<group>"; };
+		A8E9D11D0A7B4C5294A7F006 /* VideoOptimizationRecordStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoOptimizationRecordStore.swift; sourceTree = "<group>"; };
+		A8E9D11D0A7B4C5294A7F008 /* VideoOptimizationAutomationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoOptimizationAutomationService.swift; sourceTree = "<group>"; };
+		A8E9D11D0A7B4C5294A7F00A /* VideoOptimizationQueueCheckpointStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoOptimizationQueueCheckpointStore.swift; sourceTree = "<group>"; };
 		92926695BBCFC62936A5FADE /* WorkshopViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkshopViewModel.swift; sourceTree = "<group>"; };
 		92F7E4EFC4F9FF86BBDC4354 /* CloudSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncModels.swift; sourceTree = "<group>"; };
 		93B2EB16B350D0A586479BD5 /* NetworkState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkState.swift; sourceTree = "<group>"; };
@@ -791,6 +799,10 @@
 				2D9714C3DBCF062B148341C8 /* VideoToolboxProcessor.swift */,
 				D658BC393B2A381F062DE3F5 /* VideoTranscodeService.swift */,
 				A8E9D11D0A7B4C5294A7F002 /* VideoOptimizationQueueService.swift */,
+				A8E9D11D0A7B4C5294A7F004 /* VideoLoopAnalysisService.swift */,
+				A8E9D11D0A7B4C5294A7F006 /* VideoOptimizationRecordStore.swift */,
+				A8E9D11D0A7B4C5294A7F008 /* VideoOptimizationAutomationService.swift */,
+				A8E9D11D0A7B4C5294A7F00A /* VideoOptimizationQueueCheckpointStore.swift */,
 				9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */,
 				9EB00ACA846F3DBC547A2F3A /* WallpaperDynamicTextParser.swift */,
 				2934909A6169304E41884812 /* WallpaperEngineXBridge.swift */,
@@ -1343,6 +1355,10 @@
 				E721812719872412E439B046 /* VideoToolboxProcessor.swift in Sources */,
 				E516A5F7AB176EAABEECE5AD /* VideoTranscodeService.swift in Sources */,
 				A8E9D11D0A7B4C5294A7F001 /* VideoOptimizationQueueService.swift in Sources */,
+				A8E9D11D0A7B4C5294A7F003 /* VideoLoopAnalysisService.swift in Sources */,
+				A8E9D11D0A7B4C5294A7F005 /* VideoOptimizationRecordStore.swift in Sources */,
+				A8E9D11D0A7B4C5294A7F007 /* VideoOptimizationAutomationService.swift in Sources */,
+				A8E9D11D0A7B4C5294A7F009 /* VideoOptimizationQueueCheckpointStore.swift in Sources */,
 				3AB9CA4DC78C3EE5C05B81F2 /* VideoWallpaperManager.swift in Sources */,
 				71CA95FCFE98D1F5968921DE /* ViewExtensions.swift in Sources */,
 				1A9632409BCF492AB4FDA6E2 /* WaifuXApp.swift in Sources */,

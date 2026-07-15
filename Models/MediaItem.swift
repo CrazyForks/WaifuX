@@ -350,8 +350,6 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
     var sceneBakeEligibility: SceneBakeEligibilitySnapshot?
     /// 已成功烘焙的循环视频路径（与下载库 `DownloadPathManager.rootFolderURL` 下同级的 `SceneBakes/...`；默认即 Application Support 下 WaifuX）；与 eligibility 的 analysisId 一致时视为命中缓存
     var sceneBakeArtifact: SceneBakeArtifact?
-    /// 是否已完成 crossfade 循环预处理（替换原始文件后标记为 true）
-    var isLooped: Bool?
 
     init(
         item: MediaItem,
@@ -360,8 +358,7 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
         metadata: SyncMetadata? = nil,
         folderID: String? = nil,
         sceneBakeEligibility: SceneBakeEligibilitySnapshot? = nil,
-        sceneBakeArtifact: SceneBakeArtifact? = nil,
-        isLooped: Bool? = nil
+        sceneBakeArtifact: SceneBakeArtifact? = nil
     ) {
         self.id = item.id
         self.item = item
@@ -374,7 +371,6 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
         self.folderID = folderID
         self.sceneBakeEligibility = sceneBakeEligibility
         self.sceneBakeArtifact = sceneBakeArtifact
-        self.isLooped = isLooped
     }
 
     var localFileURL: URL {
@@ -420,7 +416,7 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, item, localFilePath, downloadedAt, metadata, folderID, sceneBakeEligibility, sceneBakeArtifact, isLooped
+        case id, item, localFilePath, downloadedAt, metadata, folderID, sceneBakeEligibility, sceneBakeArtifact
     }
 
     init(from decoder: Decoder) throws {
@@ -437,6 +433,5 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
             forKey: .sceneBakeEligibility
         )
         sceneBakeArtifact = try container.decodeIfPresent(SceneBakeArtifact.self, forKey: .sceneBakeArtifact)
-        isLooped = try container.decodeIfPresent(Bool.self, forKey: .isLooped)
     }
 }

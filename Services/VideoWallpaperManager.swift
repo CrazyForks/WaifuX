@@ -114,10 +114,6 @@ final class VideoWallpaperManager: ObservableObject {
     private var videoLetterboxAnalysisTasks: [String: Task<VideoLetterboxCrop?, Never>] = [:]
     private var videoLetterboxCropCache: [String: VideoLetterboxCrop] = [:]
     private var videoLetterboxNoCropCache = Set<String>()
-    /// 每屏原生视频补帧判断结果。补帧完成后会直接替换源视频文件。
-    private var frameInterpolationDecisionsByScreen: [String: VideoFrameInterpolationDecision] = [:]
-    private var frameInterpolationAnalysisTasks: [String: Task<VideoFrameInterpolationDecision, Never>] = [:]
-    private var frameInterpolatedPlaybackURLByScreen: [String: URL] = [:]
     /// 延迟释放的工作项，用于取消上一次未执行的清理，避免快速切换时多组 AVPlayer 并发驻留
     private var pendingPlayerCleanups: [DispatchWorkItem] = []
     private var pendingWindowCleanups: [DispatchWorkItem] = []
@@ -201,14 +197,6 @@ final class VideoWallpaperManager: ObservableObject {
 
     private var autoRemoveVideoLetterboxEnabled: Bool {
         UserDefaults.standard.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
-    }
-
-    private var frameInterpolationEnabled: Bool {
-        UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
-    }
-
-    private func frameInterpolationTargetFPS(for screen: NSScreen?) -> Int {
-        FrameInterpolationTargetFPSResolver.targetFPS(for: screen)
     }
 
     /// 动态锁屏启用后，任何静态 poster 写入都会通过 macOS 桌面壁纸接口覆盖用户手动选择的锁屏实例。
@@ -438,7 +426,7 @@ final class VideoWallpaperManager: ObservableObject {
     /// 队列只报告文件被原地替换；播放器在这里确认该路径仍属于当前屏幕后才刷新。
     @objc private func handleVideoOptimizationFileReplacement(_ notification: Notification) {
         guard let videoURL = notification.object as? URL else { return }
-        reloadPlaybackAfterInPlaceInterpolation(videoURL: videoURL)
+        reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
     }
 
     @MainActor
@@ -882,7 +870,6 @@ final class VideoWallpaperManager: ObservableObject {
         if let targetScreen {
             let screenID = targetScreen.wallpaperScreenIdentifier
             resetVideoLetterboxState(for: screenID)
-            resetFrameInterpolationState(for: screenID)
             posterURLByScreen[screenID] = posterURL
             posterURLByScreenFingerprint[targetScreen.wallpaperScreenFingerprint] = posterURL
             videoURLByScreen[screenID] = localFileURL
@@ -891,7 +878,6 @@ final class VideoWallpaperManager: ObservableObject {
             for screen in NSScreen.screens {
                 let screenID = screen.wallpaperScreenIdentifier
                 resetVideoLetterboxState(for: screenID)
-                resetFrameInterpolationState(for: screenID)
                 posterURLByScreen[screenID] = posterURL
                 posterURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = posterURL
                 videoURLByScreen[screenID] = localFileURL
@@ -1108,33 +1094,6 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
-    func refreshFrameInterpolationSettings() {
-        for task in frameInterpolationAnalysisTasks.values { task.cancel() }
-        frameInterpolationAnalysisTasks.removeAll()
-        frameInterpolationDecisionsByScreen.removeAll()
-
-        for screen in activeScreens {
-            let screenID = screen.wallpaperScreenIdentifier
-            guard let window = windows[screenID],
-                  let containerView = window.contentView as? WallpaperVideoContainerView,
-                  let player = players[screenID],
-                  let item = player.currentItem,
-                  let videoURL = videoURLByScreen[screenID]
-                    ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
-                    ?? currentVideoURL else {
-                continue
-            }
-            prepareFrameInterpolation(
-                screenID: screenID,
-                screen: screen,
-                videoURL: videoURL,
-                player: player,
-                item: item,
-                containerView: containerView
-            )
-        }
-    }
-
     @objc private func handleCropDidChange(_ note: Notification) {
         guard let screenID = note.userInfo?["screenID"] as? String,
               let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else { return }
@@ -1207,122 +1166,11 @@ final class VideoWallpaperManager: ObservableObject {
         return "\(url.standardizedFileURL.path)|\(size)|\(modified)"
     }
 
-    private func prepareFrameInterpolation(
-        screenID: String,
-        screen: NSScreen,
-        videoURL: URL,
-        player: AVQueuePlayer,
-        item: AVPlayerItem,
-        containerView: WallpaperVideoContainerView
-    ) {
-        let targetFPS = frameInterpolationTargetFPS(for: screen)
-        guard frameInterpolationEnabled else {
-            if frameInterpolatedPlaybackURLByScreen[screenID] != nil {
-                frameInterpolationDebugPrint("设置已关闭：当前视频补帧状态已重置。视频：\(videoURL.path)")
-                replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
-            } else {
-                resetFrameInterpolation(for: screenID, player: player, item: item)
-            }
-            frameInterpolationDebugPrint("设置未开启：跳过补帧。视频：\(videoURL.path)")
-            return
-        }
-        guard targetFPS > 0 else {
-            resetFrameInterpolation(for: screenID, player: player, item: item)
-            frameInterpolationDebugPrint("目标 FPS 无效：跳过补帧。目标 FPS：\(targetFPS)，视频：\(videoURL.path)")
-            return
-        }
-
-        if let record = VideoOptimizationQueueService.shared.completedRecord(videoURL: videoURL, satisfying: targetFPS) {
-            resetFrameInterpolation(for: screenID, player: player, item: item)
-            frameInterpolationDebugPrint("已有补帧完成记录覆盖当前目标 FPS：记录 FPS=\(record.targetFPS)，目标 FPS=\(targetFPS)，跳过补帧。视频：\(videoURL.path)")
-            return
-        }
-
-        if let activeTargetFPS = VideoOptimizationQueueService.shared.activeInterpolationTargetFPS(videoURL: videoURL),
-           activeTargetFPS >= targetFPS {
-            frameInterpolationDebugPrint("已有补帧任务覆盖当前目标 FPS：任务 FPS=\(activeTargetFPS)，目标 FPS=\(targetFPS)，跳过重复分析。视频：\(videoURL.path)")
-            return
-        }
-
-        let targetMode = "固定档位"
-        frameInterpolationDebugPrint("开始准备补帧：目标 FPS=\(targetFPS)，模式=\(targetMode)，屏幕=\(screen.localizedName)，视频：\(videoURL.path)")
-
-        guard frameInterpolationAnalysisTasks[screenID] == nil else {
-            frameInterpolationDebugPrint("FPS 分析已在进行中：本次不重复启动。")
-            return
-        }
-
-        frameInterpolationDebugPrint("后台读取视频原始 FPS...")
-        let task = Task.detached(priority: .utility) {
-            await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: targetFPS)
-        }
-        frameInterpolationAnalysisTasks[screenID] = task
-
-        Task { @MainActor [weak self, weak player, weak item, weak containerView] in
-            let decision = await task.value
-            guard let self else { return }
-            self.frameInterpolationAnalysisTasks.removeValue(forKey: screenID)
-
-            let currentScreen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID })
-            let currentVideoURL = self.videoURLByScreen[screenID]
-                ?? currentScreen.flatMap { self.videoURLByScreenFingerprint[$0.wallpaperScreenFingerprint] }
-                ?? self.currentVideoURL
-            guard currentVideoURL?.standardizedFileURL == videoURL.standardizedFileURL,
-                  let player,
-                  let item,
-                  let containerView else {
-                return
-            }
-            self.applyFrameInterpolationDecision(
-                decision,
-                screenID: screenID,
-                videoURL: videoURL,
-                player: player,
-                item: item,
-                containerView: containerView
-            )
-        }
-    }
-
-    private func applyFrameInterpolationDecision(
-        _ decision: VideoFrameInterpolationDecision,
-        screenID: String,
-        videoURL: URL,
-        player: AVQueuePlayer,
-        item: AVPlayerItem,
-        containerView: WallpaperVideoContainerView
-    ) {
-        frameInterpolationDecisionsByScreen[screenID] = decision
-        let sourceFPS = decision.sourceFPS.map { String(format: "%.2f", $0) } ?? "未知"
-        frameInterpolationDebugPrint("FPS 分析完成：原始 FPS=\(sourceFPS)，目标 FPS=\(decision.targetFPS)，是否需要补帧=\(decision.shouldInterpolate ? "是" : "否")，原因：\(decision.reason)")
-
-        guard decision.shouldInterpolate else {
-            if decision.reason.contains("已达到或高于目标 FPS"),
-               VideoOptimizationQueueService.shared.completedRecord(videoURL: videoURL) != nil {
-                VideoOptimizationQueueService.shared.markCompleted(
-                    videoURL: videoURL,
-                    title: videoURL.deletingPathExtension().lastPathComponent,
-                    targetFPS: decision.targetFPS
-                )
-                frameInterpolationDebugPrint("当前文件已满足目标 FPS：已修复补帧完成记录。目标 FPS=\(decision.targetFPS)，视频：\(videoURL.path)")
-            }
-            resetFrameInterpolation(for: screenID, player: player, item: item)
-            return
-        }
-
-        // 禁止任何自动补帧：调度/设壁纸只读现成资源。
-        // 补帧只能由用户在队列里手动添加；完成后由队列原地替换源文件，
-        // 若当前仍在播该路径，再统一走 reloadPlaybackAfterInPlaceInterpolation。
-        frameInterpolationDebugPrint("视频需要补帧：已禁用自动入队，继续播放原资源。视频=\(videoURL.lastPathComponent)")
-        resetFrameInterpolation(for: screenID, player: player, item: item)
-    }
-
-    private func replacePlayerWithInterpolatedVideoIfNeeded(screenID: String, sourceURL: URL, outputURL: URL) {
-        guard frameInterpolationEnabled,
-              frameInterpolatedPlaybackURLByScreen[screenID]?.standardizedFileURL != outputURL.standardizedFileURL,
-              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+    private func reloadPlayerAfterOptimizedFileReplacement(screenID: String, sourceURL: URL, outputURL: URL) {
+        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
               windows[screenID] != nil,
-              videoURLByScreen[screenID]?.standardizedFileURL == sourceURL.standardizedFileURL,
+              (videoURLByScreen[screenID]
+                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint])?.standardizedFileURL == sourceURL.standardizedFileURL,
               let window = windows[screenID],
               let containerView = window.contentView as? WallpaperVideoContainerView else {
             return
@@ -1348,7 +1196,6 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         players[screenID] = components.player
-        frameInterpolatedPlaybackURLByScreen[screenID] = outputURL
         containerView.playerLayer.player = components.player
         containerView.playerLayer.videoGravity = .resizeAspectFill
         applyCropToScreen(screen)
@@ -1368,25 +1215,10 @@ final class VideoWallpaperManager: ObservableObject {
             oldPlayer.removeAllItems()
             retainPlayersTemporarily([oldPlayer])
         }
-        frameInterpolationDebugPrint("播放器已刷新：补帧源视频=\(sourceURL.lastPathComponent)，播放文件=\(outputURL.lastPathComponent)")
+        frameInterpolationDebugPrint("播放器已刷新优化后的视频：源=\(sourceURL.lastPathComponent)，播放=\(outputURL.lastPathComponent)")
     }
 
-    func restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: URL, targetFPSs: Set<Int>) {
-        for screen in NSScreen.screens {
-            let screenID = screen.wallpaperScreenIdentifier
-            let currentSourceURL = videoURLByScreen[screenID]
-                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
-                ?? currentVideoURL
-            guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL,
-                  targetFPSs.contains(frameInterpolationTargetFPS(for: screen)),
-                  frameInterpolatedPlaybackURLByScreen[screenID] != nil else {
-                continue
-            }
-            replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
-        }
-    }
-
-    func reloadPlaybackAfterInPlaceInterpolation(videoURL: URL) {
+    func restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: URL, targetFPSs _: Set<Int>) {
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
             let currentSourceURL = videoURLByScreen[screenID]
@@ -1395,7 +1227,20 @@ final class VideoWallpaperManager: ObservableObject {
             guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL else {
                 continue
             }
-            replacePlayerWithInterpolatedVideoIfNeeded(screenID: screenID, sourceURL: videoURL, outputURL: videoURL)
+            replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
+        }
+    }
+
+    func reloadPlaybackAfterInPlaceOptimization(videoURL: URL) {
+        for screen in NSScreen.screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            let currentSourceURL = videoURLByScreen[screenID]
+                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
+                ?? currentVideoURL
+            guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL else {
+                continue
+            }
+            reloadPlayerAfterOptimizedFileReplacement(screenID: screenID, sourceURL: videoURL, outputURL: videoURL)
         }
     }
 
@@ -1426,7 +1271,6 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         players[screenID] = components.player
-        frameInterpolatedPlaybackURLByScreen.removeValue(forKey: screenID)
         containerView.playerLayer.player = components.player
         containerView.playerLayer.videoGravity = .resizeAspectFill
         applyCropToScreen(screen)
@@ -1449,38 +1293,16 @@ final class VideoWallpaperManager: ObservableObject {
         frameInterpolationDebugPrint("删除补帧后已切回原视频：屏幕=\(screen.localizedName)，视频=\(sourceURL.lastPathComponent)")
     }
 
-    private func resetFrameInterpolation(for screenID: String, player: AVQueuePlayer, item: AVPlayerItem) {
-        frameInterpolatedPlaybackURLByScreen.removeValue(forKey: screenID)
-        item.videoComposition = nil
-        for queuedItem in player.items() {
-            queuedItem.videoComposition = nil
-        }
-    }
-
     private func clearVideoLetterboxState() {
         for task in videoLetterboxAnalysisTasks.values { task.cancel() }
         videoLetterboxAnalysisTasks.removeAll()
         videoLetterboxContentCrops.removeAll()
     }
 
-    private func clearFrameInterpolationState() {
-        for task in frameInterpolationAnalysisTasks.values { task.cancel() }
-        frameInterpolationAnalysisTasks.removeAll()
-        frameInterpolationDecisionsByScreen.removeAll()
-        frameInterpolatedPlaybackURLByScreen.removeAll()
-    }
-
     private func resetVideoLetterboxState(for screenID: String) {
         videoLetterboxAnalysisTasks[screenID]?.cancel()
         videoLetterboxAnalysisTasks.removeValue(forKey: screenID)
         videoLetterboxContentCrops.removeValue(forKey: screenID)
-    }
-
-    private func resetFrameInterpolationState(for screenID: String) {
-        frameInterpolationAnalysisTasks[screenID]?.cancel()
-        frameInterpolationAnalysisTasks.removeValue(forKey: screenID)
-        frameInterpolationDecisionsByScreen.removeValue(forKey: screenID)
-        frameInterpolatedPlaybackURLByScreen.removeValue(forKey: screenID)
     }
 
     /// 检测指定屏幕当前是否处于暂停状态。
@@ -1698,7 +1520,6 @@ final class VideoWallpaperManager: ObservableObject {
         loopers.removeAll()
         videoSizes.removeAll()
         clearVideoLetterboxState()
-        clearFrameInterpolationState()
         lastAppliedScreenConfigurations.removeAll()
     }
 
@@ -1746,14 +1567,13 @@ final class VideoWallpaperManager: ObservableObject {
         let screenID = targetScreen.wallpaperScreenIdentifier
         let screenFingerprint = targetScreen.wallpaperScreenFingerprint
 
-        // 取消该屏尚未应用的切换队列、poster 任务与补帧任务，避免 stop 后异步回调把视频窗重建回来。
+        // 取消该屏尚未应用的切换队列和 poster 任务，避免 stop 后异步回调把视频窗重建回来。
         pendingDisplaySwitches.removeValue(forKey: screenID)
         if activeDisplaySwitchScreenID == screenID {
             releaseDisplaySwitchGate(screenID: screenID, reason: "stopNativeOnly")
         }
         posterTasks[screenID]?.cancel()
         posterTasks.removeValue(forKey: screenID)
-        resetFrameInterpolationState(for: screenID)
 
         // 兼容 screenID 变化：按 fingerprint 找回旧 key 上的窗口/播放器。
         let windowKey = windows[screenID] != nil
@@ -1902,7 +1722,6 @@ final class VideoWallpaperManager: ObservableObject {
         videoLetterboxContentCrops.removeValue(forKey: screenID)
         videoLetterboxAnalysisTasks[screenID]?.cancel()
         videoLetterboxAnalysisTasks.removeValue(forKey: screenID)
-        resetFrameInterpolationState(for: screenID)
         pendingDisplaySwitches.removeValue(forKey: screenID)
         if activeDisplaySwitchScreenID == screenID {
             releaseDisplaySwitchGate(screenID: screenID, reason: "teardownWindow")
@@ -2384,7 +2203,6 @@ final class VideoWallpaperManager: ObservableObject {
                 for screen in NSScreen.screens {
                     let screenID = screen.wallpaperScreenIdentifier
                     resetVideoLetterboxState(for: screenID)
-                    resetFrameInterpolationState(for: screenID)
                     videoURLByScreen[screenID] = url
                     videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = url
                     posterURLByScreen[screenID] = globalPosterURL
@@ -2917,14 +2735,6 @@ final class VideoWallpaperManager: ObservableObject {
                     self.hidePosterImage(for: targetScreenID)
                     self.applyCropToScreen(targetScreen)
                     self.scheduleVideoLetterboxAnalysis(screenID: targetScreenID, videoURL: videoURL)
-                    self.prepareFrameInterpolation(
-                        screenID: targetScreenID,
-                        screen: targetScreen,
-                        videoURL: videoURL,
-                        player: components.player,
-                        item: components.item,
-                        containerView: containerView
-                    )
 
                     if let oldLooper {
                         oldLooper.disableLooping()
@@ -3238,14 +3048,6 @@ final class VideoWallpaperManager: ObservableObject {
         players[screenID] = components.player
         applyCropToScreen(screen)
         scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: videoURL)
-        prepareFrameInterpolation(
-            screenID: screenID,
-            screen: screen,
-            videoURL: videoURL,
-            player: components.player,
-            item: components.item,
-            containerView: containerView
-        )
 
         // 先隐藏窗口，等视频首帧就绪后再淡入，避免启动时闪黑
         window.alphaValue = 0
@@ -3414,7 +3216,6 @@ final class VideoWallpaperManager: ObservableObject {
         players.removeAll()
         videoSizes.removeAll()
         clearVideoLetterboxState()
-        clearFrameInterpolationState()
 
         // 延迟释放 player，让 MediaToolbox 后台线程完成 FigNotificationCenter 清理。
         // 延迟完成后必须移除 work item，否则闭包会继续持有旧 player。

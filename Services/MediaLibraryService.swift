@@ -178,13 +178,6 @@ final class MediaLibraryService: ObservableObject {
         downloadRecords.first { $0.localFilePath == path && $0.isActive }
     }
 
-    func markAsLooped(localFilePath path: String) {
-        guard let index = downloadRecords.firstIndex(where: { $0.localFilePath == path }) else { return }
-        downloadRecords[index].isLooped = true
-        saveDlToCache(downloadRecords[index])
-        syncDlIndex()
-    }
-
     func isDownloaded(_ item: MediaItem) -> Bool {
         // ⚡ 先通过 Set 快速判断（O(1)），再通过字典索引 O(1) 获取记录
         guard downloadIDSet.contains(item.id),
@@ -258,7 +251,7 @@ final class MediaLibraryService: ObservableObject {
         SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
 
         // 视频文件下载完成后异步生成抽帧，供封面展示使用；
-        // 若开启「下载时自动补帧」，再入队离线补帧（不走调度/设壁纸路径）。
+        // 自动循环分析与补帧由统一优化队列按当前策略串行处理（不走调度/设壁纸路径）。
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
         let videoFileURL: URL? = if videoExts.contains(localFileURL.pathExtension.lowercased()) {
             localFileURL
@@ -270,6 +263,10 @@ final class MediaLibraryService: ObservableObject {
             let title = item.title
             Task { @MainActor in
                 _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL)
+                VideoOptimizationQueueService.shared.registerDownloadedSource(
+                    videoURL: videoFileURL,
+                    sourceURL: item.pageURL
+                )
                 VideoOptimizationQueueService.shared.enqueueAfterDownloadIfNeeded(
                     videoURL: videoFileURL,
                     title: title
@@ -852,13 +849,16 @@ final class MediaLibraryService: ObservableObject {
 
         // 1. 删除烘焙视频文件（如果存在）
         if let artifact = record.sceneBakeArtifact,
-           !artifact.videoPath.isEmpty,
-           fm.fileExists(atPath: artifact.videoPath) {
-            do {
-                try fm.removeItem(atPath: artifact.videoPath)
-                print("[MediaLibraryService] ✅ Deleted scene bake video: \(artifact.videoPath)")
-            } catch {
-                print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(artifact.videoPath): \(error)")
+           !artifact.videoPath.isEmpty {
+            let videoURL = URL(fileURLWithPath: artifact.videoPath)
+            VideoOptimizationRecordStore.shared.reset(for: videoURL)
+            if fm.fileExists(atPath: artifact.videoPath) {
+                do {
+                    try fm.removeItem(atPath: artifact.videoPath)
+                    print("[MediaLibraryService] ✅ Deleted scene bake video: \(artifact.videoPath)")
+                } catch {
+                    print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(artifact.videoPath): \(error)")
+                }
             }
         }
         // 2. 删除该 item 对应的烘焙目录（清理空目录或残留文件）
@@ -1503,13 +1503,6 @@ final class WallpaperLibraryService: ObservableObject {
         return downloadRecords.first { record in
             record.isActive && record.wallpaper.path == urlString
         }
-    }
-
-    func markAsLooped(localFilePath path: String) {
-        guard let index = downloadRecords.firstIndex(where: { $0.localFilePath == path }) else { return }
-        downloadRecords[index].isLooped = true
-        saveDlToCache(downloadRecords[index])
-        syncDlIndex()
     }
 
     func isDownloaded(_ wallpaper: Wallpaper) -> Bool {

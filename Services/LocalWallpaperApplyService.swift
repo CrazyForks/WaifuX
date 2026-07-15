@@ -66,6 +66,7 @@ enum LocalWallpaperApplyService {
         // 1) 直接视频文件
         if !isDirectory.boolValue, videoExts.contains(ext) {
             try await applyVideo(localURL, to: screens, options: options)
+            VideoOptimizationAutomationService.considerAppliedVideo(localURL)
             return true
         }
 
@@ -88,6 +89,7 @@ enum LocalWallpaperApplyService {
         case .video:
             if let videoURL = findVideoFile(in: contentRoot) {
                 try await applyVideo(videoURL, to: screens, options: options)
+                VideoOptimizationAutomationService.considerAppliedVideo(videoURL)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }
@@ -112,6 +114,7 @@ enum LocalWallpaperApplyService {
                     return true
                 }
                 try await applyVideo(bakedURL, to: screens, options: options)
+                VideoOptimizationAutomationService.considerAppliedBakedVideo(bakedURL)
                 return true
             }
             // 无烘焙：不在此阻塞长烘焙。
@@ -140,10 +143,12 @@ enum LocalWallpaperApplyService {
         case .unknown:
             if let videoURL = findVideoFile(in: contentRoot) {
                 try await applyVideo(videoURL, to: screens, options: options)
+                VideoOptimizationAutomationService.considerAppliedVideo(videoURL)
                 return true
             }
             if let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
                 try await applyVideo(bakedURL, to: screens, options: options)
+                VideoOptimizationAutomationService.considerAppliedBakedVideo(bakedURL)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }

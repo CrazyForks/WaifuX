@@ -136,25 +136,40 @@ struct FrameInterpolationQueueItem: Identifiable, Equatable {
 
 typealias VideoOptimizationQueueItem = FrameInterpolationQueueItem
 
-struct VideoOptimizationHistoryRecord: Identifiable, Equatable, Codable {
-    enum Outcome: String, Codable {
-        case completed
-        case failed
-        case cancelled
+/// The settings-derived policy used when a downloaded or newly applied local
+/// video is considered for automatic optimization. Manual requests always pass
+/// their requested operations explicitly.
+struct VideoOptimizationAutomaticPolicy: Equatable {
+    var loopAnalysisEnabled: Bool
+    var automaticallyAnalyzeLoopPoints: Bool
+    var frameInterpolationEnabled: Bool
+    var automaticallyInterpolateFrames: Bool
+    var targetFPS: Int
+
+    static let disabled = VideoOptimizationAutomaticPolicy(
+        loopAnalysisEnabled: false,
+        automaticallyAnalyzeLoopPoints: false,
+        frameInterpolationEnabled: false,
+        automaticallyInterpolateFrames: false,
+        targetFPS: 60
+    )
+
+    var operations: [FrameInterpolationQueueItem.Operation] {
+        var operations: [FrameInterpolationQueueItem.Operation] = []
+        if loopAnalysisEnabled && automaticallyAnalyzeLoopPoints {
+            operations.append(.loopAnalysis)
+        }
+        if frameInterpolationEnabled && automaticallyInterpolateFrames {
+            operations.append(.frameInterpolation)
+        }
+        return operations
     }
+}
 
-    let id: UUID
-    let videoPath: String
-    let title: String
-    let targetFPS: Int
-    let source: FrameInterpolationQueueItem.Source
-    let operations: [FrameInterpolationQueueItem.Operation]
-    let completedOperations: [FrameInterpolationQueueItem.Operation]
-    let outcome: Outcome
-    let message: String?
-    let completedAt: Date
-
-    var videoURL: URL { URL(fileURLWithPath: videoPath) }
+private enum VideoOptimizationQueueOutcome: String {
+    case completed
+    case failed
+    case cancelled
 }
 
 struct FrameInterpolationExportProgress: Sendable {
@@ -183,51 +198,47 @@ struct FrameInterpolationRecordItem: Identifiable, Equatable, Codable {
 final class VideoOptimizationQueueService: ObservableObject {
     static let shared = VideoOptimizationQueueService()
 
-    @Published private(set) var items: [FrameInterpolationQueueItem] = []
-    @Published private(set) var completedInterpolationItems: [FrameInterpolationRecordItem] = []
-    @Published private(set) var blacklistedInterpolationItems: [FrameInterpolationRecordItem] = []
-    @Published private(set) var history: [VideoOptimizationHistoryRecord] = []
-    /// 下载完成时是否自动入队补帧（调度/设壁纸路径禁止使用）。
-    @Published var autoInterpolateOnDownload: Bool {
-        didSet {
-            UserDefaults.standard.set(autoInterpolateOnDownload, forKey: Self.autoOnDownloadKey)
-        }
+    @Published private(set) var items: [FrameInterpolationQueueItem] = [] {
+        didSet { scheduleQueueCheckpointSave() }
     }
-
-    /// 兼容旧设置页绑定名；映射到「下载时自动补帧」。
-    @Published var autoEnqueueEnabled: Bool {
-        didSet {
-            if autoEnqueueEnabled != autoInterpolateOnDownload {
-                autoInterpolateOnDownload = autoEnqueueEnabled
-            }
-        }
-    }
+    @Published private(set) var automaticPolicy = VideoOptimizationAutomaticPolicy.disabled
 
     private var runningTasks: [UUID: Task<Void, Never>] = [:]
     private var heartbeatTasks: [UUID: Task<Void, Never>] = [:]
     private var taskStartDates: [UUID: Date] = [:]
-    private var interpolationRecordsLoaded = false
-    private var historyLoaded = false
-
-    private static let completedInterpolationRecordsKey = "frame_interpolation_completed_records_v1"
-    private static let blacklistedInterpolationRecordsKey = "frame_interpolation_blacklist_records_v1"
-    private static let autoOnDownloadKey = "frame_interpolation_auto_on_download"
-    private static let legacyAutoEnqueueKey = "frame_interpolation_auto_enqueue"
-    private static let historyKey = "video_optimization_history_v1"
+    /// A source restore is unfinished pipeline work. It is checkpointed with
+    /// the active queue until the resumed download writes its new sidecar.
+    private var sourceRestoreRequests: [String: VideoOptimizationQueueCheckpointStore.SourceRestoreRequest] = [:]
+    private var automaticPolicyLoaded = false
+    private var didMigrateLegacyTerminalState = false
+    private var queueCheckpointSaveTask: Task<Void, Never>?
 
     private init() {
-        // 不在单例初始化阶段读取 UserDefaults。macOS 26+ 上启动早期读偏好设置
-        // 可能触发 _CFXPreferences 递归；真实设置由 SettingsViewModel 延迟恢复后同步过来。
-        self.autoInterpolateOnDownload = false
-        self.autoEnqueueEnabled = false
+        let restoredState = VideoOptimizationQueueCheckpointStore.load()
+        items = restoredState.items
+        sourceRestoreRequests = Dictionary(
+            uniqueKeysWithValues: restoredState.sourceRestoreRequests.map { ($0.videoPath, $0) }
+        )
+        Task { @MainActor [weak self] in
+            self?.scheduleNext()
+        }
     }
 
     /// 由设置页恢复偏好后调用。
-    func applySettings(autoOnDownload: Bool) {
-        autoInterpolateOnDownload = autoOnDownload
-        autoEnqueueEnabled = autoOnDownload
-        // 清理旧的「切换壁纸时自动补帧」开关，避免再被读回。
-        UserDefaults.standard.set(false, forKey: Self.legacyAutoEnqueueKey)
+    func applySettings(automaticPolicy: VideoOptimizationAutomaticPolicy) {
+        self.automaticPolicy = automaticPolicy
+        automaticPolicyLoaded = true
+        migrateLegacyTerminalStateIfNeeded()
+    }
+
+    var isLoopAnalysisEnabled: Bool {
+        ensureAutomaticPolicyLoaded()
+        return automaticPolicy.loopAnalysisEnabled
+    }
+
+    var isFrameInterpolationEnabled: Bool {
+        ensureAutomaticPolicyLoaded()
+        return automaticPolicy.frameInterpolationEnabled
     }
 
     /// 将单个视频加入循环分析任务。若同一文件已有待处理任务，返回原任务 id。
@@ -260,6 +271,25 @@ final class VideoOptimizationQueueService: ObservableObject {
             targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             source: source,
             operations: [.loopAnalysis, .frameInterpolation]
+        )
+    }
+
+    /// Explicit interpolation is intentionally independent from loop analysis.
+    /// The combined API above is reserved for automatic and full re-optimization
+    /// flows which require a strict loop-analysis-then-interpolation sequence.
+    @discardableResult
+    func enqueueFrameInterpolation(
+        videoURL: URL,
+        title: String? = nil,
+        targetFPS: Int? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> UUID? {
+        enqueue(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+            source: source,
+            operations: [.frameInterpolation]
         )
     }
 
@@ -337,17 +367,87 @@ final class VideoOptimizationQueueService: ObservableObject {
         return videoURL
     }
 
-    /// 下载完成后按设置决定是否入队补帧。调度/设壁纸路径不得调用。
+    /// 下载完成后按设置决定是否入队。调度/设壁纸路径不得调用。
+    /// 同一文件永远由单一队列任务串行执行“循环分析 -> 补帧”。
     @discardableResult
     func enqueueAfterDownloadIfNeeded(
         videoURL: URL,
         title: String? = nil
     ) -> UUID? {
-        let defaults = UserDefaults.standard
-        let enabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
-        let onDownload = autoInterpolateOnDownload
-            || (defaults.object(forKey: Self.autoOnDownloadKey) as? Bool ?? false)
-        guard enabled, onDownload else { return nil }
+        let path = videoURL.standardizedFileURL.path
+        if let request = sourceRestoreRequests.removeValue(forKey: path) {
+            persistQueueCheckpointImmediately()
+            if let operation = request.blacklistOperation {
+                VideoOptimizationRecordStore.shared.markBlacklisted(
+                    operation,
+                    for: videoURL,
+                    title: request.title ?? title ?? videoURL.deletingPathExtension().lastPathComponent,
+                    targetFPS: request.targetFPS
+                )
+                return nil
+            } else {
+                return enqueue(
+                    videoURL: videoURL,
+                    title: request.title ?? title,
+                    targetFPS: request.targetFPS,
+                    source: .manual,
+                    operations: request.operations
+                )
+            }
+        }
+        return enqueueAutomaticOptimizationIfNeeded(videoURL: videoURL, title: title)
+    }
+
+    /// Defers a manual action until the original source has been downloaded.
+    /// It prevents the automatic policy from racing the requested pipeline.
+    func requestAfterSourceRestore(
+        videoURL: URL,
+        title: String? = nil,
+        operations: [FrameInterpolationQueueItem.Operation]
+    ) {
+        sourceRestoreRequests[videoURL.standardizedFileURL.path] = .enqueue(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+            operations: normalizedOperations(operations)
+        )
+        persistQueueCheckpointImmediately()
+    }
+
+    /// A blacklist always applies to a fresh source file. The caller restores
+    /// the original download first, then the terminal blacklist is written to
+    /// that new file's adjacent sidecar instead of an in-memory flag.
+    func requestBlacklistAfterSourceRestore(
+        videoURL: URL,
+        title: String? = nil,
+        operation: FrameInterpolationQueueItem.Operation
+    ) {
+        sourceRestoreRequests[videoURL.standardizedFileURL.path] = .blacklist(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+            operation: operation
+        )
+        persistQueueCheckpointImmediately()
+    }
+
+    func cancelSourceRestoreRequest(videoURL: URL) {
+        sourceRestoreRequests.removeValue(forKey: videoURL.standardizedFileURL.path)
+        persistQueueCheckpointImmediately()
+    }
+
+    /// Applies the persisted automatic policy to a local source video. Download
+    /// completion, Scene bake completion, and a successful video application
+    /// share this API; callers must not enumerate, replace, or refresh playback.
+    @discardableResult
+    func enqueueAutomaticOptimizationIfNeeded(
+        videoURL: URL,
+        title: String? = nil
+    ) -> UUID? {
+        ensureAutomaticPolicyLoaded()
+        let policy = automaticPolicy
+        var operations = policy.operations
+        guard !operations.isEmpty else { return nil }
         guard videoURL.isFileURL,
               FileManager.default.fileExists(atPath: videoURL.path) else {
             return nil
@@ -355,18 +455,55 @@ final class VideoOptimizationQueueService: ObservableObject {
         let ext = videoURL.pathExtension.lowercased()
         guard ["mp4", "mov", "m4v", "mkv"].contains(ext) else { return nil }
 
-        let targetFPS = FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+        let targetFPS = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(policy.targetFPS)
         guard targetFPS > 0 else { return nil }
-        guard !isBlacklisted(videoURL: videoURL) else { return nil }
-        if completedRecord(videoURL: videoURL, satisfying: targetFPS) != nil { return nil }
+        operations = automaticOperationsNeedingWork(
+            operations,
+            for: videoURL,
+            targetFPS: targetFPS
+        )
+        guard !operations.isEmpty else { return nil }
 
-        frameInterpolationDebugPrint("下载完成：按设置自动入队补帧。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
+        if operations == [.frameInterpolation],
+           completedRecord(videoURL: videoURL, satisfying: targetFPS) != nil {
+            return nil
+        }
+
+        frameInterpolationDebugPrint("自动入口：按设置入队视频优化。操作=\(operations.map(\.rawValue).joined(separator: ","))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
         return enqueue(
             videoURL: videoURL,
             title: title,
             targetFPS: targetFPS,
-            source: .automatic
+            source: .automatic,
+            operations: operations
         )
+    }
+
+    /// Marks a freshly received source file as a new optimization origin.
+    /// A re-download must not inherit terminal states from the prior optimized file.
+    func registerDownloadedSource(videoURL: URL, sourceURL: URL? = nil) {
+        resetOptimizationState(videoURL: videoURL)
+        VideoOptimizationRecordStore.shared.recordDownloadedSource(for: videoURL, sourceURL: sourceURL)
+    }
+
+    /// A baked artifact is a new source only when its file path is new. Existing
+    /// artifacts retain their sidecar decisions, while their bake provenance is
+    /// refreshed from the authoritative artifact metadata.
+    func registerBakedSource(
+        videoURL: URL,
+        sourcePath: String,
+        artifact: SceneBakeArtifact
+    ) {
+        VideoOptimizationRecordStore.shared.recordBakeArtifact(
+            for: videoURL,
+            sourcePath: sourcePath,
+            artifact: artifact
+        )
+    }
+
+    @discardableResult
+    func enqueueAfterBakeIfNeeded(videoURL: URL, title: String? = nil) -> UUID? {
+        enqueueAutomaticOptimizationIfNeeded(videoURL: videoURL, title: title)
     }
 
     func hasPendingInterpolation(videoURL: URL, targetFPS: Int) -> Bool {
@@ -405,23 +542,18 @@ final class VideoOptimizationQueueService: ObservableObject {
         await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: targetFPS).shouldInterpolate
     }
 
-    func isCompleted(videoURL: URL) -> Bool {
-        ensureInterpolationRecordsLoaded()
-        let id = interpolationRecordID(for: videoURL)
-        return completedInterpolationItems.contains { $0.id == id }
-    }
-
     func completedRecord(videoURL: URL) -> FrameInterpolationRecordItem? {
-        ensureInterpolationRecordsLoaded()
-        let id = interpolationRecordID(for: videoURL)
-        return completedInterpolationItems
-            .filter { $0.id == id }
-            .max {
-                if $0.targetFPS == $1.targetFPS {
-                    return $0.recordedAt < $1.recordedAt
-                }
-                return $0.targetFPS < $1.targetFPS
-            }
+        if let event = VideoOptimizationRecordStore.shared.latestFrameEvent(for: videoURL),
+           event.kind == .frameApplied {
+            return FrameInterpolationRecordItem(
+                id: interpolationRecordID(for: videoURL),
+                videoPath: videoURL.standardizedFileURL.path,
+                title: videoURL.deletingPathExtension().lastPathComponent,
+                targetFPS: event.metadata["targetFPS"].flatMap(Int.init) ?? 0,
+                recordedAt: event.date
+            )
+        }
+        return nil
     }
 
     func completedRecord(videoURL: URL, satisfying targetFPS: Int) -> FrameInterpolationRecordItem? {
@@ -432,47 +564,71 @@ final class VideoOptimizationQueueService: ObservableObject {
         return record
     }
 
+    func isBlacklisted(videoURL: URL, operation: FrameInterpolationQueueItem.Operation) -> Bool {
+        switch operation {
+        case .loopAnalysis:
+            return VideoOptimizationRecordStore.shared.loopState(for: videoURL) == .blacklisted
+        case .frameInterpolation:
+            return VideoOptimizationRecordStore.shared.frameState(for: videoURL) == .blacklisted
+        }
+    }
+
     func isBlacklisted(videoURL: URL) -> Bool {
-        ensureInterpolationRecordsLoaded()
-        let id = interpolationRecordID(for: videoURL)
-        return blacklistedInterpolationItems.contains { $0.id == id }
+        isBlacklisted(videoURL: videoURL, operation: .frameInterpolation)
     }
 
     func markCompleted(videoURL: URL, title: String, targetFPS: Int) {
-        ensureInterpolationRecordsLoaded()
         let existingRecord = completedRecord(videoURL: videoURL)
         let effectiveTargetFPS = max(targetFPS, existingRecord?.targetFPS ?? targetFPS)
-        let effectiveTitle = title.isEmpty ? (existingRecord?.title ?? "") : title
-        let record = makeInterpolationRecord(videoURL: videoURL, title: effectiveTitle, targetFPS: effectiveTargetFPS)
-        completedInterpolationItems.removeAll { $0.id == record.id }
-        completedInterpolationItems.append(record)
-        completedInterpolationItems.sort { $0.recordedAt > $1.recordedAt }
-        blacklistedInterpolationItems.removeAll { $0.id == record.id }
-        saveInterpolationRecords()
+        VideoOptimizationRecordStore.shared.append(
+            .frameApplied,
+            for: videoURL,
+            metadata: [
+                "targetFPS": String(effectiveTargetFPS),
+                "title": title.isEmpty ? videoURL.deletingPathExtension().lastPathComponent : title,
+            ]
+        )
     }
 
-    func removeCompleted(videoURL: URL) {
-        ensureInterpolationRecordsLoaded()
-        let id = interpolationRecordID(for: videoURL)
-        completedInterpolationItems.removeAll { $0.id == id }
-        saveInterpolationRecords()
+    func markInterpolationNotNeeded(videoURL: URL, title: String, targetFPS: Int, reason: String) {
+        VideoOptimizationRecordStore.shared.append(
+            .frameNotNeeded,
+            for: videoURL,
+            detail: reason,
+            metadata: [
+                "targetFPS": String(targetFPS),
+                "title": title.isEmpty ? videoURL.deletingPathExtension().lastPathComponent : title,
+            ]
+        )
     }
 
-    func markBlacklisted(videoURL: URL, title: String, targetFPS: Int) {
-        ensureInterpolationRecordsLoaded()
-        let record = makeInterpolationRecord(videoURL: videoURL, title: title, targetFPS: targetFPS)
-        blacklistedInterpolationItems.removeAll { $0.id == record.id }
-        blacklistedInterpolationItems.append(record)
-        blacklistedInterpolationItems.sort { $0.recordedAt > $1.recordedAt }
-        completedInterpolationItems.removeAll { $0.id == record.id }
-        saveInterpolationRecords()
+    func removeBlacklisted(
+        videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation = .frameInterpolation
+    ) {
+        VideoOptimizationRecordStore.shared.removeBlacklist(operation, for: videoURL)
     }
 
-    func removeBlacklisted(videoURL: URL) {
-        ensureInterpolationRecordsLoaded()
-        let id = interpolationRecordID(for: videoURL)
-        blacklistedInterpolationItems.removeAll { $0.id == id }
-        saveInterpolationRecords()
+    /// Removes every optimization state associated with a video before it is
+    /// re-downloaded or deliberately restored to its source version.
+    func resetOptimizationState(videoURL: URL) {
+        let standardizedURL = videoURL.standardizedFileURL
+        let matchingIDs = items.compactMap { item in
+            item.videoURL.standardizedFileURL == standardizedURL ? item.id : nil
+        }
+
+        for id in matchingIDs {
+            if let task = runningTasks[id] {
+                task.cancel()
+                runningTasks[id] = nil
+            }
+            stopHeartbeat(id: id)
+            taskStartDates[id] = nil
+        }
+        items.removeAll { $0.videoURL.standardizedFileURL == standardizedURL }
+        VideoOptimizationRecordStore.shared.reset(for: standardizedURL)
+        persistQueueCheckpointImmediately()
+        scheduleNext()
     }
 
     @discardableResult
@@ -488,12 +644,10 @@ final class VideoOptimizationQueueService: ObservableObject {
               FileManager.default.fileExists(atPath: videoURL.path) else {
             return nil
         }
-        let requestedOperations = normalizedOperations(operations)
+        VideoOptimizationRecordStore.shared.recordImportedSourceIfNeeded(for: videoURL)
+        var requestedOperations = normalizedOperations(operations)
+        requestedOperations.removeAll { isBlacklisted(videoURL: videoURL, operation: $0) }
         guard !requestedOperations.isEmpty else { return nil }
-        guard !isBlacklisted(videoURL: videoURL) else {
-            frameInterpolationDebugPrint("补帧队列：视频在黑名单中，跳过添加。视频=\(videoURL.lastPathComponent)")
-            return nil
-        }
 
         if requestedOperations == [.frameInterpolation],
            let record = completedRecord(videoURL: videoURL, satisfying: targetFPS) {
@@ -516,6 +670,9 @@ final class VideoOptimizationQueueService: ObservableObject {
                 items[coveredIndex].operations = normalizedOperations(
                     items[coveredIndex].operations + requestedOperations
                 )
+                // The queued work was expanded in place, so persist it now
+                // instead of relying on the coalesced snapshot write.
+                persistQueueCheckpointImmediately()
             }
             frameInterpolationDebugPrint("补帧队列：已有任务覆盖目标 FPS，跳过重复添加。任务 FPS=\(items[coveredIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
             return items[coveredIndex].id
@@ -561,12 +718,14 @@ final class VideoOptimizationQueueService: ObservableObject {
         items.append(item)
         frameInterpolationDebugPrint("补帧队列：已添加任务。来源=\(source.rawValue)，目标 FPS=\(targetFPS)，视频=\(videoURL.path)")
         clearProgressForWaitingItems()
+        persistQueueCheckpointImmediately()
         scheduleNext()
         return id
     }
 
     private func scheduleNext() {
         clearProgressForWaitingItems()
+        persistQueueCheckpointImmediately()
         let runningCount = runningTasks.count
         let availableSlots = max(0, 1 - runningCount)
         guard availableSlots > 0 else { return }
@@ -598,7 +757,13 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].opticalFlowFrames = 0
         items[index].elapsedSeconds = 0
         items[index].remainingSeconds = nil
-        let initialOperations = items[index].operations
+        let initialOperations = items[index].operations.filter {
+            !items[index].completedOperations.contains($0)
+        }
+        guard !initialOperations.isEmpty else {
+            finishCompleted(id: id, message: nil)
+            return
+        }
         items[index].currentOperation = initialOperations.first
         items[index].currentStage = initialOperations.first == .loopAnalysis
             ? "循环分析中"
@@ -610,27 +775,50 @@ final class VideoOptimizationQueueService: ObservableObject {
 
         let task = Task.detached(priority: .utility) { [weak self] in
             if initialOperations.contains(.loopAnalysis) {
-                let loopResult = await VideoLoopPreprocessingService.shared.preprocessIfNeeded(videoURL)
+                do {
+                    let loopResult = try await VideoLoopAnalysisService.analyzeAndReplace(videoURL: videoURL) { progress in
+                        Task { @MainActor in
+                            self?.updateLoopProgress(id: id, progress: progress)
+                        }
+                    }
+                    guard !Task.isCancelled else {
+                        await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
+                        return
+                    }
 
-                guard !Task.isCancelled else {
+                    await MainActor.run {
+                        guard let self else { return }
+                        switch loopResult {
+                        case .applied(let firstContentFrame, let matchFrame):
+                            VideoOptimizationRecordStore.shared.append(
+                                .loopApplied,
+                                for: videoURL,
+                                metadata: [
+                                    "firstContentFrame": String(firstContentFrame),
+                                    "matchFrame": String(matchFrame),
+                                ]
+                            )
+                            NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)
+                        case .notNeeded:
+                            VideoOptimizationRecordStore.shared.append(.loopNotNeeded, for: videoURL)
+                        case .noReliablePoint:
+                            VideoOptimizationRecordStore.shared.append(.loopNoReliablePoint, for: videoURL)
+                        }
+                        self.markOperationCompleted(id: id, operation: .loopAnalysis)
+                    }
+                } catch is CancellationError {
                     await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
                     return
-                }
-
-                switch loopResult {
-                case .failed(let message):
-                    await MainActor.run { self?.finishFailed(id: id, message: message) }
-                    return
-                case .processed:
+                } catch {
                     await MainActor.run {
-                        NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)
+                        VideoOptimizationRecordStore.shared.append(
+                            .loopFailed,
+                            for: videoURL,
+                            detail: error.localizedDescription
+                        )
+                        self?.finishFailed(id: id, message: error.localizedDescription)
                     }
-                case .alreadyProcessed:
-                    break
-                }
-
-                await MainActor.run {
-                    self?.markOperationCompleted(id: id, operation: .loopAnalysis)
+                    return
                 }
             }
 
@@ -769,6 +957,17 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].currentStage = progress.currentStage
     }
 
+    private func updateLoopProgress(id: UUID, progress: Double) {
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              runningTasks[id] != nil,
+              items[index].currentOperation == .loopAnalysis else {
+            return
+        }
+        items[index].status = .analyzing
+        items[index].progress = min(1, max(0, progress))
+        items[index].currentStage = "循环分析中"
+    }
+
     /// 取消等待或正在执行的任务。取消不会影响同队列中的其它视频。
     func cancel(id: UUID) {
         if let task = runningTasks[id] {
@@ -778,31 +977,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         finishCancelled(id: id, reason: "任务已取消")
     }
 
-    /// 仅重试失败任务；成功和主动取消不会被隐式重新执行。
-    @discardableResult
-    func retry(historyID: UUID) -> UUID? {
-        ensureHistoryLoaded()
-        guard let record = history.first(where: { $0.id == historyID }),
-              record.outcome == .failed else {
-            return nil
-        }
-        return enqueue(
-            videoURL: record.videoURL,
-            title: record.title,
-            targetFPS: record.targetFPS,
-            source: record.source,
-            operations: record.operations
-        )
-    }
-
     func item(for videoURL: URL) -> VideoOptimizationQueueItem? {
         items.first { $0.videoURL.standardizedFileURL == videoURL.standardizedFileURL }
-    }
-
-    func history(for videoURL: URL) -> [VideoOptimizationHistoryRecord] {
-        ensureHistoryLoaded()
-        let path = videoURL.standardizedFileURL.path
-        return history.filter { $0.videoPath == path }
     }
 
     private func clearProgressForWaitingItems() {
@@ -831,15 +1007,22 @@ final class VideoOptimizationQueueService: ObservableObject {
             let videoURL = items[index].videoURL
             let title = items[index].title
             let targetFPS = items[index].targetFPS
-            let shouldRepairCompletedRecord = completedRecord(videoURL: videoURL) != nil
+            let shouldKeepCompletedState = completedRecord(videoURL: videoURL) != nil
                 && reason.contains("已达到或高于目标 FPS")
             items[index].status = .completed
             items[index].progress = 1
             items[index].completedOperations.insert(.frameInterpolation)
             let completedItem = items.remove(at: index)
-            if shouldRepairCompletedRecord {
+            if shouldKeepCompletedState {
                 markCompleted(videoURL: videoURL, title: title, targetFPS: targetFPS)
                 frameInterpolationDebugPrint("补帧队列：本地文件已满足目标 FPS，已修复完成记录。目标 FPS=\(targetFPS)，视频=\(videoName)")
+            } else {
+                VideoOptimizationRecordStore.shared.append(
+                    .frameNotNeeded,
+                    for: videoURL,
+                    detail: reason,
+                    metadata: ["targetFPS": String(targetFPS)]
+                )
             }
             archive(completedItem, outcome: .completed, message: reason)
             frameInterpolationDebugPrint("补帧队列：无需补帧，任务已移除。原因=\(reason)，视频=\(videoName)")
@@ -882,6 +1065,12 @@ final class VideoOptimizationQueueService: ObservableObject {
         } else {
             items[index].status = .failed("optical-flow 导出失败")
             let failedItem = items.remove(at: index)
+            VideoOptimizationRecordStore.shared.append(
+                .frameFailed,
+                for: sourceURL,
+                detail: "optical-flow 导出失败",
+                metadata: ["targetFPS": String(failedItem.targetFPS)]
+            )
             archive(failedItem, outcome: .failed, message: "optical-flow 导出失败")
             frameInterpolationDebugPrint("补帧队列：任务失败。视频=\(sourceURL.lastPathComponent)")
         }
@@ -893,6 +1082,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].completedOperations.insert(operation)
         items[index].currentOperation = nil
         items[index].progress = operation == .loopAnalysis ? 0.08 : items[index].progress
+        persistQueueCheckpointImmediately()
     }
 
     private func finishCompleted(id: UUID, message: String?) {
@@ -918,13 +1108,71 @@ final class VideoOptimizationQueueService: ObservableObject {
         }
         var item = items.remove(at: index)
         item.status = .failed(message)
+        if item.currentOperation == .frameInterpolation {
+            VideoOptimizationRecordStore.shared.append(.frameFailed, for: item.videoURL, detail: message)
+        }
         archive(item, outcome: .failed, message: message)
         frameInterpolationDebugPrint("视频优化队列：任务失败。原因=\(message)，视频=\(item.videoURL.lastPathComponent)")
         scheduleNext()
     }
 
+    /// Queue checkpoints are deliberately short-lived. A restart can resume
+    /// remaining operations, while a completed, failed, or cancelled item is
+    /// removed from this file and leaves only its terminal sidecar outcome.
+    private func scheduleQueueCheckpointSave() {
+        queueCheckpointSaveTask?.cancel()
+        let itemSnapshot = items
+        let sourceRestoreSnapshot = Array(sourceRestoreRequests.values)
+        queueCheckpointSaveTask = Task { [itemSnapshot, sourceRestoreSnapshot] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            VideoOptimizationQueueCheckpointStore.save(
+                itemSnapshot,
+                sourceRestoreRequests: sourceRestoreSnapshot
+            )
+        }
+    }
+
+    private func persistQueueCheckpointImmediately() {
+        queueCheckpointSaveTask?.cancel()
+        VideoOptimizationQueueCheckpointStore.save(
+            items,
+            sourceRestoreRequests: Array(sourceRestoreRequests.values)
+        )
+    }
+
     private func normalizedOperations(_ operations: [FrameInterpolationQueueItem.Operation]) -> [FrameInterpolationQueueItem.Operation] {
         FrameInterpolationQueueItem.Operation.allCases.filter { operations.contains($0) }
+    }
+
+    /// Automatic triggers should not rerun a terminal decision every time the
+    /// same wallpaper is selected. Manual actions intentionally remain retryable
+    /// for failed/no-reliable loop analysis states.
+    private func automaticOperationsNeedingWork(
+        _ operations: [FrameInterpolationQueueItem.Operation],
+        for videoURL: URL,
+        targetFPS: Int
+    ) -> [FrameInterpolationQueueItem.Operation] {
+        operations.filter { operation in
+            switch operation {
+            case .loopAnalysis:
+                switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+                case .applied, .notNeeded, .noReliablePoint, .failed, .blacklisted:
+                    return false
+                case .idle:
+                    return true
+                }
+            case .frameInterpolation:
+                switch VideoOptimizationRecordStore.shared.frameState(for: videoURL) {
+                case let .applied(recordedTargetFPS), let .notNeeded(recordedTargetFPS):
+                    return (recordedTargetFPS ?? 0) < targetFPS
+                case .failed, .blacklisted:
+                    return false
+                case .idle:
+                    return true
+                }
+            }
+        }
     }
 
     private struct LibraryOptimizationTarget {
@@ -969,25 +1217,14 @@ final class VideoOptimizationQueueService: ObservableObject {
 
     private func archive(
         _ item: FrameInterpolationQueueItem,
-        outcome: VideoOptimizationHistoryRecord.Outcome,
+        outcome: VideoOptimizationQueueOutcome,
         message: String?
     ) {
-        ensureHistoryLoaded()
-        let record = VideoOptimizationHistoryRecord(
-            id: item.id,
-            videoPath: item.videoURL.standardizedFileURL.path,
-            title: item.title,
-            targetFPS: item.targetFPS,
-            source: item.source,
-            operations: item.operations,
-            completedOperations: item.completedOperations.sorted { $0.rawValue < $1.rawValue },
-            outcome: outcome,
-            message: message,
-            completedAt: Date()
+        // Terminal outcomes already live in the video's sidecar. The active
+        // queue intentionally keeps no second persisted history store.
+        frameInterpolationDebugPrint(
+            "视频优化队列归档：结果=\(outcome.rawValue)，操作=\(item.operations.map(\.rawValue).joined(separator: ","))，视频=\(item.videoURL.lastPathComponent)，说明=\(message ?? "无")"
         )
-        history.insert(record, at: 0)
-        history = Array(history.prefix(200))
-        saveHistory()
     }
 
     private static func formatSeconds(_ seconds: TimeInterval) -> String {
@@ -1012,59 +1249,87 @@ final class VideoOptimizationQueueService: ObservableObject {
         }.count
     }
 
-    private func ensureInterpolationRecordsLoaded() {
-        guard !interpolationRecordsLoaded else { return }
-        completedInterpolationItems = Self.loadInterpolationRecords(key: Self.completedInterpolationRecordsKey)
-        blacklistedInterpolationItems = Self.loadInterpolationRecords(key: Self.blacklistedInterpolationRecordsKey)
-        interpolationRecordsLoaded = true
-    }
+    /// SettingsViewModel is created lazily by the settings window. Load the
+    /// persisted policy only when the queue is first queried, never while this
+    /// singleton is initializing, to avoid startup-time preferences recursion.
+    private func ensureAutomaticPolicyLoaded() {
+        guard !automaticPolicyLoaded else { return }
+        let defaults = UserDefaults.standard
+        let loopEnabled = defaults.object(forKey: "loop_point_analysis_enabled") as? Bool ?? true
+        let autoLoop = loopEnabled
+            && (defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false)
+        let frameEnabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+        let autoFrame = frameEnabled
+            && (defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false)
+        let configuredFPS = (defaults.object(forKey: "frame_interpolation_target_fps") as? NSNumber)?.doubleValue ?? 60
 
-    private func saveInterpolationRecords() {
-        Self.saveInterpolationRecords(completedInterpolationItems, key: Self.completedInterpolationRecordsKey)
-        Self.saveInterpolationRecords(blacklistedInterpolationItems, key: Self.blacklistedInterpolationRecordsKey)
-    }
-
-    private func makeInterpolationRecord(videoURL: URL, title: String, targetFPS: Int) -> FrameInterpolationRecordItem {
-        FrameInterpolationRecordItem(
-            id: interpolationRecordID(for: videoURL),
-            videoPath: videoURL.standardizedFileURL.path,
-            title: title.isEmpty ? videoURL.deletingPathExtension().lastPathComponent : title,
-            targetFPS: targetFPS,
-            recordedAt: Date()
+        automaticPolicy = VideoOptimizationAutomaticPolicy(
+            loopAnalysisEnabled: loopEnabled,
+            automaticallyAnalyzeLoopPoints: autoLoop,
+            frameInterpolationEnabled: frameEnabled,
+            automaticallyInterpolateFrames: autoFrame,
+            targetFPS: FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int(configuredFPS.rounded()))
         )
+        automaticPolicyLoaded = true
+        migrateLegacyTerminalStateIfNeeded()
+    }
+
+    /// The former queue persisted terminal interpolation records in
+    /// UserDefaults. Migrate those one time to the adjacent sidecar, then
+    /// delete the duplicate store so future decisions have exactly one source.
+    private func migrateLegacyTerminalStateIfNeeded() {
+        guard !didMigrateLegacyTerminalState else { return }
+        didMigrateLegacyTerminalState = true
+
+        let defaults = UserDefaults.standard
+        let completedKey = "frame_interpolation_completed_records_v1"
+        let blacklistedKey = "frame_interpolation_blacklist_records_v1"
+        let historyKey = "video_optimization_history_v1"
+
+        if let data = defaults.data(forKey: completedKey),
+           let records = try? JSONDecoder().decode([FrameInterpolationRecordItem].self, from: data) {
+            for record in records {
+                let videoURL = record.videoURL
+                guard FileManager.default.fileExists(atPath: videoURL.path),
+                      VideoOptimizationRecordStore.shared.latestFrameEvent(for: videoURL) == nil else {
+                    continue
+                }
+                VideoOptimizationRecordStore.shared.append(
+                    .frameApplied,
+                    for: videoURL,
+                    metadata: [
+                        "targetFPS": String(record.targetFPS),
+                        "title": record.title,
+                        "migrated": "true",
+                    ]
+                )
+            }
+        }
+
+        if let data = defaults.data(forKey: blacklistedKey),
+           let records = try? JSONDecoder().decode([FrameInterpolationRecordItem].self, from: data) {
+            for record in records {
+                let videoURL = record.videoURL
+                guard FileManager.default.fileExists(atPath: videoURL.path) else { continue }
+                VideoOptimizationRecordStore.shared.append(
+                    .frameBlacklisted,
+                    for: videoURL,
+                    metadata: [
+                        "targetFPS": String(record.targetFPS),
+                        "title": record.title,
+                        "migrated": "true",
+                    ]
+                )
+            }
+        }
+
+        defaults.removeObject(forKey: completedKey)
+        defaults.removeObject(forKey: blacklistedKey)
+        defaults.removeObject(forKey: historyKey)
     }
 
     private func interpolationRecordID(for videoURL: URL) -> String {
         videoURL.standardizedFileURL.path
-    }
-
-    private static func loadInterpolationRecords(key: String) -> [FrameInterpolationRecordItem] {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let records = try? JSONDecoder().decode([FrameInterpolationRecordItem].self, from: data) else {
-            return []
-        }
-        return records.sorted { $0.recordedAt > $1.recordedAt }
-    }
-
-    private static func saveInterpolationRecords(_ records: [FrameInterpolationRecordItem], key: String) {
-        if let data = try? JSONEncoder().encode(records) {
-            UserDefaults.standard.set(data, forKey: key)
-        }
-    }
-
-    private func ensureHistoryLoaded() {
-        guard !historyLoaded else { return }
-        defer { historyLoaded = true }
-        guard let data = UserDefaults.standard.data(forKey: Self.historyKey),
-              let records = try? JSONDecoder().decode([VideoOptimizationHistoryRecord].self, from: data) else {
-            return
-        }
-        history = records.sorted { $0.completedAt > $1.completedAt }
-    }
-
-    private func saveHistory() {
-        guard let data = try? JSONEncoder().encode(history) else { return }
-        UserDefaults.standard.set(data, forKey: Self.historyKey)
     }
 }
 
@@ -1695,178 +1960,5 @@ enum VideoFrameInterpolationExporter {
         let raw = "\(sourceURL.standardizedFileURL.path)|\(size)|\(modified)|fps=\(targetFPS)|algorithm=optical-flow-only-v1"
         let digest = SHA256.hash(data: Data(raw.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-// MARK: - Video Loop Preprocessing Service
-
-enum VideoLoopPreprocessingResult: Sendable {
-    case alreadyProcessed
-    case processed
-    case failed(String)
-}
-
-/// 负责视频壁纸的离线 crossfade 预处理。
-/// 只在用户**设置壁纸时**触发，不会在下载时自动处理，也不做批量扫描。
-/// 处理完成后直接替换原始文件，并在对应下载记录中标记 `isLooped = true`。
-@MainActor
-final class VideoLoopPreprocessingService: ObservableObject {
-    static let shared = VideoLoopPreprocessingService()
-
-    @Published private(set) var isProcessing = false
-    @Published private(set) var currentProcessingFile: String?
-
-    private let tempDirectory: URL
-
-    private init() {
-        tempDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WaifuXLoopExport", isDirectory: true)
-        try? FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
-    }
-
-    // MARK: - Query
-
-    /// 通过下载记录判断指定路径的视频是否已做 loop 预处理
-    func isProcessed(_ fileURL: URL) -> Bool {
-        let path = fileURL.path
-        if let record = WallpaperLibraryService.shared.downloadRecord(forLocalFilePath: path) {
-            return record.isLooped == true
-        }
-        if let record = MediaLibraryService.shared.downloadRecord(forLocalFilePath: path) {
-            return record.isLooped == true
-        }
-        return false
-    }
-
-    // MARK: - Preprocessing
-
-    /// 异步预处理指定视频。如果已处理则不重复导出。
-    /// 处理完成后替换原始文件，并更新对应下载记录的 `isLooped` 标记。
-    func preprocessIfNeeded(_ originalURL: URL) async -> VideoLoopPreprocessingResult {
-        guard !isProcessed(originalURL) else { return .alreadyProcessed }
-
-        isProcessing = true
-        currentProcessingFile = originalURL.lastPathComponent
-        defer {
-            isProcessing = false
-            currentProcessingFile = nil
-        }
-
-        do {
-            let tempURL = tempDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
-            try await exportLoopedVideo(from: originalURL, to: tempURL)
-
-            guard FileManager.default.fileExists(atPath: tempURL.path) else {
-                throw NSError(domain: "VideoLoop", code: 6, userInfo: [NSLocalizedDescriptionKey: "Exported file not found"])
-            }
-
-            // 原子替换原始文件
-            _ = try FileManager.default.replaceItemAt(originalURL, withItemAt: tempURL)
-
-            // 更新下载记录标记
-            let path = originalURL.path
-            WallpaperLibraryService.shared.markAsLooped(localFilePath: path)
-            MediaLibraryService.shared.markAsLooped(localFilePath: path)
-
-            print("[VideoLoopPreprocessing] Replaced original with looped version: \(originalURL.lastPathComponent)")
-            return .processed
-        } catch {
-            print("[VideoLoopPreprocessing] Failed for \(originalURL.lastPathComponent): \(error)")
-            let tempURL = tempDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
-            try? FileManager.default.removeItem(at: tempURL)
-            return .failed(error.localizedDescription)
-        }
-    }
-
-    // MARK: - Export
-
-    private func exportLoopedVideo(from originalURL: URL, to outputURL: URL) async throws {
-        let asset = AVURLAsset(url: originalURL)
-        let duration = try await asset.load(.duration)
-        let videoTracks = try await asset.loadTracks(withMediaType: .video)
-
-        guard let videoTrack = videoTracks.first else {
-            throw NSError(domain: "VideoLoop", code: 1, userInfo: [NSLocalizedDescriptionKey: "No video track"])
-        }
-
-        let fadeDuration: Double = 1.0
-        let fadeCMTime = CMTime(seconds: fadeDuration, preferredTimescale: 600)
-
-        // 视频太短不做 crossfade，直接复制原文件
-        guard duration > CMTimeMultiply(fadeCMTime, multiplier: 2) else {
-            try? FileManager.default.copyItem(at: originalURL, to: outputURL)
-            return
-        }
-
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try FileManager.default.removeItem(at: outputURL)
-        }
-
-        let composition = AVMutableComposition()
-
-        // Track 1: 原视频完整播放（底层）
-        guard let track1 = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-            throw NSError(domain: "VideoLoop", code: 2)
-        }
-        try track1.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: videoTrack, at: .zero)
-
-        // Track 2: 原视频开头 fadeDuration 秒，插入到 (duration - fadeDuration) 处（上层）
-        guard let track2 = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-            throw NSError(domain: "VideoLoop", code: 3)
-        }
-        let track2InsertTime = duration - fadeCMTime
-        try track2.insertTimeRange(CMTimeRange(start: .zero, duration: fadeCMTime), of: videoTrack, at: track2InsertTime)
-
-        // 音频：简单复制完整音频
-        if let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
-           let compositionAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-            try? compositionAudioTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: audioTrack, at: .zero)
-        }
-
-        // Video composition: opacity ramps
-        let naturalSize = try await videoTrack.load(.naturalSize)
-        let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
-        let frameRate = nominalFrameRate > 0 ? nominalFrameRate : 30
-
-        let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = naturalSize
-        videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
-
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-
-        let layerInstruction1 = AVMutableVideoCompositionLayerInstruction(assetTrack: track1)
-        let layerInstruction2 = AVMutableVideoCompositionLayerInstruction(assetTrack: track2)
-
-        let fadeStart = duration - fadeCMTime
-        layerInstruction1.setOpacityRamp(
-            fromStartOpacity: 1.0, toEndOpacity: 0.0,
-            timeRange: CMTimeRange(start: fadeStart, duration: fadeCMTime)
-        )
-        layerInstruction2.setOpacityRamp(
-            fromStartOpacity: 0.0, toEndOpacity: 1.0,
-            timeRange: CMTimeRange(start: fadeStart, duration: fadeCMTime)
-        )
-
-        instruction.layerInstructions = [layerInstruction1, layerInstruction2]
-        videoComposition.instructions = [instruction]
-
-        guard let exportSession = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-            throw NSError(domain: "VideoLoop", code: 4, userInfo: [NSLocalizedDescriptionKey: "Export session creation failed"])
-        }
-
-        exportSession.videoComposition = videoComposition
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = .mp4
-        exportSession.shouldOptimizeForNetworkUse = false
-
-        await exportSession.export()
-
-        if let error = exportSession.error {
-            throw error
-        }
-        guard exportSession.status == .completed else {
-            throw NSError(domain: "VideoLoop", code: 5, userInfo: [NSLocalizedDescriptionKey: "Export status: \(exportSession.status.rawValue)"])
-        }
     }
 }

@@ -75,11 +75,14 @@ struct MediaDetailSheet: View {
     @State private var showMoreOptionsPopover = false
     @State private var showDeleteBakeConfirm = false
     @State private var showDeleteFrameInterpolationConfirm = false
-    @State private var showRemoveFrameInterpolationBlacklistConfirm = false
+    @State private var showOptimizationTerminalActionConfirm = false
+    @State private var showOptimizationBlacklistRemovalConfirm = false
     @State private var pendingDeleteFrameInterpolationURL: URL?
-    @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
+    @State private var pendingOptimizationActionURL: URL?
+    @State private var pendingOptimizationOperation: FrameInterpolationQueueItem.Operation?
+    @State private var sourceRestoreOptimizationOperations: [FrameInterpolationQueueItem.Operation] = []
     @State private var isDeletingBake = false
-    @State private var isDeletingFrameInterpolation = false
+    @State private var isResettingVideoOptimization = false
     @State private var frameInterpolationNeedCheckKey: String?
     @State private var frameInterpolationNeedsInterpolation: Bool?
     @State private var frameInterpolationNeedCheckTask: Task<Void, Never>?
@@ -369,7 +372,8 @@ struct MediaDetailSheet: View {
         .alert(t("frameInterpolationDeleteConfirmTitle"), isPresented: $showDeleteFrameInterpolationConfirm) {
             Button(t("frameInterpolationDeleteButton"), role: .destructive) {
                 guard let url = pendingDeleteFrameInterpolationURL else { return }
-                Task { await deleteFrameInterpolationFileAndRedownload(videoURL: url) }
+                sourceRestoreOptimizationOperations = []
+                Task { await resetOptimizationAndRedownload(videoURL: url) }
             }
             Button(t("cancel"), role: .cancel) {
                 pendingDeleteFrameInterpolationURL = nil
@@ -377,19 +381,37 @@ struct MediaDetailSheet: View {
         } message: {
             Text(t("frameInterpolationDeleteConfirmMessage"))
         }
-        .alert(t("frameInterpolationBlacklistRemoveConfirmTitle"), isPresented: $showRemoveFrameInterpolationBlacklistConfirm) {
-            Button(t("frameInterpolationBlacklistRemoveButton"), role: .destructive) {
-                if let url = pendingRemoveFrameInterpolationBlacklistURL {
-                    frameInterpolationQueue.removeBlacklisted(videoURL: url)
-                    refreshFrameInterpolationNeedCheck(force: true)
-                }
-                pendingRemoveFrameInterpolationBlacklistURL = nil
+        .alert(t("videoOptimizationTerminalActionTitle"), isPresented: $showOptimizationTerminalActionConfirm) {
+            Button(t("videoOptimizationRetryButton")) {
+                guard let url = pendingOptimizationActionURL,
+                      let operation = pendingOptimizationOperation else { return }
+                retryTerminalOptimization(videoURL: url, operation: operation)
+            }
+            Button(t("videoOptimizationBlacklistButton"), role: .destructive) {
+                guard let url = pendingOptimizationActionURL,
+                      let operation = pendingOptimizationOperation else { return }
+                blacklistOptimization(videoURL: url, operation: operation)
             }
             Button(t("cancel"), role: .cancel) {
-                pendingRemoveFrameInterpolationBlacklistURL = nil
+                clearPendingOptimizationAction()
             }
         } message: {
-            Text(t("frameInterpolationBlacklistRemoveConfirmMessage"))
+            Text(String(format: t("videoOptimizationTerminalActionMessage"), pendingOptimizationOperation.map(optimizationOperationTitle) ?? ""))
+        }
+        .alert(t("videoOptimizationBlacklistRemoveConfirmTitle"), isPresented: $showOptimizationBlacklistRemovalConfirm) {
+            Button(t("videoOptimizationBlacklistRemoveButton"), role: .destructive) {
+                if let url = pendingOptimizationActionURL,
+                   let operation = pendingOptimizationOperation {
+                    frameInterpolationQueue.removeBlacklisted(videoURL: url, operation: operation)
+                    refreshFrameInterpolationNeedCheck(force: true)
+                }
+                clearPendingOptimizationAction()
+            }
+            Button(t("cancel"), role: .cancel) {
+                clearPendingOptimizationAction()
+            }
+        } message: {
+            Text(String(format: t("videoOptimizationBlacklistRemoveConfirmMessage"), pendingOptimizationOperation.map(optimizationOperationTitle) ?? ""))
         }
         .overlay {
             authorSheetOverlay
@@ -1192,10 +1214,9 @@ struct MediaDetailSheet: View {
                 print("[MediaDetailSheet] WARN: hasCachedArtifact true but sceneBakeArtifact nil, falling back to re-bake")
             }
             do {
-                let artifact = try await SceneOfflineBakeService.bake(record: record, renderer: renderer) { progress in
+                _ = try await SceneOfflineBakeService.bake(record: record, renderer: renderer) { progress in
                     updateSceneBakeProgress(progress)
                 }
-                let videoURL = URL(fileURLWithPath: artifact.videoPath)
 
                 await MainActor.run {
                     isBakingScene = false
@@ -1449,6 +1470,28 @@ struct MediaDetailSheet: View {
                 .disabled(!hasValidSteamPageURL)
             }
 
+            if let optimizationVideoURL = currentOptimizationVideoURL {
+                Button {
+                    showMoreOptionsPopover = false
+                    NSWorkspace.shared.activateFileViewerSelecting([optimizationVideoURL])
+                } label: {
+                    HStack {
+                        Image(systemName: "folder")
+                        Text(t("showInFinder"))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .background(
+                    Rectangle()
+                        .fill(Color.white.opacity(0.15))
+                        .frame(height: 1),
+                    alignment: .bottom
+                )
+            }
+
             // 重新烘焙（仅 Scene 类型已下载壁纸）
             if sceneOfflineBakeButtonVisible {
                 Button {
@@ -1520,48 +1563,71 @@ struct MediaDetailSheet: View {
                 .disabled(isTranscodingVideo)
             }
 
-            if let interpolationVideoURL = currentFrameInterpolationVideoURL {
-                let activeOptimization = frameInterpolationQueue.item(for: interpolationVideoURL)
-                if let activeOptimization,
-                   activeOptimization.operations.contains(.loopAnalysis) {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "hourglass")
-                            Text(
-                                activeOptimization.currentOperation == .loopAnalysis
-                                    ? t("videoOptimizationLoopAnalyzing")
-                                    : activeOptimization.currentStage
-                            )
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
-                } else {
-                    Button {
-                        showMoreOptionsPopover = false
-                        frameInterpolationQueue.enqueueLoopAnalysis(
-                            videoURL: interpolationVideoURL,
-                            title: resolvedItem.title
-                        )
-                    } label: {
-                        HStack {
-                            Image(systemName: "point.3.connected.trianglepath.dotted")
-                            Text(t("videoOptimizationAnalyzeLoop"))
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                }
+            if let optimizationVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isLoopAnalysisEnabled
+                || frameInterpolationQueue.isFrameInterpolationEnabled
+                || VideoOptimizationRecordStore.shared.loopState(for: optimizationVideoURL) != .idle
+                || VideoOptimizationRecordStore.shared.frameState(for: optimizationVideoURL) != .idle) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
             }
 
-            if frameInterpolationSettingsEnabled,
-               let interpolationVideoURL = currentFrameInterpolationVideoURL {
+            if let interpolationVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isLoopAnalysisEnabled
+                || VideoOptimizationRecordStore.shared.loopState(for: interpolationVideoURL) != .idle) {
+                Button {
+                    showMoreOptionsPopover = false
+                    handleLoopAnalysisStatusTap(videoURL: interpolationVideoURL)
+                } label: {
+                    HStack {
+                        Image(systemName: loopAnalysisIconName(videoURL: interpolationVideoURL))
+                        Text(loopAnalysisButtonTitle(videoURL: interpolationVideoURL))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(loopAnalysisForegroundStyle(videoURL: interpolationVideoURL))
+                .disabled(loopAnalysisActionDisabled(videoURL: interpolationVideoURL))
+            }
+
+            if frameInterpolationQueue.isLoopAnalysisEnabled,
+               frameInterpolationQueue.isFrameInterpolationEnabled,
+               let interpolationVideoURL = currentOptimizationVideoURL {
+                Button {
+                    showMoreOptionsPopover = false
+                    if VideoOptimizationRecordStore.shared.loopState(for: interpolationVideoURL) == .applied {
+                        sourceRestoreOptimizationOperations = [.loopAnalysis, .frameInterpolation]
+                        Task { await resetOptimizationAndRedownload(videoURL: interpolationVideoURL) }
+                    } else {
+                        frameInterpolationQueue.enqueueLoopAnalysisThenInterpolation(
+                            videoURL: interpolationVideoURL,
+                            title: resolvedItem.title,
+                            targetFPS: currentFrameInterpolationTargetFPS
+                        )
+                    }
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text(t("videoOptimizationReoptimizeVideo"))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .disabled(frameInterpolationQueue.hasActiveInterpolation(videoURL: interpolationVideoURL))
+            }
+
+            if let interpolationVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isFrameInterpolationEnabled
+                || VideoOptimizationRecordStore.shared.frameState(for: interpolationVideoURL) != .idle) {
                 let targetFPS = currentFrameInterpolationTargetFPS
+                let frameState = VideoOptimizationRecordStore.shared.frameState(for: interpolationVideoURL)
                 if frameInterpolationQueue.hasActiveInterpolation(videoURL: interpolationVideoURL, satisfying: targetFPS) {
                     Button {} label: {
                         HStack {
@@ -1574,67 +1640,20 @@ struct MediaDetailSheet: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(true)
-                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL, satisfying: targetFPS) != nil {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "checkmark.circle")
-                            Text(t("frameInterpolationAlreadyCompleted"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
+                } else if case .applied = frameState {
+                    optimizationTerminalStatusButton(
+                        videoURL: interpolationVideoURL,
+                        operation: .frameInterpolation,
+                        iconName: "checkmark.circle",
+                        title: t("frameInterpolationAlreadyCompleted"),
+                        foregroundStyle: Color.white.opacity(0.72)
+                    )
 
-                    Button {
-                        showMoreOptionsPopover = false
-                        pendingDeleteFrameInterpolationURL = interpolationVideoURL
-                        showDeleteFrameInterpolationConfirm = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "trash")
-                            Text(t("frameInterpolationDeleteFile"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color(hex: "FF453A"))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isDeletingFrameInterpolation)
-                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL) != nil {
-                    if frameInterpolationNeedsInterpolation == false {
-                        Button {} label: {
-                            HStack {
-                                Image(systemName: "checkmark.circle")
-                                Text(t("frameInterpolationNotNeeded"))
-                                Spacer()
-                            }
-                            .foregroundStyle(Color.white.opacity(0.46))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(true)
-                    } else if frameInterpolationNeedsInterpolation == nil {
-                        Button {} label: {
-                            HStack {
-                                Image(systemName: "hourglass")
-                                Text(t("frameInterpolationChecking"))
-                                Spacer()
-                            }
-                            .foregroundStyle(Color.white.opacity(0.46))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(true)
-                    } else {
+                    if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL, satisfying: targetFPS) == nil,
+                       frameInterpolationNeedsInterpolation == true {
                         Button {
                             showMoreOptionsPopover = false
-                            frameInterpolationQueue.enqueueLoopAnalysisThenInterpolation(
+                            frameInterpolationQueue.enqueueFrameInterpolation(
                                 videoURL: interpolationVideoURL,
                                 title: resolvedItem.title,
                                 targetFPS: targetFPS
@@ -1666,36 +1685,29 @@ struct MediaDetailSheet: View {
                         .padding(.vertical, 10)
                     }
                     .buttonStyle(.plain)
-                    .disabled(isDeletingFrameInterpolation)
-                } else if frameInterpolationQueue.isBlacklisted(videoURL: interpolationVideoURL) {
-                    Button {
-                        showMoreOptionsPopover = false
-                        pendingRemoveFrameInterpolationBlacklistURL = interpolationVideoURL
-                        showRemoveFrameInterpolationBlacklistConfirm = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "nosign")
-                            Text(t("frameInterpolationBlacklisted"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                } else if frameInterpolationNeedsInterpolation == false {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "checkmark.circle")
-                            Text(t("frameInterpolationNotNeeded"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
+                    .disabled(isResettingVideoOptimization)
+                } else if case .notNeeded = frameState {
+                    optimizationTerminalStatusButton(
+                        videoURL: interpolationVideoURL,
+                        operation: .frameInterpolation,
+                        iconName: "checkmark.circle",
+                        title: t("frameInterpolationNotNeeded"),
+                        foregroundStyle: Color.white.opacity(0.72)
+                    )
+                } else if case .failed = frameState {
+                    optimizationTerminalStatusButton(
+                        videoURL: interpolationVideoURL,
+                        operation: .frameInterpolation,
+                        iconName: "exclamationmark.triangle",
+                        title: t("frameInterpolationFailed"),
+                        foregroundStyle: Color(hex: "FF9F0A")
+                    )
+                } else if case .blacklisted = frameState {
+                    optimizationBlacklistStatusButton(
+                        videoURL: interpolationVideoURL,
+                        operation: .frameInterpolation,
+                        title: t("frameInterpolationBlacklisted")
+                    )
                 } else if frameInterpolationNeedsInterpolation == nil {
                     Button {} label: {
                         HStack {
@@ -1712,7 +1724,7 @@ struct MediaDetailSheet: View {
                 } else {
                     Button {
                         showMoreOptionsPopover = false
-                        frameInterpolationQueue.enqueueLoopAnalysisThenInterpolation(
+                        frameInterpolationQueue.enqueueFrameInterpolation(
                             videoURL: interpolationVideoURL,
                             title: resolvedItem.title,
                             targetFPS: targetFPS
@@ -1750,21 +1762,227 @@ struct MediaDetailSheet: View {
         .frame(width: 192)
     }
 
-    private var currentFrameInterpolationVideoURL: URL? {
-        guard isAlreadyDownloaded else { return nil }
-        if let localURL = currentDownloadRecord?.localFileURL,
-           let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) {
-            return videoURL
-        }
-        return findLocalWorkshopFile()
-    }
+    /// Optimization actions must resolve the physical local video, not rely on
+    /// the UI's download marker. Workshop and restored library entries can be
+    /// locally available before that marker has refreshed.
+    private var currentOptimizationVideoURL: URL? {
+        let candidates = [
+            currentDownloadRecord?.localFileURL,
+            findLocalWorkshopFile()
+        ].compactMap { $0 }
 
-    private var frameInterpolationSettingsEnabled: Bool {
-        UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+        for localURL in candidates {
+            if let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) {
+                return videoURL
+            }
+        }
+        return nil
     }
 
     private var currentFrameInterpolationTargetFPS: Int {
         FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+    }
+
+    private func loopAnalysisButtonTitle(videoURL: URL) -> String {
+        if loopAnalysisIsActive(videoURL: videoURL) {
+            return t("videoOptimizationLoopAnalyzing")
+        }
+
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .applied:
+            return t("videoOptimizationLoopApplied")
+        case .notNeeded:
+            return t("videoOptimizationLoopNotNeeded")
+        case .noReliablePoint:
+            return t("videoOptimizationLoopNoReliablePoint")
+        case .failed:
+            return t("videoOptimizationLoopFailed")
+        case .blacklisted:
+            return t("videoOptimizationLoopBlacklisted")
+        case .idle:
+            return t("videoOptimizationAnalyzeLoop")
+        }
+    }
+
+    private func loopAnalysisIconName(videoURL: URL) -> String {
+        if loopAnalysisIsActive(videoURL: videoURL) {
+            return "hourglass"
+        }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .applied, .notNeeded:
+            return "checkmark.circle"
+        case .noReliablePoint, .failed:
+            return "exclamationmark.triangle"
+        case .blacklisted:
+            return "nosign"
+        case .idle:
+            return "point.3.connected.trianglepath.dotted"
+        }
+    }
+
+    private func loopAnalysisIsActive(videoURL: URL) -> Bool {
+        guard let activeItem = frameInterpolationQueue.item(for: videoURL) else { return false }
+        return activeItem.operations.contains(.loopAnalysis)
+            && !activeItem.completedOperations.contains(.loopAnalysis)
+    }
+
+    private func loopAnalysisActionDisabled(videoURL: URL) -> Bool {
+        loopAnalysisIsActive(videoURL: videoURL)
+    }
+
+    private func loopAnalysisForegroundStyle(videoURL: URL) -> Color {
+        if loopAnalysisActionDisabled(videoURL: videoURL) {
+            return Color.white.opacity(0.46)
+        }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .noReliablePoint, .failed:
+            return Color(hex: "FF9F0A")
+        case .blacklisted:
+            return Color.white.opacity(0.46)
+        case .idle, .applied, .notNeeded:
+            return .white
+        }
+    }
+
+    private func handleLoopAnalysisStatusTap(videoURL: URL) {
+        guard !loopAnalysisIsActive(videoURL: videoURL) else { return }
+
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .idle:
+            frameInterpolationQueue.enqueueLoopAnalysis(
+                videoURL: videoURL,
+                title: resolvedItem.title
+            )
+        case .blacklisted:
+            presentBlacklistRemoval(for: videoURL, operation: .loopAnalysis)
+        case .applied, .notNeeded, .noReliablePoint, .failed:
+            presentTerminalOptimizationAction(for: videoURL, operation: .loopAnalysis)
+        }
+    }
+
+    private func optimizationTerminalStatusButton(
+        videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation,
+        iconName: String,
+        title: String,
+        foregroundStyle: Color
+    ) -> some View {
+        Button {
+            showMoreOptionsPopover = false
+            presentTerminalOptimizationAction(for: videoURL, operation: operation)
+        } label: {
+            HStack {
+                Image(systemName: iconName)
+                Text(title)
+                Spacer()
+            }
+            .foregroundStyle(foregroundStyle)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func optimizationBlacklistStatusButton(
+        videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation,
+        title: String
+    ) -> some View {
+        Button {
+            showMoreOptionsPopover = false
+            presentBlacklistRemoval(for: videoURL, operation: operation)
+        } label: {
+            HStack {
+                Image(systemName: "nosign")
+                Text(title)
+                Spacer()
+            }
+            .foregroundStyle(Color.white.opacity(0.46))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func presentTerminalOptimizationAction(
+        for videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation
+    ) {
+        pendingOptimizationActionURL = videoURL
+        pendingOptimizationOperation = operation
+        showOptimizationTerminalActionConfirm = true
+    }
+
+    private func presentBlacklistRemoval(
+        for videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation
+    ) {
+        pendingOptimizationActionURL = videoURL
+        pendingOptimizationOperation = operation
+        showOptimizationBlacklistRemovalConfirm = true
+    }
+
+    private func retryTerminalOptimization(
+        videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation
+    ) {
+        let needsOriginalSource: Bool
+        switch operation {
+        case .loopAnalysis:
+            needsOriginalSource = VideoOptimizationRecordStore.shared.loopState(for: videoURL) == .applied
+        case .frameInterpolation:
+            if case .applied = VideoOptimizationRecordStore.shared.frameState(for: videoURL) {
+                needsOriginalSource = true
+            } else {
+                needsOriginalSource = false
+            }
+        }
+        clearPendingOptimizationAction()
+
+        if needsOriginalSource {
+            sourceRestoreOptimizationOperations = [operation]
+            Task { await resetOptimizationAndRedownload(videoURL: videoURL) }
+            return
+        }
+
+        switch operation {
+        case .loopAnalysis:
+            frameInterpolationQueue.enqueueLoopAnalysis(videoURL: videoURL, title: resolvedItem.title)
+        case .frameInterpolation:
+            frameInterpolationQueue.enqueueFrameInterpolation(
+                videoURL: videoURL,
+                title: resolvedItem.title,
+                targetFPS: currentFrameInterpolationTargetFPS
+            )
+        }
+    }
+
+    private func blacklistOptimization(
+        videoURL: URL,
+        operation: FrameInterpolationQueueItem.Operation
+    ) {
+        clearPendingOptimizationAction()
+        sourceRestoreOptimizationOperations = []
+        frameInterpolationQueue.requestBlacklistAfterSourceRestore(
+            videoURL: videoURL,
+            title: resolvedItem.title,
+            operation: operation
+        )
+        Task { await resetOptimizationAndRedownload(videoURL: videoURL) }
+    }
+
+    private func clearPendingOptimizationAction() {
+        pendingOptimizationActionURL = nil
+        pendingOptimizationOperation = nil
+    }
+
+    private func optimizationOperationTitle(_ operation: FrameInterpolationQueueItem.Operation) -> String {
+        switch operation {
+        case .loopAnalysis:
+            return t("videoOptimizationAnalyzeLoop")
+        case .frameInterpolation:
+            return t("videoOptimizationInterpolateVideo")
+        }
     }
 
     private var frameInterpolationRemainingDetail: String? {
@@ -1773,8 +1991,8 @@ struct MediaDetailSheet: View {
     }
 
     private func refreshFrameInterpolationNeedCheck(force: Bool = false) {
-        guard frameInterpolationSettingsEnabled,
-              let videoURL = currentFrameInterpolationVideoURL else {
+        guard frameInterpolationQueue.isFrameInterpolationEnabled,
+              let videoURL = currentOptimizationVideoURL else {
             clearFrameInterpolationNeedCheck()
             return
         }
@@ -1803,13 +2021,21 @@ struct MediaDetailSheet: View {
             )
             await MainActor.run {
                 guard frameInterpolationNeedCheckKey == key else { return }
-                if !needsInterpolation,
-                   frameInterpolationQueue.completedRecord(videoURL: videoURL) != nil {
-                    frameInterpolationQueue.markCompleted(
-                        videoURL: videoURL,
-                        title: resolvedItem.title,
-                        targetFPS: targetFPS
-                    )
+                if !needsInterpolation {
+                    if frameInterpolationQueue.completedRecord(videoURL: videoURL) != nil {
+                        frameInterpolationQueue.markCompleted(
+                            videoURL: videoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS
+                        )
+                    } else {
+                        frameInterpolationQueue.markInterpolationNotNeeded(
+                            videoURL: videoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS,
+                            reason: "原始 FPS 已达到或高于目标 FPS"
+                        )
+                    }
                     clearFrameInterpolationNeedCheck()
                     return
                 }
@@ -2418,22 +2644,32 @@ struct MediaDetailSheet: View {
         }
     }
 
-    private func deleteFrameInterpolationFileAndRedownload(videoURL: URL) async {
-        guard !isDeletingFrameInterpolation else { return }
+    /// Re-downloads the source video after clearing every durable optimization
+    /// state. Both interpolation deletion and an already-applied loop point use
+    /// this single path so a fresh source never inherits old outcomes.
+    private func resetOptimizationAndRedownload(videoURL: URL) async {
+        guard !isResettingVideoOptimization else { return }
         let downloadingItem = resolvedItem
         let itemID = downloadingItem.id
-        isDeletingFrameInterpolation = true
+        isResettingVideoOptimization = true
         downloadActivity.start(itemID: itemID)
         errorMessage = ""
         defer {
-            isDeletingFrameInterpolation = false
+            isResettingVideoOptimization = false
             downloadActivity.finish(itemID: itemID)
             pendingDeleteFrameInterpolationURL = nil
+            sourceRestoreOptimizationOperations = []
         }
 
-        let targetFPS = currentFrameInterpolationTargetFPS
-        frameInterpolationQueue.removeCompleted(videoURL: videoURL)
-        frameInterpolationQueue.markBlacklisted(videoURL: videoURL, title: downloadingItem.title, targetFPS: targetFPS)
+        frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
+        let requestedOperations = sourceRestoreOptimizationOperations
+        if !requestedOperations.isEmpty {
+            frameInterpolationQueue.requestAfterSourceRestore(
+                videoURL: videoURL,
+                title: downloadingItem.title,
+                operations: requestedOperations
+            )
+        }
 
         do {
             if FileManager.default.fileExists(atPath: videoURL.path) {
@@ -2446,13 +2682,20 @@ struct MediaDetailSheet: View {
                 try await viewModel.download(downloadingItem)
             }
 
-            VideoWallpaperManager.shared.restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: videoURL, targetFPSs: [targetFPS])
+            VideoWallpaperManager.shared.restoreOriginalVideoAfterDeletingFrameInterpolation(
+                videoURL: videoURL,
+                targetFPSs: [currentFrameInterpolationTargetFPS]
+            )
             sceneBakeStatusFlash = "已重新下载原文件"
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 sceneBakeStatusFlash = nil
             }
         } catch {
+            // A failed restore must not leave a stale manual request to hijack
+            // a later, unrelated download of the same filename.
+            frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
+            frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
             errorMessage = Self.truncateErrorMessage(error.localizedDescription)
             showError = true
             AppLogger.error(.download, "删除补帧文件后重新下载失败", metadata: [
@@ -2823,7 +3066,7 @@ struct MediaDetailSheet: View {
                 let cacheKey = persistID ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: sceneContentRoot.path)
 
                 // 使用 wallpaper-wgpu bake 子命令烘焙
-                let artifact = try await SceneOfflineBakeService.bake(
+                _ = try await SceneOfflineBakeService.bake(
                     eligibility: eligibility,
                     contentRoot: sceneContentRoot,
                     cacheItemID: cacheKey,

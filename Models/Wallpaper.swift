@@ -579,16 +579,13 @@ struct WallpaperDownloadRecord: Identifiable, Codable, Hashable {
     var downloadedAt: Date
     var metadata: SyncMetadata
     var folderID: String?
-    /// 是否已完成 crossfade 循环预处理（替换原始文件后标记为 true）
-    var isLooped: Bool?
 
     init(
         wallpaper: Wallpaper,
         localFilePath: String,
         downloadedAt: Date = .now,
         metadata: SyncMetadata? = nil,
-        folderID: String? = nil,
-        isLooped: Bool? = nil
+        folderID: String? = nil
     ) {
         self.id = wallpaper.id
         self.wallpaper = wallpaper
@@ -599,7 +596,6 @@ struct WallpaperDownloadRecord: Identifiable, Codable, Hashable {
             entityType: "wallpaper.download"
         )
         self.folderID = folderID
-        self.isLooped = isLooped
     }
 
     var localFileURL: URL {
@@ -611,7 +607,7 @@ struct WallpaperDownloadRecord: Identifiable, Codable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, wallpaper, localFilePath, downloadedAt, metadata, folderID, isLooped
+        case id, wallpaper, localFilePath, downloadedAt, metadata, folderID
     }
 
     init(from decoder: Decoder) throws {
@@ -623,6 +619,5 @@ struct WallpaperDownloadRecord: Identifiable, Codable, Hashable {
         metadata = try container.decodeIfPresent(SyncMetadata.self, forKey: .metadata)
             ?? SyncMetadata(recordID: "wallpaper.download.\(wallpaper.id)", entityType: "wallpaper.download")
         folderID = try container.decodeIfPresent(String.self, forKey: .folderID)
-        isLooped = try container.decodeIfPresent(Bool.self, forKey: .isLooped)
     }
 }

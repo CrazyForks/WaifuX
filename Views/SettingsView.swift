@@ -546,12 +546,12 @@ private struct GeneralSettingsTab: View {
 
             }
 
-            // 动态壁纸补帧设置组
-            MacSettingsSection(header: t("frameInterpolationSection")) {
+            // 动态壁纸优化设置组。自动任务均由公共优化队列串行处理。
+            MacSettingsSection(header: t("videoOptimizationSection")) {
                 MacSettingsRow(
                     title: t("frameInterpolation"),
                     subtitle: t("frameInterpolationDesc"),
-                    showDivider: viewModel.frameInterpolationEnabled
+                    showDivider: true
                 ) {
                     MacToggle(isOn: $viewModel.frameInterpolationEnabled)
                 }
@@ -568,7 +568,7 @@ private struct GeneralSettingsTab: View {
                     MacSettingsRow(
                         title: t("frameInterpolationTargetFPS"),
                         subtitle: nil,
-                        showDivider: false
+                        showDivider: true
                     ) {
                         Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
                             ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
@@ -578,6 +578,24 @@ private struct GeneralSettingsTab: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(width: 180)
+                    }
+                }
+
+                MacSettingsRow(
+                    title: t("loopPointAnalysis"),
+                    subtitle: t("loopPointAnalysisDesc"),
+                    showDivider: viewModel.loopPointAnalysisEnabled
+                ) {
+                    MacToggle(isOn: $viewModel.loopPointAnalysisEnabled)
+                }
+
+                if viewModel.loopPointAnalysisEnabled {
+                    MacSettingsRow(
+                        title: t("loopPointAnalysisAutoEnqueue"),
+                        subtitle: t("loopPointAnalysisAutoEnqueueDesc"),
+                        showDivider: false
+                    ) {
+                        MacToggle(isOn: $viewModel.autoAnalyzeLoopPoint)
                     }
                 }
             }
