@@ -270,7 +270,7 @@ final class MediaLibraryService: ObservableObject {
             let title = item.title
             Task { @MainActor in
                 _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL)
-                FrameInterpolationQueueService.shared.enqueueAfterDownloadIfNeeded(
+                VideoOptimizationQueueService.shared.enqueueAfterDownloadIfNeeded(
                     videoURL: videoFileURL,
                     title: title
                 )

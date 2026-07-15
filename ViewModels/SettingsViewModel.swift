@@ -92,7 +92,7 @@ class SettingsViewModel: ObservableObject {
             UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_on_download")
             // 旧 key 清理，防止被当成「切换时自动补帧」读回。
             UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
-            FrameInterpolationQueueService.shared.applySettings(autoOnDownload: frameInterpolationAutoEnqueue)
+            VideoOptimizationQueueService.shared.applySettings(autoOnDownload: frameInterpolationAutoEnqueue)
         }
     }
     @Published var showAllWorkshopContent = false { didSet { UserDefaults.standard.set(showAllWorkshopContent, forKey: "show_all_workshop_content") } }
@@ -278,7 +278,7 @@ class SettingsViewModel: ObservableObject {
         VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
         StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
         VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
-        FrameInterpolationQueueService.shared.applySettings(autoOnDownload: effectiveAutoOnDownload)
+        VideoOptimizationQueueService.shared.applySettings(autoOnDownload: effectiveAutoOnDownload)
         NotchOverlayManager.shared.setEnabled(hideNotch)
         if sceneRealtimeRenderingEnabled {
             LiquidGlassClockSettings.shared.update { $0.enabled = false }
