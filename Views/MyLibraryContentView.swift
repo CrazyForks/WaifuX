@@ -897,6 +897,18 @@ struct MyLibraryContentView: View {
             },
             onRelock: {
                 folderLockService.lockFolder(folder.id)
+            },
+            onAnalyzeLoopPoints: {
+                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
+                    folder,
+                    operations: [.loopAnalysis]
+                )
+            },
+            onInterpolateVideos: {
+                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
+                    folder,
+                    operations: [.loopAnalysis, .frameInterpolation]
+                )
             }
         )
     }
@@ -1244,6 +1256,25 @@ struct MyLibraryContentView: View {
                     Label(t("remove.from.folder"), systemImage: "folder.badge.minus")
                 }
             }
+            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
+                Divider()
+                Button {
+                    VideoOptimizationQueueService.shared.enqueueLoopAnalysis(
+                        videoURL: videoURL,
+                        title: item.wallpaper.title
+                    )
+                } label: {
+                    Label(t("videoOptimizationAnalyzeLoop"), systemImage: "point.3.connected.trianglepath.dotted")
+                }
+                Button {
+                    VideoOptimizationQueueService.shared.enqueueLoopAnalysisThenInterpolation(
+                        videoURL: videoURL,
+                        title: item.wallpaper.title
+                    )
+                } label: {
+                    Label(t("videoOptimizationInterpolateVideo"), systemImage: "rectangle.stack.badge.play")
+                }
+            }
         }
         card.draggable(dragPayload(for: item.id))
     }
@@ -1325,6 +1356,18 @@ struct MyLibraryContentView: View {
             },
             onRelock: {
                 folderLockService.lockFolder(folder.id)
+            },
+            onAnalyzeLoopPoints: {
+                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
+                    folder,
+                    operations: [.loopAnalysis]
+                )
+            },
+            onInterpolateVideos: {
+                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
+                    folder,
+                    operations: [.loopAnalysis, .frameInterpolation]
+                )
             }
         )
     }
@@ -1410,6 +1453,25 @@ struct MyLibraryContentView: View {
                     updateMediaItems()
                 } label: {
                     Label(t("remove.from.folder"), systemImage: "folder.badge.minus")
+                }
+            }
+            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
+                Divider()
+                Button {
+                    VideoOptimizationQueueService.shared.enqueueLoopAnalysis(
+                        videoURL: videoURL,
+                        title: item.mediaItem.title
+                    )
+                } label: {
+                    Label(t("videoOptimizationAnalyzeLoop"), systemImage: "point.3.connected.trianglepath.dotted")
+                }
+                Button {
+                    VideoOptimizationQueueService.shared.enqueueLoopAnalysisThenInterpolation(
+                        videoURL: videoURL,
+                        title: item.mediaItem.title
+                    )
+                } label: {
+                    Label(t("videoOptimizationInterpolateVideo"), systemImage: "rectangle.stack.badge.play")
                 }
             }
         }

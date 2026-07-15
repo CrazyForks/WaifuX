@@ -68,8 +68,8 @@ struct FrameInterpolationQueueItem: Identifiable, Equatable {
 
         var label: String {
             switch self {
-            case .loopAnalysis: return "循环分析"
-            case .frameInterpolation: return "补帧"
+            case .loopAnalysis: return t("videoOptimizationAnalyzeLoop")
+            case .frameInterpolation: return t("videoOptimizationInterpolateVideo")
             }
         }
     }
@@ -306,6 +306,37 @@ final class VideoOptimizationQueueService: ObservableObject {
         return enqueue(videoURLs: urls, operation: operation, targetFPS: targetFPS, source: source)
     }
 
+    /// 从“我的库”的逻辑文件夹解析本地视频并批量入队；视图只传递文件夹与操作，不枚举或替换文件。
+    @discardableResult
+    func enqueueLibraryFolder(
+        _ folder: LibraryFolder,
+        operations: [FrameInterpolationQueueItem.Operation],
+        targetFPS: Int? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> [UUID] {
+        let effectiveTargetFPS = targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+        return libraryOptimizationTargets(in: folder).compactMap { target in
+            enqueue(
+                videoURL: target.videoURL,
+                title: target.title,
+                targetFPS: effectiveTargetFPS,
+                source: source,
+                operations: operations
+            )
+        }
+    }
+
+    /// 统一判断库条目是否能作为视频优化输入，避免各个视图各自猜测文件类型。
+    func optimizableVideoURL(from localURL: URL?) -> URL? {
+        guard let localURL, localURL.isFileURL else {
+            return nil
+        }
+        guard let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) else {
+            return nil
+        }
+        return videoURL
+    }
+
     /// 下载完成后按设置决定是否入队补帧。调度/设壁纸路径不得调用。
     @discardableResult
     func enqueueAfterDownloadIfNeeded(
@@ -475,7 +506,13 @@ final class VideoOptimizationQueueService: ObservableObject {
                 && $0.targetFPS >= targetFPS
                 && !$0.isTerminalForCleanup
         }) {
+            let canExtendPipeline: Bool
             if case .waiting = items[coveredIndex].status {
+                canExtendPipeline = true
+            } else {
+                canExtendPipeline = items[coveredIndex].currentOperation == .loopAnalysis
+            }
+            if canExtendPipeline {
                 items[coveredIndex].operations = normalizedOperations(
                     items[coveredIndex].operations + requestedOperations
                 )
@@ -561,9 +598,9 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].opticalFlowFrames = 0
         items[index].elapsedSeconds = 0
         items[index].remainingSeconds = nil
-        let operations = items[index].operations
-        items[index].currentOperation = operations.first
-        items[index].currentStage = operations.first == .loopAnalysis
+        let initialOperations = items[index].operations
+        items[index].currentOperation = initialOperations.first
+        items[index].currentStage = initialOperations.first == .loopAnalysis
             ? "循环分析中"
             : t("frameInterpolationStageReadingFPS")
         let videoURL = items[index].videoURL
@@ -572,7 +609,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         frameInterpolationDebugPrint("补帧队列：开始任务。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
 
         let task = Task.detached(priority: .utility) { [weak self] in
-            if operations.contains(.loopAnalysis) {
+            if initialOperations.contains(.loopAnalysis) {
                 let loopResult = await VideoLoopPreprocessingService.shared.preprocessIfNeeded(videoURL)
 
                 guard !Task.isCancelled else {
@@ -597,7 +634,10 @@ final class VideoOptimizationQueueService: ObservableObject {
                 }
             }
 
-            guard operations.contains(.frameInterpolation) else {
+            let shouldInterpolate = await MainActor.run {
+                self?.items.first(where: { $0.id == id })?.operations.contains(.frameInterpolation) ?? false
+            }
+            guard shouldInterpolate else {
                 await MainActor.run { self?.finishCompleted(id: id, message: "循环分析完成") }
                 return
             }
@@ -885,6 +925,46 @@ final class VideoOptimizationQueueService: ObservableObject {
 
     private func normalizedOperations(_ operations: [FrameInterpolationQueueItem.Operation]) -> [FrameInterpolationQueueItem.Operation] {
         FrameInterpolationQueueItem.Operation.allCases.filter { operations.contains($0) }
+    }
+
+    private struct LibraryOptimizationTarget {
+        let videoURL: URL
+        let title: String
+    }
+
+    private func libraryOptimizationTargets(in folder: LibraryFolder) -> [LibraryOptimizationTarget] {
+        switch (folder.contentType, folder.collection) {
+        case (.media, .downloads):
+            return MediaLibraryService.shared.downloadedItems(inFolder: folder.id).compactMap { record in
+                makeLibraryOptimizationTarget(localURL: record.localFileURL, title: record.item.title)
+            }
+        case (.media, .favorites):
+            return MediaLibraryService.shared.favoriteItems(inFolder: folder.id).compactMap { item in
+                makeLibraryOptimizationTarget(
+                    localURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item),
+                    title: item.title
+                )
+            }
+        case (.wallpaper, .downloads):
+            return WallpaperLibraryService.shared.downloadedWallpapers(inFolder: folder.id).compactMap { record in
+                makeLibraryOptimizationTarget(
+                    localURL: record.localFileURL,
+                    title: record.wallpaper.title ?? record.localFileURL.deletingPathExtension().lastPathComponent
+                )
+            }
+        case (.wallpaper, .favorites):
+            return WallpaperLibraryService.shared.favoriteWallpapers(inFolder: folder.id).compactMap { wallpaper in
+                makeLibraryOptimizationTarget(
+                    localURL: WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper),
+                    title: wallpaper.title ?? wallpaper.id
+                )
+            }
+        }
+    }
+
+    private func makeLibraryOptimizationTarget(localURL: URL?, title: String) -> LibraryOptimizationTarget? {
+        guard let videoURL = optimizableVideoURL(from: localURL) else { return nil }
+        return LibraryOptimizationTarget(videoURL: videoURL, title: title)
     }
 
     private func archive(

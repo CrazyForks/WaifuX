@@ -1520,6 +1520,45 @@ struct MediaDetailSheet: View {
                 .disabled(isTranscodingVideo)
             }
 
+            if let interpolationVideoURL = currentFrameInterpolationVideoURL {
+                let activeOptimization = frameInterpolationQueue.item(for: interpolationVideoURL)
+                if let activeOptimization,
+                   activeOptimization.operations.contains(.loopAnalysis) {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "hourglass")
+                            Text(
+                                activeOptimization.currentOperation == .loopAnalysis
+                                    ? t("videoOptimizationLoopAnalyzing")
+                                    : activeOptimization.currentStage
+                            )
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+                } else {
+                    Button {
+                        showMoreOptionsPopover = false
+                        frameInterpolationQueue.enqueueLoopAnalysis(
+                            videoURL: interpolationVideoURL,
+                            title: resolvedItem.title
+                        )
+                    } label: {
+                        HStack {
+                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                            Text(t("videoOptimizationAnalyzeLoop"))
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             if frameInterpolationSettingsEnabled,
                let interpolationVideoURL = currentFrameInterpolationVideoURL {
                 let targetFPS = currentFrameInterpolationTargetFPS
@@ -1595,11 +1634,10 @@ struct MediaDetailSheet: View {
                     } else {
                         Button {
                             showMoreOptionsPopover = false
-                            frameInterpolationQueue.enqueue(
+                            frameInterpolationQueue.enqueueLoopAnalysisThenInterpolation(
                                 videoURL: interpolationVideoURL,
                                 title: resolvedItem.title,
-                                targetFPS: targetFPS,
-                                source: .manual
+                                targetFPS: targetFPS
                             )
                         } label: {
                             HStack {
@@ -1674,11 +1712,10 @@ struct MediaDetailSheet: View {
                 } else {
                     Button {
                         showMoreOptionsPopover = false
-                        frameInterpolationQueue.enqueue(
+                        frameInterpolationQueue.enqueueLoopAnalysisThenInterpolation(
                             videoURL: interpolationVideoURL,
                             title: resolvedItem.title,
-                            targetFPS: targetFPS,
-                            source: .manual
+                            targetFPS: targetFPS
                         )
                     } label: {
                         HStack {
