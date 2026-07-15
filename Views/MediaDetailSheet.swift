@@ -1463,23 +1463,6 @@ struct MediaDetailSheet: View {
                 .disabled(!hasValidSteamPageURL)
             }
 
-            // 仅在存在可用的 Scene 烘焙 MP4 时展示。
-            if let bakedVideoURL = cachedSceneBakeVideoURL {
-                Button {
-                    showMoreOptionsPopover = false
-                    copyBakedSceneVideoToPasteboard(bakedVideoURL)
-                } label: {
-                    HStack {
-                        Image(systemName: "doc.on.doc")
-                        Text("复制烘焙资源")
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
-            }
-
             // 重新烘焙（仅 Scene 类型已下载壁纸）
             if sceneOfflineBakeButtonVisible {
                 Button {
@@ -1733,6 +1716,23 @@ struct MediaDetailSheet: View {
                     HStack {
                         Image(systemName: "photo.on.rectangle")
                         Text("复制静态图片")
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+            }
+
+            // 仅在存在可用的 Scene 烘焙 MP4 时展示。
+            if let bakedVideoURL = cachedSceneBakeVideoURL {
+                Button {
+                    showMoreOptionsPopover = false
+                    copyBakedSceneVideoToPasteboard(bakedVideoURL)
+                } label: {
+                    HStack {
+                        Image(systemName: "doc.on.doc")
+                        Text("复制烘焙资源")
                         Spacer()
                     }
                     .padding(.horizontal, 12)
