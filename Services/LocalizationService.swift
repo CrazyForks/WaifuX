@@ -277,6 +277,10 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.cropUnsupported": "Web wallpapers do not support crop adjustment",
         "statusbar.cropStaticUnsupported": "Static image wallpapers do not support crop adjustment",
         "statusbar.sceneAdvancedSettings": "Advanced Scene Settings",
+        "statusbar.globalDisplaySettings": "Global Display Settings",
+        "globalSchedulerConfig": "GLOBAL SCHEDULER CONFIGURATION",
+        "syncAllDisplaysWallpaper": "Sync All Display Wallpapers",
+        "syncAllDisplaysWallpaperDesc": "Use one shared rotation and video decoder for every display. All displays will stay in sync.",
         // Tabs
         "tab.all": "ALL",
         "tab.nature": "NATURE",
@@ -1693,6 +1697,10 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.cropUnsupported": "Web 壁纸暂不支持可视区域调节",
         "statusbar.cropStaticUnsupported": "静态图片壁纸暂不支持可视区域调节",
         "statusbar.sceneAdvancedSettings": "场景高级设置",
+        "statusbar.globalDisplaySettings": "全局显示器设置",
+        "globalSchedulerConfig": "全局调度配置",
+        "syncAllDisplaysWallpaper": "同步所有显示器壁纸",
+        "syncAllDisplaysWallpaperDesc": "所有显示器共用同一套自动更换与视频解码，所有显示器将保持一致。",
         "statusbar.quit": "退出",
         // Tabs
         "tab.all": "全部",
@@ -3113,6 +3121,10 @@ private let translations: [LocalizationService.Language: [String: String]] = [
         "statusbar.cropUnsupported": "Web壁紙は表示範囲調整に対応していません",
         "statusbar.cropStaticUnsupported": "静止画壁紙は表示範囲調整に対応していません",
         "statusbar.sceneAdvancedSettings": "シーン詳細設定",
+        "statusbar.globalDisplaySettings": "グローバルディスプレイ設定",
+        "globalSchedulerConfig": "グローバルスケジューラー設定",
+        "syncAllDisplaysWallpaper": "すべてのディスプレイの壁紙を同期",
+        "syncAllDisplaysWallpaperDesc": "すべてのディスプレイで同じ切り替え設定と動画デコーダーを共有し、表示を同期します。",
         // Tabs
         "tab.all": "すべて",
         "tab.nature": "自然",

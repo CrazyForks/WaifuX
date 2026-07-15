@@ -31,6 +31,8 @@ enum LocalWallpaperApplyService {
         var generatePosterFromVideoIfNeeded: Bool = false
         var sceneBakeItemID: String? = nil
         var bakedVideoPath: String? = nil
+        /// 全局显示器同步时，同一视频只创建一个 AVPlayer 解码实例并供所有视频层复用。
+        var usesSharedVideoDecoder: Bool = false
         var reason: String = "apply"
     }
 
@@ -197,7 +199,8 @@ enum LocalWallpaperApplyService {
             posterURL: posterURL,
             muted: options.muted,
             targetScreens: screens,
-            animatedTransition: options.animatedTransition
+            animatedTransition: options.animatedTransition,
+            usesSharedVideoDecoder: options.usesSharedVideoDecoder
         )
         // 仅系统壁纸同步开启时注册桌面 poster；动态层（视频窗）不受影响
         if let posterURL, VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {

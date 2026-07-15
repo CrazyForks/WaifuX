@@ -128,6 +128,9 @@ struct SchedulerConfig: Codable {
     var includeWallpapers: Bool
     var includeMedia: Bool
     var displayConfigs: [String: DisplaySchedulerConfig]
+    /// 全局同步模式只维护这一份轮换设置；每屏配置仍会保留，关闭同步后可继续使用。
+    var isGlobalDisplaySyncEnabled: Bool
+    var globalDisplayConfig: DisplaySchedulerConfig
 
     /// 特殊间隔值：播完即换（视频播放完毕后自动切换到下一个）
     static let intervalOnEndMinutes: Int = -1
@@ -140,7 +143,15 @@ struct SchedulerConfig: Codable {
         order: .random,
         includeWallpapers: true,
         includeMedia: true,
-        displayConfigs: [:]
+        displayConfigs: [:],
+        isGlobalDisplaySyncEnabled: false,
+        globalDisplayConfig: DisplaySchedulerConfig(
+            isEnabled: false,
+            intervalMinutes: 60,
+            order: .random,
+            includeWallpapers: true,
+            includeMedia: true
+        )
     )
 
     static let intervalOptions: [Int] = [1, 3, 5, 15, 30, 60, 360, 1440]
@@ -153,6 +164,8 @@ struct SchedulerConfig: Codable {
         case includeWallpapers
         case includeMedia
         case displayConfigs
+        case isGlobalDisplaySyncEnabled
+        case globalDisplayConfig
     }
 
     init(
@@ -161,7 +174,9 @@ struct SchedulerConfig: Codable {
         order: ScheduleOrder,
         includeWallpapers: Bool,
         includeMedia: Bool,
-        displayConfigs: [String: DisplaySchedulerConfig] = [:]
+        displayConfigs: [String: DisplaySchedulerConfig] = [:],
+        isGlobalDisplaySyncEnabled: Bool = false,
+        globalDisplayConfig: DisplaySchedulerConfig? = nil
     ) {
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
@@ -169,6 +184,14 @@ struct SchedulerConfig: Codable {
         self.includeWallpapers = includeWallpapers
         self.includeMedia = includeMedia
         self.displayConfigs = displayConfigs
+        self.isGlobalDisplaySyncEnabled = isGlobalDisplaySyncEnabled
+        self.globalDisplayConfig = globalDisplayConfig ?? DisplaySchedulerConfig(
+            isEnabled: isEnabled,
+            intervalMinutes: intervalMinutes,
+            order: order,
+            includeWallpapers: includeWallpapers,
+            includeMedia: includeMedia
+        )
     }
 
     init(from decoder: Decoder) throws {
@@ -196,6 +219,16 @@ struct SchedulerConfig: Codable {
             self.includeWallpapers = true
             self.includeMedia = true
         }
+
+        isGlobalDisplaySyncEnabled = try container.decodeIfPresent(Bool.self, forKey: .isGlobalDisplaySyncEnabled) ?? false
+        globalDisplayConfig = try container.decodeIfPresent(DisplaySchedulerConfig.self, forKey: .globalDisplayConfig)
+            ?? DisplaySchedulerConfig(
+                isEnabled: isEnabled,
+                intervalMinutes: intervalMinutes,
+                order: order,
+                includeWallpapers: includeWallpapers,
+                includeMedia: includeMedia
+            )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -206,9 +239,19 @@ struct SchedulerConfig: Codable {
         try container.encode(includeWallpapers, forKey: .includeWallpapers)
         try container.encode(includeMedia, forKey: .includeMedia)
         try container.encode(displayConfigs, forKey: .displayConfigs)
+        try container.encode(isGlobalDisplaySyncEnabled, forKey: .isGlobalDisplaySyncEnabled)
+        try container.encode(globalDisplayConfig, forKey: .globalDisplayConfig)
     }
 
     func resolvedDisplayConfig(for screenID: String) -> DisplaySchedulerConfig {
+        if isGlobalDisplaySyncEnabled {
+            return globalDisplayConfig
+        }
+        return storedDisplayConfig(for: screenID)
+    }
+
+    /// 返回该屏自身保存的配置；全局同步开启时也不会被全局配置覆盖。
+    func storedDisplayConfig(for screenID: String) -> DisplaySchedulerConfig {
         if let config = displayConfigs[screenID] {
             return config
         }

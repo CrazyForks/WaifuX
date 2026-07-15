@@ -46,7 +46,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -59,7 +61,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -72,7 +76,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: include,
                 includeMedia: config.includeMedia,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -85,7 +91,9 @@ class WallpaperSchedulerViewModel: ObservableObject {
                 order: config.order,
                 includeWallpapers: config.includeWallpapers,
                 includeMedia: include,
-                displayConfigs: config.displayConfigs
+                displayConfigs: config.displayConfigs,
+                isGlobalDisplaySyncEnabled: config.isGlobalDisplaySyncEnabled,
+                globalDisplayConfig: config.globalDisplayConfig
             )
         )
     }
@@ -134,6 +142,48 @@ class WallpaperSchedulerViewModel: ObservableObject {
 
     func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
         schedulerService.updateDisplayAutoChangeOnExternalConnect(enabled, for: screen)
+    }
+
+    // MARK: - Global Display Sync
+
+    var isGlobalDisplaySyncEnabled: Bool {
+        config.isGlobalDisplaySyncEnabled
+    }
+
+    var globalDisplayConfig: DisplaySchedulerConfig {
+        config.globalDisplayConfig
+    }
+
+    func updateGlobalDisplaySyncEnabled(_ enabled: Bool) {
+        schedulerService.updateGlobalDisplaySyncEnabled(enabled)
+    }
+
+    func updateGlobalDisplayEnabled(_ enabled: Bool) {
+        schedulerService.updateGlobalDisplayEnabled(enabled)
+    }
+
+    func updateGlobalDisplayInterval(_ minutes: Int) {
+        schedulerService.updateGlobalDisplayInterval(minutes)
+    }
+
+    func updateGlobalDisplayOrder(_ order: ScheduleOrder) {
+        schedulerService.updateGlobalDisplayOrder(order)
+    }
+
+    func updateGlobalDisplayIncludeWallpapers(_ include: Bool) {
+        schedulerService.updateGlobalDisplayIncludeWallpapers(include)
+    }
+
+    func updateGlobalDisplayIncludeMedia(_ include: Bool) {
+        schedulerService.updateGlobalDisplayIncludeMedia(include)
+    }
+
+    func updateGlobalDisplayFolderIDs(_ folderIDs: [String]?) {
+        schedulerService.updateGlobalDisplayFolderIDs(folderIDs)
+    }
+
+    func updateGlobalDisplayWebSceneSwitchSeconds(_ seconds: Int?) {
+        schedulerService.updateGlobalDisplayWebSceneSwitchSeconds(seconds)
     }
 
     // MARK: - Computed Properties

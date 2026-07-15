@@ -1114,14 +1114,27 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
-    func applyDynamicWallpaper(_ item: MediaItem, muted: Bool, targetScreen: NSScreen? = nil) async throws {
+    func applyDynamicWallpaper(
+        _ item: MediaItem,
+        muted: Bool,
+        targetScreen: NSScreen? = nil,
+        targetScreens: [NSScreen]? = nil,
+        usesSharedVideoDecoder: Bool = false
+    ) async throws {
+        let resolvedTargetScreens = targetScreens ?? targetScreen.map { [$0] }
         // Workshop 项：优先查找本地已下载的视频文件
         if item.id.hasPrefix("workshop_"),
            let localVideoURL = findLocalWorkshopVideo(for: item) {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
             mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-            try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+            try videoWallpaperManager.applyVideoWallpaper(
+                from: localVideoURL,
+                posterURL: posterURL,
+                muted: muted,
+                targetScreens: resolvedTargetScreens,
+                usesSharedVideoDecoder: usesSharedVideoDecoder
+            )
             return
         }
 
@@ -1132,7 +1145,13 @@ final class MediaExploreViewModel: ObservableObject {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
                 mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
                 let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
-                try videoWallpaperManager.applyVideoWallpaper(from: localURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+                try videoWallpaperManager.applyVideoWallpaper(
+                    from: localURL,
+                    posterURL: posterURL,
+                    muted: muted,
+                    targetScreens: resolvedTargetScreens,
+                    usesSharedVideoDecoder: usesSharedVideoDecoder
+                )
                 return
             }
         }
@@ -1144,7 +1163,13 @@ final class MediaExploreViewModel: ObservableObject {
             saveToDownloads: true
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-        try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+        try videoWallpaperManager.applyVideoWallpaper(
+            from: localVideoURL,
+            posterURL: posterURL,
+            muted: muted,
+            targetScreens: resolvedTargetScreens,
+            usesSharedVideoDecoder: usesSharedVideoDecoder
+        )
     }
 
     /// Registers an already-local item before it is applied from the detail sheet.

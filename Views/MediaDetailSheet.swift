@@ -2816,7 +2816,26 @@ struct MediaDetailSheet: View {
 
         // 检测多显示器
         let screens = NSScreen.screens
-        if screens.count > 1 {
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            applyingWallpaperStatusKey = "applyingWallpaper.video"
+            isSettingWallpaper = true
+            errorMessage = ""
+            Task { @MainActor in
+                do {
+                    try await viewModel.applyDynamicWallpaper(
+                        resolvedItem,
+                        muted: isMuted,
+                        targetScreens: NSScreen.screens,
+                        usesSharedVideoDecoder: true
+                    )
+                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: nil)
+                } catch {
+                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                    showError = true
+                }
+                isSettingWallpaper = false
+            }
+        } else if screens.count > 1 {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
@@ -2938,7 +2957,10 @@ struct MediaDetailSheet: View {
             }
             Task { @MainActor in
                 do {
-                    let targetScreens = selectedScreen.map { [$0] }
+                    let isGlobalDisplaySyncEnabled = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+                    let targetScreens = isGlobalDisplaySyncEnabled
+                        ? NSScreen.screens
+                        : selectedScreen.map { [$0] }
                     var options = LocalWallpaperApplyService.Options(
                         animatedTransition: false,
                         requirePlaybackEndSupport: false,
@@ -2947,6 +2969,7 @@ struct MediaDetailSheet: View {
                         generatePosterFromVideoIfNeeded: true,
                         sceneBakeItemID: currentDownloadRecord?.item.id,
                         bakedVideoPath: currentDownloadRecord?.sceneBakeArtifact?.videoPath,
+                        usesSharedVideoDecoder: isGlobalDisplaySyncEnabled,
                         reason: "manual-apply"
                     )
                     if let art = currentDownloadRecord?.sceneBakeArtifact,
@@ -2959,7 +2982,7 @@ struct MediaDetailSheet: View {
                         options: options
                     )
                     WallpaperSchedulerService.shared.notifyManualWallpaperChange(
-                        screenID: selectedScreen?.wallpaperScreenIdentifier
+                        screenID: isGlobalDisplaySyncEnabled ? nil : selectedScreen?.wallpaperScreenIdentifier
                     )
                 } catch {
                     errorMessage = Self.truncateErrorMessage(error.localizedDescription)
@@ -2969,7 +2992,9 @@ struct MediaDetailSheet: View {
             }
         }
 
-        if screens.count > 1 {
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            run(nil)
+        } else if screens.count > 1 {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")

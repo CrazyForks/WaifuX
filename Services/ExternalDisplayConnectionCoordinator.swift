@@ -74,6 +74,11 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
 
     private func handleConnectedExternalDisplay(_ screen: NSScreen) {
         Task { @MainActor in
+            if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+                // 全局模式没有单屏接入决策：通过调度器的统一入口把当前全局壁纸扩展到新屏幕。
+                WallpaperSchedulerService.shared.synchronizeCurrentGlobalWallpaperToConnectedDisplays()
+                return
+            }
             if await restorePreviousDisplayStateIfAvailable(for: screen) {
                 return
             }

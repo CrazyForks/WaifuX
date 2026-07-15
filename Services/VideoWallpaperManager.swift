@@ -107,6 +107,12 @@ final class VideoWallpaperManager: ObservableObject {
     private var windows: [String: WallpaperVideoWindow] = [:]
     private var players: [String: AVQueuePlayer] = [:]
     private var loopers: [String: AVPlayerLooper] = [:]
+    /// 全局同步模式下，多个视频层共享同一个解码器与时间轴。
+    /// 每块屏幕仍拥有自己的窗口和 AVPlayerLayer，但不再各自创建 AVQueuePlayer。
+    private var usesSharedVideoDecoder = false
+    private var sharedVideoPlayer: AVQueuePlayer?
+    private var sharedVideoLooper: AVPlayerLooper?
+    private var sharedVideoItem: AVPlayerItem?
     /// 每屏视频真实尺寸缓存（naturalSize），供 crop 计算用。设置壁纸时填充。
     private var videoSizes: [String: CGSize] = [:]
     /// 每屏视频源文件自带黑边的内容裁切框。只在全屏自动铺满模式下叠加。
@@ -279,6 +285,60 @@ final class VideoWallpaperManager: ObservableObject {
         videoURLByScreen[screen.wallpaperScreenIdentifier] ??
         videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint] ??
         currentVideoURL
+    }
+
+    /// 切换全局同步的解码策略。调用者只声明播放目标范围，播放器负责重建为单解码或按屏解码。
+    func setSharedDecoderPlaybackEnabled(
+        _ enabled: Bool,
+        sourceScreen: NSScreen? = nil
+    ) {
+        guard usesSharedVideoDecoder != enabled else { return }
+        let sourceVideoURL = sourceScreen.flatMap(videoURL(for:)) ?? currentVideoURL
+        let sourcePosterURL = sourceScreen.flatMap(posterURL(for:)) ?? currentPosterURL
+        guard let sourceVideoURL,
+              FileManager.default.fileExists(atPath: sourceVideoURL.path) else {
+            usesSharedVideoDecoder = enabled
+            return
+        }
+
+        do {
+            try applyVideoWallpaper(
+                from: sourceVideoURL,
+                posterURL: sourcePosterURL,
+                muted: isMuted,
+                targetScreen: nil,
+                animatedTransition: false,
+                usesSharedVideoDecoder: enabled
+            )
+        } catch {
+            AppLogger.error(.wallpaper, "Failed to change shared video decoder mode", metadata: [
+                "enabled": enabled,
+                "error": error.localizedDescription,
+            ])
+        }
+    }
+
+    /// 显示器集合发生变化时，将现有共享视频层重新绑定到当前所有屏幕。
+    func refreshSharedDecoderTargets() {
+        guard usesSharedVideoDecoder,
+              let currentVideoURL,
+              FileManager.default.fileExists(atPath: currentVideoURL.path) else { return }
+        // 让 apply 路径感知到屏幕集合变化，触发一次窗口重建而不是仅同步旧窗口坐标。
+        videoTargetScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+        videoTargetScreenFingerprints = Set(NSScreen.screens.map(\.wallpaperScreenFingerprint))
+        let currentWindowIDs = Set(windows.keys)
+        if currentWindowIDs == videoTargetScreenIDs {
+            // 强制避开同源视频的复用快路径，以便为新接入的屏幕创建一层。
+            videoTargetScreenIDs.removeAll()
+        }
+        try? applyVideoWallpaper(
+            from: currentVideoURL,
+            posterURL: currentPosterURL,
+            muted: isMuted,
+            targetScreens: NSScreen.screens,
+            animatedTransition: false,
+            usesSharedVideoDecoder: true
+        )
     }
 
     /// 外接屏重连时按物理指纹恢复之前分配给这块屏的视频壁纸。
@@ -733,8 +793,20 @@ final class VideoWallpaperManager: ObservableObject {
         posterURL: URL? = nil,
         muted: Bool = true,
         targetScreens: [NSScreen]?,
-        animatedTransition: Bool = false
+        animatedTransition: Bool = false,
+        usesSharedVideoDecoder: Bool = false
     ) throws {
+        if usesSharedVideoDecoder {
+            try applyVideoWallpaper(
+                from: localFileURL,
+                posterURL: posterURL,
+                muted: muted,
+                targetScreen: nil,
+                animatedTransition: animatedTransition,
+                usesSharedVideoDecoder: true
+            )
+            return
+        }
         if let screens = targetScreens, !screens.isEmpty {
             for screen in screens {
                 try applyVideoWallpaper(
@@ -742,7 +814,8 @@ final class VideoWallpaperManager: ObservableObject {
                     posterURL: posterURL,
                     muted: muted,
                     targetScreen: screen,
-                    animatedTransition: animatedTransition
+                    animatedTransition: animatedTransition,
+                    usesSharedVideoDecoder: false
                 )
             }
         } else {
@@ -751,7 +824,8 @@ final class VideoWallpaperManager: ObservableObject {
                 posterURL: posterURL,
                 muted: muted,
                 targetScreen: nil,
-                animatedTransition: animatedTransition
+                animatedTransition: animatedTransition,
+                usesSharedVideoDecoder: false
             )
         }
     }
@@ -761,7 +835,8 @@ final class VideoWallpaperManager: ObservableObject {
         posterURL: URL? = nil,
         muted: Bool = true,
         targetScreen: NSScreen? = nil,
-        animatedTransition: Bool = false
+        animatedTransition: Bool = false,
+        usesSharedVideoDecoder: Bool = false
     ) throws {
         AppLogger.error(.wallpaper, "applyVideoWallpaper 开始", metadata: [
             "video": localFileURL.lastPathComponent,
@@ -799,6 +874,7 @@ final class VideoWallpaperManager: ObservableObject {
             WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
         }
 
+        let playbackModeChanged = self.usesSharedVideoDecoder != usesSharedVideoDecoder
         let isNewVideo = currentVideoURL != localFileURL
         let activeScreenIDs = Set(windows.keys)
         let screenIDsNow = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
@@ -813,7 +889,8 @@ final class VideoWallpaperManager: ObservableObject {
            (targetScreen == nil || (isSameVideoForTarget && targetScreenAlreadyActive)),
            activeScreenIDs == videoTargetScreenIDs,
            videoTargetScreenIDs.isSubset(of: screenIDsNow),
-           !targetDisplayConfigurationChanged {
+           !targetDisplayConfigurationChanged,
+           !playbackModeChanged {
             synchronizeExistingWindowFramesToCurrentScreens()
             currentVideoURL = localFileURL
             setMuted(muted)
@@ -836,6 +913,8 @@ final class VideoWallpaperManager: ObservableObject {
             }
             return
         }
+
+        self.usesSharedVideoDecoder = usesSharedVideoDecoder
 
         if let targetScreen {
             videoTargetScreenIDs.insert(targetScreen.wallpaperScreenIdentifier)
@@ -1232,6 +1311,18 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     func reloadPlaybackAfterInPlaceOptimization(videoURL: URL) {
+        if usesSharedVideoDecoder,
+           currentVideoURL?.standardizedFileURL == videoURL.standardizedFileURL {
+            try? applyVideoWallpaper(
+                from: videoURL,
+                posterURL: currentPosterURL,
+                muted: isMuted,
+                targetScreens: NSScreen.screens,
+                animatedTransition: false,
+                usesSharedVideoDecoder: true
+            )
+            return
+        }
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
             let currentSourceURL = videoURLByScreen[screenID]
@@ -1692,13 +1783,17 @@ final class VideoWallpaperManager: ObservableObject {
         playerItemObserverTokens.removeValue(forKey: screenID)
         fadeInTimeouts[screenID]?.cancel()
         fadeInTimeouts.removeValue(forKey: screenID)
+        let removedPlaybackEndObserver: Bool
         if let observer = playbackEndObservers[screenID] {
             NotificationCenter.default.removeObserver(observer)
             playbackEndObservers.removeValue(forKey: screenID)
+            removedPlaybackEndObserver = true
+        } else {
+            removedPlaybackEndObserver = false
         }
         onEndModeScreens.remove(screenID)
 
-        if let looper = loopers[screenID] {
+        if let looper = loopers[screenID], !usesSharedVideoDecoder {
             looper.disableLooping()
             loopers.removeValue(forKey: screenID)
         }
@@ -1713,10 +1808,33 @@ final class VideoWallpaperManager: ObservableObject {
             retainWindowsTemporarily([window])
         }
         if let player = players[screenID] {
-            player.pause()
-            player.removeAllItems()
             players.removeValue(forKey: screenID)
-            retainPlayersTemporarily([player])
+            let stillUsedByAnotherScreen = usesSharedVideoDecoder
+                && players.values.contains(where: { $0 === player })
+            if !stillUsedByAnotherScreen {
+                player.pause()
+                player.removeAllItems()
+                retainPlayersTemporarily([player])
+                if usesSharedVideoDecoder, player === sharedVideoPlayer {
+                    sharedVideoPlayer = nil
+                    sharedVideoLooper = nil
+                    sharedVideoItem = nil
+                }
+            }
+        }
+        if usesSharedVideoDecoder,
+           removedPlaybackEndObserver,
+           !onEndModeScreens.isEmpty,
+           let replacement = players.first,
+           let sharedVideoPlayer,
+           let sharedVideoItem,
+           replacement.value === sharedVideoPlayer {
+            // 共享播放器只有一个播完通知。承载它的屏幕断开后，将观察者迁移到仍存在的窗口。
+            setupPlaybackEndObserver(
+                for: replacement.key,
+                player: sharedVideoPlayer,
+                item: sharedVideoItem
+            )
         }
         videoSizes.removeValue(forKey: screenID)
         videoLetterboxContentCrops.removeValue(forKey: screenID)
@@ -2888,10 +3006,11 @@ final class VideoWallpaperManager: ObservableObject {
             playerItem.appliesPerFrameHDRDisplayMetadata = hdrMetadataEnabled
         }
 
-        // 计算屏幕物理像素分辨率，用于后续所有与分辨率/码率相关的限制
-        let scaleFactor = screen.backingScaleFactor
-        let screenPixelWidth = screen.frame.width * scaleFactor
-        let screenPixelHeight = screen.frame.height * scaleFactor
+        // 共享解码要覆盖所有目标屏幕，按其中最大物理分辨率设置上限；
+        // 否则主屏分辨率较低时，外接高分屏会被同一个解码器限制在低清分辨率。
+        let sizingScreens = usesSharedVideoDecoder ? screensForVideoWallpaperTargets() : [screen]
+        let screenPixelWidth = sizingScreens.map { $0.frame.width * $0.backingScaleFactor }.max() ?? screen.frame.width * screen.backingScaleFactor
+        let screenPixelHeight = sizingScreens.map { $0.frame.height * $0.backingScaleFactor }.max() ?? screen.frame.height * screen.backingScaleFactor
 
         // 1) 动态峰值码率限制
         // 根据屏幕分辨率计算合理的峰值码率上限，避免超大码率视频导致持续性磁盘 I/O 和内存带宽压力。
@@ -3009,15 +3128,30 @@ final class VideoWallpaperManager: ObservableObject {
         // 统一使用 AVPlayerLooper 简单循环播放原视频。
         let hdrMetadataEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
         let playbackURL = videoURL
-        let components = makePlayerComponents(
-            for: screen,
-            videoURL: playbackURL,
-            muted: muted,
-            hdrMetadataEnabled: hdrMetadataEnabled,
-            enableLooping: !isOnEndMode
-        )
-        if let looper = components.looper {
-            self.loopers[screenID] = looper
+        let components: (player: AVQueuePlayer, looper: AVPlayerLooper?, item: AVPlayerItem)
+        if usesSharedVideoDecoder,
+           let sharedVideoPlayer,
+           let sharedVideoItem {
+            components = (sharedVideoPlayer, sharedVideoLooper, sharedVideoItem)
+        } else {
+            components = makePlayerComponents(
+                for: screen,
+                videoURL: playbackURL,
+                muted: muted,
+                hdrMetadataEnabled: hdrMetadataEnabled,
+                enableLooping: !isOnEndMode
+            )
+            if usesSharedVideoDecoder {
+                sharedVideoPlayer = components.player
+                sharedVideoLooper = components.looper
+                sharedVideoItem = components.item
+            }
+        }
+        if usesSharedVideoDecoder {
+            // shared looper 只由 teardownAllWindows 统一关闭，避免拆任意一个屏幕就影响其它层。
+            loopers.removeValue(forKey: screenID)
+        } else if let looper = components.looper {
+            loopers[screenID] = looper
         } else {
             loopers.removeValue(forKey: screenID)
         }
@@ -3114,7 +3248,9 @@ final class VideoWallpaperManager: ObservableObject {
         // 如果是"播完即换"模式，添加视频播放完成的观察者
         if isOnEndMode {
             onEndModeScreens.insert(screenID)
-            setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
+            if !usesSharedVideoDecoder || playbackEndObservers.isEmpty {
+                setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
+            }
         } else {
             onEndModeScreens.remove(screenID)
             // 清理旧的播放结束观察者
@@ -3197,10 +3333,13 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         // 2. 停止 looper
+        sharedVideoLooper?.disableLooping()
         for looper in loopers.values {
             looper.disableLooping()
         }
         loopers.removeAll()
+        sharedVideoLooper = nil
+        sharedVideoItem = nil
 
         // 3. 暂停 player 并清空 items
         // ⚠️ 关键：不要立即释放 player！
@@ -3208,12 +3347,16 @@ final class VideoWallpaperManager: ObservableObject {
         // 在后台线程异步清理 AVPlayerItem 的通知监听器，如果 player 在此期间被释放，
         // 后台线程访问已释放对象 → 主线程 autorelease pool drain 时 objc_release 已死对象 → SIGSEGV
         // 修复：先暂停+清空，然后延迟释放，让后台清理完成
-        let playersToDelay = players.values.map { $0 }
+        var seenPlayers = Set<ObjectIdentifier>()
+        let playersToDelay = players.values.filter { player in
+            seenPlayers.insert(ObjectIdentifier(player)).inserted
+        }
         for player in playersToDelay {
             player.pause()
             player.removeAllItems()
         }
         players.removeAll()
+        sharedVideoPlayer = nil
         videoSizes.removeAll()
         clearVideoLetterboxState()
 
