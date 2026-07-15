@@ -941,12 +941,16 @@ final class StatusBarController: NSObject {
             NSSound.beep()
             return
         }
-        WebPropertyEditorPanelController.shared.presentSceneConfig(for: wallpaperPath)
+        presentEditorPopover { anchorView in
+            WebPropertyEditorPanelController.shared.presentSceneConfig(for: wallpaperPath, from: anchorView)
+        }
     }
 
     @objc private func openWebWallpaperDesignPanel() {
         if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
-            WebPropertyEditorPanelController.shared.presentSceneDesign(for: sceneWallpaperPath)
+            presentEditorPopover { anchorView in
+                WebPropertyEditorPanelController.shared.presentSceneDesign(for: sceneWallpaperPath, from: anchorView)
+            }
             return
         }
 
@@ -955,19 +959,37 @@ final class StatusBarController: NSObject {
             return
         }
         if weBridge.isCurrentWallpaperWeb {
-            WebPropertyEditorPanelController.shared.presentWeb(for: wallpaperPath)
+            presentEditorPopover { anchorView in
+                WebPropertyEditorPanelController.shared.presentWeb(for: wallpaperPath, from: anchorView)
+            }
             return
         }
         if weBridge.isCurrentWallpaperScene {
             // 实时渲染模式下，显示属性编辑面板；否则显示文本设计面板
             if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
-                WebPropertyEditorPanelController.shared.presentScene(for: wallpaperPath)
+                presentEditorPopover { anchorView in
+                    WebPropertyEditorPanelController.shared.presentScene(for: wallpaperPath, from: anchorView)
+                }
             } else {
-                WebPropertyEditorPanelController.shared.presentSceneDesign(for: wallpaperPath)
+                presentEditorPopover { anchorView in
+                    WebPropertyEditorPanelController.shared.presentSceneDesign(for: wallpaperPath, from: anchorView)
+                }
             }
             return
         }
         NSSound.beep()
+    }
+
+    private func presentEditorPopover(_ present: @escaping (NSView) -> Void) {
+        guard let statusButton = statusItem.button else {
+            NSSound.beep()
+            return
+        }
+        // NSMenu is still tracking while its item's action runs. Presenting on
+        // the next turn prevents it from immediately dismissing the popover.
+        DispatchQueue.main.async {
+            present(statusButton)
+        }
     }
 
     private func currentSceneDesignWallpaperPath() -> String? {

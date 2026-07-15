@@ -676,6 +676,14 @@ private struct GeneralSettingsTab: View {
                 }
 
                 MacSettingsRow(
+                    title: t("preventSystemSleep"),
+                    subtitle: t("preventSystemSleepDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.preventSystemSleep)
+                }
+
+                MacSettingsRow(
                     title: t("hideNotch"),
                     subtitle: t("hideNotchDesc"),
                     showDivider: true

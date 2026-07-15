@@ -44,6 +44,31 @@ private func isDynamicLockScreenEnabledForCurrentLaunch() -> Bool {
     return rawValue == "1" || rawValue == "true" || rawValue == "yes"
 }
 
+/// 与 App「系统壁纸同步」开关对齐。
+/// 优先读热更新控制文件（App 改开关后立刻生效），再回退到启动环境变量；都没有则默认开启。
+private let systemWallpaperSyncControlPath = "/tmp/waifux-system-wallpaper-sync.json"
+
+private func isSystemWallpaperSyncEnabledForCurrentLaunch() -> Bool {
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: systemWallpaperSyncControlPath)),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let enabled = obj["enabled"] as? Bool {
+            return enabled
+        }
+        if let n = obj["enabled"] as? NSNumber {
+            return n.boolValue
+        }
+        if let s = obj["enabled"] as? String {
+            let v = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return v == "1" || v == "true" || v == "yes"
+        }
+    }
+    let rawValue = ProcessInfo.processInfo.environment["WAIFUX_SYSTEM_WALLPAPER_SYNC_ENABLED"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    if rawValue == nil || rawValue?.isEmpty == true { return true }
+    return rawValue == "1" || rawValue == "true" || rawValue == "yes"
+}
+
 private func dlog(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
     if let data = line.data(using: .utf8) {
@@ -1415,6 +1440,10 @@ private final class DesktopWallpaperManager {
         guard FileManager.default.fileExists(atPath: capPath) else { return }
         guard !isDynamicLockScreenEnabledForCurrentLaunch() else {
             dlog("[DesktopWallpaperManager] Dynamic lock screen enabled; skip static capture desktop apply")
+            return
+        }
+        guard isSystemWallpaperSyncEnabledForCurrentLaunch() else {
+            dlog("[DesktopWallpaperManager] System wallpaper sync disabled; skip static capture desktop apply")
             return
         }
         let src = URL(fileURLWithPath: capPath)

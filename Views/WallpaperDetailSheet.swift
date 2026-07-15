@@ -1776,35 +1776,42 @@ struct WallpaperDetailSheet: View {
             // 全部已下载时只归夹；defer 会复位按钮，不弹错误框
             guard !pendingWallpapers.isEmpty else { return }
 
-            // 并发提交所有下载任务，统计成败，保证按钮状态一定复位
+            // 并发提交下载；folderID 在落盘登记时一并写入，避免“成功落盘却落在根目录”
             let vm = viewModel
             let folderID = folder.id
             var successCount = 0
             var failureCount = 0
-            await withTaskGroup(of: Bool.self) { group in
+            await withTaskGroup(of: (String, Bool).self) { group in
                 for wallpaper in pendingWallpapers {
                     group.addTask {
                         do {
-                            try await vm.downloadWallpaper(wallpaper)
-                            await MainActor.run {
-                                folderStore.moveWallpaperToFolder(
-                                    wallpaperID: wallpaper.id,
-                                    folderID: folderID,
-                                    scope: .downloads
-                                )
-                            }
-                            return true
+                            try await vm.downloadWallpaper(wallpaper, folderID: folderID)
+                            return (wallpaper.id, true)
                         } catch {
                             AppLogger.error(.download, "作者壁纸批量下载失败",
                                 metadata: ["wallpaperID": wallpaper.id, "author": authorName,
                                            "error": error.localizedDescription])
-                            return false
+                            return (wallpaper.id, false)
                         }
                     }
                 }
-                for await ok in group {
+                for await (_, ok) in group {
                     if ok { successCount += 1 } else { failureCount += 1 }
                 }
+            }
+
+            // 兜底：本批成功项再归一次作者夹。
+            // 优先按 isDownloaded；若仅有下载记录（文件检测偶发缓存滞后）也尝试归夹。
+            for wallpaper in stampedWallpapers {
+                let hasRecord = libraryService.downloadRecords.contains {
+                    $0.wallpaper.id == wallpaper.id && $0.isActive
+                }
+                guard libraryService.isDownloaded(wallpaper) || hasRecord else { continue }
+                folderStore.moveWallpaperToFolder(
+                    wallpaperID: wallpaper.id,
+                    folderID: folderID,
+                    scope: .downloads
+                )
             }
 
             if failureCount > 0 {

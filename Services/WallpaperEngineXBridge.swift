@@ -1490,6 +1490,8 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 给旧 CLI 客户端进程拼装环境变量（仅 web 壁纸 daemon 使用）。
     private static func legacyCLILaunchEnvironment(for cli: URL) -> [String: String] {
+        // 每次拉起/调用 CLI 前刷新控制文件，保证长驻 daemon 读到最新开关
+        VideoWallpaperManager.shared.publishSystemWallpaperSyncControlToWebDaemon()
         var env = ProcessInfo.processInfo.environment
         env["LSUIElement"] = "1"
         if #available(macOS 26.0, *) {
@@ -1497,6 +1499,8 @@ final class WallpaperEngineXBridge: ObservableObject {
         } else {
             env["WAIFUX_DYNAMIC_LOCK_SCREEN_ENABLED"] = "0"
         }
+        // 与 App 内「系统壁纸同步」一致：关闭时 daemon 不得 setDesktopImageURL
+        env["WAIFUX_SYSTEM_WALLPAPER_SYNC_ENABLED"] = VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled ? "1" : "0"
         return env
     }
 
@@ -2610,6 +2614,12 @@ final class WallpaperEngineXBridge: ObservableObject {
             return true
         }
 
+        // 系统壁纸同步关闭时：动态 scene 仍由 wgpu 渲染，但不得写系统桌面静态图。
+        guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+            print("[WallpaperEngineXBridge] 🧊 系统壁纸同步已关闭，跳过静态 fallback 桌面写入")
+            return true
+        }
+
         let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
             .imageScaling: NSImageScaling.scaleAxesIndependently.rawValue,
             .fillColor: NSColor.black
@@ -2764,6 +2774,11 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             print("[WallpaperEngineXBridge] 🔒 动态锁屏已启用，跳过静态 fallback 壁纸设置以保护用户锁屏选择")
+            return true
+        }
+
+        guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+            print("[WallpaperEngineXBridge] 🧊 系统壁纸同步已关闭，跳过窗口截帧写系统桌面")
             return true
         }
 
@@ -3942,6 +3957,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
         if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             print("[WebRendererBridge] 🔒 动态锁屏已启用，跳过 Web 捕获静态桌面写入")
+            return
+        }
+        guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+            print("[WebRendererBridge] 🧊 系统壁纸同步已关闭，跳过 Web 捕获静态桌面写入")
             return
         }
 

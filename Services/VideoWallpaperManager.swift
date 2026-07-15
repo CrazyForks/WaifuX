@@ -183,6 +183,22 @@ final class VideoWallpaperManager: ObservableObject {
         UserDefaults.standard.object(forKey: "system_wallpaper_sync_enabled") as? Bool ?? true
     }
 
+    /// 同步给 web daemon（wallpaperengine-cli）的热更新控制文件路径。
+    /// daemon 长驻进程读此文件，避免仅依赖启动时 env。
+    static let systemWallpaperSyncControlPath = "/tmp/waifux-system-wallpaper-sync.json"
+
+    /// 把当前「系统壁纸同步」状态写到控制文件，供 web daemon 即时遵守。
+    func publishSystemWallpaperSyncControlToWebDaemon() {
+        let enabled = isSystemWallpaperSyncEnabled
+        let payload: [String: Any] = [
+            "enabled": enabled,
+            "updatedAt": Date().timeIntervalSince1970,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
+        try? data.write(to: URL(fileURLWithPath: Self.systemWallpaperSyncControlPath), options: .atomic)
+        print("[VideoWallpaperManager] 🧊 已发布系统壁纸同步状态到 web daemon: enabled=\(enabled)")
+    }
+
     private var autoRemoveVideoLetterboxEnabled: Bool {
         UserDefaults.standard.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
     }

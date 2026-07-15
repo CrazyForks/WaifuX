@@ -2894,6 +2894,8 @@ struct MyLibraryContentView: View {
             let message: String
             if progress.failedImports > 0 {
                 message = String(format: t("import.result.partial"), progress.successfulImports, progress.failedImports)
+            } else if progress.skippedImports > 0 {
+                message = String(format: t("import.result.partial.skipped"), progress.successfulImports, progress.skippedImports)
             } else if progress.successfulImports > 0 {
                 message = String(format: t("import.result.success"), progress.successfulImports)
             } else {
@@ -2904,7 +2906,7 @@ struct MyLibraryContentView: View {
                 let alert = NSAlert()
                 alert.messageText = t("import.completed")
                 alert.informativeText = message
-                alert.alertStyle = progress.failedImports > 0 ? .warning : .informational
+                alert.alertStyle = (progress.failedImports > 0 || progress.skippedImports > 0) ? .warning : .informational
                 alert.addButton(withTitle: "OK")
                 alert.runModal()
             }

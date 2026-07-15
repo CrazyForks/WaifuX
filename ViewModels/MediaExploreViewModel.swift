@@ -1072,8 +1072,13 @@ final class MediaExploreViewModel: ObservableObject {
     ///   - item: 媒体项
     ///   - option: 下载选项
     /// - Returns: 下载后的本地文件 URL
-    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption) async throws -> URL {
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
+    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption, folderID: String? = nil) async throws -> URL {
         let task = downloadTaskService.addTask(mediaItem: item)
+        // 作者批量下载需要库记录才能归夹：即使设置关闭“写入媒体库”，有 folderID 时也强制入库
+        let saveToLibrary = persistDownloadedMediaToAppLibrary
+            || MediaLibraryService.normalizedFolderID(folderID) != nil
 
         // 创建真正执行下载逻辑的 Task（有返回值）
         let valueTask = Task { [weak self] () -> URL in
@@ -1082,8 +1087,9 @@ final class MediaExploreViewModel: ObservableObject {
             let localURL = try await ensureLocalVideoFile(
                 for: item,
                 preferredOption: option,
-                saveToDownloads: persistDownloadedMediaToAppLibrary,
-                taskID: task.id
+                saveToDownloads: saveToLibrary,
+                taskID: task.id,
+                folderID: folderID
             )
             downloadTaskService.markCompleted(id: task.id)
             return localURL
@@ -1391,7 +1397,8 @@ final class MediaExploreViewModel: ObservableObject {
         for item: MediaItem,
         preferredOption: MediaDownloadOption?,
         saveToDownloads: Bool,
-        taskID: String? = nil
+        taskID: String? = nil,
+        folderID: String? = nil
     ) async throws -> URL {
         let resolvedItem = try await loadDetail(for: item)
         if let taskID {
@@ -1423,7 +1430,11 @@ final class MediaExploreViewModel: ObservableObject {
             }
 
             if saveToDownloads {
-                mediaLibrary.ensureDownloadRecord(item: resolvedItem, localFileURL: fileLocation.url)
+                mediaLibrary.ensureDownloadRecord(
+                    item: resolvedItem,
+                    localFileURL: fileLocation.url,
+                    folderID: folderID
+                )
             }
 
             return fileLocation.url
@@ -1487,7 +1498,12 @@ final class MediaExploreViewModel: ObservableObject {
             if let taskID {
                 updateDownloadProgress(taskID: taskID, progress: 0.96)
             }
-            mediaLibrary.recordDownload(item: resolvedItem, localFileURL: fileURL)
+            // 作者批量下载把 folderID 和落盘登记绑在同一步
+            mediaLibrary.recordDownload(
+                item: resolvedItem,
+                localFileURL: fileURL,
+                folderID: folderID
+            )
             return fileURL
         }
 
@@ -2278,7 +2294,8 @@ final class MediaExploreViewModel: ObservableObject {
     // MARK: - Workshop 下载
 
     /// 下载 Workshop 壁纸（通过 SteamCMD）
-    func downloadWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil) async throws {
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    func downloadWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil, folderID: String? = nil) async throws {
         guard item.id.hasPrefix("workshop_") else {
             throw WorkshopError.workshopNotSupported
         }
@@ -2306,7 +2323,8 @@ final class MediaExploreViewModel: ObservableObject {
                 }
             )
             let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
-            mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL)
+            // 作者批量下载把 folderID 和落盘登记绑在同一步
+            mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
             downloadTaskService.markCompleted(id: taskID)
             print("[MediaExploreViewModel] downloadWorkshopWallpaper completed: \(normalizedURL)")
         }

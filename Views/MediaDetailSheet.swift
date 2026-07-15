@@ -815,11 +815,10 @@ struct MediaDetailSheet: View {
             }
 
             Button {
-                if let cachedSceneBakeVideoURL {
-                    applyWorkshopVideoWallpaper(
-                        videoURL: cachedSceneBakeVideoURL,
-                        preferPosterFrameFromVideo: true
-                    )
+                if cachedSceneBakeVideoURL != nil,
+                   let local = findLocalWorkshopFile(for: resolvedItem) {
+                    // 与「设为壁纸」同一方法
+                    applyWorkshopWallpaperFromLocalURL(local)
                 } else {
                     presentSceneBakeRendererDialog(clearCachedArtifact: false)
                 }
@@ -1181,8 +1180,9 @@ struct MediaDetailSheet: View {
                     await MainActor.run {
                         isBakingScene = false
                         bakeProgress = 0
-                        if shouldAutoApplyAfterBake {
-                            applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
+                        if shouldAutoApplyAfterBake,
+                           let local = findLocalWorkshopFile(for: resolvedItem) {
+                            applyWorkshopWallpaperFromLocalURL(local)
                         } else {
                             sceneBakeStatusFlash = t("sceneBake.cached")
                         }
@@ -1202,31 +1202,15 @@ struct MediaDetailSheet: View {
                     isBakingScene = false
                     bakeProgress = 0
                     if shouldAutoApplyAfterBake {
-                        // 实时渲染模式下，烘焙产物不自动设置到桌面（已由 wallpaper-wgpu 实时渲染）
+                        // 实时渲染：桌面已由 wgpu 渲染，不自动把烘焙 MP4 设到桌面
                         if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
-                            if #available(macOS 26.0, *), !VideoWallpaperManager.shared.isLockScreenEnabled {
-                                // 动态锁屏关闭：用烘焙产物的静态帧设置桌面 poster（不启动视频播放器）
-                                Task {
-                                    if let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: videoURL, fallbackPosterURL: nil) {
-                                        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
-                                            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
-                                            .allowClipping: true
-                                        ]
-                                        for screen in NSScreen.screens {
-                                            try? NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
-                                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
-                                        }
-                                        print("[MediaDetailSheet] 实时渲染模式：烘焙完成，已设置桌面 poster")
-                                    }
-                                }
-                                scheduleSceneBakeSuccessFlash()
-                            } else {
-                                sceneBakeStatusFlash = t("sceneBake.cached")
-                                print("[MediaDetailSheet] 实时渲染模式：烘焙完成，产物已缓存用于锁屏推送")
-                            }
+                            sceneBakeStatusFlash = t("sceneBake.cached")
+                            print("[MediaDetailSheet] 实时渲染模式：烘焙完成，产物已缓存（锁屏/companion 由统一 apply 路径处理）")
+                        } else if let local = findLocalWorkshopFile(for: resolvedItem) {
+                            scheduleSceneBakeSuccessFlash()
+                            applyWorkshopWallpaperFromLocalURL(local)
                         } else {
                             scheduleSceneBakeSuccessFlash()
-                            applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
                         }
                     } else {
                         // 重新烘焙 / 多显示器：只缓存，不自动改壁纸
@@ -2656,79 +2640,86 @@ struct MediaDetailSheet: View {
         print("[DependencyDownload] \(dependencyID) completed at \(localURL.path)")
     }
 
-    /// 从本地 URL 设置 Workshop 壁纸（提取原 setAsDesktopWallpaper 中的设置逻辑）
+    /// 从本地 URL 设置 Workshop 壁纸。
+    /// 核心设置统一走 `LocalWallpaperApplyService`（与调度器同一方法）；本处只负责 UI（多屏选择/转圈/错误）。
     private func applyWorkshopWallpaperFromLocalURL(_ localURL: URL) {
-        let ext = localURL.pathExtension.lowercased()
-        let isVideoFile = ["mp4", "mov", "webm"].contains(ext)
-        let isImageFile = ["jpg", "jpeg", "png", "bmp", "gif", "webp"].contains(ext)
-        var isDirectory: ObjCBool = false
-        FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory)
-
-        if isVideoFile && !isDirectory.boolValue {
-            print("[MediaDetailSheet] WE video file, using VideoWallpaperManager: \(localURL.path)")
-            applyWorkshopVideoWallpaper(videoURL: localURL, preferPosterFrameFromVideo: true)
-            return
-        }
-
-        // pickWorkshopPlayableFile 已识别为 .image 并返回了图片文件路径 → 直接处理，不走 sceneEngineContentRoot
-        if isImageFile && !isDirectory.boolValue {
-            applyWorkshopImageWallpaper(imageURL: localURL)
-            return
-        }
-
+        // 非实时 scene 且尚无烘焙产物：保留详情页「先烘再设」流程（会阻塞生成 MP4）
         let contentRoot = sceneEngineContentRoot(for: localURL)
-
-        // Preset 类型预处理：如果 project.json 含 preset 字段，生成 HTML 轮播页面
-        ensurePresetHTMLGenerated(at: contentRoot)
-
-        let contentType = determineWorkshopContentType(at: contentRoot)
-        if case .unsupported(let detectedType) = contentType {
-            errorMessage = "检测到该文件类型为 \(detectedType.capitalized)，暂不支持设置此类型壁纸"
-            showError = true
+        let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+        let hasUsableBake: Bool = {
+            if let record = currentDownloadRecord,
+               let art = record.sceneBakeArtifact,
+               art.analysisId == record.sceneBakeEligibility?.analysisId,
+               SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
+                return true
+            }
+            return false
+        }()
+        let projectType = Self.projectTypeString(at: contentRoot)
+        if projectType == "scene", !isRealtime, !hasUsableBake {
+            applySceneWallpaperPreferringBake(sceneContentRoot: contentRoot, cliPath: localURL.path)
             return
         }
 
-        switch contentType {
-        case .scene:
-            let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-            AppLogger.error(.wallpaper, "applyWorkshopWallpaperFromLocalURL 路由: scene", metadata: [
-                "realtime": isRealtime,
-                "contentRoot": contentRoot.lastPathComponent
-            ])
-            if isRealtime {
-                // 实时渲染模式：直接用 wallpaper-wgpu 渲染桌面，后台烘焙推锁屏
-                applyWorkshopRendererWallpaper(
-                    path: contentRoot.path,
-                    posterURL: preferredWorkshopPosterForVideo,
-                    statusKey: "applyingWallpaper.realtime"
-                )
-            } else {
-                // 非实时渲染模式：走烘焙产物
-                applySceneWallpaperPreferringBake(sceneContentRoot: contentRoot, cliPath: localURL.path)
+        let screens = NSScreen.screens
+        let run: (NSScreen?) -> Void = { [self] selectedScreen in
+            applyingWallpaperStatusKey = "applyingWallpaper.realtime"
+            isSettingWallpaper = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in
+                guard isSettingWallpaper else { return }
+                isSettingWallpaper = false
             }
-        case .web:
-            applyWorkshopWebWallpaper(webDirPath: localURL.path, posterURL: preferredWorkshopPosterForVideo)
-        case .image:
-            applyWorkshopImageWallpaper(imageURL: localURL)
-        case .video:
-            // localURL 本身是视频文件的情况已在开头拦截；
-            // 这里处理目录型 video workshop（background/file 指向子目录中的视频）
-            if let videoURL = findVideoFile(in: contentRoot) {
-                applyWorkshopVideoWallpaper(videoURL: videoURL, preferPosterFrameFromVideo: true)
-            } else {
-                applyWorkshopRendererWallpaper(
-                    path: localURL.path,
-                    posterURL: preferredWorkshopPosterForVideo,
-                    statusKey: "applyingWallpaper.realtime"
-                )
+            Task { @MainActor in
+                do {
+                    let targetScreens = selectedScreen.map { [$0] }
+                    var options = LocalWallpaperApplyService.Options(
+                        animatedTransition: false,
+                        requirePlaybackEndSupport: false,
+                        muted: isMuted,
+                        fallbackPosterURL: preferredWorkshopPosterForVideo,
+                        generatePosterFromVideoIfNeeded: true,
+                        sceneBakeItemID: currentDownloadRecord?.item.id,
+                        bakedVideoPath: currentDownloadRecord?.sceneBakeArtifact?.videoPath,
+                        reason: "manual-apply"
+                    )
+                    if let art = currentDownloadRecord?.sceneBakeArtifact,
+                       SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
+                        options.bakedVideoPath = art.videoPath
+                    }
+                    _ = try await LocalWallpaperApplyService.apply(
+                        localURL: localURL,
+                        targetScreens: targetScreens,
+                        options: options
+                    )
+                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(
+                        screenID: selectedScreen?.wallpaperScreenIdentifier
+                    )
+                } catch {
+                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                    showError = true
+                }
+                isSettingWallpaper = false
             }
-        default:
-            applyWorkshopRendererWallpaper(
-                path: localURL.path,
-                posterURL: preferredWorkshopPosterForVideo,
-                statusKey: "applyingWallpaper.realtime"
-            )
         }
+
+        if screens.count > 1 {
+            DisplaySelectorManager.shared.showSelector(
+                title: t("setWallpaper"),
+                message: t("multiDisplayDetected")
+            ) { selected in
+                run(selected)
+            }
+        } else {
+            run(screens.first)
+        }
+    }
+
+    private static func projectTypeString(at contentRoot: URL) -> String? {
+        let projectURL = contentRoot.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: projectURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else { return nil }
+        return type.lowercased()
     }
 
     /// Scene 壁纸设置：优先使用烘焙产物，无缓存时自动用 wallpaper-wgpu 烘焙后应用
@@ -2743,24 +2734,14 @@ struct MediaDetailSheet: View {
             "hasBakeArtifact": hasBakeArtifact
         ])
 
-        // 1. 已有烘焙产物 → 直接应用
+        // 1. 已有烘焙产物 → 走统一 LocalWallpaperApplyService（与调度器同一方法）
         if let record = currentDownloadRecord,
            let art = record.sceneBakeArtifact,
-           art.analysisId == record.sceneBakeEligibility?.analysisId {
-            // 优先使用 .web 组合目录（视频背景 + Web overlay）
-            let webDirPath = art.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
-            if fm.fileExists(atPath: webDirPath) {
-                applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
-                return
-            }
-            // 回退到纯视频
-            if fm.fileExists(atPath: art.videoPath) {
-                applyWorkshopVideoWallpaper(
-                    videoURL: URL(fileURLWithPath: art.videoPath),
-                    preferPosterFrameFromVideo: true
-                )
-                return
-            }
+           art.analysisId == record.sceneBakeEligibility?.analysisId,
+           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath))
+            || fm.fileExists(atPath: art.videoPath.replacingOccurrences(of: ".mp4", with: ".web")) {
+            applyWorkshopWallpaperFromLocalURL(sceneContentRoot)
+            return
         }
 
         // 2. 无烘焙产物 → 自动用 wallpaper-wgpu 烘焙后应用
@@ -2831,19 +2812,12 @@ struct MediaDetailSheet: View {
                     }
                 )
 
-                let webDirPath = artifact.videoPath.replacingOccurrences(of: ".mp4", with: ".web")
                 await MainActor.run {
                     isBakingScene = false
                     isSettingWallpaper = false
                     scheduleSceneBakeSuccessFlash()
-                    if fm.fileExists(atPath: webDirPath) {
-                        applyWorkshopWebWallpaper(webDirPath: webDirPath, posterURL: preferredWorkshopPosterForVideo)
-                    } else {
-                        applyWorkshopVideoWallpaper(
-                            videoURL: URL(fileURLWithPath: artifact.videoPath),
-                            preferPosterFrameFromVideo: true
-                        )
-                    }
+                    // 烘焙完成后与手动设壁纸同一路径
+                    applyWorkshopWallpaperFromLocalURL(sceneContentRoot)
                 }
             } catch {
                 await MainActor.run {
@@ -3688,288 +3662,6 @@ struct MediaDetailSheet: View {
         return t("sceneBake.progressSubtitle")
     }
 
-    /// 直接应用 Workshop / 烘焙 MP4 视频壁纸（须在主线程调用；内部 `Task` 使用 `@MainActor` 以匹配 `VideoWallpaperManager`）
-    /// - Parameter preferPosterFrameFromVideo: 为 true 时从该 MP4 抽一帧作静态桌面/锁屏（与 Workshop 预览图逻辑一致，失败则回退 `preferredWorkshopPosterForVideo`）。
-    private func applyWorkshopVideoWallpaper(
-        videoURL: URL,
-        preferPosterFrameFromVideo: Bool = true,
-        onApplyFinished: (() -> Void)? = nil
-    ) {
-        let path = videoURL.path
-        guard FileManager.default.fileExists(atPath: path) else {
-            errorMessage = t("sceneBake.error.outputMissing")
-            showError = true
-            return
-        }
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-           let sz = attrs[.size] as? NSNumber, sz.int64Value <= 10_000 {
-            errorMessage = t("sceneBake.error.outputMissing")
-            showError = true
-            return
-        }
-        let screens = NSScreen.screens
-        if screens.count > 1 {
-            DisplaySelectorManager.shared.showSelector(
-                title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
-            ) { [self] selectedScreen in
-                applyingWallpaperStatusKey = "applyingWallpaper.video"
-                isSettingWallpaper = true
-                Task { @MainActor in
-                    let posterFromVideo = await preferredPosterFrame(
-                        for: videoURL,
-                        preferPosterFrameFromVideo: preferPosterFrameFromVideo
-                    )
-                    let posterURL = posterFromVideo ?? preferredWorkshopPosterForVideo
-                    do {
-                        try wallpaperManager.applyVideoWallpaper(
-                            from: videoURL,
-                            posterURL: posterURL,
-                            muted: isMuted,
-                            targetScreens: selectedScreen.map { [$0] }
-                        )
-                        WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
-                        onApplyFinished?()
-                    } catch {
-                        errorMessage = error.localizedDescription
-                        showError = true
-                    }
-                    isSettingWallpaper = false
-                }
-            }
-        } else {
-            applyingWallpaperStatusKey = "applyingWallpaper.video"
-            isSettingWallpaper = true
-            Task { @MainActor in
-                let posterFromVideo = await preferredPosterFrame(
-                    for: videoURL,
-                    preferPosterFrameFromVideo: preferPosterFrameFromVideo
-                )
-                let posterURL = posterFromVideo ?? preferredWorkshopPosterForVideo
-                do {
-                    try wallpaperManager.applyVideoWallpaper(
-                        from: videoURL,
-                        posterURL: posterURL,
-                        muted: isMuted
-                    )
-                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(
-                        screenID: NSScreen.screens.first?.wallpaperScreenIdentifier
-                    )
-                    onApplyFinished?()
-                } catch {
-                    errorMessage = error.localizedDescription
-                    showError = true
-                }
-                isSettingWallpaper = false
-            }
-        }
-    }
-
-    private func applyWorkshopWebWallpaper(webDirPath: String, posterURL: URL?) {
-        applyWorkshopRendererWallpaper(
-            path: webDirPath,
-            posterURL: posterURL,
-            statusKey: "applyingWallpaper.web"
-        )
-    }
-
-    private func applyWorkshopRendererWallpaper(
-        path: String,
-        posterURL: URL?,
-        statusKey: String = "applyingWallpaper.realtime"
-    ) {
-        let screens = NSScreen.screens
-        print("[MediaDetailSheet] applyWorkshopRendererWallpaper path=\(path) screens=\(screens.count)")
-
-        // 检查二进制是否存在
-        if WallpaperEngineXBridge.resolvedCLIExecutableURL() == nil {
-            print("[MediaDetailSheet] ❌ wallpaper-wgpu 二进制不存在")
-            errorMessage = "wallpaper-wgpu 渲染器未找到"
-            showError = true
-            return
-        }
-
-        // 检查路径是否存在
-        if !FileManager.default.fileExists(atPath: path) {
-            print("[MediaDetailSheet] ❌ 壁纸路径不存在: \(path)")
-            errorMessage = "壁纸文件不存在"
-            showError = true
-            return
-        }
-
-        let runSetWallpaper: (NSScreen?) -> Void = { [self] selectedScreen in
-            applyingWallpaperStatusKey = statusKey
-            isSettingWallpaper = true
-            // 5 秒 UI 超时：停止转圈圈，壁纸设置在后台继续
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in
-                guard isSettingWallpaper else { return }
-                print("[MediaDetailSheet] ⏱ 设置壁纸 5s UI 超时，停止转圈（后台继续）")
-                isSettingWallpaper = false
-            }
-            Task { @MainActor in
-                do {
-                    let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-                    let userProps = isRealtime ? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path) : nil
-                    AppLogger.error(.wallpaper, "MediaDetailSheet 开始设置壁纸", metadata: [
-                        "path": path,
-                        "selectedScreen": selectedScreen?.localizedName ?? "全部",
-                        "realtime": isRealtime
-                    ])
-                    try await WallpaperEngineXBridge.shared.setWallpaper(
-                        path: path,
-                        targetScreens: selectedScreen.map { [$0] },
-                        userProperties: userProps
-                    )
-                    print("[MediaDetailSheet] ✅ 壁纸设置成功")
-                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
-
-                    // 实时渲染模式下，后台触发烘焙；完成后若动态锁屏开启，则推送到对应锁屏实例。
-                    if isRealtime {
-                        SceneOfflineBakeService.scheduleRealtimeCompanionBake(
-                            path: path,
-                            targetScreens: selectedScreen.map { [$0] },
-                            reason: "manual-apply"
-                        )
-                    }
-                } catch {
-                    AppLogger.error(.wallpaper, "MediaDetailSheet 设置壁纸失败", metadata: ["path": path, "error": error.localizedDescription])
-                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                    showError = true
-                }
-                isSettingWallpaper = false
-            }
-        }
-
-        if screens.count > 1 {
-            DisplaySelectorManager.shared.showSelector(
-                title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
-            ) { selectedScreen in
-                runSetWallpaper(selectedScreen)
-            }
-        } else {
-            runSetWallpaper(nil)
-        }
-    }
-
-    /// 应用 Workshop 静态图片壁纸：无 type/file、有 background 指向图片的资源，不走 CLI，直接设静态桌面。
-    private func applyWorkshopImageWallpaper(imageURL: URL) {
-        guard FileManager.default.fileExists(atPath: imageURL.path) else {
-            errorMessage = "图片文件不存在"
-            showError = true
-            return
-        }
-
-        let screens = NSScreen.screens
-        if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
-            let applyToDynamicLockScreen: (NSScreen?) -> Void = { selectedScreen in
-                applyingWallpaperStatusKey = "applyingWallpaper.static"
-                isSettingWallpaper = true
-                Task { @MainActor in
-                    defer { isSettingWallpaper = false }
-                    WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: selectedScreen)
-                    VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: selectedScreen)
-                    let targetScreens = selectedScreen.map { [$0] } ?? screens
-                    let displayIDs = targetScreens.compactMap { screen -> UInt32? in
-                        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-                    }
-                    do {
-                        try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: displayIDs)
-                        WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
-                        print("[MediaDetailSheet] 🔒 动态锁屏已启用，已将 Workshop 静态图同步到 WaifuX 实例")
-                    } catch {
-                        errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                        showError = true
-                    }
-                }
-            }
-
-            if screens.count > 1 {
-                DisplaySelectorManager.shared.showSelector(
-                    title: t("setWallpaper"),
-                    message: t("multiDisplayDetected")
-                ) { selectedScreen in
-                    applyToDynamicLockScreen(selectedScreen)
-                }
-            } else {
-                applyToDynamicLockScreen(screens.first)
-            }
-            return
-        }
-
-        // macOS 26+：仅当用户未启用动态锁屏时才清空帧源缓存。
-        // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive。
-        if #available(macOS 26.0, *) {
-            if !VideoWallpaperManager.shared.isLockScreenEnabled {
-                LockScreenWallpaperService.shared.clearMirroringSourceCache()
-            }
-        }
-
-        if screens.count > 1 {
-            DisplaySelectorManager.shared.showSelector(
-                title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
-            ) { [self] selectedScreen in
-                applyingWallpaperStatusKey = "applyingWallpaper.static"
-                isSettingWallpaper = true
-                Task { @MainActor in
-                    do {
-                        let targetScreens = selectedScreen.map { [$0] } ?? screens
-                        WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: selectedScreen)
-                        VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: selectedScreen)
-                        // 系统壁纸同步关闭时走独立静态图 overlay，不写系统壁纸
-                        if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
-                            for screen in targetScreens {
-                                await StaticImageWallpaperOverlayManager.shared.showPrepared(imageURL: imageURL, for: screen)
-                            }
-                        } else {
-                            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
-                            for screen in targetScreens {
-                                try NSWorkspace.shared.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: screen)
-                                DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: screen)
-                            }
-                            // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
-                            StaticImageWallpaperOverlayManager.shared.clearState()
-                        }
-                        WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: selectedScreen?.wallpaperScreenIdentifier)
-                    } catch {
-                        errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                        showError = true
-                    }
-                    isSettingWallpaper = false
-                }
-            }
-        } else {
-            applyingWallpaperStatusKey = "applyingWallpaper.static"
-            isSettingWallpaper = true
-            Task { @MainActor in
-                do {
-                    WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: screens.first)
-                    VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screens.first)
-                    if let mainScreen = screens.first {
-                        // 系统壁纸同步关闭时走独立静态图 overlay，不写系统壁纸
-                        if !VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
-                            await StaticImageWallpaperOverlayManager.shared.showPrepared(imageURL: imageURL, for: mainScreen)
-                        } else {
-                            let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(for: imageURL)
-                            try NSWorkspace.shared.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: mainScreen)
-                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: mainScreen)
-                            // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
-                            StaticImageWallpaperOverlayManager.shared.clearState()
-                        }
-                    }
-                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(
-                        screenID: NSScreen.screens.first?.wallpaperScreenIdentifier
-                    )
-                } catch {
-                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                    showError = true
-                }
-                isSettingWallpaper = false
-            }
-        }
-    }
-
     // MARK: - 作者壁纸弹窗
 
     @ViewBuilder
@@ -4098,44 +3790,51 @@ struct MediaDetailSheet: View {
             // 全部已下载时只归夹；defer 会复位按钮，不弹错误框
             guard !pendingItems.isEmpty else { return }
 
-            // 并发提交所有下载任务，统计成败，保证按钮状态一定复位
+            // 并发提交下载；folderID 在落盘登记时一并写入，避免“成功落盘却落在根目录”
             let vm = viewModel
             let folderID = folder.id
             var successCount = 0
             var failureCount = 0
-            await withTaskGroup(of: Bool.self) { group in
+            await withTaskGroup(of: (String, Bool).self) { group in
                 for item in pendingItems {
                     group.addTask {
                         do {
                             if item.id.hasPrefix("workshop_") {
-                                try await vm.downloadWorkshopWallpaper(item)
+                                try await vm.downloadWorkshopWallpaper(item, folderID: folderID)
                             } else {
                                 guard let bestOption = item.downloadOptions.max(by: {
                                     $0.qualityRank < $1.qualityRank
                                 }) else {
-                                    return false
+                                    return (item.id, false)
                                 }
-                                _ = try await vm.downloadMedia(item, option: bestOption)
+                                _ = try await vm.downloadMedia(item, option: bestOption, folderID: folderID)
                             }
-                            await MainActor.run {
-                                folderStore.moveMediaToFolder(
-                                    mediaID: item.id,
-                                    folderID: folderID,
-                                    scope: .downloads
-                                )
-                            }
-                            return true
+                            return (item.id, true)
                         } catch {
                             AppLogger.error(.download, "作者媒体批量下载失败",
                                 metadata: ["itemID": item.id, "author": authorName,
                                            "error": error.localizedDescription])
-                            return false
+                            return (item.id, false)
                         }
                     }
                 }
-                for await ok in group {
+                for await (_, ok) in group {
                     if ok { successCount += 1 } else { failureCount += 1 }
                 }
+            }
+
+            // 兜底：本批成功项再归一次作者夹。
+            // 优先按 isDownloaded；若仅有下载记录（文件检测偶发缓存滞后）也尝试归夹。
+            for item in stampedItems {
+                let hasRecord = libraryService.downloadRecords.contains {
+                    $0.item.id == item.id && $0.isActive
+                }
+                guard libraryService.isDownloaded(item) || hasRecord else { continue }
+                folderStore.moveMediaToFolder(
+                    mediaID: item.id,
+                    folderID: folderID,
+                    scope: .downloads
+                )
             }
 
             if failureCount > 0 {

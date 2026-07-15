@@ -15,6 +15,14 @@ class SettingsViewModel: ObservableObject {
     }
     @Published private var themeModeRawValue: String = ThemeMode.system.rawValue { didSet { UserDefaults.standard.set(themeModeRawValue, forKey: "theme_mode") } }
     @Published var launchAtLogin = false { didSet { UserDefaults.standard.set(launchAtLogin, forKey: "launch_at_login") } }
+    /// 永不休眠：持有 IOPM assertion，阻止空闲息屏 / 系统睡眠，锁屏时桌面可继续显示。
+    @Published var preventSystemSleep = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(preventSystemSleep, forKey: "prevent_system_sleep")
+            SleepPreventer.shared.setPreventingSleep(preventSystemSleep, reason: .userSetting)
+        }
+    }
     @Published var grainTextureEnabled = false {
         didSet {
             guard !isBatchUpdating else { return }
@@ -167,6 +175,8 @@ class SettingsViewModel: ObservableObject {
             // 批量恢复期间抑制联动副作用，避免启动时误清实例
             guard !isBatchUpdating else { return }
             UserDefaults.standard.set(systemWallpaperSyncEnabled, forKey: "system_wallpaper_sync_enabled")
+            // 通知 web daemon：关同步后不得再 setDesktopImageURL
+            VideoWallpaperManager.shared.publishSystemWallpaperSyncControlToWebDaemon()
             // 单向联动：关闭系统壁纸同步时，强制关闭动态锁屏并清理锁屏实例
             if !systemWallpaperSyncEnabled && dynamicLockScreenEnabled {
                 dynamicLockScreenEnabled = false
@@ -278,6 +288,11 @@ class SettingsViewModel: ObservableObject {
         // 纯 UserDefaults 属性（批量期间 didSet 被跳过，统一补写）
         UserDefaults.standard.set(autoBakeScene, forKey: "auto_bake_scene")
         UserDefaults.standard.set(systemWallpaperSyncEnabled, forKey: "system_wallpaper_sync_enabled")
+        UserDefaults.standard.set(preventSystemSleep, forKey: "prevent_system_sleep")
+        // 启动恢复后同步给 web daemon，避免旧 daemon 仍按默认写系统桌面
+        VideoWallpaperManager.shared.publishSystemWallpaperSyncControlToWebDaemon()
+        // 恢复「永不休眠」电源 assertion（批量期间 didSet 被抑制）
+        SleepPreventer.shared.setPreventingSleep(preventSystemSleep, reason: .userSetting)
     }
 
     // MARK: - 调度器相关（延迟初始化，避免启动时阻塞）
@@ -344,6 +359,7 @@ class SettingsViewModel: ObservableObject {
                 themeModeRawValue = raw
             }
             launchAtLogin = defaults.bool(forKey: "launch_at_login")
+            preventSystemSleep = defaults.bool(forKey: "prevent_system_sleep")
             grainTextureEnabled = defaults.object(forKey: "grain_texture_enabled") as? Bool ?? false
             grainTextureQuality = defaults.string(forKey: "grain_texture_quality") ?? "high"
             let savedGrainIntensity = defaults.double(forKey: "arc_grain_intensity")

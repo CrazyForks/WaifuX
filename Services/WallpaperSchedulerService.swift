@@ -917,217 +917,36 @@ class WallpaperSchedulerService: ObservableObject {
         try? await Task.sleep(nanoseconds: delayNanoseconds)
     }
 
+    /// 调度只选片 + 触发；真正设壁纸与详情页共用 `LocalWallpaperApplyService`。
     private func applyItem(_ item: SchedulableItem, toScreenID screenID: String) async -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             return false
         }
 
         let displayConfig = config.resolvedDisplayConfig(for: screenID)
-        let isOnEndMode = displayConfig.isOnEndMode
-        // Web/Scene 壁纸在播完即换模式下是否启用了定时切换
-        let webSceneSwitchEnabled = isOnEndMode && displayConfig.webSceneSwitchSeconds != nil
-
-        let fileURL = item.fileURL
-        let ext = fileURL.pathExtension.lowercased()
-        let isDirectory = (try? FileManager.default
-            .attributesOfItem(atPath: fileURL.path)[.type] as? FileAttributeType) == .typeDirectory
+        // 播完即换且未开 web/scene 定时：只能切可接播放完成通知的视频类
+        let requirePlaybackEndSupport = displayConfig.isOnEndMode
+            && displayConfig.webSceneSwitchSeconds == nil
 
         do {
-            // 优先使用烘焙 MP4 产物（WE Scene 离线烘焙）。
-            // 实时渲染模式下需跳过：scene 壁纸的烘焙 MP4 仅供锁屏/桌面 poster，不得反向替换
-            // 桌面实时渲染（否则会变成播放固定时长 MP4 循环而非 wallpaper-wgpu 实时渲染）。
-            // on-end 模式下：如果设置了 webSceneSwitchSeconds（走定时器而非视频通知），允许实时渲染。
-            let preferRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-                && (!isOnEndMode || webSceneSwitchEnabled)
-            if let bakedPath = item.bakedVideoPath,
-               !preferRealtime,
-               SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: bakedPath)) {
-                print("\(logTag) Using baked video: \(bakedPath)")
-                let bakedURL = URL(fileURLWithPath: bakedPath)
-                // 只读下载/烘焙阶段已写好的抽帧，不在切换路径重新生成。
-                let posterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
-                    forLocalVideo: bakedURL,
+            print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName)")
+            let ok = try await LocalWallpaperApplyService.apply(
+                localURL: item.fileURL,
+                targetScreens: [screen],
+                options: LocalWallpaperApplyService.Options(
+                    animatedTransition: true,
+                    requirePlaybackEndSupport: requirePlaybackEndSupport,
+                    muted: true,
+                    fallbackPosterURL: nil,
+                    generatePosterFromVideoIfNeeded: false,
                     sceneBakeItemID: item.sceneBakeItemID,
-                    projectRoot: item.fileURL
+                    bakedVideoPath: item.bakedVideoPath,
+                    reason: "scheduler"
                 )
-                try VideoWallpaperManager.shared.applyVideoWallpaper(
-                    from: bakedURL,
-                    posterURL: posterURL,
-                    muted: true,
-                    targetScreen: screen,
-                    animatedTransition: true
-                )
-                if let posterURL = posterURL {
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                }
-            } else if isDirectory || ext == "pkg" {
-                // 2. Workshop 目录 → 根据 project.json 类型分发
-                let resolvedRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: fileURL)
-                let projectJSONPath = resolvedRoot.appendingPathComponent("project.json")
-
-                if FileManager.default.fileExists(atPath: projectJSONPath.path),
-                   let projectData = try? Data(contentsOf: projectJSONPath),
-                   let projectJSON = try? JSONSerialization.jsonObject(with: projectData) as? [String: Any] {
-
-                    // Preset 类型（图片轮播）：project.json 含 "preset" 字段且无 "type" 字段
-                    if projectJSON["type"] == nil,
-                       let presetDict = projectJSON["preset"] as? [String: Any],
-                       let customDir = presetDict["customdirectory"] as? String {
-                        // "播完即换"模式下跳过图片轮播（不支持播放完成通知）
-                        // 但如果设置了 webSceneSwitchSeconds，则允许图片轮播
-                        if isOnEndMode && !webSceneSwitchEnabled {
-                            print("\(logTag) Skipping preset slideshow in on-end mode")
-                            return false
-                        }
-                        let imagesDir = resolvedRoot.appendingPathComponent(customDir)
-                        let images = enumerateImages(in: imagesDir)
-                        if !images.isEmpty {
-                            // 根据 preset 配置生成 HTML 轮播页面
-                            // imageswitchtimes 是倍率（1=默认），使用 5 秒基础间隔
-                            let multiplier = presetDict["imageswitchtimes"] as? Int ?? 1
-                            let switchTime = max(multiplier * 5, 3)
-                            let transitionMode = presetDict["TransitionMode"] as? Int ?? 1
-                            generatePresetHTML(
-                                images: images, imagesDir: imagesDir,
-                                switchTime: switchTime, transitionMode: transitionMode,
-                                outputDir: resolvedRoot
-                            )
-                            print("\(logTag) Generated preset HTML slideshow: \(images.count) images, interval=\(switchTime)s")
-                            // 通过 CLI web 渲染器渲染
-                            try await WallpaperEngineXBridge.shared.setWallpaper(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen]
-                            )
-                            // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                            return true
-                        }
-                    }
-
-                    let typeString = projectJSON["type"] as? String
-                    let type = typeString?.lowercased() ?? ""
-
-                    if type == "video" {
-                        // Video 类型：提取实际视频文件路径，用 VideoWallpaperManager 播放
-                        if let videoURL = findVideoFileInProject(projectJSON: projectJSON, root: resolvedRoot) {
-                            print("\(logTag) Using video from WE project: \(videoURL.lastPathComponent)")
-                            let posterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
-                                forLocalVideo: videoURL,
-                                sceneBakeItemID: item.sceneBakeItemID,
-                                projectRoot: resolvedRoot
-                            )
-                            try VideoWallpaperManager.shared.applyVideoWallpaper(
-                                from: videoURL,
-                                posterURL: posterURL,
-                                muted: true,
-                                targetScreen: screen,
-                                animatedTransition: true
-                            )
-                            if let posterURL = posterURL {
-                                DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                            }
-                        } else {
-                            print("\(logTag) Video type but no video file found in project, falling back to CLI")
-                            // "播完即换"模式下不能用 CLI 壁纸
-                            // 但如果设置了 webSceneSwitchSeconds，则允许 CLI fallback
-                            if isOnEndMode && !webSceneSwitchEnabled {
-                                print("\(logTag) Skipping CLI fallback in on-end mode")
-                                return false
-                            }
-                            try await WallpaperEngineXBridge.shared.setWallpaper(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen]
-                            )
-                            // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                        }
-                    } else {
-                        // Scene/Web 类型：通过 CLI 渲染
-                        // "播完即换"模式下不能用 CLI 壁纸（无播放完成通知），跳过
-                        // 但如果设置了 webSceneSwitchSeconds，则允许通过 CLI 渲染
-                        if isOnEndMode && !webSceneSwitchEnabled {
-                            print("\(logTag) Skipping \(type) wallpaper '\(item.title)' in on-end mode (CLI renderer not supported)")
-                            return false
-                        }
-                        print("\(logTag) Using CLI renderer for WE \(type): \(resolvedRoot.path)")
-                        let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
-                        let userProps = isRealtime
-                            ? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: resolvedRoot.path)
-                            : nil
-                        try await WallpaperEngineXBridge.shared.setWallpaper(
-                            path: resolvedRoot.path,
-                            targetScreens: [screen],
-                            userProperties: userProps
-                        )
-                        // 实时渲染模式下，后台生成离线 MP4；完成后若动态锁屏开启，则推送到当前屏幕实例。
-                        if isRealtime {
-                            SceneOfflineBakeService.scheduleRealtimeCompanionBake(
-                                path: resolvedRoot.path,
-                                targetScreens: [screen],
-                                reason: "scheduler"
-                            )
-                        }
-                        // 注：CLI 壁纸由 daemon 自身管理桌面 capture，不注册到 DesktopWallpaperSyncManager
-                    }
-                } else {
-                    // resolve 失败或 project.json 不可读：先在目录树里找可播视频，避免把 WE 壳目录当静态图。
-                    if let nestedVideo = findFirstVideoFile(in: fileURL) {
-                        print("\(logTag) No project.json at resolved root, using nested video: \(nestedVideo.path)")
-                        let posterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
-                            forLocalVideo: nestedVideo,
-                            sceneBakeItemID: item.sceneBakeItemID,
-                            projectRoot: nestedVideo.deletingLastPathComponent()
-                        )
-                        try VideoWallpaperManager.shared.applyVideoWallpaper(
-                            from: nestedVideo,
-                            posterURL: posterURL,
-                            muted: true,
-                            targetScreen: screen,
-                            animatedTransition: true
-                        )
-                        if let posterURL = posterURL {
-                            DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                        }
-                    } else {
-                        if isOnEndMode && !webSceneSwitchEnabled {
-                            print("\(logTag) Skipping static image directory '\(item.title)' in on-end mode")
-                            return false
-                        }
-                        print("\(logTag) Using static image from directory: \(fileURL.path)")
-                        let vm = WallpaperViewModel()
-                        try await vm.setWallpaper(from: fileURL, option: .desktop, for: screen)
-                    }
-                }
-            } else if videoExtensions.contains(ext) {
-                // 3. 视频文件 → VideoWallpaperManager
-                print("\(logTag) Using video wallpaper: \(fileURL.lastPathComponent)")
-                // 只读下载/列表阶段已写好的抽帧，不在切换路径重新生成。
-                let posterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
-                    forLocalVideo: fileURL,
-                    sceneBakeItemID: item.sceneBakeItemID
-                )
-                try VideoWallpaperManager.shared.applyVideoWallpaper(
-                    from: fileURL,
-                    posterURL: posterURL,
-                    muted: true,
-                    targetScreen: screen,
-                    animatedTransition: true
-                )
-                if let posterURL = posterURL {
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
-                }
-            } else {
-                // 4. 静态图 → WallpaperViewModel
-                if isOnEndMode && !webSceneSwitchEnabled {
-                    print("\(logTag) Skipping static image '\(item.title)' in on-end mode")
-                    return false
-                }
-                print("\(logTag) Using static image: \(fileURL.lastPathComponent)")
-                let vm = WallpaperViewModel()
-                try await vm.setWallpaper(from: fileURL, option: .desktop, for: screen)
-            }
-            // com.apple.desktop 通知已由 setDesktopImageURLForAllSpaces 内部发送，无需重复触发
-            return true
+            )
+            return ok
         } catch {
-            print("\(logTag) applyItem failed for '\(item.title)' (\(fileURL.lastPathComponent)): \(error)")
+            print("\(logTag) applyItem failed for '\(item.title)' (\(item.fileURL.lastPathComponent)): \(error)")
             return false
         }
     }

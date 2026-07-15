@@ -6,9 +6,9 @@
 <title>Wallpaper Property Editor</title>
 <style>
   :root {
-    --bg-primary: #1a1d2e;
-    --bg-secondary: #252840;
-    --bg-card: #2a2d45;
+    --bg-primary: transparent;
+    --bg-secondary: rgba(30, 34, 52, 0.58);
+    --bg-card: rgba(32, 36, 56, 0.52);
     --accent: #3b82f6;
     --accent-hover: #2563eb;
     --accent-dim: rgba(59, 130, 246, 0.15);
@@ -23,7 +23,7 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    background: var(--bg-primary);
+    background: transparent;
     color: var(--text-primary);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
     font-size: 13px;
@@ -100,14 +100,21 @@
     font-size: 12px;
     font-weight: 500;
     color: var(--text-primary);
-    min-width: 88px;
-    flex-shrink: 0;
+    flex: 1 1 0;
+    min-width: 0;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    word-break: break-word;
   }
   .prop-control {
-    flex: 1;
+    flex: 1 1 0;
+    min-width: 0;
     display: flex;
     align-items: center;
     justify-content: flex-end;
+  }
+  .prop-row--toggle .prop-control {
+    flex: 0 0 auto;
   }
 
   .toggle-wrap {
@@ -358,7 +365,16 @@
   .u-gap-3 { gap: 12px; }
   .u-min-w-0 { min-width: 0; }
   .u-title { font-size: 15px; font-weight: 700; line-height: 1.25; }
-  .u-subtitle { font-size: 10px; color: var(--text-muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .u-subtitle {
+    font-size: 10px;
+    font-weight: 500;
+    color: rgba(226, 232, 240, 0.84);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.58);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .u-close-btn {
     width: 22px; height: 22px; border-radius: 6px;
     background: rgba(255,255,255,0.06);
@@ -767,6 +783,24 @@ function translateLabel(raw) {
   return trimmed;
 }
 
+// Workshop property labels are untrusted author content. Wallpaper Engine
+// permits markup in them, including on normal controls, but this editor only
+// needs readable labels. Parse it in a detached document and use text only.
+function plainLabel(raw) {
+  if (!raw) return '';
+  if (!/<[a-zA-Z]|&(?:#x?[0-9a-f]+|[a-z]+);/i.test(raw)) return raw;
+  const document = new DOMParser().parseFromString(raw, 'text/html');
+  document.body.querySelectorAll('br, hr').forEach(function(node) {
+    node.replaceWith(document.createTextNode('\n'));
+  });
+  return (document.body.textContent || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/&nbsp;|&#160;|&#x0*a0;/gi, ' ')
+    .replace(/[ \t]*\n[ \t]*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function evaluateCondition(expr, values) {
   if (!expr || expr.trim() === '') return true;
   try {
@@ -951,25 +985,25 @@ function createPropertyElement(prop, visible) {
   if (!visible) container.classList.add('hidden-prop');
 
   const type = (prop.type || '').toLowerCase();
-  const label = translateLabel(prop.text || prop.key);
+  const label = plainLabel(translateLabel(prop.text || prop.key));
 
-  // Text/group/description types: render as HTML or display text (never as input controls)
+  // Text/group/description types are display-only. Labels are normalized above
+  // so untrusted Workshop markup is never inserted into the editor document.
   if (type === 'group' || type === 'description' || type === 'label' || type === 'text') {
-    if (/<[a-zA-Z]/.test(label)) {
-      // HTML content: render as section header or rich content
+    if (label) {
       if (type === 'group') {
         container.className = 'section-header';
-        container.innerHTML = '<div class="section-bar"></div><div class="section-title">' + label + '</div>';
+        const bar = document.createElement('div');
+        bar.className = 'section-bar';
+        const title = document.createElement('div');
+        title.className = 'section-title';
+        title.textContent = label;
+        container.appendChild(bar);
+        container.appendChild(title);
       } else {
         container.className = 'desc-text px-1';
-        container.innerHTML = label;
+        container.textContent = label;
       }
-      return container;
-    }
-    // Plain text (no HTML): render as display-only text
-    if (label) {
-      container.className = 'desc-text px-1';
-      container.textContent = label;
       return container;
     }
     // Empty text: skip rendering
@@ -980,6 +1014,7 @@ function createPropertyElement(prop, visible) {
   card.className = 'prop-card';
   const row = document.createElement('div');
   row.className = 'prop-row';
+  if (type === 'bool') row.classList.add('prop-row--toggle');
 
   const labelEl = document.createElement('div');
   labelEl.className = 'prop-label';

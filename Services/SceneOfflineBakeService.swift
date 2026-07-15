@@ -350,7 +350,12 @@ enum SceneOfflineBakeService {
             )
             print("[SceneOfflineBake] realtime companion bake synced lock screen (\(reason)): display=\(displayIDs) video=\(videoID)")
         } else {
-            // 动态锁屏关闭：用烘焙产物的静态帧设置桌面 poster（不启动视频播放器）
+            // 动态锁屏关闭：仅在系统壁纸同步开启时写桌面 poster。
+            // 关闭同步时桌面由实时 scene 渲染，不得偷偷改系统壁纸。
+            guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+                print("[SceneOfflineBake] 🧊 系统壁纸同步已关闭，跳过 companion bake 桌面 poster (\(reason))")
+                return
+            }
             guard let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
                 forLocalVideo: videoURL,
                 fallbackPosterURL: nil

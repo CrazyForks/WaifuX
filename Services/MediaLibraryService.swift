@@ -219,15 +219,27 @@ final class MediaLibraryService: ObservableObject {
         return record.resolvedVideoFileURL
     }
 
-    func recordDownload(item: MediaItem, localFileURL: URL) {
+    /// 登记下载记录。
+    /// - Parameter folderID: 可选目标文件夹。传入时写入/覆盖归属；
+    ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
+    func recordDownload(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
+        let targetFolderID = Self.normalizedFolderID(folderID)
         if let index = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
             downloadRecords[index].item = item
             downloadRecords[index].localFilePath = localFileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
+            // 仅在显式指定时改归属；nil 表示调用方不关心，保留现有 folderID
+            if let targetFolderID {
+                downloadRecords[index].folderID = targetFolderID
+            }
         } else {
             downloadRecords.insert(
-                MediaDownloadRecord(item: item, localFilePath: localFileURL.path),
+                MediaDownloadRecord(
+                    item: item,
+                    localFilePath: localFileURL.path,
+                    folderID: targetFolderID
+                ),
                 at: 0
             )
         }
@@ -235,11 +247,12 @@ final class MediaLibraryService: ObservableObject {
         // 预缓存文件存在性，后续 isDownloaded() 不再走 FileManager
         fileCache.markExisting(atPath: localFileURL.path)
 
-        // 单条写入 Cache
+        // 单条写入 Cache；强制数组重赋值以触发 didSet / downloadIDSet 重建
         if let record = downloadRecords.first(where: { $0.item.id == item.id }) {
             saveDlToCache(record)
         }
         syncDlIndex()
+        downloadRecords = Array(downloadRecords)
         upsert(item)
 
         SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
@@ -267,12 +280,18 @@ final class MediaLibraryService: ObservableObject {
 
     /// Ensure an existing local media file has a persistent library record.
     /// Applying a wallpaper is an explicit user action, so it must not remain cache-only.
-    func ensureDownloadRecord(item: MediaItem, localFileURL: URL) {
+    /// - Parameter folderID: 可选目标文件夹；已有同内容记录时也会补写归属。
+    func ensureDownloadRecord(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
         if let existing = downloadRecords.first(where: { $0.item.id == item.id && $0.isActive }),
            existing.hasSameLocalContent(as: localFileURL) {
+            // 记录已在且路径一致：仍允许补写作者批量下载 folderID
+            if let targetFolderID = Self.normalizedFolderID(folderID),
+               Self.normalizedFolderID(existing.folderID) != targetFolderID {
+                moveMediaToFolder(mediaID: item.id, folderID: targetFolderID, scope: .downloads)
+            }
             return
         }
-        recordDownload(item: item, localFileURL: localFileURL)
+        recordDownload(item: item, localFileURL: localFileURL, folderID: folderID)
     }
 
     /// 以用户当前下载根为准重建媒体库。目录迁移完成后，`DownloadPathManager` 指向的
@@ -1524,15 +1543,27 @@ final class WallpaperLibraryService: ObservableObject {
         return url
     }
 
-    func recordDownload(_ wallpaper: Wallpaper, fileURL: URL) {
+    /// 登记下载记录。
+    /// - Parameter folderID: 可选目标文件夹。传入时写入/覆盖归属；
+    ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
+    func recordDownload(_ wallpaper: Wallpaper, fileURL: URL, folderID: String? = nil) {
+        let targetFolderID = Self.normalizedFolderID(folderID)
         if let index = downloadRecords.firstIndex(where: { $0.wallpaper.id == wallpaper.id }) {
             downloadRecords[index].wallpaper = wallpaper
             downloadRecords[index].localFilePath = fileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
+            // 仅在显式指定时改归属；nil 表示调用方不关心，保留现有 folderID
+            if let targetFolderID {
+                downloadRecords[index].folderID = targetFolderID
+            }
         } else {
             downloadRecords.insert(
-                WallpaperDownloadRecord(wallpaper: wallpaper, localFilePath: fileURL.path),
+                WallpaperDownloadRecord(
+                    wallpaper: wallpaper,
+                    localFilePath: fileURL.path,
+                    folderID: targetFolderID
+                ),
                 at: 0
             )
         }
@@ -1540,10 +1571,11 @@ final class WallpaperLibraryService: ObservableObject {
         // 预缓存文件存在性，后续 isDownloaded() 不再走 FileManager
         fileCache.markExisting(atPath: fileURL.path)
 
-        // 单条写入 Cache
+        // 单条写入 Cache；强制数组重赋值以触发 didSet / downloadIDSet 重建
         let record = downloadRecords.first { $0.wallpaper.id == wallpaper.id }
         if let record { saveDlToCache(record) }
         syncDlIndex()
+        downloadRecords = Array(downloadRecords)
         upsert(wallpaper)
     }
 

@@ -475,7 +475,7 @@ enum SceneWallpaperPropertiesService {
             let order = prop["order"] as? Int
             let group = prop["group"] as? String
             let condition = prop["condition"] as? String
-            let presentation = determinePresentation(rawType: rawType, key: key, text: text)
+            let propertyPresentation = presentation(rawType: rawType, key: key, text: text)
 
             let value = parseAnyCodableValue(prop["value"])
 
@@ -494,7 +494,7 @@ enum SceneWallpaperPropertiesService {
                 order: order,
                 group: group,
                 condition: condition,
-                presentation: presentation
+                presentation: propertyPresentation
             )
             result.append(sceneProp)
         }
@@ -521,7 +521,13 @@ enum SceneWallpaperPropertiesService {
         return nil
     }
 
-    private static func determinePresentation(rawType: String, key: String, text: String?) -> ScenePropertyPresentation {
+    /// Classifies Wallpaper Engine's non-standard author-created properties.
+    ///
+    /// Some Workshop items use an otherwise valid property record solely to
+    /// place an image or hyperlink in the original editor. Keep this logic
+    /// shared with the Web property editor so those records never become
+    /// accidental controls there.
+    static func presentation(rawType: String, key: String, text: String?) -> ScenePropertyPresentation {
         let lower = rawType.lowercased()
         if lower == "group" || lower == "description" {
             return .group
@@ -532,7 +538,7 @@ enum SceneWallpaperPropertiesService {
         if keyLower.hasPrefix("imgsrc") || keyLower.hasPrefix("brimgsrc")
             || keyLower.contains("imgsrchttp") || keyLower.contains("hrefhttps")
             || textLower.contains("<img") || textLower.contains("<a ")
-            || textLower.contains("<hr") || textLower.contains("rf=viewer")
+            || textLower.contains("rf=viewer")
             || (key.count > 96 && !key.contains("_")) {
             return .decoration
         }

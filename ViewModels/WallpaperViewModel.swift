@@ -1277,7 +1277,9 @@ class WallpaperViewModel: ObservableObject {
     }
 
     // MARK: - 下载壁纸
-    func downloadWallpaper(_ wallpaper: Wallpaper) async throws {
+    /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
+    ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
+    func downloadWallpaper(_ wallpaper: Wallpaper, folderID: String? = nil) async throws {
         let task = downloadTaskService.addTask(wallpaper: wallpaper)
 
         // 将实际下载逻辑包装为可取消的 Task，并注册到 DownloadTaskService
@@ -1316,7 +1318,9 @@ class WallpaperViewModel: ObservableObject {
             // 验证文件是否成功写入（后台 I/O）
             let fileExists = await fileURL.fileExistsAsync()
             if fileExists {
-                wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL)
+                // 作者批量下载把 folderID 和落盘登记绑在同一步，避免
+                // “文件已写盘但后续 moveToFolder 因并发/失败中断未执行”落在根目录
+                wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL, folderID: folderID)
                 downloadTaskService.markCompleted(id: task.id)
             } else {
                 throw DownloadError.writeFailed(NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "File not found after write"]))
