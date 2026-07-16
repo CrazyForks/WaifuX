@@ -147,6 +147,7 @@
 		7D16B8DA5A272696D4601A81 /* WebWallpaperDesignService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41B90FB7E5E929B342AD6FB7 /* WebWallpaperDesignService.swift */; };
 		7D439B9CC297E0893336CDFE /* LiquidGlassWallpaperCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF7159115AD04C7CD5E4B85F /* LiquidGlassWallpaperCard.swift */; };
 		8031A64AD0A42E18E2095BAB /* FrameInterpolationMetalInterpolator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 747AF5B27704F01082B2C5E4 /* FrameInterpolationMetalInterpolator.swift */; };
+		A1B2C3D4E5F60718293A4B5D /* VideoLoopAnalysisMetalComparator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* VideoLoopAnalysisMetalComparator.swift */; };
 		819B9105E8E85CCD720117FC /* HTMLParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC5EF18290E78CAC93FAF3FA /* HTMLParser.swift */; };
 		81AB5AA8F403A0E0FD99B5E1 /* KonachanModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E0B8FBA853691DEFB867233 /* KonachanModels.swift */; };
 		84DDA015EC91D1FC45D283A9 /* DisplaySelectorSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BBD359FCF0CF51002527914 /* DisplaySelectorSheet.swift */; };
@@ -429,6 +430,7 @@
 		71372B83F6B9CC04A2DA24EE /* NativeVideoPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeVideoPlayer.swift; sourceTree = "<group>"; };
 		7161F6D026FC623EB6D42B01 /* LiquidGlassClockOverlayManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassClockOverlayManager.swift; sourceTree = "<group>"; };
 		747AF5B27704F01082B2C5E4 /* FrameInterpolationMetalInterpolator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameInterpolationMetalInterpolator.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4B5C /* VideoLoopAnalysisMetalComparator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoLoopAnalysisMetalComparator.swift; sourceTree = "<group>"; };
 		767CAF3A84C77A18E7DED0F0 /* AnimeWindowManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimeWindowManager.swift; sourceTree = "<group>"; };
 		7CE736888A84E23833953C49 /* ArcBackgroundSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArcBackgroundSettings.swift; sourceTree = "<group>"; };
 		7CF588585C18394E4A84E4F3 /* RuleLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuleLoader.swift; sourceTree = "<group>"; };
@@ -658,6 +660,7 @@
 			isa = PBXGroup;
 			children = (
 				747AF5B27704F01082B2C5E4 /* FrameInterpolationMetalInterpolator.swift */,
+				A1B2C3D4E5F60718293A4B5C /* VideoLoopAnalysisMetalComparator.swift */,
 				2B4FD55B46C90758093AF3D8 /* LiquidGlassClockShaders.metal */,
 				5A57F1B7402811BEA53CACDC /* LiquidGlassMetalRenderer.swift */,
 			);
@@ -1241,6 +1244,7 @@
 				567CAB920D17CCAA38CAC210 /* FourKWallpapersParser.swift in Sources */,
 				B051739C27A7C23D6D91A33C /* FourKWallpapersService.swift in Sources */,
 				8031A64AD0A42E18E2095BAB /* FrameInterpolationMetalInterpolator.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5D /* VideoLoopAnalysisMetalComparator.swift in Sources */,
 				E544D46BB305A201F8933FEB /* FullScreenWallpaperView.swift in Sources */,
 				FD8C69180BB22EF12B34A40B /* GitHubDNSResolver.swift in Sources */,
 				0E43E1F9DE0D6B27229C36B8 /* GitHubHosts.swift in Sources */,

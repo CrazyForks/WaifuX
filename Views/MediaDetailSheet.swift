@@ -1669,7 +1669,7 @@ struct MediaDetailSheet: View {
                     } else {
                         showMoreOptionsPopover = false
                         deleteAndRedownloadCurrentItem(
-                            forcedOptimizationOperations: [.loopAnalysis, .frameInterpolation]
+                            forcedOptimizationOperations: [.loopAnalysis]
                         )
                     }
                 } label: {

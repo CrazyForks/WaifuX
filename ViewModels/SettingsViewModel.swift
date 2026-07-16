@@ -85,13 +85,13 @@ class SettingsViewModel: ObservableObject {
             applyVideoOptimizationSettings()
         }
     }
-    /// 下载完成或视频壁纸成功设定后，按公共策略自动补帧。
+    /// 视频下载、烘焙或设为壁纸后，按公共策略自动补帧。
     @Published var frameInterpolationAutoEnqueue = false {
         didSet {
             guard !isBatchUpdating else { return }
             UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_on_download")
             // 旧 key 清理，防止被当成「切换时自动补帧」读回。
-            UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
+            UserDefaults.standard.removeObject(forKey: "frame_interpolation_auto_enqueue")
             applyVideoOptimizationSettings()
         }
     }
@@ -283,7 +283,7 @@ class SettingsViewModel: ObservableObject {
         let effectiveAutoOnDownload = frameInterpolationEnabled && frameInterpolationAutoEnqueue
         frameInterpolationAutoEnqueue = effectiveAutoOnDownload
         UserDefaults.standard.set(effectiveAutoOnDownload, forKey: "frame_interpolation_auto_on_download")
-        UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
+        UserDefaults.standard.removeObject(forKey: "frame_interpolation_auto_enqueue")
         let effectiveAutoAnalyzeLoopPoint = loopPointAnalysisEnabled && autoAnalyzeLoopPoint
         autoAnalyzeLoopPoint = effectiveAutoAnalyzeLoopPoint
         UserDefaults.standard.set(loopPointAnalysisEnabled, forKey: "loop_point_analysis_enabled")
@@ -399,7 +399,7 @@ class SettingsViewModel: ObservableObject {
             // 新语义：下载时自动补帧。旧 key「切换时自动」不再迁移为开启。
             frameInterpolationAutoEnqueue = frameInterpolationEnabled
                 && (defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false)
-            defaults.set(false, forKey: "frame_interpolation_auto_enqueue")
+            defaults.removeObject(forKey: "frame_interpolation_auto_enqueue")
             loopPointAnalysisEnabled = defaults.object(forKey: "loop_point_analysis_enabled") as? Bool ?? true
             autoAnalyzeLoopPoint = loopPointAnalysisEnabled
                 && (defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false)

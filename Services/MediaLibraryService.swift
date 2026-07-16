@@ -248,10 +248,20 @@ final class MediaLibraryService: ObservableObject {
         downloadRecords = Array(downloadRecords)
         upsert(item)
 
-        SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
+        let projectType = wallpaperEngineProjectType(at: localFileURL)
+        if projectType == "scene" {
+            // Scene 下载完成后仅交给已有的资格分析 / 自动烘焙流程。
+            // 优化队列会在烘焙 MP4 实际产出时接收该视频。
+            SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
+            return
+        }
+        if projectType == "web" {
+            // Web 壁纸由 Web daemon 管理，不把项目内部媒体误当成视频壁纸优化。
+            return
+        }
 
         // 视频文件下载完成后异步生成抽帧，供封面展示使用；
-        // 自动循环分析与补帧由统一优化队列按当前策略串行处理（不走调度/设壁纸路径）。
+        // 自动优化入口只负责投递第一个独立任务；循环完成后再决定是否补帧。
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
         let videoFileURL: URL? = if videoExts.contains(localFileURL.pathExtension.lowercased()) {
             localFileURL
@@ -744,6 +754,14 @@ final class MediaLibraryService: ObservableObject {
         if let index = downloadRecords.firstIndex(where: { $0.item.id == id }) {
             let record = downloadRecords[index]
             let filePath = record.localFilePath
+            VideoOptimizationQueueService.shared.removeTasks(
+                forDeletedContentAt: URL(fileURLWithPath: filePath)
+            )
+            if let artifact = record.sceneBakeArtifact {
+                VideoOptimizationQueueService.shared.removeTasks(
+                    forDeletedContentAt: URL(fileURLWithPath: artifact.videoPath)
+                )
+            }
             // 标记软删除
             downloadRecords[index].metadata.markLocalMutation(deleted: true)
             saveDlToCache(downloadRecords[index])
@@ -771,6 +789,14 @@ final class MediaLibraryService: ObservableObject {
         downloadRecords = Array(downloadRecords)
         // 删除所有对应的物理文件及烘焙产物
         for record in recordsToDelete {
+            VideoOptimizationQueueService.shared.removeTasks(
+                forDeletedContentAt: URL(fileURLWithPath: record.localFilePath)
+            )
+            if let artifact = record.sceneBakeArtifact {
+                VideoOptimizationQueueService.shared.removeTasks(
+                    forDeletedContentAt: URL(fileURLWithPath: artifact.videoPath)
+                )
+            }
             deletePhysicalFile(at: record.localFilePath)
             deleteSceneBakeArtifacts(for: record)
         }
@@ -799,6 +825,23 @@ final class MediaLibraryService: ObservableObject {
                 print("[MediaLibraryService] ⚠️ Failed to delete file \(path): \(error)")
             }
         }
+    }
+
+    /// Returns the Wallpaper Engine project type for a downloaded project
+    /// directory (or a file within one). A plain video has no project type.
+    private func wallpaperEngineProjectType(at localFileURL: URL) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: localFileURL.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        let root = isDirectory.boolValue ? localFileURL : localFileURL.deletingLastPathComponent()
+        let projectURL = root.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: projectURL),
+              let project = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = project["type"] as? String else {
+            return nil
+        }
+        return type.lowercased()
     }
 
     /// 公开方法：清除指定下载记录的 Scene 烘焙缓存（删除文件 + 重置 artifact），供重新烘焙使用
@@ -1739,6 +1782,9 @@ final class WallpaperLibraryService: ObservableObject {
         downloadRecords = Array(downloadRecords)
         // 删除所有对应的物理文件
         for path in filesToDelete {
+            VideoOptimizationQueueService.shared.removeTasks(
+                forDeletedContentAt: URL(fileURLWithPath: path)
+            )
             wallpaperDeletePhysicalFile(at: path)
         }
     }

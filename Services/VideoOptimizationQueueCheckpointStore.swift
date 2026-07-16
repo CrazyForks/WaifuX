@@ -53,6 +53,31 @@ struct VideoOptimizationQueueCheckpointStore {
                 blacklistOperation: operation
             )
         }
+
+        /// Legacy checkpoints may contain a combined loop-analysis and frame-
+        /// interpolation request. Restore only the first operation so the
+        /// queue never recreates the previous combined pipeline.
+        func normalizedForRestore() -> SourceRestoreRequest? {
+            guard blacklistOperation == nil else { return self }
+
+            let operation: FrameInterpolationQueueItem.Operation?
+            if operations.contains(.loopAnalysis) {
+                operation = .loopAnalysis
+            } else if operations.contains(.frameInterpolation) {
+                operation = .frameInterpolation
+            } else {
+                operation = nil
+            }
+
+            guard let operation else { return nil }
+            return SourceRestoreRequest(
+                videoPath: videoPath,
+                title: title,
+                targetFPS: targetFPS,
+                operations: [operation],
+                blacklistOperation: nil
+            )
+        }
     }
 
     struct Item: Codable {
@@ -87,7 +112,15 @@ struct VideoOptimizationQueueCheckpointStore {
             guard FileManager.default.fileExists(atPath: videoURL.path) else { return nil }
 
             let pendingOperations = operations.filter { !completedOperations.contains($0) }
-            guard !pendingOperations.isEmpty else { return nil }
+            let restoredOperation: FrameInterpolationQueueItem.Operation?
+            if pendingOperations.contains(.loopAnalysis) {
+                restoredOperation = .loopAnalysis
+            } else if pendingOperations.contains(.frameInterpolation) {
+                restoredOperation = .frameInterpolation
+            } else {
+                restoredOperation = nil
+            }
+            guard let restoredOperation else { return nil }
 
             return FrameInterpolationQueueItem(
                 id: id,
@@ -95,8 +128,8 @@ struct VideoOptimizationQueueCheckpointStore {
                 title: title,
                 targetFPS: targetFPS,
                 source: source,
-                operations: operations,
-                completedOperations: Set(completedOperations),
+                operations: [restoredOperation],
+                completedOperations: [],
                 currentOperation: nil,
                 sourceFPS: nil,
                 status: .waiting,
@@ -124,7 +157,9 @@ struct VideoOptimizationQueueCheckpointStore {
         }
         return RestoredState(
             items: snapshot.items.compactMap { $0.restoredQueueItem() },
-            sourceRestoreRequests: snapshot.sourceRestoreRequests ?? []
+            sourceRestoreRequests: (snapshot.sourceRestoreRequests ?? []).compactMap {
+                $0.normalizedForRestore()
+            }
         )
     }
 

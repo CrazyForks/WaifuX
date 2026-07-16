@@ -153,17 +153,6 @@ struct VideoOptimizationAutomaticPolicy: Equatable {
         automaticallyInterpolateFrames: false,
         targetFPS: 60
     )
-
-    var operations: [FrameInterpolationQueueItem.Operation] {
-        var operations: [FrameInterpolationQueueItem.Operation] = []
-        if loopAnalysisEnabled && automaticallyAnalyzeLoopPoints {
-            operations.append(.loopAnalysis)
-        }
-        if frameInterpolationEnabled && automaticallyInterpolateFrames {
-            operations.append(.frameInterpolation)
-        }
-        return operations
-    }
 }
 
 private enum VideoOptimizationQueueOutcome: String {
@@ -257,26 +246,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         )
     }
 
-    /// 将同一个文件按“循环分析 -> 补帧”的顺序加入统一队列。
-    @discardableResult
-    func enqueueLoopAnalysisThenInterpolation(
-        videoURL: URL,
-        title: String? = nil,
-        targetFPS: Int? = nil,
-        source: FrameInterpolationQueueItem.Source = .manual
-    ) -> UUID? {
-        enqueue(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            source: source,
-            operations: [.loopAnalysis, .frameInterpolation]
-        )
-    }
-
-    /// Explicit interpolation is intentionally independent from loop analysis.
-    /// The combined API above is reserved for automatic and full re-optimization
-    /// flows which require a strict loop-analysis-then-interpolation sequence.
+    /// Explicit interpolation is independent from loop analysis. Automatic
+    /// follow-up interpolation is decided only after a loop task finishes.
     @discardableResult
     func enqueueFrameInterpolation(
         videoURL: URL,
@@ -367,8 +338,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         return videoURL
     }
 
-    /// 下载完成后按设置决定是否入队。调度/设壁纸路径不得调用。
-    /// 同一文件永远由单一队列任务串行执行“循环分析 -> 补帧”。
+    /// 下载完成后按设置决定首个优化任务。自动循环分析与自动补帧
+    /// 是独立队列：循环分析完成时才会按当前设置投递补帧。
     @discardableResult
     func enqueueAfterDownloadIfNeeded(
         videoURL: URL,
@@ -398,18 +369,21 @@ final class VideoOptimizationQueueService: ObservableObject {
         return enqueueAutomaticOptimizationIfNeeded(videoURL: videoURL, title: title)
     }
 
-    /// Defers a manual action until the original source has been downloaded.
-    /// It prevents the automatic policy from racing the requested pipeline.
+    /// Defers one manual operation until the original source has been downloaded.
+    /// The restored source enters the same queue as every other request, so it
+    /// cannot retain a separate multi-step pipeline outside the queue.
     func requestAfterSourceRestore(
         videoURL: URL,
         title: String? = nil,
         operations: [FrameInterpolationQueueItem.Operation]
     ) {
+        let initialOperation = initialQueueOperation(from: operations)
+        guard !initialOperation.isEmpty else { return }
         sourceRestoreRequests[videoURL.standardizedFileURL.path] = .enqueue(
             videoURL: videoURL,
             title: title,
             targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            operations: normalizedOperations(operations)
+            operations: initialOperation
         )
         persistQueueCheckpointImmediately()
     }
@@ -439,6 +413,11 @@ final class VideoOptimizationQueueService: ObservableObject {
     /// Applies the persisted automatic policy to a local source video. Download
     /// completion, Scene bake completion, and a successful video application
     /// share this API; callers must not enumerate, replace, or refresh playback.
+    ///
+    /// When loop analysis is still needed it is always the first independent
+    /// task. Frame interpolation is only enqueued after that loop task finishes.
+    /// If loop analysis is disabled or already has a terminal record, an enabled
+    /// automatic interpolation policy can enqueue directly.
     @discardableResult
     func enqueueAutomaticOptimizationIfNeeded(
         videoURL: URL,
@@ -446,8 +425,6 @@ final class VideoOptimizationQueueService: ObservableObject {
     ) -> UUID? {
         ensureAutomaticPolicyLoaded()
         let policy = automaticPolicy
-        var operations = policy.operations
-        guard !operations.isEmpty else { return nil }
         guard videoURL.isFileURL,
               FileManager.default.fileExists(atPath: videoURL.path) else {
             return nil
@@ -457,25 +434,23 @@ final class VideoOptimizationQueueService: ObservableObject {
 
         let targetFPS = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(policy.targetFPS)
         guard targetFPS > 0 else { return nil }
-        operations = automaticOperationsNeedingWork(
-            operations,
-            for: videoURL,
-            targetFPS: targetFPS
-        )
-        guard !operations.isEmpty else { return nil }
-
-        if operations == [.frameInterpolation],
-           completedRecord(videoURL: videoURL, satisfying: targetFPS) != nil {
-            return nil
+        if policy.loopAnalysisEnabled,
+           policy.automaticallyAnalyzeLoopPoints,
+           automaticOperationsNeedingWork([.loopAnalysis], for: videoURL, targetFPS: targetFPS) == [.loopAnalysis] {
+            frameInterpolationDebugPrint("自动入口：加入循环点分析队列。视频=\(videoURL.lastPathComponent)")
+            return enqueue(
+                videoURL: videoURL,
+                title: title,
+                targetFPS: targetFPS,
+                source: .automatic,
+                operations: [.loopAnalysis]
+            )
         }
 
-        frameInterpolationDebugPrint("自动入口：按设置入队视频优化。操作=\(operations.map(\.rawValue).joined(separator: ","))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
-        return enqueue(
+        return enqueueAutomaticInterpolationIfNeeded(
             videoURL: videoURL,
             title: title,
-            targetFPS: targetFPS,
-            source: .automatic,
-            operations: operations
+            targetFPS: targetFPS
         )
     }
 
@@ -504,6 +479,43 @@ final class VideoOptimizationQueueService: ObservableObject {
     @discardableResult
     func enqueueAfterBakeIfNeeded(videoURL: URL, title: String? = nil) -> UUID? {
         enqueueAutomaticOptimizationIfNeeded(videoURL: videoURL, title: title)
+    }
+
+    /// A loop task calls this only after it reaches a successful terminal
+    /// outcome. It deliberately evaluates the latest settings at that moment.
+    @discardableResult
+    private func enqueueAutomaticInterpolationIfNeeded(
+        videoURL: URL,
+        title: String? = nil,
+        targetFPS: Int? = nil
+    ) -> UUID? {
+        ensureAutomaticPolicyLoaded()
+        let policy = automaticPolicy
+        guard policy.frameInterpolationEnabled,
+              policy.automaticallyInterpolateFrames,
+              videoURL.isFileURL,
+              FileManager.default.fileExists(atPath: videoURL.path) else {
+            return nil
+        }
+
+        let effectiveTargetFPS = targetFPS ?? FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(policy.targetFPS)
+        guard effectiveTargetFPS > 0,
+              automaticOperationsNeedingWork(
+                [.frameInterpolation],
+                for: videoURL,
+                targetFPS: effectiveTargetFPS
+              ) == [.frameInterpolation] else {
+            return nil
+        }
+
+        frameInterpolationDebugPrint("自动入口：加入补帧队列。视频=\(videoURL.lastPathComponent)，目标 FPS=\(effectiveTargetFPS)")
+        return enqueue(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: effectiveTargetFPS,
+            source: .automatic,
+            operations: [.frameInterpolation]
+        )
     }
 
     func hasPendingInterpolation(videoURL: URL, targetFPS: Int) -> Bool {
@@ -637,6 +649,28 @@ final class VideoOptimizationQueueService: ObservableObject {
         scheduleNext()
     }
 
+    /// A library delete may race an active export. Remove matching jobs at once
+    /// rather than waiting for the next persisted-checkpoint restore.
+    func removeTasks(forDeletedContentAt contentURL: URL) {
+        let rootURL = contentURL.standardizedFileURL
+        let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        let matchingIDs = items.compactMap { item -> UUID? in
+            let path = item.videoURL.standardizedFileURL.path
+            return path == rootURL.path || path.hasPrefix(rootPath) ? item.id : nil
+        }
+        guard !matchingIDs.isEmpty else { return }
+
+        for id in matchingIDs {
+            runningTasks[id]?.cancel()
+            runningTasks[id] = nil
+            stopHeartbeat(id: id)
+        }
+        items.removeAll { matchingIDs.contains($0.id) }
+        frameInterpolationDebugPrint("视频优化队列：媒体已删除，移除任务数=\(matchingIDs.count)，路径=\(contentURL.path)")
+        persistQueueCheckpointImmediately()
+        scheduleNext()
+    }
+
     @discardableResult
     func enqueue(
         videoURL: URL,
@@ -655,6 +689,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         requestedOperations.removeAll { isBlacklisted(videoURL: videoURL, operation: $0) }
         guard !requestedOperations.isEmpty else { return nil }
 
+        requestedOperations = initialQueueOperation(from: requestedOperations)
+
         if requestedOperations == [.frameInterpolation],
            let record = completedRecord(videoURL: videoURL, satisfying: targetFPS) {
             frameInterpolationDebugPrint("补帧队列：已有完成记录覆盖目标 FPS，跳过添加。记录 FPS=\(record.targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
@@ -664,33 +700,26 @@ final class VideoOptimizationQueueService: ObservableObject {
         if let coveredIndex = items.firstIndex(where: {
             $0.videoURL.standardizedFileURL == videoURL.standardizedFileURL
                 && $0.targetFPS >= targetFPS
+                && $0.operations == requestedOperations
                 && !$0.isTerminalForCleanup
         }) {
-            let canExtendPipeline: Bool
-            if case .waiting = items[coveredIndex].status {
-                canExtendPipeline = true
-            } else {
-                canExtendPipeline = items[coveredIndex].currentOperation == .loopAnalysis
-            }
-            if canExtendPipeline {
-                items[coveredIndex].operations = normalizedOperations(
-                    items[coveredIndex].operations + requestedOperations
-                )
-                // The queued work was expanded in place, so persist it now
-                // instead of relying on the coalesced snapshot write.
-                persistQueueCheckpointImmediately()
-            }
-            frameInterpolationDebugPrint("补帧队列：已有任务覆盖目标 FPS，跳过重复添加。任务 FPS=\(items[coveredIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
+            frameInterpolationDebugPrint("视频优化队列：已有相同操作覆盖目标 FPS，跳过重复添加。任务 FPS=\(items[coveredIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
             return items[coveredIndex].id
         }
 
-        let lowerWaitingIDs = items.compactMap { item -> UUID? in
-            guard item.videoURL.standardizedFileURL == videoURL.standardizedFileURL,
-                  item.targetFPS < targetFPS,
-                  case .waiting = item.status else {
-                return nil
+        let lowerWaitingIDs: [UUID]
+        if requestedOperations == [.frameInterpolation] {
+            lowerWaitingIDs = items.compactMap { item -> UUID? in
+                guard item.videoURL.standardizedFileURL == videoURL.standardizedFileURL,
+                      item.operations == [.frameInterpolation],
+                      item.targetFPS < targetFPS,
+                      case .waiting = item.status else {
+                    return nil
+                }
+                return item.id
             }
-            return item.id
+        } else {
+            lowerWaitingIDs = []
         }
         for waitingID in lowerWaitingIDs {
             guard let index = items.firstIndex(where: { $0.id == waitingID }) else { continue }
@@ -729,20 +758,23 @@ final class VideoOptimizationQueueService: ObservableObject {
         return id
     }
 
-    /// Optimizations have two independent workers. A loop analysis for one
-    /// video must not wait for an unrelated optical-flow export, but two
-    /// workers are never allowed to rewrite the same source file together.
+    /// Loop analysis and frame interpolation use independent worker pools.
+    /// Each pool can process two different videos at once, while a single
+    /// source file is still never analyzed and rewritten concurrently.
+    private let maxConcurrentTasksPerOperation = 2
+
     private func scheduleNext() {
+        removeMissingVideoTasksIfNeeded()
         clearProgressForWaitingItems()
         persistQueueCheckpointImmediately()
 
-        if !hasRunningOperation(.loopAnalysis),
-           let id = nextWaitingItemID(for: .loopAnalysis) {
+        while runningTaskCount(for: .loopAnalysis) < maxConcurrentTasksPerOperation,
+              let id = nextWaitingItemID(for: .loopAnalysis) {
             startLoopAnalysis(id: id)
         }
 
-        if !hasRunningOperation(.frameInterpolation),
-           let id = nextWaitingItemID(for: .frameInterpolation) {
+        while runningTaskCount(for: .frameInterpolation) < maxConcurrentTasksPerOperation,
+              let id = nextWaitingItemID(for: .frameInterpolation) {
             startFrameInterpolation(id: id)
         }
     }
@@ -770,9 +802,12 @@ final class VideoOptimizationQueueService: ObservableObject {
         item.operations.first { !item.completedOperations.contains($0) }
     }
 
-    private func hasRunningOperation(_ operation: FrameInterpolationQueueItem.Operation) -> Bool {
-        runningTasks.keys.contains { id in
-            items.first(where: { $0.id == id })?.currentOperation == operation
+    private func runningTaskCount(for operation: FrameInterpolationQueueItem.Operation) -> Int {
+        runningTasks.keys.reduce(into: 0) { count, id in
+            guard let item = items.first(where: { $0.id == id }) else { return }
+            if item.currentOperation == operation {
+                count += 1
+            }
         }
     }
 
@@ -873,10 +908,18 @@ final class VideoOptimizationQueueService: ObservableObject {
             return
         }
 
+        let videoURL = items[index].videoURL
+        let title = items[index].title
+        let targetFPS = items[index].targetFPS
         items[index].completedOperations.insert(.loopAnalysis)
         items[index].currentOperation = nil
         if nextPendingOperation(for: items[index]) == nil {
             finishCompleted(id: id, message: "循环分析完成")
+            _ = enqueueAutomaticInterpolationIfNeeded(
+                videoURL: videoURL,
+                title: title,
+                targetFPS: targetFPS
+            )
             return
         }
 
@@ -964,6 +1007,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     private func updateHeartbeat(id: UUID) {
+        removeMissingVideoTasksIfNeeded()
         guard let index = items.firstIndex(where: { $0.id == id }),
               let startDate = taskStartDates[id] else {
             stopHeartbeat(id: id)
@@ -995,6 +1039,25 @@ final class VideoOptimizationQueueService: ObservableObject {
         frameInterpolationDebugPrint(
             "补帧队列心跳：状态=\(items[index].statusText)，阶段=\(items[index].currentStage)，进度=\(percent)%，已写=\(items[index].writtenFrames)/\(items[index].totalFrames.map(String.init) ?? "未知")，光流帧=\(items[index].opticalFlowFrames)，耗时=\(Self.formatSeconds(elapsed))，剩余=\(items[index].remainingSeconds.map(Self.formatSeconds) ?? "未知")，视频=\(items[index].videoURL.lastPathComponent)"
         )
+    }
+
+    /// Queue checkpoints already discard missing files after an app restart.
+    /// Mirror that behavior at runtime so a deleted video cannot keep an
+    /// invisible worker alive or later replace a newly removed source.
+    private func removeMissingVideoTasksIfNeeded() {
+        let missingIDs = items.compactMap { item -> UUID? in
+            FileManager.default.fileExists(atPath: item.videoURL.path) ? nil : item.id
+        }
+        guard !missingIDs.isEmpty else { return }
+
+        for id in missingIDs {
+            runningTasks[id]?.cancel()
+            runningTasks[id] = nil
+            stopHeartbeat(id: id)
+        }
+        items.removeAll { missingIDs.contains($0.id) }
+        frameInterpolationDebugPrint("视频优化队列：检测到源文件已删除，移除任务数=\(missingIDs.count)")
+        persistQueueCheckpointImmediately()
     }
 
     private func updateProgress(id: UUID, progress: FrameInterpolationExportProgress) {
@@ -1029,7 +1092,7 @@ final class VideoOptimizationQueueService: ObservableObject {
             return
         }
         items[index].status = .analyzing
-        items[index].progress = min(1, max(0, progress))
+        items[index].progress = max(items[index].progress, min(1, max(0, progress)))
         items[index].currentStage = "循环分析中"
     }
 
@@ -1224,6 +1287,23 @@ final class VideoOptimizationQueueService: ObservableObject {
         FrameInterpolationQueueItem.Operation.allCases.filter { operations.contains($0) }
     }
 
+    /// A queue item represents exactly one operation. When callers from an
+    /// older checkpoint request both operations, retain the loop analysis as
+    /// the first task and let its terminal handler decide whether to enqueue
+    /// automatic interpolation.
+    private func initialQueueOperation(
+        from operations: [FrameInterpolationQueueItem.Operation]
+    ) -> [FrameInterpolationQueueItem.Operation] {
+        let normalized = normalizedOperations(operations)
+        if normalized.contains(.loopAnalysis) {
+            return [.loopAnalysis]
+        }
+        if normalized.contains(.frameInterpolation) {
+            return [.frameInterpolation]
+        }
+        return []
+    }
+
     /// Automatic triggers should not rerun a terminal decision every time the
     /// same wallpaper is selected. Manual actions intentionally remain retryable
     /// for failed/no-reliable loop analysis states.
@@ -1410,7 +1490,7 @@ final class VideoOptimizationQueueService: ObservableObject {
 
 private actor VideoFrameInterpolationExportCoordinator {
     static let shared = VideoFrameInterpolationExportCoordinator()
-    private let maxConcurrentExports = 1
+    private let maxConcurrentExports = 2
     private var activeExportCount = 0
     private var exportWaiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var tasks: [String: Task<URL?, Never>] = [:]
@@ -1524,7 +1604,8 @@ enum VideoFrameInterpolationExporter {
         progress: (@Sendable (FrameInterpolationExportProgress) -> Void)? = nil
     ) async -> URL? {
         try? FileManager.default.removeItem(at: outputURL)
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              FileManager.default.fileExists(atPath: sourceURL.path) else {
             frameInterpolationDebugPrint("导出任务：启动前已取消。视频=\(sourceURL.lastPathComponent)")
             return nil
         }
@@ -1535,7 +1616,8 @@ enum VideoFrameInterpolationExporter {
             frameInterpolationDebugPrint("导出任务：读取视频轨道、尺寸、方向、码率或时长失败。")
             return nil
         }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              FileManager.default.fileExists(atPath: sourceURL.path) else {
             frameInterpolationDebugPrint("导出任务：读取参数后已取消。视频=\(sourceURL.lastPathComponent)")
             return nil
         }
@@ -1568,7 +1650,8 @@ enum VideoFrameInterpolationExporter {
             try? FileManager.default.removeItem(at: outputURL)
             return nil
         }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled,
+              FileManager.default.fileExists(atPath: sourceURL.path) else {
             frameInterpolationDebugPrint("导出任务：写入完成后已取消，保留原视频。视频=\(sourceURL.lastPathComponent)")
             try? FileManager.default.removeItem(at: outputURL)
             return nil
@@ -2012,6 +2095,9 @@ enum VideoFrameInterpolationExporter {
     }
 
     private static func replaceSourceVideo(_ sourceURL: URL, with temporaryURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw CancellationError()
+        }
         let backupURL = sourceURL
             .deletingLastPathComponent()
             .appendingPathComponent(".\(sourceURL.lastPathComponent).waifux-original-\(UUID().uuidString)")

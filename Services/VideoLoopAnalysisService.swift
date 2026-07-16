@@ -46,6 +46,10 @@ enum VideoLoopAnalysisService {
                     userInfo: [NSLocalizedDescriptionKey: "Exported file not found"]
                 )
             }
+            try Task.checkCancellation()
+            guard FileManager.default.fileExists(atPath: videoURL.path) else {
+                throw CancellationError()
+            }
             _ = try FileManager.default.replaceItemAt(videoURL, withItemAt: temporaryURL)
             progress(1)
             return .applied(
@@ -81,6 +85,7 @@ enum VideoLoopAnalysisService {
     }
 
     private struct RefinedLoopBoundary: Sendable {
+        let candidateFrame: Int
         let start: TimedFrameSignature
         let end: TimedFrameSignature
         let difference: FrameWindowDifference
@@ -129,10 +134,14 @@ enum VideoLoopAnalysisService {
         var referenceFrames: [TimedFrameSignature] = []
         var activeCandidates: [PendingLoopCandidate] = []
         var verifiedCandidates: [LoopCandidate] = []
+        var pendingRefinements: [LoopCandidate] = []
+        var refinedBoundaries: [RefinedLoopBoundary] = []
+        var signatureWindow: [TimedFrameSignature] = []
         var frameIndex = 0
         let durationSeconds = max(0.001, duration.seconds)
         let verificationFrameCount = 12
         let refinementFrameCount = 20
+        let signatureWindowCapacity = refinementFrameCount * 2 + 1
         let minimumLoopDuration: Double = 0.75
 
         // Decode once from the first non-black frame. A candidate needs 12
@@ -145,56 +154,81 @@ enum VideoLoopAnalysisService {
             }
             let signature = try FrameSignature(pixelBuffer: pixelBuffer)
             let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            let timedSignature = TimedFrameSignature(
+                frame: frameIndex,
+                time: presentationTime,
+                signature: signature
+            )
             if referenceFrames.isEmpty {
                 if !signature.isPureBlack {
-                    referenceFrames.append(TimedFrameSignature(
-                        frame: frameIndex,
-                        time: presentationTime,
-                        signature: signature
-                    ))
+                    referenceFrames.append(timedSignature)
+                    signatureWindow.append(timedSignature)
                 }
-            } else if referenceFrames.count < refinementFrameCount {
-                referenceFrames.append(TimedFrameSignature(
-                    frame: frameIndex,
-                    time: presentationTime,
-                    signature: signature
-                ))
-            } else if let startTime = referenceFrames.first?.time {
-                var remainingCandidates: [PendingLoopCandidate] = []
-                remainingCandidates.reserveCapacity(activeCandidates.count)
+            } else {
+                signatureWindow.append(timedSignature)
+                if signatureWindow.count > signatureWindowCapacity {
+                    signatureWindow.removeFirst(signatureWindow.count - signatureWindowCapacity)
+                }
 
-                for var candidate in activeCandidates {
-                    let referenceIndex = candidate.comparedFrameCount
-                    candidate.append(signature, reference: referenceFrames[referenceIndex].signature)
-                    if candidate.comparedFrameCount == verificationFrameCount {
-                        if candidate.difference.isReliableLoopMatch {
-                            verifiedCandidates.append(candidate.completed())
+                if referenceFrames.count < refinementFrameCount {
+                    referenceFrames.append(timedSignature)
+                } else if let startTime = referenceFrames.first?.time {
+                    var remainingCandidates: [PendingLoopCandidate] = []
+                    remainingCandidates.reserveCapacity(activeCandidates.count)
+
+                    for var candidate in activeCandidates {
+                        let referenceIndex = candidate.comparedFrameCount
+                        candidate.append(signature, reference: referenceFrames[referenceIndex].signature)
+                        if candidate.comparedFrameCount == verificationFrameCount {
+                            if candidate.difference.isReliableLoopMatch {
+                                let verifiedCandidate = candidate.completed()
+                                verifiedCandidates.append(verifiedCandidate)
+                                pendingRefinements.append(verifiedCandidate)
+                            }
+                        } else {
+                            remainingCandidates.append(candidate)
                         }
-                    } else {
-                        remainingCandidates.append(candidate)
                     }
-                }
-                activeCandidates = remainingCandidates
+                    activeCandidates = remainingCandidates
 
-                let elapsedFromStart = max(0, CMTimeGetSeconds(CMTimeSubtract(presentationTime, startTime)))
-                if elapsedFromStart >= minimumLoopDuration {
-                    let difference = signature.difference(to: referenceFrames[0].signature)
-                    if difference.isPotentialLoopMatch {
-                        activeCandidates.append(PendingLoopCandidate(
-                            frame: frameIndex,
-                            time: presentationTime,
-                            firstDifference: difference
-                        ))
+                    let elapsedFromStart = max(0, CMTimeGetSeconds(CMTimeSubtract(presentationTime, startTime)))
+                    if elapsedFromStart >= minimumLoopDuration {
+                        let difference = signature.difference(to: referenceFrames[0].signature)
+                        if difference.isPotentialLoopMatch {
+                            activeCandidates.append(PendingLoopCandidate(
+                                frame: frameIndex,
+                                time: presentationTime,
+                                firstDifference: difference
+                            ))
+                        }
                     }
+
+                    refineReadyCandidates(
+                        pendingRefinements: &pendingRefinements,
+                        referenceFrames: referenceFrames,
+                        signatureWindow: signatureWindow,
+                        currentFrame: frameIndex,
+                        isAtEnd: false,
+                        refinedBoundaries: &refinedBoundaries
+                    )
                 }
             }
 
             if frameIndex % 12 == 0 {
                 let elapsed = max(0, presentationTime.seconds)
-                progress(0.05 + 0.70 * min(1, elapsed / durationSeconds))
+                progress(0.05 + 0.60 * min(1, elapsed / durationSeconds))
             }
             frameIndex += 1
         }
+
+        refineReadyCandidates(
+            pendingRefinements: &pendingRefinements,
+            referenceFrames: referenceFrames,
+            signatureWindow: signatureWindow,
+            currentFrame: frameIndex,
+            isAtEnd: true,
+            refinedBoundaries: &refinedBoundaries
+        )
 
         if reader.status == .failed {
             throw reader.error ?? NSError(
@@ -235,40 +269,19 @@ enum VideoLoopAnalysisService {
             return .noReliablePoint
         }
 
-        let fallbackCandidate = selectLastReliableCandidate(from: candidatesForRefinement)
-        var refinedBoundaries: [RefinedLoopBoundary] = []
-        refinedBoundaries.reserveCapacity(candidatesForRefinement.count)
-        for (index, candidate) in candidatesForRefinement.enumerated() {
-            try Task.checkCancellation()
-            do {
-                if let refinedBoundary = try await refineLoopBoundary(
-                    in: asset,
-                    videoTrack: videoTrack,
-                    duration: duration,
-                    referenceFrames: referenceFrames,
-                    candidate: candidate
-                ) {
-                    refinedBoundaries.append(refinedBoundary)
+        let candidateFrames = Set(candidatesForRefinement.map(\.frame))
+        let fallbackCandidate = selectBestReliableCandidate(from: candidatesForRefinement)
+        let bestRefinedBoundary = refinedBoundaries
+            .filter { candidateFrames.contains($0.candidateFrame) }
+            .min { lhs, rhs in
+                if lhs.difference.qualityScore == rhs.difference.qualityScore {
+                    return CMTimeCompare(lhs.end.time, rhs.end.time) > 0
                 }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                AppLogger.info(.media, "循环点候选精修跳过", metadata: [
-                    "frame": String(candidate.frame),
-                    "error": error.localizedDescription,
-                ])
+                return lhs.difference.qualityScore < rhs.difference.qualityScore
             }
-            progress(0.70 + 0.07 * Double(index + 1) / Double(max(1, candidatesForRefinement.count)))
-        }
-
-        let bestRefinedBoundary = refinedBoundaries.min { lhs, rhs in
-            if lhs.difference.qualityScore == rhs.difference.qualityScore {
-                return lhs.end.time > rhs.end.time
-            }
-            return lhs.difference.qualityScore < rhs.difference.qualityScore
-        }
         guard let selectedBoundary = bestRefinedBoundary ?? fallbackCandidate.map({
             RefinedLoopBoundary(
+                candidateFrame: $0.frame,
                 start: firstReferenceFrame,
                 end: TimedFrameSignature(frame: $0.frame, time: $0.time, signature: firstReferenceFrame.signature),
                 difference: $0.difference
@@ -382,9 +395,9 @@ enum VideoLoopAnalysisService {
             return false
         }
 
-        // Similar decoded frames still need a loop-point crop. Skip analysis only
-        // when every decoded Y and CbCr byte in the boundary frame matches.
-        return firstFrame.exactlyMatches(lastFrame)
+        // Similar decoded frames still need a loop-point crop. Skip analysis
+        // only when the full decoded image differs by codec-rounding noise.
+        return firstFrame.visuallyMatches(lastFrame)
     }
 
     private static func readExactBoundaryFrame(
@@ -412,7 +425,7 @@ enum VideoLoopAnalysisService {
             guard !signature.isPureBlack else { continue }
 
             if let matchingSampledLuma,
-               !signature.hasIdenticalSampledLuma(to: matchingSampledLuma) {
+               !signature.isNearIdenticalSampledLuma(to: matchingSampledLuma) {
                 if selectLastNonBlackFrame {
                     selectedFrame = nil
                 }
@@ -433,56 +446,61 @@ enum VideoLoopAnalysisService {
         return selectedFrame
     }
 
-    private static func refineLoopBoundary(
-        in asset: AVAsset,
-        videoTrack: AVAssetTrack,
-        duration: CMTime,
+    /// Refines every verified candidate from the 41-frame signature window
+    /// collected during the primary decode. Reopening an AVAssetReader for each
+    /// candidate made visually static videos disproportionately slow.
+    private static func refineReadyCandidates(
+        pendingRefinements: inout [LoopCandidate],
         referenceFrames: [TimedFrameSignature],
+        signatureWindow: [TimedFrameSignature],
+        currentFrame: Int,
+        isAtEnd: Bool,
+        refinedBoundaries: inout [RefinedLoopBoundary]
+    ) {
+        let localFrameCount = min(20, referenceFrames.count)
+        guard localFrameCount >= 5 else { return }
+
+        while let candidate = pendingRefinements.first,
+              isAtEnd || currentFrame >= candidate.frame + localFrameCount {
+            pendingRefinements.removeFirst()
+            let lowerBound = candidate.frame - localFrameCount
+            let upperBound = candidate.frame + localFrameCount
+            let candidateFrames = signatureWindow.filter {
+                $0.frame >= lowerBound && $0.frame <= upperBound
+            }
+            if let refinedBoundary = refineLoopBoundary(
+                referenceFrames: referenceFrames,
+                candidateFrames: candidateFrames,
+                candidate: candidate
+            ) {
+                refinedBoundaries.append(refinedBoundary)
+            }
+        }
+    }
+
+    private static func refineLoopBoundary(
+        referenceFrames: [TimedFrameSignature],
+        candidateFrames: [TimedFrameSignature],
         candidate: LoopCandidate
-    ) async throws -> RefinedLoopBoundary? {
+    ) -> RefinedLoopBoundary? {
         let localFrameCount = min(20, referenceFrames.count)
         let starts = Array(referenceFrames.prefix(localFrameCount))
         guard starts.count >= 5 else { return nil }
 
-        let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
-        let framesPerSecond = nominalFrameRate > 0 ? Double(nominalFrameRate) : 30
-        let frameDuration = CMTime(seconds: 1 / framesPerSecond, preferredTimescale: 600_000)
-        let readerStart = CMTimeMaximum(
-            .zero,
-            CMTimeSubtract(candidate.time, CMTimeMultiply(frameDuration, multiplier: Int32(localFrameCount)))
+        let gpuDifferences = VideoLoopAnalysisMetalComparator.shared.pairwiseDifferences(
+            referenceSignatures: starts.map(\.signature.luma),
+            candidateSignatures: candidateFrames.map(\.signature.luma)
         )
-        let readerEnd = CMTimeMinimum(
-            duration,
-            CMTimeAdd(candidate.time, CMTimeMultiply(frameDuration, multiplier: Int32(localFrameCount + 1)))
-        )
-        guard CMTimeCompare(readerEnd, readerStart) > 0 else { return nil }
-
-        let reader = try AVAssetReader(asset: asset)
-        reader.timeRange = CMTimeRange(start: readerStart, duration: CMTimeSubtract(readerEnd, readerStart))
-        let output = makeLoopAnalysisVideoOutput(for: videoTrack)
-        guard reader.canAdd(output) else {
-            throw NSError(domain: "VideoLoopAnalysis", code: 15)
+        let cpuDifferences: [FrameDifference]?
+        if gpuDifferences == nil {
+            cpuDifferences = starts.flatMap { start in
+                candidateFrames.map { candidateFrame in
+                    start.signature.difference(to: candidateFrame.signature)
+                }
+            }
+        } else {
+            cpuDifferences = nil
         }
-        reader.add(output)
-        guard reader.startReading() else {
-            throw reader.error ?? NSError(domain: "VideoLoopAnalysis", code: 16)
-        }
-
-        var candidateFrames: [TimedFrameSignature] = []
-        while candidateFrames.count < localFrameCount * 2 + 1,
-              let sampleBuffer = output.copyNextSampleBuffer() {
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
-            candidateFrames.append(TimedFrameSignature(
-                frame: candidate.frame - localFrameCount + candidateFrames.count,
-                time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
-                signature: try FrameSignature(pixelBuffer: pixelBuffer)
-            ))
-        }
-        if reader.status == .failed {
-            throw reader.error ?? NSError(domain: "VideoLoopAnalysis", code: 17)
-        }
-        if reader.status == .reading { reader.cancelReading() }
-
         let validationFrameCount = 5
         var bestBoundary: RefinedLoopBoundary?
         var bestScore = Double.greatestFiniteMagnitude
@@ -495,15 +513,24 @@ enum VideoLoopAnalysisService {
                 }
                 var difference = FrameWindowDifference()
                 for offset in 0..<validationFrameCount {
-                    difference.append(starts[startIndex + offset].signature.difference(
-                        to: candidateFrames[endIndex + offset].signature
-                    ))
+                    let referenceIndex = startIndex + offset
+                    let candidateIndex = endIndex + offset
+                    if let gpuDifferences {
+                        difference.append(FrameDifference(
+                            gpuDifferences[referenceIndex * candidateFrames.count + candidateIndex]
+                        ))
+                    } else if let cpuDifferences {
+                        difference.append(
+                            cpuDifferences[referenceIndex * candidateFrames.count + candidateIndex]
+                        )
+                    }
                 }
-                guard difference.isReliableLoopMatch else { continue }
+                guard difference.isVisuallyReliableLoopMatch else { continue }
                 let score = difference.qualityScore + Double(abs(startIndex - endIndex)) * 0.015
                 if score < bestScore {
                     bestScore = score
                     bestBoundary = RefinedLoopBoundary(
+                        candidateFrame: candidate.frame,
                         start: starts[startIndex],
                         end: candidateFrames[endIndex],
                         difference: difference
@@ -549,6 +576,15 @@ enum VideoLoopAnalysisService {
                 && strongDifferenceRatio <= 0.05
         }
 
+        /// The final crop boundary may tolerate a little decoded-video noise
+        /// after the strict 12-frame candidate gate. Every accepted boundary is
+        /// still ranked against all verified candidates by `qualityScore`.
+        var isVisuallyReliableLoopMatch: Bool {
+            meanAbsoluteDifference <= 9
+                && rootMeanSquareDifference <= 20
+                && strongDifferenceRatio <= 0.08
+        }
+
         var qualityScore: Double {
             meanAbsoluteDifference / 7
                 + rootMeanSquareDifference / 16
@@ -561,6 +597,25 @@ enum VideoLoopAnalysisService {
         let squaredDifferenceTotal: Int
         let strongDifferenceCount: Int
         let sampleCount: Int
+
+        init(
+            absoluteDifferenceTotal: Int,
+            squaredDifferenceTotal: Int,
+            strongDifferenceCount: Int,
+            sampleCount: Int
+        ) {
+            self.absoluteDifferenceTotal = absoluteDifferenceTotal
+            self.squaredDifferenceTotal = squaredDifferenceTotal
+            self.strongDifferenceCount = strongDifferenceCount
+            self.sampleCount = sampleCount
+        }
+
+        init(_ metrics: VideoLoopAnalysisDifferenceMetrics) {
+            absoluteDifferenceTotal = metrics.absoluteDifferenceTotal
+            squaredDifferenceTotal = metrics.squaredDifferenceTotal
+            strongDifferenceCount = metrics.strongDifferenceCount
+            sampleCount = metrics.sampleCount
+        }
 
         var meanAbsoluteDifference: Double {
             Double(absoluteDifferenceTotal) / Double(max(1, sampleCount))
@@ -612,11 +667,18 @@ enum VideoLoopAnalysisService {
     private struct ExactFramePixels: Sendable {
         let signature: FrameSignature
         let pixelFormat: OSType
+        let width: Int
+        let height: Int
         let planes: [Data]
 
         init(pixelBuffer: CVPixelBuffer, signature: FrameSignature) throws {
             self.signature = signature
             pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+            width = CVPixelBufferGetWidth(pixelBuffer)
+            height = CVPixelBufferGetHeight(pixelBuffer)
+            guard width > 0, height > 0 else {
+                throw NSError(domain: "VideoLoopAnalysis", code: 21)
+            }
 
             CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
             defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -625,7 +687,7 @@ enum VideoLoopAnalysisService {
             case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                  kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
                 guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else {
-                    throw NSError(domain: "VideoLoopAnalysis", code: 21)
+                    throw NSError(domain: "VideoLoopAnalysis", code: 22)
                 }
                 planes = try (0..<2).map { planeIndex in
                     try Self.copyPlane(
@@ -636,10 +698,8 @@ enum VideoLoopAnalysisService {
                 }
             case kCVPixelFormatType_32BGRA:
                 guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-                    throw NSError(domain: "VideoLoopAnalysis", code: 22)
+                    throw NSError(domain: "VideoLoopAnalysis", code: 23)
                 }
-                let width = CVPixelBufferGetWidth(pixelBuffer)
-                let height = CVPixelBufferGetHeight(pixelBuffer)
                 let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
                 planes = [Self.copyRows(
                     baseAddress: baseAddress,
@@ -650,14 +710,74 @@ enum VideoLoopAnalysisService {
             default:
                 throw NSError(
                     domain: "VideoLoopAnalysis",
-                    code: 23,
+                    code: 24,
                     userInfo: [NSLocalizedDescriptionKey: "Unsupported video pixel format: \(pixelFormat)"]
                 )
             }
         }
 
-        func exactlyMatches(_ other: ExactFramePixels) -> Bool {
-            pixelFormat == other.pixelFormat && planes == other.planes
+        /// Treat only codec-rounding noise as an already seamless loop. This
+        /// deliberately remains much stricter than the visual candidate score
+        /// used for selecting a crop boundary.
+        func visuallyMatches(_ other: ExactFramePixels) -> Bool {
+            guard pixelFormat == other.pixelFormat,
+                  width == other.width,
+                  height == other.height,
+                  planes.count == other.planes.count else {
+                return false
+            }
+
+            if planes.count == 1 {
+                return Self.matchesWithinCodecTolerance(
+                    planes[0],
+                    other.planes[0],
+                    maximumMeanDifference: 0.35,
+                    toleratedDifference: 2,
+                    maximumDifference: 4
+                )
+            }
+
+            return Self.matchesWithinCodecTolerance(
+                planes[0],
+                other.planes[0],
+                maximumMeanDifference: 0.35,
+                toleratedDifference: 2,
+                maximumDifference: 4
+            ) && Self.matchesWithinCodecTolerance(
+                planes[1],
+                other.planes[1],
+                maximumMeanDifference: 0.5,
+                toleratedDifference: 3,
+                maximumDifference: 5
+            )
+        }
+
+        private static func matchesWithinCodecTolerance(
+            _ lhs: Data,
+            _ rhs: Data,
+            maximumMeanDifference: Double,
+            toleratedDifference: Int,
+            maximumDifference: Int
+        ) -> Bool {
+            guard lhs.count == rhs.count, !lhs.isEmpty else { return false }
+
+            var absoluteDifferenceTotal = 0
+            var outlierCount = 0
+            var observedMaximumDifference = 0
+            for (left, right) in zip(lhs, rhs) {
+                let difference = abs(Int(left) - Int(right))
+                absoluteDifferenceTotal += difference
+                observedMaximumDifference = max(observedMaximumDifference, difference)
+                if difference > toleratedDifference {
+                    outlierCount += 1
+                }
+            }
+
+            let meanDifference = Double(absoluteDifferenceTotal) / Double(lhs.count)
+            let outlierRatio = Double(outlierCount) / Double(lhs.count)
+            return meanDifference <= maximumMeanDifference
+                && observedMaximumDifference <= maximumDifference
+                && outlierRatio <= 0.0005
         }
 
         private static func copyPlane(
@@ -696,23 +816,13 @@ enum VideoLoopAnalysisService {
         }
     }
 
-    private static func selectLastReliableCandidate(from candidates: [LoopCandidate]) -> LoopCandidate? {
+    private static func selectBestReliableCandidate(from candidates: [LoopCandidate]) -> LoopCandidate? {
         guard !candidates.isEmpty else { return nil }
-        let clusterGap: Double = 0.75
-        var clusters: [[LoopCandidate]] = []
-        var currentCluster: [LoopCandidate] = []
-        for candidate in candidates {
-            if let previous = currentCluster.last,
-               CMTimeGetSeconds(CMTimeSubtract(candidate.time, previous.time)) > clusterGap {
-                clusters.append(currentCluster)
-                currentCluster = [candidate]
-            } else {
-                currentCluster.append(candidate)
+        return candidates.min { lhs, rhs in
+            if lhs.difference.qualityScore == rhs.difference.qualityScore {
+                return CMTimeCompare(lhs.time, rhs.time) > 0
             }
-        }
-        if !currentCluster.isEmpty { clusters.append(currentCluster) }
-        return clusters.last?.min { lhs, rhs in
-            lhs.difference.qualityScore < rhs.difference.qualityScore
+            return lhs.difference.qualityScore < rhs.difference.qualityScore
         }
     }
 
@@ -815,8 +925,26 @@ enum VideoLoopAnalysisService {
             )
         }
 
-        func hasIdenticalSampledLuma(to other: FrameSignature) -> Bool {
-            luma == other.luma
+        func isNearIdenticalSampledLuma(to other: FrameSignature) -> Bool {
+            guard luma.count == other.luma.count, !luma.isEmpty else { return false }
+
+            var absoluteDifferenceTotal = 0
+            var largeDifferenceCount = 0
+            var maximumDifference = 0
+            for index in luma.indices {
+                let difference = abs(Int(luma[index]) - Int(other.luma[index]))
+                absoluteDifferenceTotal += difference
+                maximumDifference = max(maximumDifference, difference)
+                if difference > 1 {
+                    largeDifferenceCount += 1
+                }
+            }
+
+            let meanDifference = Double(absoluteDifferenceTotal) / Double(luma.count)
+            let largeDifferenceRatio = Double(largeDifferenceCount) / Double(luma.count)
+            return meanDifference <= 0.35
+                && maximumDifference <= 3
+                && largeDifferenceRatio <= 0.005
         }
     }
 }

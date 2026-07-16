@@ -907,7 +907,7 @@ struct MyLibraryContentView: View {
             onInterpolateVideos: {
                 VideoOptimizationQueueService.shared.enqueueLibraryFolder(
                     folder,
-                    operations: [.loopAnalysis, .frameInterpolation]
+                    operations: [.frameInterpolation]
                 )
             }
         )
@@ -1366,7 +1366,7 @@ struct MyLibraryContentView: View {
             onInterpolateVideos: {
                 VideoOptimizationQueueService.shared.enqueueLibraryFolder(
                     folder,
-                    operations: [.loopAnalysis, .frameInterpolation]
+                    operations: [.frameInterpolation]
                 )
             }
         )
