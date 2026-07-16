@@ -1425,6 +1425,7 @@ class WallpaperViewModel: ObservableObject {
     /// - Note: macOS 的锁屏壁纸即桌面壁纸，没有独立的锁屏壁纸 API。
     ///   `.lockScreen` 和 `.both` 最终都等同于设置桌面壁纸，避免重复操作。
     func setWallpaper(from imageURL: URL, option: WallpaperOption) async throws {
+        DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(for: NSScreen.screens)
         WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
         VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
 
@@ -1495,6 +1496,7 @@ class WallpaperViewModel: ObservableObject {
 
         // 如果指定了特定屏幕，只设置到该屏幕
         if let targetScreen = targetScreen {
+            DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(for: [targetScreen])
             // 切到静态图前如果目标屏幕被 CLI 管理则停 CLI 引擎
             if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
                 WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)

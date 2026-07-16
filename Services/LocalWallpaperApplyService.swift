@@ -58,6 +58,8 @@ enum LocalWallpaperApplyService {
         }
         guard !screens.isEmpty else { return false }
 
+        DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(for: screens)
+
         let ext = localURL.pathExtension.lowercased()
         var isDirectory: ObjCBool = false
         FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory)
@@ -207,6 +209,62 @@ enum LocalWallpaperApplyService {
         options: Options = Options()
     ) async throws -> Bool {
         try await apply(localURL: localURL, targetScreens: [screen], options: options)
+    }
+
+    // MARK: - Display ownership
+
+    static func isWallpaperEnabled(for screen: NSScreen, globally: Bool) -> Bool {
+        let scheduler = WallpaperSchedulerService.shared
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            return scheduler.globalDisplayConfig.isWallpaperEnabled
+        }
+        return scheduler.resolvedDisplayConfig(for: screen).isWallpaperEnabled
+    }
+
+    /// 开关显示器的 WaifuX 壁纸接管。自动更换配置仍由调度器单独保存。
+    static func setWallpaperEnabled(
+        _ enabled: Bool,
+        targetScreens: [NSScreen],
+        globally: Bool
+    ) {
+        let screens = targetScreens.isEmpty ? NSScreen.screens : targetScreens
+        guard !screens.isEmpty else { return }
+
+        let scheduler = WallpaperSchedulerService.shared
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            scheduler.updateGlobalDisplayWallpaperEnabled(enabled)
+        } else {
+            for screen in screens {
+                scheduler.updateDisplayWallpaperEnabled(enabled, for: screen.wallpaperScreenIdentifier)
+            }
+        }
+
+        guard !enabled else {
+            if globally || scheduler.isGlobalDisplaySyncEnabled {
+                scheduler.triggerNextGlobalWallpaperNow()
+            } else {
+                for screen in screens {
+                    scheduler.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
+                }
+            }
+            return
+        }
+
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+            StaticImageWallpaperOverlayManager.shared.clearState()
+        } else {
+            for screen in screens {
+                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: screen)
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screen)
+                StaticImageWallpaperOverlayManager.shared.clearState(for: screen)
+            }
+        }
+
+        for screen in screens {
+            DesktopWallpaperSyncManager.shared.restoreOriginalSystemWallpaper(for: screen)
+        }
     }
 
     // MARK: - Primitives

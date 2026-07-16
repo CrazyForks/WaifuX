@@ -496,15 +496,18 @@ final class StatusBarController: NSObject {
                 ? t("statusbar.globalDisplaySettings")
                 : screen.localizedName
 
-            // 该屏是否有壁纸（决定控件是否启用）
-            let screenHasWallpaper: Bool
+            // 该屏是否有 WaifuX 壁纸；静态图也属于可关闭/打开的壁纸状态。
+            let screenHasPausableWallpaper: Bool
             if isExtensionMode {
-                screenHasWallpaper = hasWallpaperOnAnyScreen
+                screenHasPausableWallpaper = hasWallpaperOnAnyScreen
             } else if weBridge.isManaging(screen: screen) {
-                screenHasWallpaper = true
+                screenHasPausableWallpaper = true
             } else {
-                screenHasWallpaper = videoWallpaperManager.hasActiveWallpaper(on: screen)
+                screenHasPausableWallpaper = videoWallpaperManager.hasActiveWallpaper(on: screen)
             }
+            let screenHasWallpaper = screenHasPausableWallpaper
+                || StaticImageWallpaperOverlayManager.shared.imageURL(for: screen) != nil
+                || DesktopWallpaperSyncManager.shared.imageURL(for: screen) != nil
 
             // 该屏壁纸是否为 web（web 暂不支持可视区域调节）
             let isWebWallpaper = weBridge.isWebWallpaperOn(screen: screen)
@@ -527,6 +530,11 @@ final class StatusBarController: NSObject {
                 ? WallpaperSchedulerService.shared.globalDisplayConfig
                 : WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
 
+            let wallpaperEnabled = LocalWallpaperApplyService.isWallpaperEnabled(
+                for: screen,
+                globally: isGlobalDisplaySyncEnabled
+            )
+
             // 自动切换开关
             let autoSwitchItem = NSMenuItem(
                 title: schedulerConfig.isEnabled ? t("statusbar.disableAutoSwitch") : t("statusbar.enableAutoSwitch"),
@@ -548,16 +556,16 @@ final class StatusBarController: NSObject {
 
             screenSubMenu.addItem(.separator())
 
-            // 动态壁纸控制。关闭后不显示暂停和“打开当前壁纸”，避免对空目标执行无效操作。
+            // 壁纸接管控制。关闭后恢复系统壁纸，并且不显示打开/暂停项目。
             let disableItem = NSMenuItem(
-                title: screenHasWallpaper ? t("statusbar.disableWallpaper") : t("statusbar.enableWallpaper"),
+                title: wallpaperEnabled ? t("statusbar.disableWallpaper") : t("statusbar.enableWallpaper"),
                 action: #selector(perScreenToggleDynamicWallpaper(_:)),
                 keyEquivalent: "")
             disableItem.target = self
             disableItem.representedObject = screen
             screenSubMenu.addItem(disableItem)
 
-            if screenHasWallpaper {
+            if wallpaperEnabled && screenHasWallpaper {
                 let openCurrentItem = NSMenuItem(
                     title: t("statusbar.openCurrentWallpaper"),
                     action: #selector(openCurrentWallpaper(_:)),
@@ -566,13 +574,15 @@ final class StatusBarController: NSObject {
                 openCurrentItem.representedObject = screen
                 screenSubMenu.addItem(openCurrentItem)
 
-                let pauseItem = NSMenuItem(
-                    title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
-                    action: #selector(perScreenTogglePlayback(_:)),
-                    keyEquivalent: "")
-                pauseItem.target = self
-                pauseItem.representedObject = screen
-                screenSubMenu.addItem(pauseItem)
+                if screenHasPausableWallpaper {
+                    let pauseItem = NSMenuItem(
+                        title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
+                        action: #selector(perScreenTogglePlayback(_:)),
+                        keyEquivalent: "")
+                    pauseItem.target = self
+                    pauseItem.representedObject = screen
+                    screenSubMenu.addItem(pauseItem)
+                }
             }
 
             // 音量（扩展模式跳过，与原逻辑一致）
@@ -803,34 +813,13 @@ final class StatusBarController: NSObject {
             return
         }
 
-        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
-            if videoWallpaperManager.isVideoWallpaperActive || weBridge.isControllingExternalEngine {
-                toggleDynamicWallpaper()
-            } else {
-                WallpaperSchedulerService.shared.triggerNextGlobalWallpaperNow()
-            }
-            return
-        }
-
-        if weBridge.isManaging(screen: screen) {
-            // 关闭外部引擎壁纸（单屏）
-            weBridge.ensureStoppedForNonCLIWallpaper(for: screen)
-            // 对称关闭该屏静态图 overlay
-            StaticImageWallpaperOverlayManager.shared.hide(for: screen)
-            return
-        }
-
-        // macOS 26+：扩展控制模式下停止单屏视频
-        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
-            videoWallpaperManager.stopWallpaper(for: screen)
-            return
-        }
-
-        if videoWallpaperManager.hasActiveWallpaper(on: screen) {
-            videoWallpaperManager.stopWallpaper(for: screen)
-        } else {
-            WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
-        }
+        let isGlobal = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+        let enabled = LocalWallpaperApplyService.isWallpaperEnabled(for: screen, globally: isGlobal)
+        LocalWallpaperApplyService.setWallpaperEnabled(
+            !enabled,
+            targetScreens: isGlobal ? NSScreen.screens : [screen],
+            globally: isGlobal
+        )
     }
 
     @objc private func openCurrentWallpaper(_ sender: NSMenuItem) {
@@ -840,6 +829,9 @@ final class StatusBarController: NSObject {
             url = videoURL
         } else if let path = weBridge.currentWallpaperPath(for: screen) {
             url = URL(fileURLWithPath: path)
+        } else if let staticURL = StaticImageWallpaperOverlayManager.shared.imageURL(for: screen)
+                    ?? DesktopWallpaperSyncManager.shared.imageURL(for: screen) {
+            url = staticURL
         } else {
             url = nil
         }

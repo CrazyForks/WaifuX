@@ -206,6 +206,20 @@ final class StaticImageWallpaperOverlayManager {
         stateChangeSignal &+= 1
     }
 
+    /// 彻底清除指定屏幕的静态壁纸状态，不影响其它显示器。
+    func clearState(for screen: NSScreen) {
+        let screenID = screen.wallpaperScreenIdentifier
+        let fingerprint = screen.wallpaperScreenFingerprint
+        imageByScreen.removeValue(forKey: screenID)
+        imageByScreenFingerprint.removeValue(forKey: fingerprint)
+        imageSizes.removeValue(forKey: screenID)
+        imageLetterboxContentCrops.removeValue(forKey: screenID)
+        imageLetterboxAnalysisTasks.removeValue(forKey: screenID)?.cancel()
+        hide(for: screen)
+        persistState()
+        stateChangeSignal &+= 1
+    }
+
     /// 返回指定屏幕当前显示的静态图 URL（无 overlay 时返回 nil）
     func imageURL(for screen: NSScreen) -> URL? {
         let screenID = screen.wallpaperScreenIdentifier

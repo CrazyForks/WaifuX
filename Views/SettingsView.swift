@@ -979,9 +979,23 @@ private struct SchedulerSettingsTab: View {
 
                     if isGlobal {
                         dividerLine
+                        HStack(spacing: 12) {
+                            Text(t("scheduler.wallpaperEnabled"))
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Color.white.opacity(0.9))
+                            Spacer()
+                            MacToggle(isOn: Binding(
+                                get: { viewModel.schedulerViewModel.globalDisplayConfig.isWallpaperEnabled },
+                                set: { viewModel.schedulerViewModel.updateGlobalDisplayWallpaperEnabled($0) }
+                            ))
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        dividerLine
                         schedulerControls(
                             config: viewModel.schedulerViewModel.globalDisplayConfig,
-                            showsEnabledControl: true,
+                            showsAutoSwitchControl: true,
+                            isWallpaperEnabled: viewModel.schedulerViewModel.globalDisplayConfig.isWallpaperEnabled,
                             updateEnabled: viewModel.schedulerViewModel.updateGlobalDisplayEnabled,
                             updateInterval: viewModel.schedulerViewModel.updateGlobalDisplayInterval,
                             updateOrder: viewModel.schedulerViewModel.updateGlobalDisplayOrder,
@@ -1006,27 +1020,26 @@ private struct SchedulerSettingsTab: View {
                                     .foregroundStyle(Color.white.opacity(0.9))
                                 Spacer()
                                 MacToggle(isOn: Binding(
-                                    get: { displayConfig.isEnabled },
-                                    set: { viewModel.schedulerViewModel.updateDisplayEnabled($0, for: screenID) }
+                                    get: { displayConfig.isWallpaperEnabled },
+                                    set: { viewModel.schedulerViewModel.updateDisplayWallpaperEnabled($0, for: screen) }
                                 ))
                             }
                             .padding(.horizontal, 16)
                             .padding(.vertical, 12)
 
-                            if displayConfig.isEnabled {
-                                dividerLine
-                                schedulerControls(
-                                    config: displayConfig,
-                                    showsEnabledControl: false,
-                                    updateEnabled: { _ in },
-                                    updateInterval: { viewModel.schedulerViewModel.updateDisplayInterval($0, for: screenID) },
-                                    updateOrder: { viewModel.schedulerViewModel.updateDisplayOrder($0, for: screenID) },
-                                    updateIncludeWallpapers: { viewModel.schedulerViewModel.updateDisplayIncludeWallpapers($0, for: screenID) },
-                                    updateIncludeMedia: { viewModel.schedulerViewModel.updateDisplayIncludeMedia($0, for: screenID) },
-                                    updateFolderIDs: { viewModel.schedulerViewModel.updateDisplayFolderIDs($0, for: screenID) },
-                                    updateWebSceneSeconds: { viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds($0, for: screenID) }
-                                )
-                            }
+                            dividerLine
+                            schedulerControls(
+                                config: displayConfig,
+                                showsAutoSwitchControl: true,
+                                isWallpaperEnabled: displayConfig.isWallpaperEnabled,
+                                updateEnabled: { viewModel.schedulerViewModel.updateDisplayEnabled($0, for: screenID) },
+                                updateInterval: { viewModel.schedulerViewModel.updateDisplayInterval($0, for: screenID) },
+                                updateOrder: { viewModel.schedulerViewModel.updateDisplayOrder($0, for: screenID) },
+                                updateIncludeWallpapers: { viewModel.schedulerViewModel.updateDisplayIncludeWallpapers($0, for: screenID) },
+                                updateIncludeMedia: { viewModel.schedulerViewModel.updateDisplayIncludeMedia($0, for: screenID) },
+                                updateFolderIDs: { viewModel.schedulerViewModel.updateDisplayFolderIDs($0, for: screenID) },
+                                updateWebSceneSeconds: { viewModel.schedulerViewModel.updateDisplayWebSceneSwitchSeconds($0, for: screenID) }
+                            )
                         }
                         if index < screens.count - 1 { dividerLine }
                     }
@@ -1038,7 +1051,8 @@ private struct SchedulerSettingsTab: View {
     @ViewBuilder
     private func schedulerControls(
         config: DisplaySchedulerConfig,
-        showsEnabledControl: Bool,
+        showsAutoSwitchControl: Bool,
+        isWallpaperEnabled: Bool,
         updateEnabled: @escaping (Bool) -> Void,
         updateInterval: @escaping (Int) -> Void,
         updateOrder: @escaping (ScheduleOrder) -> Void,
@@ -1047,9 +1061,9 @@ private struct SchedulerSettingsTab: View {
         updateFolderIDs: @escaping ([String]?) -> Void,
         updateWebSceneSeconds: @escaping (Int?) -> Void
     ) -> some View {
-        if showsEnabledControl {
+        if showsAutoSwitchControl {
             HStack(spacing: 12) {
-                Text(t("statusbar.enableAutoSwitch"))
+                Text(t("scheduler.autoSwitchEnabled"))
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.9))
                 Spacer()
@@ -1059,6 +1073,7 @@ private struct SchedulerSettingsTab: View {
             .padding(.vertical, 12)
             dividerLine
         }
+        Group {
         HStack(spacing: 12) {
             Text(t("replaceInterval"))
                 .font(.system(size: 13, weight: .medium))
@@ -1160,6 +1175,9 @@ private struct SchedulerSettingsTab: View {
         )
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+        }
+        .disabled(!isWallpaperEnabled || !config.isEnabled)
+        .opacity(isWallpaperEnabled && config.isEnabled ? 1 : 0.45)
     }
 
     // MARK: - 文件夹选择组件（支持多选）

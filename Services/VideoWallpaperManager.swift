@@ -867,6 +867,10 @@ final class VideoWallpaperManager: ObservableObject {
             throw NSError(domain: "VideoWallpaper", code: 1002, userInfo: [NSLocalizedDescriptionKey: "视频文件不存在。"])
         }
 
+        DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(
+            for: targetScreen.map { [$0] } ?? NSScreen.screens
+        )
+
         if let targetScreen,
            animatedTransition,
            cacheDisplaySwitchIfNeeded(
