@@ -1068,6 +1068,11 @@ struct MediaDetailSheet: View {
         presentSceneBakeRendererDialog(clearCachedArtifact: true)
     }
 
+    /// “重新优化视频”在 Scene 烘焙产物上执行时，确认渲染器后清除旧产物并重新烘焙。
+    private func reoptimizeBakedSceneVideo() {
+        presentSceneBakeRendererDialog(clearCachedArtifact: true)
+    }
+
     /// 「更多」菜单→「删除烘焙产物」执行体：保留静态预览图(poster)、删 MP4、并立即用静态图替换正在显示该烘焙的锁屏/桌面壁纸。
     /// sceneBakeEligibility 不动；用户后续仍可重新烘焙。
     @MainActor
@@ -1663,12 +1668,10 @@ struct MediaDetailSheet: View {
                 Button {
                     if isCurrentOptimizationBakedSceneVideo {
                         showMoreOptionsPopover = false
-                        reBakeScene()
+                        reoptimizeBakedSceneVideo()
                     } else {
                         showMoreOptionsPopover = false
-                        deleteAndRedownloadCurrentItem(
-                            forcedOptimizationOperations: [.loopAnalysis]
-                        )
+                        deleteAndRedownloadCurrentItem()
                     }
                 } label: {
                     HStack {
@@ -2646,9 +2649,7 @@ struct MediaDetailSheet: View {
     /// Removes the downloaded item and every optimization record before a new
     /// source download starts. This keeps the fresh source from inheriting an
     /// old loop, interpolation, blacklist, or baked-video outcome.
-    private func deleteAndRedownloadCurrentItem(
-        forcedOptimizationOperations: [FrameInterpolationQueueItem.Operation] = []
-    ) {
+    private func deleteAndRedownloadCurrentItem() {
         guard !isResettingVideoOptimization, !isLocalFile else { return }
 
         let downloadingItem = resolvedItem
@@ -2669,15 +2670,6 @@ struct MediaDetailSheet: View {
         for videoURL in Set(videoURLs.map(\.standardizedFileURL)) {
             frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
             frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
-        }
-
-        if let sourceRestoreVideoURL,
-           !forcedOptimizationOperations.isEmpty {
-            frameInterpolationQueue.requestAfterSourceRestore(
-                videoURL: sourceRestoreVideoURL,
-                title: downloadingItem.title,
-                operations: forcedOptimizationOperations
-            )
         }
 
         viewModel.removeDownloads(withIDs: [itemID])
