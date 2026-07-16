@@ -129,7 +129,6 @@ enum VideoLoopAnalysisService {
         var referenceFrames: [TimedFrameSignature] = []
         var activeCandidates: [PendingLoopCandidate] = []
         var verifiedCandidates: [LoopCandidate] = []
-        var lastSignature: FrameSignature?
         var frameIndex = 0
         let durationSeconds = max(0.001, duration.seconds)
         let verificationFrameCount = 12
@@ -146,8 +145,6 @@ enum VideoLoopAnalysisService {
             }
             let signature = try FrameSignature(pixelBuffer: pixelBuffer)
             let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            lastSignature = signature
-
             if referenceFrames.isEmpty {
                 if !signature.isPureBlack {
                     referenceFrames.append(TimedFrameSignature(
@@ -215,9 +212,10 @@ enum VideoLoopAnalysisService {
         }
 
         guard !verifiedCandidates.isEmpty else {
-            return lastSignature?.isLoopBoundarySimilar(to: firstReferenceFrame.signature) == true
-                ? .notNeeded
-                : .noReliablePoint
+            // Only the full-pixel preflight may mark a video as already looped.
+            // The analysis signatures are deliberately lossy, so their similarity
+            // is not enough to skip a required crop.
+            return .noReliablePoint
         }
 
         // Videos longer than ten seconds cannot crop to a short accidental
@@ -368,42 +366,34 @@ enum VideoLoopAnalysisService {
         let windowDurationSeconds = min(max(0.75, 42 / fps), durationSeconds * 0.25)
         let windowDuration = CMTime(seconds: windowDurationSeconds, preferredTimescale: 600_000)
         let tailStart = CMTimeMaximum(.zero, CMTimeSubtract(duration, windowDuration))
-        let firstFrames = Array(try readLoopSignatures(
+        guard let firstFrame = try readExactBoundaryFrame(
             from: asset,
             videoTrack: videoTrack,
             timeRange: CMTimeRange(start: .zero, duration: windowDuration),
-            maximumCount: 28
-        ).filter { !$0.isPureBlack }.prefix(14))
-        let lastFrames = Array(try readLoopSignatures(
+            selectLastNonBlackFrame: false,
+            matchingSampledLuma: nil
+        ), let lastFrame = try readExactBoundaryFrame(
             from: asset,
             videoTrack: videoTrack,
             timeRange: CMTimeRange(start: tailStart, duration: CMTimeSubtract(duration, tailStart)),
-            maximumCount: 42
-        ).filter { !$0.isPureBlack }.suffix(14))
-        guard firstFrames.count >= 4, lastFrames.count >= 4 else { return false }
+            selectLastNonBlackFrame: true,
+            matchingSampledLuma: firstFrame.signature
+        ) else {
+            return false
+        }
 
-        let first = firstFrames[0]
-        let next = firstFrames[1]
-        let previousLast = lastFrames[lastFrames.count - 2]
-        let last = lastFrames[lastFrames.count - 1]
-        let boundaryDifference = last.difference(to: first)
-        let incomingTransition = previousLast.difference(to: last)
-        let outgoingTransition = first.difference(to: next)
-        let boundaryMatches = boundaryDifference.meanAbsoluteDifference <= 10
-            && boundaryDifference.rootMeanSquareDifference <= 22
-            && boundaryDifference.strongDifferenceRatio <= 0.08
-        let transitionIsContinuous = abs(
-            incomingTransition.meanAbsoluteDifference - outgoingTransition.meanAbsoluteDifference
-        ) <= 8
-        return boundaryMatches && transitionIsContinuous
+        // Similar decoded frames still need a loop-point crop. Skip analysis only
+        // when every decoded Y and CbCr byte in the boundary frame matches.
+        return firstFrame.exactlyMatches(lastFrame)
     }
 
-    private static func readLoopSignatures(
+    private static func readExactBoundaryFrame(
         from asset: AVAsset,
         videoTrack: AVAssetTrack,
         timeRange: CMTimeRange,
-        maximumCount: Int
-    ) throws -> [FrameSignature] {
+        selectLastNonBlackFrame: Bool,
+        matchingSampledLuma: FrameSignature?
+    ) throws -> ExactFramePixels? {
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = timeRange
         let output = makeLoopAnalysisVideoOutput(for: videoTrack)
@@ -415,18 +405,32 @@ enum VideoLoopAnalysisService {
             throw reader.error ?? NSError(domain: "VideoLoopAnalysis", code: 19)
         }
 
-        var signatures: [FrameSignature] = []
-        signatures.reserveCapacity(maximumCount)
-        while signatures.count < maximumCount,
-              let sampleBuffer = output.copyNextSampleBuffer() {
+        var selectedFrame: ExactFramePixels?
+        while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
-            signatures.append(try FrameSignature(pixelBuffer: pixelBuffer))
+            let signature = try FrameSignature(pixelBuffer: pixelBuffer)
+            guard !signature.isPureBlack else { continue }
+
+            if let matchingSampledLuma,
+               !signature.hasIdenticalSampledLuma(to: matchingSampledLuma) {
+                if selectLastNonBlackFrame {
+                    selectedFrame = nil
+                }
+                continue
+            }
+
+            let exactFrame = try ExactFramePixels(pixelBuffer: pixelBuffer, signature: signature)
+            if !selectLastNonBlackFrame {
+                if reader.status == .reading { reader.cancelReading() }
+                return exactFrame
+            }
+            selectedFrame = exactFrame
         }
         if reader.status == .failed {
             throw reader.error ?? NSError(domain: "VideoLoopAnalysis", code: 20)
         }
         if reader.status == .reading { reader.cancelReading() }
-        return signatures
+        return selectedFrame
     }
 
     private static func refineLoopBoundary(
@@ -605,6 +609,93 @@ enum VideoLoopAnalysisService {
         let difference: FrameWindowDifference
     }
 
+    private struct ExactFramePixels: Sendable {
+        let signature: FrameSignature
+        let pixelFormat: OSType
+        let planes: [Data]
+
+        init(pixelBuffer: CVPixelBuffer, signature: FrameSignature) throws {
+            self.signature = signature
+            pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+            switch pixelFormat {
+            case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+                guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else {
+                    throw NSError(domain: "VideoLoopAnalysis", code: 21)
+                }
+                planes = try (0..<2).map { planeIndex in
+                    try Self.copyPlane(
+                        from: pixelBuffer,
+                        index: planeIndex,
+                        bytesPerSample: planeIndex == 0 ? 1 : 2
+                    )
+                }
+            case kCVPixelFormatType_32BGRA:
+                guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+                    throw NSError(domain: "VideoLoopAnalysis", code: 22)
+                }
+                let width = CVPixelBufferGetWidth(pixelBuffer)
+                let height = CVPixelBufferGetHeight(pixelBuffer)
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+                planes = [Self.copyRows(
+                    baseAddress: baseAddress,
+                    bytesPerRow: bytesPerRow,
+                    rowByteCount: min(bytesPerRow, width * 4),
+                    height: height
+                )]
+            default:
+                throw NSError(
+                    domain: "VideoLoopAnalysis",
+                    code: 23,
+                    userInfo: [NSLocalizedDescriptionKey: "Unsupported video pixel format: \(pixelFormat)"]
+                )
+            }
+        }
+
+        func exactlyMatches(_ other: ExactFramePixels) -> Bool {
+            pixelFormat == other.pixelFormat && planes == other.planes
+        }
+
+        private static func copyPlane(
+            from pixelBuffer: CVPixelBuffer,
+            index: Int,
+            bytesPerSample: Int
+        ) throws -> Data {
+            let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, index)
+            let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, index)
+            let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, index)
+            guard width > 0, height > 0,
+                  let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, index) else {
+                throw NSError(domain: "VideoLoopAnalysis", code: 24)
+            }
+            return copyRows(
+                baseAddress: baseAddress,
+                bytesPerRow: bytesPerRow,
+                rowByteCount: min(bytesPerRow, width * bytesPerSample),
+                height: height
+            )
+        }
+
+        private static func copyRows(
+            baseAddress: UnsafeMutableRawPointer,
+            bytesPerRow: Int,
+            rowByteCount: Int,
+            height: Int
+        ) -> Data {
+            var data = Data()
+            data.reserveCapacity(rowByteCount * height)
+            for rowIndex in 0..<height {
+                let row = baseAddress.advanced(by: rowIndex * bytesPerRow)
+                data.append(contentsOf: UnsafeRawBufferPointer(start: row, count: rowByteCount))
+            }
+            return data
+        }
+    }
+
     private static func selectLastReliableCandidate(from candidates: [LoopCandidate]) -> LoopCandidate? {
         guard !candidates.isEmpty else { return nil }
         let clusterGap: Double = 0.75
@@ -724,11 +815,8 @@ enum VideoLoopAnalysisService {
             )
         }
 
-        func isLoopBoundarySimilar(to other: FrameSignature) -> Bool {
-            let difference = difference(to: other)
-            return difference.meanAbsoluteDifference <= 7
-                && difference.rootMeanSquareDifference <= 16
-                && difference.strongDifferenceRatio <= 0.05
+        func hasIdenticalSampledLuma(to other: FrameSignature) -> Bool {
+            luma == other.luma
         }
     }
 }

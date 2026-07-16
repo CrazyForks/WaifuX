@@ -365,6 +365,7 @@ extension Notification.Name {
     static let appShouldReleaseForegroundMemory = Notification.Name("appShouldReleaseForegroundMemory")
     static let appDidReceiveMemoryPressure = Notification.Name("appDidReceiveMemoryPressure")
     static let switchToLibraryTab = Notification.Name("switchToLibraryTab")
+    static let openLibraryItemForLocalURL = Notification.Name("openLibraryItemForLocalURL")
 }
 
 enum MainNavigationRequestStore {
@@ -386,5 +387,13 @@ enum MainNavigationRequestStore {
 
     static func clearLibraryTabRequest() {
         UserDefaults.standard.removeObject(forKey: pendingTabKey)
+    }
+
+    static func requestLibraryItem(for localURL: URL) {
+        NotificationCenter.default.post(
+            name: .openLibraryItemForLocalURL,
+            object: nil,
+            userInfo: ["localURL": localURL]
+        )
     }
 }

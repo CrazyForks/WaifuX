@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import Foundation
 import Kingfisher
 
@@ -96,11 +97,11 @@ private actor SceneOfflineBakeConcurrencyGate {
 /// 跨详情页生命周期保留的烘焙进度。
 /// 详情页关闭后 `@State` 会丢，重进时需要从这里恢复 UI。
 @MainActor
-final class SceneOfflineBakeProgressTracker {
+final class SceneOfflineBakeProgressTracker: ObservableObject {
     static let shared = SceneOfflineBakeProgressTracker()
 
-    private(set) var activeItemID: String?
-    private(set) var progress: Double = 0
+    @Published private(set) var activeItemID: String?
+    @Published private(set) var progress: Double = 0
 
     var isBaking: Bool { activeItemID != nil }
 

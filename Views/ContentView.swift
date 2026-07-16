@@ -405,6 +405,10 @@ struct ContentView: View {
                         handleDownloadToastRetry(snapshot)
                     }
                 )
+                BackgroundDownloadProgressToastHost(
+                    onExpand: { DownloadTaskService.shared.restoreAllRunningToasts() }
+                )
+                VideoOptimizationProgressToastHost()
                 WallpaperSourceSwitchToast()
                     .padding(.horizontal, 24)
                     .padding(.bottom, 8)
@@ -466,6 +470,10 @@ struct ContentView: View {
                 MainNavigationRequestStore.clearLibraryTabRequest()
                 navigationState.selectedTab = .myMedia
             }
+            .onReceive(NotificationCenter.default.publisher(for: .openLibraryItemForLocalURL)) { notification in
+                guard let url = notification.userInfo?["localURL"] as? URL else { return }
+                openLibraryDetail(for: url)
+            }
             .id(localization.currentLanguage)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -500,6 +508,44 @@ struct ContentView: View {
             return
         }
         navigationState.selectedTab = .myMedia
+    }
+
+    private func openLibraryDetail(for localURL: URL) {
+        let path = localURL.standardizedFileURL.path
+        navigationState.selectedTab = .myMedia
+
+        if let record = MediaLibraryService.shared.downloadRecords.first(where: {
+            let recordedPath = URL(fileURLWithPath: $0.localFilePath).standardizedFileURL.path
+            return $0.isActive && (recordedPath == path || path.hasPrefix(recordedPath + "/"))
+        }) {
+            replaceDetailWithLibraryMedia(record.item)
+            return
+        }
+
+        if let record = WallpaperLibraryService.shared.downloadRecords.first(where: {
+            let recordedPath = URL(fileURLWithPath: $0.localFilePath).standardizedFileURL.path
+            return $0.isActive && (recordedPath == path || path.hasPrefix(recordedPath + "/"))
+        }) {
+            replaceDetailWithLibraryWallpaper(record.wallpaper)
+        }
+    }
+
+    private func replaceDetailWithLibraryMedia(_ item: MediaItem) {
+        detailPath.removeAll()
+        clearSelectedDetailBindings()
+        Task { @MainActor in
+            await Task.yield()
+            navigationState.librarySelectedMedia = item
+        }
+    }
+
+    private func replaceDetailWithLibraryWallpaper(_ wallpaper: Wallpaper) {
+        detailPath.removeAll()
+        clearSelectedDetailBindings()
+        Task { @MainActor in
+            await Task.yield()
+            navigationState.librarySelectedWallpaper = wallpaper
+        }
     }
 
     @ViewBuilder
@@ -581,6 +627,7 @@ struct ContentView: View {
         }
         if detailPath.isEmpty {
             clearSelectedDetailBindings()
+            DownloadTaskService.shared.suppressAllRunningToasts()
         }
     }
 
@@ -969,6 +1016,129 @@ private struct DownloadProgressToastHost: View {
                 displayedSnapshot = nil
             }
         }
+    }
+}
+
+// MARK: - Compact background task surfaces
+private struct BackgroundDownloadProgressToastHost: View {
+    @ObservedObject private var downloadService = DownloadTaskService.shared
+    let onExpand: () -> Void
+
+    private var backgroundTasks: [DownloadTask] {
+        downloadService.runningTasks.filter { downloadService.isToastSuppressed(for: $0.id) }
+    }
+
+    var body: some View {
+        Group {
+            if let task = downloadService.compactOverlayTask {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("download.backgroundProgress"), Int((task.progress * 100).rounded())),
+                    detail: remainingDetail(backgroundTasks.count - 1),
+                    progress: task.progress,
+                    onTap: onExpand
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+/// Reads the unified optimization queue without owning or changing any task.
+/// The same compact layer is visible in the library and on detail pages.
+private struct VideoOptimizationProgressToastHost: View {
+    @ObservedObject private var queue = VideoOptimizationQueueService.shared
+
+    private var loopItem: FrameInterpolationQueueItem? {
+        queue.activeItem(for: .loopAnalysis)
+            ?? queue.pendingItems(for: .loopAnalysis).first
+    }
+
+    private var interpolationItem: FrameInterpolationQueueItem? {
+        queue.activeItem(for: .frameInterpolation)
+            ?? queue.pendingItems(for: .frameInterpolation).first
+    }
+
+    private var loopCount: Int {
+        queue.pendingItems(for: .loopAnalysis).count
+    }
+
+    private var interpolationCount: Int {
+        queue.pendingItems(for: .frameInterpolation).count
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let item = loopItem {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("loopAnalysis.toastRunning"), Int((item.progress * 100).rounded())),
+                    detail: remainingDetail(loopCount - 1),
+                    progress: item.progress
+                )
+            }
+
+            if let item = interpolationItem {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("frameInterpolationToastRunning"), Int((item.progress * 100).rounded())),
+                    detail: remainingDetail(interpolationCount - 1),
+                    progress: item.progress
+                )
+            }
+        }
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+private struct BackgroundTaskProgressToast: View {
+    let title: String
+    let detail: String?
+    let progress: Double
+    var onTap: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .fixedSize(horizontal: true, vertical: false)
+
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 92, height: 5)
+
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.78))
+                    .frame(width: 92 * min(1, max(0, progress)), height: 5)
+            }
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .liquidGlassSurface(.prominent, tint: Color.white.opacity(0.06), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        .contentShape(Capsule(style: .continuous))
+        .onTapGesture { onTap?() }
+        .accessibilityAddTraits(onTap == nil ? [] : .isButton)
     }
 }
 

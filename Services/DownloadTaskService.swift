@@ -46,6 +46,9 @@ class DownloadTaskService: ObservableObject {
     static let shared = DownloadTaskService()
 
     @Published var tasks: [DownloadTask] = []
+    /// Only controls presentation of the download surface. Transfer state remains
+    /// entirely in `tasks`, so moving a task to the background never changes it.
+    @Published private(set) var toastPresentationRevision = 0
 
     private let userDefaultsKey = "download_tasks"
     private var saveTask: Task<Void, Never>?
@@ -69,16 +72,28 @@ class DownloadTaskService: ObservableObject {
 
     // MARK: - Task Management
 
-    func addTask(wallpaper: Wallpaper) -> DownloadTask {
-        upsertTask(DownloadTask(wallpaper: wallpaper))
+    func addTask(wallpaper: Wallpaper, suppressToast: Bool = false) -> DownloadTask {
+        addTask(DownloadTask(wallpaper: wallpaper), suppressToast: suppressToast)
     }
 
-    func addTask(mediaItem: MediaItem) -> DownloadTask {
-        upsertTask(DownloadTask(mediaItem: mediaItem))
+    func addTask(mediaItem: MediaItem, suppressToast: Bool = false) -> DownloadTask {
+        addTask(DownloadTask(mediaItem: mediaItem), suppressToast: suppressToast)
     }
 
-    func addTask(workshopWallpaper: MediaItem) -> DownloadTask {
-        upsertTask(DownloadTask(workshopWallpaper: workshopWallpaper))
+    func addTask(workshopWallpaper: MediaItem, suppressToast: Bool = false) -> DownloadTask {
+        addTask(DownloadTask(workshopWallpaper: workshopWallpaper), suppressToast: suppressToast)
+    }
+
+    private func addTask(_ task: DownloadTask, suppressToast: Bool) -> DownloadTask {
+        // A user-started task always reopens the full panel. Background workflows
+        // opt in to suppression explicitly and only affect their own task.
+        if suppressToast {
+            suppressedToastTaskIDs.insert(task.id)
+            publishToastPresentationChange()
+        } else if !suppressedToastTaskIDs.isEmpty {
+            restoreAllRunningToasts()
+        }
+        return upsertTask(task)
     }
 
     func updateWallpaper(_ wallpaper: Wallpaper, id: String? = nil) {
@@ -153,7 +168,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
 
         print("[DownloadTaskService] Task \(id) cancelled")
     }
@@ -225,22 +242,40 @@ class DownloadTaskService: ObservableObject {
     }
 
     func markToastSuppressed(for id: String) {
-        suppressedToastTaskIDs.insert(id)
+        guard suppressedToastTaskIDs.insert(id).inserted else { return }
+        publishToastPresentationChange()
     }
 
     /// 批量抑制所有正在运行的下载任务的 toast（"后台继续"按钮使用）
     func suppressAllRunningToasts() {
+        var changed = false
         for task in tasks where task.isRunning {
-            suppressedToastTaskIDs.insert(task.id)
+            changed = suppressedToastTaskIDs.insert(task.id).inserted || changed
         }
+        if changed { publishToastPresentationChange() }
     }
 
     func clearToastSuppression(for id: String) {
-        suppressedToastTaskIDs.remove(id)
+        guard suppressedToastTaskIDs.remove(id) != nil else { return }
+        publishToastPresentationChange()
+    }
+
+    func restoreAllRunningToasts() {
+        let runningIDs = Set(tasks.filter(\.isRunning).map(\.id))
+        guard !runningIDs.isEmpty else { return }
+        let before = suppressedToastTaskIDs.count
+        suppressedToastTaskIDs.subtract(runningIDs)
+        if suppressedToastTaskIDs.count != before {
+            publishToastPresentationChange()
+        }
     }
 
     func isToastSuppressed(for id: String) -> Bool {
         suppressedToastTaskIDs.contains(id)
+    }
+
+    private func publishToastPresentationChange() {
+        toastPresentationRevision &+= 1
     }
 
     func updateProgress(id: String, progress: Double) {
@@ -281,8 +316,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
-        suppressedToastTaskIDs.remove(id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
         scheduleVisibilityRefresh()
     }
 
@@ -301,8 +337,9 @@ class DownloadTaskService: ObservableObject {
         tasks[index].completedAt = Date()
         tasks[index].lastUpdatedAt = .now
         lastProgressUpdateTimes.removeValue(forKey: id)
-        suppressedToastTaskIDs.remove(id)
+        let removedSuppression = suppressedToastTaskIDs.remove(id) != nil
         persistTasks()
+        if removedSuppression { publishToastPresentationChange() }
     }
 
     // MARK: - Persistence
@@ -380,6 +417,18 @@ class DownloadTaskService: ObservableObject {
             .filter { $0.status == .completed }
             .sorted { $0.lastUpdatedAt > $1.lastUpdatedAt }
             .first(where: { Date().timeIntervalSince($0.lastUpdatedAt) < 1.8 })
+    }
+
+    /// The compact surface intentionally tracks the earliest background transfer.
+    /// Other active downloads only contribute to the remaining-count label.
+    var compactOverlayTask: DownloadTask? {
+        tasks
+            .filter { $0.isRunning && suppressedToastTaskIDs.contains($0.id) }
+            .sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.id < rhs.id
+            }
+            .first
     }
 
     var completedTasks: [DownloadTask] {

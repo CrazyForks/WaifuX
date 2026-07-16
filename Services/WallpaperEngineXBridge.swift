@@ -822,6 +822,38 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
+    /// Waits for a just-applied renderer before a global Web/realtime-Scene
+    /// transition advances to its next display. Web's daemon command is its
+    /// synchronous readiness acknowledgement; Scene exposes readiness by
+    /// writing the canvas-size control file after the renderer has initialized.
+    func waitForRendererReady(on screen: NSScreen, expectedPath: String) async throws {
+        let screenID = screen.wallpaperScreenIdentifier
+        let resolvedExpectedPath = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: URL(fileURLWithPath: expectedPath)
+        ).path
+
+        guard let state = screenRenderStates[screenID], state.path == resolvedExpectedPath else {
+            throw WallpaperEngineError.executionFailed("渲染器未应用到显示器 \(screen.localizedName)")
+        }
+        guard state.renderKind == .scene else { return }
+        guard let process = screenProcesses[screenID], let canvasSizeURL = process.canvasSizeURL else {
+            throw WallpaperEngineError.executionFailed("场景渲染器未启动：\(screen.localizedName)")
+        }
+
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            guard screenProcesses[screenID]?.pid == process.pid else {
+                throw WallpaperEngineError.executionFailed("场景渲染器在加载时退出：\(screen.localizedName)")
+            }
+            if let size = readCanvasSize(url: canvasSizeURL), size.width > 0, size.height > 0 {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        throw WallpaperEngineError.executionFailed("场景渲染器加载超时：\(screen.localizedName)")
+    }
+
     /// 刷新当前壁纸的用户属性（通过重启 wallpaper-wgpu 进程）
     /// - Parameter userProperties: 用户属性覆盖 JSON
     func refreshWallpaperProperties(userProperties: String?) async throws {
@@ -2331,6 +2363,19 @@ final class WallpaperEngineXBridge: ObservableObject {
             print("[WallpaperEngineXBridge] Restored previous live wallpaper for reconnected display: \(screen.localizedName)")
         }
         return restored
+    }
+
+    /// Forget a disconnected display while leaving every other Scene/Web render
+    /// and the shared Web daemon intact. Stopping the daemon here would blank
+    /// unrelated Web wallpaper screens.
+    func discardPersistedWallpaperState(screenID: String, fingerprint: String) async {
+        screenRenderStates = screenRenderStates.filter {
+            $0.value.screenID != screenID && $0.value.screenFingerprint != fingerprint
+        }
+        targetScreenIDs.remove(screenID)
+        targetScreenFingerprints.remove(fingerprint)
+        updateControlStateFromScreenStates()
+        persistState()
     }
 
     // MARK: - 二进制查找

@@ -372,6 +372,23 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
+    /// Drops only the disconnected display's persisted association. This must not
+    /// stop players or alter mappings for any remaining display.
+    func discardPersistedWallpaperState(screenID: String, fingerprint: String) {
+        videoTargetScreenIDs.remove(screenID)
+        videoTargetScreenFingerprints.remove(fingerprint)
+        videoURLByScreen.removeValue(forKey: screenID)
+        videoURLByScreenFingerprint.removeValue(forKey: fingerprint)
+        posterURLByScreen.removeValue(forKey: screenID)
+        posterURLByScreenFingerprint.removeValue(forKey: fingerprint)
+        volumeByScreen.removeValue(forKey: screenID)
+        volumeByScreenFingerprint.removeValue(forKey: fingerprint)
+        onEndModeScreens.remove(screenID)
+        syncCurrentVideoURL()
+        currentPosterURL = posterURLByScreen.values.first ?? posterURLByScreenFingerprint.values.first
+        persistState()
+    }
+
     /// 是否有任何屏幕正在运行视频壁纸（内部 guard 使用，不依赖全局单例）
     private var hasActiveVideoWallpaper: Bool {
         !videoURLByScreen.isEmpty || !videoURLByScreenFingerprint.isEmpty
@@ -1297,19 +1314,6 @@ final class VideoWallpaperManager: ObservableObject {
         frameInterpolationDebugPrint("播放器已刷新优化后的视频：源=\(sourceURL.lastPathComponent)，播放=\(outputURL.lastPathComponent)")
     }
 
-    func restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: URL, targetFPSs _: Set<Int>) {
-        for screen in NSScreen.screens {
-            let screenID = screen.wallpaperScreenIdentifier
-            let currentSourceURL = videoURLByScreen[screenID]
-                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
-                ?? currentVideoURL
-            guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL else {
-                continue
-            }
-            replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
-        }
-    }
-
     func reloadPlaybackAfterInPlaceOptimization(videoURL: URL) {
         if usesSharedVideoDecoder,
            currentVideoURL?.standardizedFileURL == videoURL.standardizedFileURL {
@@ -1333,55 +1337,6 @@ final class VideoWallpaperManager: ObservableObject {
             }
             reloadPlayerAfterOptimizedFileReplacement(screenID: screenID, sourceURL: videoURL, outputURL: videoURL)
         }
-    }
-
-    private func replacePlayerWithOriginalVideoIfNeeded(screenID: String, sourceURL: URL) {
-        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
-              let window = windows[screenID],
-              let containerView = window.contentView as? WallpaperVideoContainerView else {
-            return
-        }
-
-        let oldPlayer = players[screenID]
-        let oldLooper = loopers[screenID]
-        let schedulerConfig = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screenID)
-        let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
-        let hdrMetadataEnabled = UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? true
-        let components = makePlayerComponents(
-            for: screen,
-            videoURL: sourceURL,
-            muted: isMuted,
-            hdrMetadataEnabled: hdrMetadataEnabled,
-            enableLooping: !isOnEndMode
-        )
-
-        if let looper = components.looper {
-            loopers[screenID] = looper
-        } else {
-            loopers.removeValue(forKey: screenID)
-        }
-
-        players[screenID] = components.player
-        containerView.playerLayer.player = components.player
-        containerView.playerLayer.videoGravity = .resizeAspectFill
-        applyCropToScreen(screen)
-        applyPlayerAudioPolicy(components.player, muted: isMuted, volume: volumeByScreen[screenID] ?? volume)
-        if !isPaused {
-            components.player.play()
-        }
-
-        if isOnEndMode {
-            onEndModeScreens.insert(screenID)
-            setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
-        }
-
-        oldLooper?.disableLooping()
-        if let oldPlayer, oldPlayer !== components.player {
-            oldPlayer.pause()
-            oldPlayer.removeAllItems()
-            retainPlayersTemporarily([oldPlayer])
-        }
-        frameInterpolationDebugPrint("删除补帧后已切回原视频：屏幕=\(screen.localizedName)，视频=\(sourceURL.lastPathComponent)")
     }
 
     private func clearVideoLetterboxState() {

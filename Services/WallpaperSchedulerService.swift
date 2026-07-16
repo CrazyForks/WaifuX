@@ -9,6 +9,12 @@ class WallpaperSchedulerService: ObservableObject {
     @Published var config: SchedulerConfig = .default
     @Published var isRunning: Bool = false
 
+    /// Runtime-only gate for a user-paused wallpaper. It deliberately does not
+    /// change the persisted automatic-switch setting; resume simply restarts
+    /// the existing schedule with the user's configured scope intact.
+    private var isAutomaticSwitchGloballyPaused = false
+    private var automaticSwitchPausedScreenIDs: Set<String> = []
+
     /// Tracks last-applied item ID per screen to avoid immediate repeats.
     private var lastChangedItemIDs: [String: String] = [:]
     /// Tracks last change time per screen to honor per-display intervals.
@@ -79,6 +85,10 @@ class WallpaperSchedulerService: ObservableObject {
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard !self.isAutomaticSwitchPaused(for: screenID) else {
+                print("\(self.logTag) Skipping on-end switch for paused screen \(screenID)")
+                return
+            }
             if self.config.isGlobalDisplaySyncEnabled {
                 self.applyNextGlobalWallpaper(requiredMode: .onEnd)
             } else {
@@ -113,6 +123,36 @@ class WallpaperSchedulerService: ObservableObject {
 
     func triggerNextGlobalWallpaperNow() {
         applyNextGlobalWallpaper(requiredMode: nil)
+    }
+
+    /// Pauses or resumes automatic switching without mutating `SchedulerConfig`.
+    /// A global display-sync session has one rotation stream, so pausing any
+    /// screen through the global control pauses that stream as a whole.
+    func setAutomaticSwitchPaused(_ paused: Bool, for screen: NSScreen? = nil) {
+        if config.isGlobalDisplaySyncEnabled || screen == nil {
+            isAutomaticSwitchGloballyPaused = paused
+        } else if let screen {
+            let screenID = screen.wallpaperScreenIdentifier
+            if paused {
+                automaticSwitchPausedScreenIDs.insert(screenID)
+            } else {
+                automaticSwitchPausedScreenIDs.remove(screenID)
+            }
+        }
+
+        if isAutomaticSwitchGloballyPaused {
+            dispatchTimer?.cancel()
+            dispatchTimer = nil
+        } else if isRunning && !isScreenLocked {
+            scheduleNextChange()
+        }
+        print("\(logTag) Automatic switching \(paused ? "paused" : "resumed")\(screen.map { " for \($0.wallpaperScreenIdentifier)" } ?? "")")
+    }
+
+    private func isAutomaticSwitchPaused(for screenID: String? = nil) -> Bool {
+        if isAutomaticSwitchGloballyPaused { return true }
+        guard !config.isGlobalDisplaySyncEnabled, let screenID else { return false }
+        return automaticSwitchPausedScreenIDs.contains(screenID)
     }
 
     func hasSchedulableItems(for screenID: String) -> Bool {
@@ -164,6 +204,10 @@ class WallpaperSchedulerService: ObservableObject {
         requiredMode: RequiredSwitchMode?,
         overrideOrder: ScheduleOrder? = nil
     ) {
+        if requiredMode != nil, isAutomaticSwitchPaused(for: screenID) {
+            print("\(logTag) Skip automatic next for paused screen \(screenID)")
+            return
+        }
         if config.isGlobalDisplaySyncEnabled {
             applyNextGlobalWallpaper(requiredMode: requiredMode, overrideOrder: overrideOrder)
             return
@@ -248,6 +292,10 @@ class WallpaperSchedulerService: ObservableObject {
         requiredMode: RequiredSwitchMode?,
         overrideOrder: ScheduleOrder? = nil
     ) {
+        if requiredMode != nil, isAutomaticSwitchPaused() {
+            print("\(logTag) Skip automatic global next while wallpaper is paused")
+            return
+        }
         if isScreenLocked {
             if requiredMode == nil {
                 isScreenLocked = false
@@ -760,6 +808,8 @@ class WallpaperSchedulerService: ObservableObject {
 
     func updateGlobalDisplayFolderIDs(_ folderIDs: [String]?) {
         updateGlobalDisplayConfig { $0.folderIDs = folderIDs }
+        guard config.isGlobalDisplaySyncEnabled else { return }
+        applyNextGlobalWallpaper(requiredMode: nil)
     }
 
     func updateGlobalDisplayWebSceneSwitchSeconds(_ seconds: Int?) {
@@ -891,6 +941,8 @@ class WallpaperSchedulerService: ObservableObject {
         displayConfig.folderIDs = folderIDs
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        applyNextWallpaper(for: screenID, requiredMode: nil)
     }
 
     func updateDisplayWebSceneSwitchSeconds(_ seconds: Int?, for screenID: String) {
@@ -901,21 +953,52 @@ class WallpaperSchedulerService: ObservableObject {
         updateConfig(newConfig)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
+    /// Configures a newly connected external display to use the same schedulable
+    /// range as the primary display while choosing its first item randomly.
+    func configureExternalDisplayForRandomAllWallpapers(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
+        var newConfig = config
+        let primary = NSScreen.screens.first
+        var displayConfig = primary.map { resolvedDisplayConfig(for: $0) }
+            ?? newConfig.storedDisplayConfig(for: screenID)
+        displayConfig.isEnabled = true
+        displayConfig.order = .random
+        displayConfig.folderIDs = nil
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+        triggerRandomWallpaperNow(for: screenID)
+    }
+
+    /// Keeps the display outside automatic rotation until the user explicitly
+    /// chooses a wallpaper or enables its scheduler settings.
+    func configureExternalDisplayWithoutAutoSwitch(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
-        displayConfig.autoChangeOnExternalConnect = enabled
+        displayConfig.isEnabled = false
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
-        let screenID = displayConfigScreenID(for: screen)
+    /// Removes scheduler-only state for a disconnected display that the user did
+    /// not choose to retain. Rendering services own cleanup of their own states.
+    func discardPersistedDisplayState(screenID: String, fingerprint: String) {
         var newConfig = config
-        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
-        displayConfig.autoChangeOnExternalConnect = enabled
-        newConfig.displayConfigs[screenID] = displayConfig
+        let matchingIDs = Set(newConfig.displayConfigs.keys.filter {
+            $0 == screenID || displayFingerprints[$0] == fingerprint
+        })
+        for id in matchingIDs {
+            newConfig.displayConfigs.removeValue(forKey: id)
+            displayFingerprints.removeValue(forKey: id)
+            lastChangedItemIDs.removeValue(forKey: id)
+            lastChangeTimes.removeValue(forKey: id)
+            usedItemIDs.removeValue(forKey: id)
+        }
         updateConfig(newConfig)
+        persistSchedulerState()
+        saveDisplayFingerprints()
     }
 
     // MARK: - Scheduling
@@ -954,6 +1037,11 @@ class WallpaperSchedulerService: ObservableObject {
         dispatchTimer?.cancel()
         dispatchTimer = nil
 
+        guard !isAutomaticSwitchGloballyPaused else {
+            print("\(logTag) Automatic switching is paused, no timer scheduled")
+            return
+        }
+
         let interval = effectiveCheckInterval()
         // interval 为 0 表示所有启用的显示器都使用事件触发模式，不需要定时器
         guard interval > 0 else {
@@ -980,6 +1068,7 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
         if config.isGlobalDisplaySyncEnabled {
+            guard !isAutomaticSwitchPaused() else { return }
             changeGlobalWallpaperIfNeeded()
             return
         }
@@ -993,6 +1082,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in screens {
             let screenID = screen.wallpaperScreenIdentifier
+            guard !isAutomaticSwitchPaused(for: screenID) else { continue }
             let displayConfig = config.resolvedDisplayConfig(for: screenID)
             guard displayConfig.isEnabled else { continue }
             guard !displayConfig.isOnUnlockMode else { continue }
@@ -1071,6 +1161,7 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
         if config.isGlobalDisplaySyncEnabled {
+            guard !isAutomaticSwitchPaused() else { return }
             changeGlobalUnlockWallpaperIfNeeded()
             return
         }
@@ -1087,6 +1178,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
+            guard !isAutomaticSwitchPaused(for: screenID) else { continue }
             let displayConfig = config.resolvedDisplayConfig(for: screenID)
             guard displayConfig.isEnabled && displayConfig.isOnUnlockMode else { continue }
 
@@ -1128,7 +1220,7 @@ class WallpaperSchedulerService: ObservableObject {
 
     private func changeGlobalWallpaperIfNeeded() {
         let global = config.globalDisplayConfig
-        guard global.isEnabled, !global.isOnUnlockMode else { return }
+        guard !isAutomaticSwitchPaused(), global.isEnabled, !global.isOnUnlockMode else { return }
         let now = Date()
 
         if global.isOnEndMode {
@@ -1148,7 +1240,7 @@ class WallpaperSchedulerService: ObservableObject {
 
     private func changeGlobalUnlockWallpaperIfNeeded() {
         let global = config.globalDisplayConfig
-        guard global.isEnabled, global.isOnUnlockMode else { return }
+        guard !isAutomaticSwitchPaused(), global.isEnabled, global.isOnUnlockMode else { return }
         let now = Date()
         if let lastUnlockSwitchTime,
            now.timeIntervalSince(lastUnlockSwitchTime) < 2.0 {

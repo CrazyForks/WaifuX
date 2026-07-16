@@ -199,6 +199,16 @@ struct SettingsView: View {
         }
         .background(Color(hex: "1C1C1E"))
         .id(localization.currentLanguage)
+        .onAppear {
+            let key = "settings.openSchedulerOnNextAppearance"
+            if UserDefaults.standard.bool(forKey: key) {
+                UserDefaults.standard.removeObject(forKey: key)
+                selectedTab = .scheduler
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSchedulerSettings)) { _ in
+            selectedTab = .scheduler
+        }
     }
 
     // MARK: 左侧导航栏

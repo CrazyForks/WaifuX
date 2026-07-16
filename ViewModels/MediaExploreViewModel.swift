@@ -1047,6 +1047,44 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
+    /// Creates a media download task and returns immediately. The task is
+    /// visible in the shared download queue before any network work begins,
+    /// which is required for fire-and-forget flows such as detail-page
+    /// delete-and-redownload.
+    @discardableResult
+    func enqueueMediaDownload(
+        _ item: MediaItem,
+        preferredOption: MediaDownloadOption? = nil
+    ) -> String {
+        let task = downloadTaskService.addTask(mediaItem: item)
+        let taskID = task.id
+
+        let backgroundTask = Task<Void, Error> { [weak self] in
+            guard let self else { return }
+            defer { self.downloadTaskService.unregisterDownloadTask(id: taskID) }
+
+            do {
+                _ = try await self.ensureLocalVideoFile(
+                    for: item,
+                    preferredOption: preferredOption,
+                    saveToDownloads: self.persistDownloadedMediaToAppLibrary,
+                    taskID: taskID
+                )
+                self.downloadTaskService.markCompleted(id: taskID)
+            } catch {
+                if !(error is CancellationError) {
+                    self.downloadTaskService.markFailed(id: taskID)
+                    AppLogger.error(.download, "媒体后台下载失败", metadata: [
+                        "id": item.id,
+                        "error": error.localizedDescription,
+                    ])
+                }
+            }
+        }
+        downloadTaskService.registerDownloadTask(id: taskID, task: backgroundTask)
+        return taskID
+    }
+
     // MARK: - 便捷方法（用于 MediaDetailSheet）
 
     /// 确保获取到详细数据（用于详情页）
@@ -2366,6 +2404,52 @@ final class MediaExploreViewModel: ObservableObject {
             }
             throw error
         }
+    }
+
+    /// Queue a Workshop transfer without making the caller wait for the
+    /// SteamCMD concurrency limiter or the download itself.
+    @discardableResult
+    func enqueueWorkshopWallpaperDownload(
+        _ item: MediaItem,
+        guardCode: String? = nil,
+        folderID: String? = nil
+    ) -> String? {
+        guard item.id.hasPrefix("workshop_") else { return nil }
+
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        let task = downloadTaskService.addTask(workshopWallpaper: item)
+        let taskID = task.id
+        downloadTaskService.markDownloading(id: taskID)
+
+        let backgroundTask = Task<Void, Error> { [weak self] in
+            guard let self else { return }
+            defer { self.downloadTaskService.unregisterDownloadTask(id: taskID) }
+
+            do {
+                let localURL = try await self.workshopService.downloadWorkshopItem(
+                    workshopID: workshopID,
+                    guardCode: guardCode,
+                    progressHandler: { [weak self] progress in
+                        Task { @MainActor in
+                            self?.downloadTaskService.updateProgress(id: taskID, progress: progress)
+                        }
+                    }
+                )
+                let normalizedURL = self.normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
+                self.mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
+                self.downloadTaskService.markCompleted(id: taskID)
+            } catch {
+                if !(error is CancellationError) {
+                    self.downloadTaskService.markFailed(id: taskID)
+                    AppLogger.error(.download, "Workshop 后台下载失败", metadata: [
+                        "id": item.id,
+                        "error": error.localizedDescription,
+                    ])
+                }
+            }
+        }
+        downloadTaskService.registerDownloadTask(id: taskID, task: backgroundTask)
+        return taskID
     }
 
     private func normalizeWorkshopDownloadLocation(_ url: URL, workshopID: String) -> URL {

@@ -1,0 +1,144 @@
+import Combine
+import Foundation
+
+/// Read-only aggregation for surfaces that display task progress. It never owns
+/// work or changes queue state; downloads and video optimization remain the
+/// single writers for their own tasks.
+@MainActor
+final class TaskQueueStatusService: ObservableObject {
+    enum Category: CaseIterable, Equatable {
+        case download
+        case loopAnalysis
+        case frameInterpolation
+        case bake
+
+        var localizationKey: String {
+            switch self {
+            case .download: return "statusbar.taskQueue.download"
+            case .loopAnalysis: return "statusbar.taskQueue.loopAnalysis"
+            case .frameInterpolation: return "statusbar.taskQueue.frameInterpolation"
+            case .bake: return "statusbar.taskQueue.bake"
+            }
+        }
+    }
+
+    struct Entry: Identifiable, Equatable {
+        let id: String
+        let category: Category
+        let title: String
+        let progress: Double
+    }
+
+    static let shared = TaskQueueStatusService()
+
+    @Published private(set) var entries: [Entry] = []
+
+    private init(
+        downloadService: DownloadTaskService = .shared,
+        optimizationQueue: VideoOptimizationQueueService = .shared,
+        sceneBakeTracker: SceneOfflineBakeProgressTracker = .shared,
+        bakeService: BakeService = .shared
+    ) {
+        let sceneBakePublisher = Publishers.CombineLatest(
+            sceneBakeTracker.$activeItemID,
+            sceneBakeTracker.$progress
+        )
+        let bakeServicePublisher = Publishers.CombineLatest3(
+            bakeService.$isBaking,
+            bakeService.$progress,
+            bakeService.$statusText
+        )
+
+        Publishers.CombineLatest3(
+            downloadService.$tasks,
+            optimizationQueue.$items,
+            Publishers.CombineLatest(sceneBakePublisher, bakeServicePublisher)
+        )
+            .map { downloads, optimizations, bakeStates in
+                let (sceneBake, bakeService) = bakeStates
+                return Self.makeEntries(
+                    downloads: downloads,
+                    optimizations: optimizations,
+                    sceneBakeItemID: sceneBake.0,
+                    sceneBakeProgress: sceneBake.1,
+                    standaloneBakeIsRunning: bakeService.0,
+                    standaloneBakeProgress: bakeService.1,
+                    standaloneBakeStatus: bakeService.2
+                )
+            }
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$entries)
+    }
+
+    var combinedProgress: Double {
+        guard !entries.isEmpty else { return 0 }
+        return entries.reduce(0) { $0 + $1.progress } / Double(entries.count)
+    }
+
+    private static func makeEntries(
+        downloads: [DownloadTask],
+        optimizations: [FrameInterpolationQueueItem],
+        sceneBakeItemID: String?,
+        sceneBakeProgress: Double,
+        standaloneBakeIsRunning: Bool,
+        standaloneBakeProgress: Double,
+        standaloneBakeStatus: String
+    ) -> [Entry] {
+        let downloadEntries = downloads
+            .filter(\.isRunning)
+            .sorted { $0.createdAt < $1.createdAt }
+            .map {
+                Entry(id: $0.id, category: .download, title: $0.title, progress: $0.progress)
+            }
+
+        let optimizationEntries = optimizations
+            .filter { !$0.isTerminalForCleanup }
+            .sorted { $0.addedAt < $1.addedAt }
+            .map { item -> Entry in
+                let category: Category
+                let pendingOperation = item.currentOperation
+                    ?? item.operations.first { !item.completedOperations.contains($0) }
+                if pendingOperation == .frameInterpolation {
+                    category = .frameInterpolation
+                } else {
+                    category = .loopAnalysis
+                }
+                return Entry(
+                    id: item.id.uuidString,
+                    category: category,
+                    title: item.title,
+                    progress: item.progress
+                )
+            }
+
+        var bakeEntries: [Entry] = []
+        if let itemID = sceneBakeItemID {
+            let title = MediaLibraryService.shared.downloadRecord(for: itemID)?.item.title
+                ?? LocalizationService.shared.t("statusbar.taskQueue.bakeRunning")
+            bakeEntries.append(
+                Entry(
+                    id: "scene-bake-\(itemID)",
+                    category: .bake,
+                    title: title,
+                    progress: sceneBakeProgress
+                )
+            )
+        }
+
+        if standaloneBakeIsRunning {
+            let title = standaloneBakeStatus.isEmpty
+                ? LocalizationService.shared.t("statusbar.taskQueue.bakeRunning")
+                : standaloneBakeStatus
+            bakeEntries.append(
+                Entry(
+                    id: "standalone-bake",
+                    category: .bake,
+                    title: title,
+                    progress: standaloneBakeProgress
+                )
+            )
+        }
+
+        return downloadEntries + optimizationEntries + bakeEntries
+    }
+}

@@ -118,6 +118,44 @@ private final class ScreenVolumeControlView: NSView {
     }
 }
 
+// MARK: - Fixed-width task queue row
+private final class TaskQueueRowView: NSView {
+    static let menuWidth: CGFloat = 300
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let progressLabel = NSTextField(labelWithString: "")
+
+    init(title: String, progress: Double, isSectionHeader: Bool = false) {
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.menuWidth, height: 24))
+        titleLabel.font = NSFont.systemFont(ofSize: isSectionHeader ? 13 : 12, weight: isSectionHeader ? .semibold : .regular)
+        titleLabel.textColor = isSectionHeader ? .secondaryLabelColor : .disabledControlTextColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        progressLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        progressLabel.textColor = .disabledControlTextColor
+        progressLabel.alignment = .right
+        progressLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(titleLabel)
+        addSubview(progressLabel)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: progressLabel.leadingAnchor, constant: -8),
+            progressLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            progressLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            progressLabel.widthAnchor.constraint(equalToConstant: 44)
+        ])
+        update(title: title, progress: progress, isSectionHeader: isSectionHeader)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(title: String, progress: Double, isSectionHeader: Bool = false) {
+        titleLabel.stringValue = title
+        progressLabel.stringValue = isSectionHeader ? "" : "\(Int((min(max(progress, 0), 1) * 100).rounded()))%"
+    }
+}
+
 @MainActor
 final class StatusBarController: NSObject {
     // MARK: - 单例
@@ -151,10 +189,12 @@ final class StatusBarController: NSObject {
     // 各屏幕独立暂停/关闭菜单项
     private var wallpaperControlItems: [NSMenuItem] = []
 
-    // MARK: - 下载进度状态栏显示
+    // MARK: - 任务队列状态栏显示
     private var originalButtonImage: NSImage?
-    private var downloadMenuItems: [NSMenuItem] = []
-    private var lastDownloadMenuUpdate: Date = .distantPast
+    private lazy var taskQueueItem = NSMenuItem(title: t("statusbar.taskQueue"), action: nil, keyEquivalent: "")
+    private lazy var taskQueueMenu = NSMenu(title: t("statusbar.taskQueue"))
+    private var taskQueueRowsByID: [String: TaskQueueRowView] = [:]
+    private var taskQueueStructure: [String] = []
 
     // 标记是否已配置，防止重复配置
     private var isConfigured = false
@@ -163,7 +203,7 @@ final class StatusBarController: NSObject {
         super.init()
         configureStatusItem()
         bindWallpaperState()
-        bindDownloadState()
+        bindTaskQueueState()
         bindLocalizationState()
         refreshMenuState()
     }
@@ -226,6 +266,13 @@ final class StatusBarController: NSObject {
         checkUpdateItem.target = self
         quitItem.target = self
 
+        taskQueueItem.submenu = taskQueueMenu
+        // The initial Combine emission is an empty task list. Build the empty
+        // categories here so the submenu is still openable before any task is
+        // created, instead of leaving AppKit with an empty submenu.
+        rebuildTaskQueueMenu([])
+        menu.addItem(taskQueueItem)
+        menu.addItem(.separator())
         menu.addItem(openWindowItem)
         menu.addItem(openLibraryItem)
         menu.addItem(releaseMemoryItem)
@@ -254,6 +301,8 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func handleLanguageDidChange() {
+        taskQueueStructure.removeAll()
+        updateTaskQueue(TaskQueueStatusService.shared.entries)
         refreshMenuState()
     }
 
@@ -285,140 +334,74 @@ final class StatusBarController: NSObject {
             .store(in: &cancellables)
     }
 
-    // MARK: - 下载进度状态栏
+    // MARK: - Unified task queue status
 
-    private func bindDownloadState() {
+    private func bindTaskQueueState() {
         originalButtonImage = statusItem.button?.image
-
-        let runningTasksPublisher = DownloadTaskService.shared.$tasks
-            .map { tasks -> [DownloadTask] in tasks.filter(\.isRunning) }
-
-        let throttled = runningTasksPublisher
-            .throttle(for: .milliseconds(500), scheduler: DispatchQueue.main, latest: true)
-
-        let deduped = throttled.removeDuplicates { (lhs: [DownloadTask], rhs: [DownloadTask]) -> Bool in
-            guard lhs.count == rhs.count else { return false }
-            for (l, r) in zip(lhs, rhs) {
-                if l.id != r.id || abs(l.progress - r.progress) >= 0.01 {
-                    return false
-                }
-            }
-            return true
-        }
-
-        deduped
+        TaskQueueStatusService.shared.$entries
+            .throttle(for: .milliseconds(180), scheduler: DispatchQueue.main, latest: true)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] (runningTasks: [DownloadTask]) in
-                guard let self else { return }
-                self.updateDownloadButtonState(runningTasks: runningTasks)
-                self.updateDownloadMenuItems(runningTasks: runningTasks)
+            .sink { [weak self] entries in
+                self?.updateTaskQueue(entries)
             }
             .store(in: &cancellables)
     }
 
-    private func updateDownloadButtonState(runningTasks: [DownloadTask]) {
-        guard let button = statusItem.button else { return }
-
-        if runningTasks.isEmpty {
-            if let originalImage = originalButtonImage {
-                button.image = originalImage
-                button.title = ""
-                button.toolTip = "WaifuX"
+    private func updateTaskQueue(_ entries: [TaskQueueStatusService.Entry]) {
+        updateTaskQueueButton(entries)
+        let structure = entries.map { "\($0.category.localizationKey):\($0.id)" }
+        if structure != taskQueueStructure {
+            taskQueueStructure = structure
+            rebuildTaskQueueMenu(entries)
+        } else {
+            for entry in entries {
+                taskQueueRowsByID[entry.id]?.update(title: entry.title, progress: entry.progress)
             }
+        }
+    }
+
+    private func updateTaskQueueButton(_ entries: [TaskQueueStatusService.Entry]) {
+        guard let button = statusItem.button else { return }
+        guard !entries.isEmpty else {
+            button.image = originalButtonImage
+            button.title = ""
+            button.toolTip = "WaifuX"
             return
         }
-
-        let progress = combinedProgress(for: runningTasks)
-        let count = runningTasks.count
-        let percent = Int((progress * 100).rounded())
-
+        let progress = entries.reduce(0) { $0 + $1.progress } / Double(entries.count)
         button.image = nil
-        button.title = "\(percent)% · \(count)"
+        button.title = "\(Int((progress * 100).rounded()))% · \(entries.count)"
         button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
-        button.toolTip = "WaifuX — \(t("wallpaper.downloads")) \(count)"
+        button.toolTip = "WaifuX — \(entries.count)"
     }
 
-    private func updateDownloadMenuItems(runningTasks: [DownloadTask]) {
-        // 移除旧的下载菜单项
-        for item in downloadMenuItems {
-            menu.removeItem(item)
+    private func rebuildTaskQueueMenu(_ entries: [TaskQueueStatusService.Entry]) {
+        taskQueueMenu.removeAllItems()
+        taskQueueRowsByID.removeAll()
+        for category in TaskQueueStatusService.Category.allCases {
+            let section = NSMenuItem()
+            section.view = TaskQueueRowView(title: t(category.localizationKey), progress: 0, isSectionHeader: true)
+            section.isEnabled = false
+            taskQueueMenu.addItem(section)
+            let categoryEntries = entries.filter { $0.category == category }
+            if categoryEntries.isEmpty {
+                let emptyItem = NSMenuItem(title: "    \(t("statusbar.taskQueue.empty"))", action: nil, keyEquivalent: "")
+                emptyItem.isEnabled = false
+                taskQueueMenu.addItem(emptyItem)
+            } else {
+                for entry in categoryEntries {
+                    let row = TaskQueueRowView(title: entry.title, progress: entry.progress)
+                    let item = NSMenuItem()
+                    item.view = row
+                    item.isEnabled = false
+                    taskQueueMenu.addItem(item)
+                    taskQueueRowsByID[entry.id] = row
+                }
+            }
+            if category != TaskQueueStatusService.Category.allCases.last {
+                taskQueueMenu.addItem(.separator())
+            }
         }
-        downloadMenuItems.removeAll()
-
-        // 下载全部完成时，恢复原始图标并退出（不受节流限制）
-        if runningTasks.isEmpty {
-            updateDownloadButtonState(runningTasks: [])
-            return
-        }
-
-        // 有下载时做节流，避免频繁重建菜单
-        let now = Date()
-        guard now.timeIntervalSince(lastDownloadMenuUpdate) > 0.4 else { return }
-        lastDownloadMenuUpdate = now
-
-        // 更新状态栏按钮
-        updateDownloadButtonState(runningTasks: runningTasks)
-
-        let progress = combinedProgress(for: runningTasks)
-        let count = runningTasks.count
-        let percent = Int((progress * 100).rounded())
-
-        // 汇总项（图标 + 进度百分比 + 队列数）
-        let summaryItem = NSMenuItem()
-        let summaryAttr = NSAttributedString(
-            string: "  ⬇  \(percent)%  ·  \(count) \(t("wallpaper.downloads"))",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-                .foregroundColor: NSColor.labelColor
-            ]
-        )
-        summaryItem.attributedTitle = summaryAttr
-        summaryItem.isEnabled = false
-        menu.insertItem(summaryItem, at: 0)
-        downloadMenuItems.append(summaryItem)
-
-        // 分隔线
-        let sep = NSMenuItem.separator()
-        menu.insertItem(sep, at: downloadMenuItems.count)
-        downloadMenuItems.append(sep)
-
-        // 每个任务一行（最多显示 5 条）
-        let displayTasks = runningTasks.prefix(5)
-        for task in displayTasks {
-            let taskItem = NSMenuItem()
-            let taskPercent = Int((task.progress * 100).rounded())
-            let title = task.title
-            let displayTitle = title.count > 28
-                ? String(title.prefix(28)) + "…"
-                : title
-            let taskAttr = NSAttributedString(
-                string: "    \(displayTitle)  \(taskPercent)%",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ]
-            )
-            taskItem.attributedTitle = taskAttr
-            taskItem.isEnabled = false
-            menu.insertItem(taskItem, at: downloadMenuItems.count)
-            downloadMenuItems.append(taskItem)
-        }
-
-        if runningTasks.count > 5 {
-            let moreItem = NSMenuItem(
-                title: "    …\(runningTasks.count - 5) \(t("wallpaper.downloads"))",
-                action: nil,
-                keyEquivalent: ""
-            )
-            moreItem.isEnabled = false
-            menu.insertItem(moreItem, at: downloadMenuItems.count)
-            downloadMenuItems.append(moreItem)
-        }
-    }
-
-    private func combinedProgress(for tasks: [DownloadTask]) -> Double {
-        guard !tasks.isEmpty else { return 0 }
-        return tasks.reduce(0.0) { $0 + $1.progress } / Double(tasks.count)
     }
 
     /// 为指定屏幕构建音量滑块菜单项
@@ -565,25 +548,32 @@ final class StatusBarController: NSObject {
 
             screenSubMenu.addItem(.separator())
 
-            // 暂停 / 继续
-            let pauseItem = NSMenuItem(
-                title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
-                action: #selector(perScreenTogglePlayback(_:)),
-                keyEquivalent: "")
-            pauseItem.target = self
-            pauseItem.representedObject = screen
-            pauseItem.isEnabled = screenHasWallpaper
-            screenSubMenu.addItem(pauseItem)
-
-            // 关闭
+            // 动态壁纸控制。关闭后不显示暂停和“打开当前壁纸”，避免对空目标执行无效操作。
             let disableItem = NSMenuItem(
-                title: t("statusbar.disableWallpaper"),
+                title: screenHasWallpaper ? t("statusbar.disableWallpaper") : t("statusbar.enableWallpaper"),
                 action: #selector(perScreenToggleDynamicWallpaper(_:)),
                 keyEquivalent: "")
             disableItem.target = self
             disableItem.representedObject = screen
-            disableItem.isEnabled = screenHasWallpaper
             screenSubMenu.addItem(disableItem)
+
+            if screenHasWallpaper {
+                let openCurrentItem = NSMenuItem(
+                    title: t("statusbar.openCurrentWallpaper"),
+                    action: #selector(openCurrentWallpaper(_:)),
+                    keyEquivalent: "")
+                openCurrentItem.target = self
+                openCurrentItem.representedObject = screen
+                screenSubMenu.addItem(openCurrentItem)
+
+                let pauseItem = NSMenuItem(
+                    title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
+                    action: #selector(perScreenTogglePlayback(_:)),
+                    keyEquivalent: "")
+                pauseItem.target = self
+                pauseItem.representedObject = screen
+                screenSubMenu.addItem(pauseItem)
+            }
 
             // 音量（扩展模式跳过，与原逻辑一致）
             if !isExtensionMode {
@@ -665,6 +655,8 @@ final class StatusBarController: NSObject {
     }
 
     private func refreshLocalizedTitles() {
+        taskQueueItem.title = t("statusbar.taskQueue")
+        taskQueueMenu.title = t("statusbar.taskQueue")
         openWindowItem.title = t("statusbar.showWindow")
         openLibraryItem.title = t("statusbar.openMyLibrary")
         openSettingsItem.title = t("settings")
@@ -759,23 +751,29 @@ final class StatusBarController: NSObject {
 
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
             if weBridge.isControllingExternalEngine {
-                weBridge.isExternalPaused ? weBridge.resumeWallpaper() : weBridge.pauseWallpaper()
+                let wasPaused = weBridge.isExternalPaused
+                wasPaused ? weBridge.resumeWallpaper() : weBridge.pauseWallpaper()
+                WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused)
             } else if videoWallpaperManager.isPaused {
                 videoWallpaperManager.resumeWallpaper()
                 DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+                WallpaperSchedulerService.shared.setAutomaticSwitchPaused(false)
             } else {
                 videoWallpaperManager.pauseWallpaper()
+                WallpaperSchedulerService.shared.setAutomaticSwitchPaused(true)
             }
             return
         }
 
         if weBridge.isControllingExternalEngine {
             // CLI 壁纸暂不支持单屏暂停，走全局
-            if weBridge.isExternalPaused {
+            let wasPaused = weBridge.isExternalPaused
+            if wasPaused {
                 weBridge.resumeWallpaper()
             } else {
                 weBridge.pauseWallpaper()
             }
+            WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused)
             return
         }
 
@@ -784,16 +782,19 @@ final class StatusBarController: NSObject {
             if let displayID = Self.cgDisplayID(for: screen) {
                 let isPaused = LockScreenWallpaperService.shared.isDisplayPaused(displayID)
                 LockScreenWallpaperService.shared.setDisplayPaused(!isPaused, forDisplayID: displayID)
+                WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!isPaused, for: screen)
             }
             return
         }
 
-        if videoWallpaperManager.isPaused(on: screen) {
+        let wasPaused = videoWallpaperManager.isPaused(on: screen)
+        if wasPaused {
             videoWallpaperManager.resumeWallpaper(for: screen)
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
         } else {
             videoWallpaperManager.pauseWallpaper(for: screen)
         }
+        WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused, for: screen)
     }
 
     @objc private func perScreenToggleDynamicWallpaper(_ sender: NSMenuItem) {
@@ -803,11 +804,15 @@ final class StatusBarController: NSObject {
         }
 
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
-            toggleDynamicWallpaper()
+            if videoWallpaperManager.isVideoWallpaperActive || weBridge.isControllingExternalEngine {
+                toggleDynamicWallpaper()
+            } else {
+                WallpaperSchedulerService.shared.triggerNextGlobalWallpaperNow()
+            }
             return
         }
 
-        if weBridge.isControllingExternalEngine {
+        if weBridge.isManaging(screen: screen) {
             // 关闭外部引擎壁纸（单屏）
             weBridge.ensureStoppedForNonCLIWallpaper(for: screen)
             // 对称关闭该屏静态图 overlay
@@ -823,25 +828,50 @@ final class StatusBarController: NSObject {
 
         if videoWallpaperManager.hasActiveWallpaper(on: screen) {
             videoWallpaperManager.stopWallpaper(for: screen)
+        } else {
+            WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
         }
+    }
+
+    @objc private func openCurrentWallpaper(_ sender: NSMenuItem) {
+        guard let screen = sender.representedObject as? NSScreen else { return }
+        let url: URL?
+        if let videoURL = videoWallpaperManager.videoURL(for: screen) {
+            url = videoURL
+        } else if let path = weBridge.currentWallpaperPath(for: screen) {
+            url = URL(fileURLWithPath: path)
+        } else {
+            url = nil
+        }
+
+        guard let url else {
+            NSSound.beep()
+            return
+        }
+        MainNavigationRequestStore.requestLibraryItem(for: url)
+        showWindowHandler?()
     }
 
     @objc private func togglePlayback() {
         // 如果当前由 Wallpaper Engine X 接管，走 URL Scheme
         if weBridge.isControllingExternalEngine {
-            if weBridge.isExternalPaused {
+            let wasPaused = weBridge.isExternalPaused
+            if wasPaused {
                 weBridge.resumeWallpaper()
                 DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             } else {
                 weBridge.pauseWallpaper()
             }
+            WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused)
             return
         }
 
         // macOS 26+：扩展控制模式下全局暂停/恢复
         if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
-            LockScreenWallpaperService.shared.setPaused(!videoWallpaperManager.isPaused)
+            let wasPaused = videoWallpaperManager.isPaused
+            LockScreenWallpaperService.shared.setPaused(!wasPaused)
             videoWallpaperManager.toggleExtensionGlobalPause()
+            WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused)
             return
         }
 
@@ -853,23 +883,27 @@ final class StatusBarController: NSObject {
                 title: videoWallpaperManager.isPaused ? t("resumeWallpaper") : t("pauseWallpaper"),
                 message: t("selectDisplayToControl")
             ) { [weak self] selectedScreen in
-                guard let self = self else { return }
+                guard let self, let selectedScreen else { return }
 
-                if self.videoWallpaperManager.isPaused {
+                let wasPaused = self.videoWallpaperManager.isPaused(on: selectedScreen)
+                if wasPaused {
                     self.videoWallpaperManager.resumeWallpaper(for: selectedScreen)
                     DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
                 } else {
                     self.videoWallpaperManager.pauseWallpaper(for: selectedScreen)
                 }
+                WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused, for: selectedScreen)
             }
         } else {
             // 单显示器环境下直接操作
-            if videoWallpaperManager.isPaused {
+            let wasPaused = videoWallpaperManager.isPaused
+            if wasPaused {
                 videoWallpaperManager.resumeWallpaper()
                 DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             } else {
                 videoWallpaperManager.pauseWallpaper()
             }
+            WallpaperSchedulerService.shared.setAutomaticSwitchPaused(!wasPaused)
         }
     }
 

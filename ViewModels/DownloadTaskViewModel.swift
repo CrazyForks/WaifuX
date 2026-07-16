@@ -136,9 +136,13 @@ final class DownloadToastViewModel: ObservableObject {
         self.downloadService = downloadService
         self.workshopService = workshopService
 
-        downloadService.$tasks
+        Publishers.CombineLatest(
+            downloadService.$tasks,
+            downloadService.$toastPresentationRevision
+        )
             .receive(on: DispatchQueue.main)
-            .map { [weak self] tasks -> (snapshot: DownloadToastSnapshot?, activeCount: Int) in
+            .map { [weak self] values -> (snapshot: DownloadToastSnapshot?, activeCount: Int) in
+                let (tasks, _) = values
                 guard let self else { return (nil, 0) }
                 return self.makePresentationState(from: tasks)
             }

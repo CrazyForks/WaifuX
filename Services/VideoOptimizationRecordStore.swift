@@ -9,6 +9,8 @@ import Foundation
 final class VideoOptimizationRecordStore {
     static let shared = VideoOptimizationRecordStore()
 
+    private static let exactLoopPreflightVersion = "exact-decoded-pixels-v1"
+
     enum EventKind: String, Codable {
         case sourceDownloaded
         case bakeCompleted
@@ -177,6 +179,17 @@ final class VideoOptimizationRecordStore {
         write(record, for: videoURL)
     }
 
+    /// A no-op loop result is valid only when it was verified against the
+    /// current full-frame comparison. Older similarity-based records are
+    /// intentionally re-evaluated.
+    func markLoopNotNeeded(for videoURL: URL) {
+        append(
+            .loopNotNeeded,
+            for: videoURL,
+            metadata: ["preflightVersion": Self.exactLoopPreflightVersion]
+        )
+    }
+
     /// Registers a completed download as the source of this exact video. A
     /// fresh download starts a new optimization lifecycle, so callers reset
     /// the old sidecar before invoking this method.
@@ -302,18 +315,21 @@ final class VideoOptimizationRecordStore {
     /// Converts durable terminal events into the state shown outside the queue.
     /// Queue progress is intentionally not serialized beside the video.
     func loopState(for videoURL: URL) -> LoopState {
-        switch latestLoopEvent(for: videoURL)?.kind {
+        guard let event = latestLoopEvent(for: videoURL) else { return .idle }
+        switch event.kind {
         case .loopApplied:
             return .applied
         case .loopNotNeeded:
-            return .notNeeded
+            return event.metadata["preflightVersion"] == Self.exactLoopPreflightVersion
+                ? .notNeeded
+                : .idle
         case .loopNoReliablePoint:
             return .noReliablePoint
         case .loopFailed:
             return .failed
         case .loopBlacklisted:
             return .blacklisted
-        case .sourceDownloaded, .bakeCompleted, .none,
+        case .sourceDownloaded, .bakeCompleted,
              .loopQueued, .loopAnalysisStarted, .loopCancelled,
              .frameQueued, .frameAnalysisStarted, .frameInterpolationStarted,
              .frameApplied, .frameNotNeeded, .frameFailed, .frameCancelled,

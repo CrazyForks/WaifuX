@@ -510,6 +510,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         items.contains { item in
             item.videoURL.standardizedFileURL == videoURL.standardizedFileURL
                 && item.targetFPS == targetFPS
+                && item.operations.contains(.frameInterpolation)
+                && !item.completedOperations.contains(.frameInterpolation)
                 && !item.isTerminalForCleanup
         }
     }
@@ -517,6 +519,8 @@ final class VideoOptimizationQueueService: ObservableObject {
     func hasActiveInterpolation(videoURL: URL) -> Bool {
         items.contains { item in
             item.videoURL.standardizedFileURL == videoURL.standardizedFileURL
+                && item.operations.contains(.frameInterpolation)
+                && !item.completedOperations.contains(.frameInterpolation)
                 && !item.isTerminalForCleanup
         }
     }
@@ -525,6 +529,8 @@ final class VideoOptimizationQueueService: ObservableObject {
         items
             .filter { item in
                 item.videoURL.standardizedFileURL == videoURL.standardizedFileURL
+                    && item.operations.contains(.frameInterpolation)
+                    && !item.completedOperations.contains(.frameInterpolation)
                     && !item.isTerminalForCleanup
             }
             .map(\.targetFPS)
@@ -723,32 +729,71 @@ final class VideoOptimizationQueueService: ObservableObject {
         return id
     }
 
+    /// Optimizations have two independent workers. A loop analysis for one
+    /// video must not wait for an unrelated optical-flow export, but two
+    /// workers are never allowed to rewrite the same source file together.
     private func scheduleNext() {
         clearProgressForWaitingItems()
         persistQueueCheckpointImmediately()
-        let runningCount = runningTasks.count
-        let availableSlots = max(0, 1 - runningCount)
-        guard availableSlots > 0 else { return }
 
-        let waitingIDs = items
+        if !hasRunningOperation(.loopAnalysis),
+           let id = nextWaitingItemID(for: .loopAnalysis) {
+            startLoopAnalysis(id: id)
+        }
+
+        if !hasRunningOperation(.frameInterpolation),
+           let id = nextWaitingItemID(for: .frameInterpolation) {
+            startFrameInterpolation(id: id)
+        }
+    }
+
+    private func nextWaitingItemID(for operation: FrameInterpolationQueueItem.Operation) -> UUID? {
+        items
             .filter { item in
-                guard runningTasks[item.id] == nil else { return false }
+                guard runningTasks[item.id] == nil,
+                      item.currentOperation == nil,
+                      nextPendingOperation(for: item) == operation,
+                      !hasRunningTask(for: item.videoURL) else {
+                    return false
+                }
                 if case .waiting = item.status { return true }
                 return false
             }
             .sorted { $0.addedAt < $1.addedAt }
-            .prefix(availableSlots)
-            .map(\.id)
+            .first?
+            .id
+    }
 
-        for id in waitingIDs {
-            startItem(id: id)
+    private func nextPendingOperation(
+        for item: FrameInterpolationQueueItem
+    ) -> FrameInterpolationQueueItem.Operation? {
+        item.operations.first { !item.completedOperations.contains($0) }
+    }
+
+    private func hasRunningOperation(_ operation: FrameInterpolationQueueItem.Operation) -> Bool {
+        runningTasks.keys.contains { id in
+            items.first(where: { $0.id == id })?.currentOperation == operation
         }
     }
 
-    private func startItem(id: UUID) {
+    private func hasRunningTask(for videoURL: URL) -> Bool {
+        let standardizedURL = videoURL.standardizedFileURL
+        return runningTasks.keys.contains { id in
+            items.first(where: { $0.id == id })?.videoURL.standardizedFileURL == standardizedURL
+        }
+    }
+
+    private func prepareToRun(
+        id: UUID,
+        operation: FrameInterpolationQueueItem.Operation,
+        stage: String
+    ) -> (videoURL: URL, targetFPS: Int)? {
         guard runningTasks[id] == nil,
-              runningTasks.count < 1,
-              let index = items.firstIndex(where: { $0.id == id }) else { return }
+              let index = items.firstIndex(where: { $0.id == id }),
+              nextPendingOperation(for: items[index]) == operation,
+              !hasRunningTask(for: items[index].videoURL) else {
+            return nil
+        }
 
         items[index].status = .analyzing
         items[index].progress = 0
@@ -757,87 +802,105 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].opticalFlowFrames = 0
         items[index].elapsedSeconds = 0
         items[index].remainingSeconds = nil
-        let initialOperations = items[index].operations.filter {
-            !items[index].completedOperations.contains($0)
-        }
-        guard !initialOperations.isEmpty else {
-            finishCompleted(id: id, message: nil)
+        items[index].currentOperation = operation
+        items[index].currentStage = stage
+        startHeartbeat(id: id)
+        return (items[index].videoURL, items[index].targetFPS)
+    }
+
+    private func startLoopAnalysis(id: UUID) {
+        guard let work = prepareToRun(id: id, operation: .loopAnalysis, stage: "循环分析中") else {
             return
         }
-        items[index].currentOperation = initialOperations.first
-        items[index].currentStage = initialOperations.first == .loopAnalysis
-            ? "循环分析中"
-            : t("frameInterpolationStageReadingFPS")
-        let videoURL = items[index].videoURL
-        let targetFPS = items[index].targetFPS
-        startHeartbeat(id: id)
+        let videoURL = work.videoURL
+        VideoOptimizationRecordStore.shared.append(.loopQueued, for: videoURL)
+        VideoOptimizationRecordStore.shared.append(.loopAnalysisStarted, for: videoURL)
+        frameInterpolationDebugPrint("循环点分析队列：开始任务。视频=\(videoURL.lastPathComponent)")
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            do {
+                let loopResult = try await VideoLoopAnalysisService.analyzeAndReplace(videoURL: videoURL) { progress in
+                    Task { @MainActor in
+                        self?.updateLoopProgress(id: id, progress: progress)
+                    }
+                }
+                guard !Task.isCancelled else {
+                    await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
+                    return
+                }
+
+                await MainActor.run {
+                    guard let self else { return }
+                    switch loopResult {
+                    case .applied(let firstContentFrame, let matchFrame):
+                        VideoOptimizationRecordStore.shared.append(
+                            .loopApplied,
+                            for: videoURL,
+                            metadata: [
+                                "firstContentFrame": String(firstContentFrame),
+                                "matchFrame": String(matchFrame),
+                            ]
+                        )
+                        NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)
+                    case .notNeeded:
+                        VideoOptimizationRecordStore.shared.markLoopNotNeeded(for: videoURL)
+                    case .noReliablePoint:
+                        VideoOptimizationRecordStore.shared.append(.loopNoReliablePoint, for: videoURL)
+                    }
+                    self.finishLoopAnalysis(id: id)
+                }
+            } catch is CancellationError {
+                await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
+            } catch {
+                await MainActor.run {
+                    VideoOptimizationRecordStore.shared.append(
+                        .loopFailed,
+                        for: videoURL,
+                        detail: error.localizedDescription
+                    )
+                    self?.finishFailed(id: id, message: error.localizedDescription)
+                }
+            }
+        }
+        runningTasks[id] = task
+    }
+
+    private func finishLoopAnalysis(id: UUID) {
+        runningTasks[id] = nil
+        stopHeartbeat(id: id)
+        guard let index = items.firstIndex(where: { $0.id == id }) else {
+            scheduleNext()
+            return
+        }
+
+        items[index].completedOperations.insert(.loopAnalysis)
+        items[index].currentOperation = nil
+        if nextPendingOperation(for: items[index]) == nil {
+            finishCompleted(id: id, message: "循环分析完成")
+            return
+        }
+
+        items[index].status = .waiting
+        clearProgress(at: index)
+        persistQueueCheckpointImmediately()
+        scheduleNext()
+    }
+
+    private func startFrameInterpolation(id: UUID) {
+        guard let work = prepareToRun(
+            id: id,
+            operation: .frameInterpolation,
+            stage: t("frameInterpolationStageReadingFPS")
+        ) else {
+            return
+        }
+        let videoURL = work.videoURL
+        let targetFPS = work.targetFPS
+        VideoOptimizationRecordStore.shared.append(.frameQueued, for: videoURL)
+        VideoOptimizationRecordStore.shared.append(.frameAnalysisStarted, for: videoURL)
         frameInterpolationDebugPrint("补帧队列：开始任务。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
 
         let task = Task.detached(priority: .utility) { [weak self] in
-            if initialOperations.contains(.loopAnalysis) {
-                do {
-                    let loopResult = try await VideoLoopAnalysisService.analyzeAndReplace(videoURL: videoURL) { progress in
-                        Task { @MainActor in
-                            self?.updateLoopProgress(id: id, progress: progress)
-                        }
-                    }
-                    guard !Task.isCancelled else {
-                        await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
-                        return
-                    }
-
-                    await MainActor.run {
-                        guard let self else { return }
-                        switch loopResult {
-                        case .applied(let firstContentFrame, let matchFrame):
-                            VideoOptimizationRecordStore.shared.append(
-                                .loopApplied,
-                                for: videoURL,
-                                metadata: [
-                                    "firstContentFrame": String(firstContentFrame),
-                                    "matchFrame": String(matchFrame),
-                                ]
-                            )
-                            NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)
-                        case .notNeeded:
-                            VideoOptimizationRecordStore.shared.append(.loopNotNeeded, for: videoURL)
-                        case .noReliablePoint:
-                            VideoOptimizationRecordStore.shared.append(.loopNoReliablePoint, for: videoURL)
-                        }
-                        self.markOperationCompleted(id: id, operation: .loopAnalysis)
-                    }
-                } catch is CancellationError {
-                    await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
-                    return
-                } catch {
-                    await MainActor.run {
-                        VideoOptimizationRecordStore.shared.append(
-                            .loopFailed,
-                            for: videoURL,
-                            detail: error.localizedDescription
-                        )
-                        self?.finishFailed(id: id, message: error.localizedDescription)
-                    }
-                    return
-                }
-            }
-
-            let shouldInterpolate = await MainActor.run {
-                self?.items.first(where: { $0.id == id })?.operations.contains(.frameInterpolation) ?? false
-            }
-            guard shouldInterpolate else {
-                await MainActor.run { self?.finishCompleted(id: id, message: "循环分析完成") }
-                return
-            }
-
-            await MainActor.run {
-                guard let self,
-                      let itemIndex = self.items.firstIndex(where: { $0.id == id }) else { return }
-                self.items[itemIndex].currentOperation = .frameInterpolation
-                self.items[itemIndex].status = .analyzing
-                self.items[itemIndex].currentStage = t("frameInterpolationStageReadingFPS")
-            }
-
             let decision = await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: targetFPS)
             await MainActor.run {
                 guard let self,
@@ -848,21 +911,23 @@ final class VideoOptimizationQueueService: ObservableObject {
             }
 
             guard !Task.isCancelled else {
-                await MainActor.run {
-                    self?.finishCancelled(id: id, reason: "任务已取消")
-                }
+                await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
                 return
             }
             guard decision.shouldInterpolate else {
-                await MainActor.run {
-                    self?.finishWithoutExport(id: id, reason: decision.reason)
-                }
+                await MainActor.run { self?.finishWithoutExport(id: id, reason: decision.reason) }
                 return
             }
 
-            let outputURL = await VideoFrameInterpolationExporter.exportIfNeeded(sourceURL: videoURL, targetFPS: targetFPS) { progress in
+            await MainActor.run {
+                VideoOptimizationRecordStore.shared.append(.frameInterpolationStarted, for: videoURL)
+            }
+            let outputURL = await VideoFrameInterpolationExporter.exportIfNeeded(
+                sourceURL: videoURL,
+                targetFPS: targetFPS
+            ) { progress in
                 Task { @MainActor in
-                    VideoOptimizationQueueService.shared.updateProgress(id: id, progress: progress)
+                    self?.updateProgress(id: id, progress: progress)
                 }
             }
 
@@ -978,7 +1043,29 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     func item(for videoURL: URL) -> VideoOptimizationQueueItem? {
-        items.first { $0.videoURL.standardizedFileURL == videoURL.standardizedFileURL }
+        let standardizedURL = videoURL.standardizedFileURL
+        return items.first { item in
+            item.videoURL.standardizedFileURL == standardizedURL && item.currentOperation != nil
+        } ?? items.first { item in
+            item.videoURL.standardizedFileURL == standardizedURL && !item.isTerminalForCleanup
+        }
+    }
+
+    /// A read-only operation lane for status surfaces. Work remains persisted
+    /// in one checkpoint, while loop analysis and interpolation are scheduled
+    /// independently from each other.
+    func pendingItems(for operation: FrameInterpolationQueueItem.Operation) -> [VideoOptimizationQueueItem] {
+        items
+            .filter {
+                !$0.isTerminalForCleanup
+                    && $0.operations.contains(operation)
+                    && !$0.completedOperations.contains(operation)
+            }
+            .sorted { $0.addedAt < $1.addedAt }
+    }
+
+    func activeItem(for operation: FrameInterpolationQueueItem.Operation) -> VideoOptimizationQueueItem? {
+        pendingItems(for: operation).first { $0.currentOperation == operation }
     }
 
     private func clearProgressForWaitingItems() {
@@ -1075,14 +1162,6 @@ final class VideoOptimizationQueueService: ObservableObject {
             frameInterpolationDebugPrint("补帧队列：任务失败。视频=\(sourceURL.lastPathComponent)")
         }
         scheduleNext()
-    }
-
-    private func markOperationCompleted(id: UUID, operation: FrameInterpolationQueueItem.Operation) {
-        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
-        items[index].completedOperations.insert(operation)
-        items[index].currentOperation = nil
-        items[index].progress = operation == .loopAnalysis ? 0.08 : items[index].progress
-        persistQueueCheckpointImmediately()
     }
 
     private func finishCompleted(id: UUID, message: String?) {
@@ -1234,11 +1313,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     var activeProcessingItem: FrameInterpolationQueueItem? {
-        items.first { item in
-            if case .analyzing = item.status { return true }
-            if case .running = item.status { return true }
-            return false
-        }
+        activeItem(for: .loopAnalysis) ?? activeItem(for: .frameInterpolation)
     }
 
     var remainingWorkCount: Int {

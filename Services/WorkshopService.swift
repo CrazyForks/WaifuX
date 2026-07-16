@@ -26,17 +26,19 @@ private actor SteamCMDDownloadLimiter {
     private let pollInterval: UInt64 = 500_000_000 // 0.5s
 
     /// 获取一个下载槽位；若已满则每隔 0.5s 轮询一次
-    func acquire() async {
+    func acquire() async throws {
         while true {
             if activeCount < maxConcurrent {
                 activeCount += 1
                 return
             }
             waitCount += 1
-            // 休眠期间若 Task 被取消，CancellationError 被 try? 静默吞掉，
-            // 循环继续检查槽位。实际下载操作在 acquire 返回后进行，
-            // 那里会通过 try await 抛出 CancellationError 并被外层捕获。
-            try? await Task.sleep(nanoseconds: pollInterval)
+            do {
+                try await Task.sleep(nanoseconds: pollInterval)
+            } catch {
+                waitCount = max(0, waitCount - 1)
+                throw error
+            }
             waitCount = max(0, waitCount - 1)
         }
     }
@@ -1588,7 +1590,7 @@ class WorkshopService: ObservableObject {
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         // 获取并发下载槽位（超出上限则排队等待）
-        await downloadLimiter.acquire()
+        try await downloadLimiter.acquire()
         // 更新排队计数
         let queued = await downloadLimiter.queuedCount()
         await MainActor.run { steamCMDQueuedCount = queued }
@@ -1688,8 +1690,9 @@ class WorkshopService: ObservableObject {
 
         try? FileManager.default.createDirectory(at: downloadDir, withIntermediateDirectories: true)
 
-        // SteamCMD 不提供下载进度输出（+download_progress 是无效命令），
-        // 因此通过 Steam API 获取文件大小，再用轮询下载目录的方式估算进度。
+        // SteamCMD 不提供可直接消费的百分比输出。目标文件会被预分配，
+        // 所以文件大小和目录占用不能代表已接收字节；稍后由 PID 网络采样器
+        // 结合此处的 Steam API 文件总大小计算每个任务的真实进度。
         let totalSize: Int64
         do {
             let details = try await fetchPublishedFileDetails(ids: [workshopID])
@@ -1757,23 +1760,29 @@ class WorkshopService: ObservableObject {
             task.standardOutput = outputPipe
             task.standardError = errorPipe
 
-            // steamcmd 创意工坊下载不创建中间文件，无法轮询字节数。
-            // 进度通过时间估算：假设下载速度不低于 200KB/s，按已耗时推算进度，上限 99%。
-            var lastReportedProgress: Double = 0
-            let startTime = Date()
-            let minSpeed: Double = 500 * 1024  // 500KB/s 最低预估速度
-            let pollingTask = Task { @MainActor in
+            final class ProgressBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var lastReportedProgress: Double = 0
+
+                func shouldReport(_ progress: Double) -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    guard progress > lastReportedProgress + 0.001 else { return false }
+                    lastReportedProgress = progress
+                    return true
+                }
+            }
+
+            let progressBox = ProgressBox()
+            let progressMonitor = SteamWorkshopNetworkProgressMonitor(
+                workshopID: workshopID,
+                totalDownloadBytes: totalSize > 0 ? totalSize : nil
+            )
+            let pollingTask = Task.detached(priority: .utility) {
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
-                    guard totalSize > 0 else { continue }
-                    let elapsed = Date().timeIntervalSince(startTime)
-                    // 基于时间的估算进度 = min(已下载估算 / 总大小, 0.99)
-                    // 已下载估算 = max(实际字节数, elapsed * minSpeed)
-                    let currentBytes = Self.dirSize(downloadDir.appendingPathComponent("steamapps"))
-                    let estimatedBytes = max(Double(currentBytes), elapsed * minSpeed)
-                    let progress = min(estimatedBytes / Double(totalSize), 0.99)
-                    if progress > lastReportedProgress + 0.001 {
-                        lastReportedProgress = progress
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    guard let progress = progressMonitor.currentProgress() else { continue }
+                    if progressBox.shouldReport(progress) {
                         progressHandler?(progress)
                     }
                 }
@@ -1808,6 +1817,7 @@ class WorkshopService: ObservableObject {
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
                 if let str = String(data: handle.availableData, encoding: .utf8) {
                     outputBox.appendOutput(str)
+                    progressMonitor.consumeSteamCMDOutput(str)
                 }
             }
             errorPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -1834,16 +1844,19 @@ class WorkshopService: ObservableObject {
                 private let errorPipe: Pipe?
                 private let timeoutTask: Task<Void, Never>?
                 private let pollingTask: Task<Void, Never>?
-                init(continuation: CheckedContinuation<T, any Error>, outputPipe: Pipe? = nil, errorPipe: Pipe? = nil, timeoutTask: Task<Void, Never>? = nil, pollingTask: Task<Void, Never>? = nil) {
+                private let progressMonitor: SteamWorkshopNetworkProgressMonitor?
+                init(continuation: CheckedContinuation<T, any Error>, outputPipe: Pipe? = nil, errorPipe: Pipe? = nil, timeoutTask: Task<Void, Never>? = nil, pollingTask: Task<Void, Never>? = nil, progressMonitor: SteamWorkshopNetworkProgressMonitor? = nil) {
                     self.continuation = continuation
                     self.outputPipe = outputPipe
                     self.errorPipe = errorPipe
                     self.timeoutTask = timeoutTask
                     self.pollingTask = pollingTask
+                    self.progressMonitor = progressMonitor
                 }
                 private func cleanup() {
                     timeoutTask?.cancel()
                     pollingTask?.cancel()
+                    progressMonitor?.stop()
                     outputPipe?.fileHandleForReading.readabilityHandler = nil
                     errorPipe?.fileHandleForReading.readabilityHandler = nil
                 }
@@ -1879,11 +1892,14 @@ class WorkshopService: ObservableObject {
                 outputPipe: outputPipe,
                 errorPipe: errorPipe,
                 timeoutTask: timeoutTask,
-                pollingTask: pollingTask
+                pollingTask: pollingTask,
+                progressMonitor: progressMonitor
             )
 
             task.terminationHandler = { _ in
+                progressMonitor.stop()
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) {
+                    AppLogger.info(.download, "Workshop 网络进度采样汇总", metadata: progressMonitor.samplingDiagnostics())
                     // 超时导致的终止，直接返回明确的超时错误
                     if timeoutFlag.value {
                         resumeBox.resume(throwing: WorkshopError.timeout)
@@ -2050,35 +2066,14 @@ class WorkshopService: ObservableObject {
 
             do {
                 try task.run()
+                progressMonitor.start(processIdentifier: task.processIdentifier)
             } catch {
                 resumeBox.resume(throwing: WorkshopError.executionFailed(error.localizedDescription))
             }
         }
     }
 
-    /// 从 SteamCMD 输出中解析下载进度
-    /// 支持旧格式 "[ 10%]" 和新格式 "[Progress] X.X% (Y / Z bytes)"
-    nonisolated private static func extractSteamCMDProgress(from output: String) -> Double? {
-        // 旧格式: "[  0%]", "[ 10%]", "[100%]" 等
-        let legacyPattern = #"\[\s*(\d+)%\]"#
-        // 新格式 (2023+): "[Progress] 45.2% (1024000 / 2270464 bytes)"
-        let progressPattern = #"\[Progress\]\s*(\d+(?:\.\d+)?)%"#
-
-        for pattern in [progressPattern, legacyPattern] {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(output.startIndex..., in: output)
-            // 取最后一处匹配（最新的进度）
-            guard let match = regex.matches(in: output, options: [], range: range).last,
-                  let numberRange = Range(match.range(at: 1), in: output),
-                  let percent = Double(output[numberRange]) else { continue }
-            // 旧格式是 0-100，新格式可能是 0.0-100.0
-            return percent > 1 ? percent / 100.0 : percent
-        }
-        return nil
-    }
-
-    /// 递归计算目录下所有文件的总大小（字节），用于轮询下载进度
-    /// 注意：不跳过隐藏文件，因为 steamcmd 下载时可能创建隐藏临时文件
+    /// 递归计算目录下所有文件的总大小，仅用于清理失败下载时统计可释放空间。
     nonisolated private static func dirSize(_ url: URL) -> Int64 {
         let fm = FileManager.default
         var isDir: ObjCBool = false
@@ -2610,6 +2605,218 @@ class WorkshopService: ObservableObject {
             NSHomeDirectory() + "/Applications/Wallpaper Engine.app"
         ]
         return paths.contains { FileManager.default.fileExists(atPath: $0) }
+    }
+}
+
+// MARK: - Steam Workshop 网络进度
+
+/// SteamCMD 会预分配 Workshop 目标文件，不能以文件长度或目录占用推算进度。
+/// 这个监视器按 SteamCMD PID 采样累计网络接收字节，并以 Steam API 返回的
+/// 文件总大小换算进度；`nettop` 不可用时只返回 nil，交由上层保持阶段状态。
+private final class SteamWorkshopNetworkProgressMonitor: @unchecked Sendable {
+    private enum NetTopSampleResult {
+        case success(Data)
+        case failure(String)
+    }
+
+    private let lock = NSLock()
+    private let workshopID: String
+    private let totalDownloadBytes: Int64?
+    private let downloadStartMarker: String
+
+    private var nettopOutputBuffer = ""
+    private var steamOutputTail = ""
+    private var bytesInColumnIndex: Int?
+    private var lastRawReceivedBytes: Int64?
+    private var cumulativeReceivedBytes: Int64 = 0
+    private var receivedBytesAtDownloadStart: Int64?
+    private var monitoredProcessID: Int32?
+    private var isStopped = false
+    private var isSampleInFlight = false
+    private var lastSampleRequestDate = Date.distantPast
+    private var downloadStartObserved = false
+    private var nettopAvailable = false
+    private var lastSamplingError: String?
+    private var sampleCount = 0
+    private var validByteSampleCount = 0
+
+    init(workshopID: String, totalDownloadBytes: Int64?) {
+        self.workshopID = workshopID
+        self.totalDownloadBytes = totalDownloadBytes
+        self.downloadStartMarker = "Downloading item \(workshopID)"
+    }
+
+    func start(processIdentifier: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard monitoredProcessID == nil else { return }
+        monitoredProcessID = processIdentifier
+        isStopped = false
+        nettopAvailable = FileManager.default.isExecutableFile(atPath: "/usr/bin/nettop")
+        if !nettopAvailable {
+            lastSamplingError = "nettop unavailable"
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        isStopped = true
+        monitoredProcessID = nil
+        lock.unlock()
+    }
+
+    func consumeSteamCMDOutput(_ output: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !downloadStartObserved else { return }
+        steamOutputTail += output
+        if steamOutputTail.localizedCaseInsensitiveContains(downloadStartMarker) {
+            downloadStartObserved = true
+            receivedBytesAtDownloadStart = lastRawReceivedBytes == nil ? nil : cumulativeReceivedBytes
+            return
+        }
+
+        let retainedLength = max(downloadStartMarker.count + 64, 256)
+        if steamOutputTail.count > retainedLength {
+            steamOutputTail = String(steamOutputTail.suffix(retainedLength))
+        }
+    }
+
+    func currentProgress() -> Double? {
+        requestNetTopSampleIfNeeded()
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard downloadStartObserved,
+              let totalDownloadBytes,
+              totalDownloadBytes > 0,
+              lastRawReceivedBytes != nil else {
+            return nil
+        }
+
+        guard let receivedBytesAtDownloadStart else {
+            self.receivedBytesAtDownloadStart = cumulativeReceivedBytes
+            return nil
+        }
+
+        let downloadedBytes = cumulativeReceivedBytes - receivedBytesAtDownloadStart
+        guard downloadedBytes > 0 else { return nil }
+        return min(Double(downloadedBytes) / Double(totalDownloadBytes), 0.99)
+    }
+
+    func samplingDiagnostics() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var diagnostics: [String: Any] = [
+            "workshopID": workshopID,
+            "nettopAvailable": nettopAvailable,
+            "downloadStartObserved": downloadStartObserved,
+            "sampleCount": sampleCount,
+            "validByteSampleCount": validByteSampleCount,
+            "cumulativeReceivedBytes": cumulativeReceivedBytes,
+        ]
+        if let totalDownloadBytes { diagnostics["totalDownloadBytes"] = totalDownloadBytes }
+        if let lastSamplingError { diagnostics["lastSamplingError"] = lastSamplingError }
+        return diagnostics
+    }
+
+    private func requestNetTopSampleIfNeeded() {
+        lock.lock()
+        guard nettopAvailable,
+              !isStopped,
+              !isSampleInFlight,
+              let processID = monitoredProcessID,
+              Date().timeIntervalSince(lastSampleRequestDate) >= 0.25 else {
+            lock.unlock()
+            return
+        }
+
+        isSampleInFlight = true
+        lastSampleRequestDate = .now
+        lock.unlock()
+
+        Task.detached(priority: .utility) { [weak self] in
+            let result = Self.readNetTopSnapshot(processIdentifier: processID)
+            self?.finishNetTopSample(result)
+        }
+    }
+
+    private func finishNetTopSample(_ result: NetTopSampleResult) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        isSampleInFlight = false
+        guard !isStopped else { return }
+
+        switch result {
+        case .success(let data):
+            guard let output = String(data: data, encoding: .utf8) else { return }
+            appendNetTopOutput(output)
+        case .failure(let error):
+            lastSamplingError = error
+        }
+    }
+
+    private func appendNetTopOutput(_ output: String) {
+        nettopOutputBuffer += output
+        while let newlineRange = nettopOutputBuffer.range(of: "\n") {
+            let line = String(nettopOutputBuffer[..<newlineRange.lowerBound])
+            nettopOutputBuffer.removeSubrange(...newlineRange.lowerBound)
+            consumeNetTopLine(line)
+        }
+    }
+
+    private func consumeNetTopLine(_ line: String) {
+        let columns = line.split(separator: ",", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !columns.isEmpty else { return }
+
+        if let headerIndex = columns.firstIndex(of: "bytes_in") {
+            bytesInColumnIndex = headerIndex
+            return
+        }
+
+        guard let bytesInColumnIndex,
+              columns.indices.contains(bytesInColumnIndex),
+              let receivedBytes = Int64(columns[bytesInColumnIndex]) else {
+            return
+        }
+
+        sampleCount += 1
+        validByteSampleCount += 1
+        if let lastRawReceivedBytes {
+            cumulativeReceivedBytes += receivedBytes >= lastRawReceivedBytes
+                ? receivedBytes - lastRawReceivedBytes
+                : receivedBytes
+        } else {
+            cumulativeReceivedBytes = receivedBytes
+        }
+        lastRawReceivedBytes = receivedBytes
+    }
+
+    private static func readNetTopSnapshot(processIdentifier: Int32) -> NetTopSampleResult {
+        let process = Process()
+        let outputPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+        process.arguments = ["-P", "-L", "1", "-x", "-n", "-p", String(processIdentifier)]
+        process.standardOutput = outputPipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                return .failure("nettop exited \(process.terminationStatus)")
+            }
+            return .success(output)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
     }
 }
 

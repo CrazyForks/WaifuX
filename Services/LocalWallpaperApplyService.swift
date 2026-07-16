@@ -96,14 +96,26 @@ enum LocalWallpaperApplyService {
             }
             guard allowNonVideoInOnEnd else { return false }
             // 无内嵌视频文件的 video 工程：退回 CLI/web 渲染，不按 scene 做 companion bake
-            try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            try await applyRenderer(
+                path: contentRoot.path,
+                to: screens,
+                options: options,
+                scheduleSceneCompanionBake: false,
+                requiresSequentialGlobalLoad: false
+            )
             return true
 
         case .scene:
             if isRealtime {
                 guard allowNonVideoInOnEnd else { return false }
                 // 详情页实时 scene：只 setWallpaper；companion bake 仅在已有产物时推锁屏，无产物且关自动烘焙则不烘不推
-                try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: true)
+                try await applyRenderer(
+                    path: contentRoot.path,
+                    to: screens,
+                    options: options,
+                    scheduleSceneCompanionBake: true,
+                    requiresSequentialGlobalLoad: true
+                )
                 return true
             }
             // 非实时：优先烘焙 MP4（与详情页 applySceneWallpaperPreferringBake 一致）
@@ -112,7 +124,13 @@ enum LocalWallpaperApplyService {
                 let webDirPath = bakedURL.path.replacingOccurrences(of: ".mp4", with: ".web")
                 if FileManager.default.fileExists(atPath: webDirPath) {
                     guard allowNonVideoInOnEnd else { return false }
-                    try await applyRenderer(path: webDirPath, to: screens, options: options, scheduleSceneCompanionBake: false)
+                    try await applyRenderer(
+                        path: webDirPath,
+                        to: screens,
+                        options: options,
+                        scheduleSceneCompanionBake: false,
+                        requiresSequentialGlobalLoad: true
+                    )
                     return true
                 }
                 try await applyVideo(bakedURL, to: screens, options: options)
@@ -122,13 +140,25 @@ enum LocalWallpaperApplyService {
             // 无烘焙：不在此阻塞长烘焙。
             // 调度器：退回实时渲染（能设上桌面）；详情页应先 bake UI 再调本方法。
             guard allowNonVideoInOnEnd else { return false }
-            try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: true)
+            try await applyRenderer(
+                path: contentRoot.path,
+                to: screens,
+                options: options,
+                scheduleSceneCompanionBake: true,
+                requiresSequentialGlobalLoad: false
+            )
             return true
 
         case .web:
             guard allowNonVideoInOnEnd else { return false }
             // web 永不走 scene companion bake
-            try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            try await applyRenderer(
+                path: contentRoot.path,
+                to: screens,
+                options: options,
+                scheduleSceneCompanionBake: false,
+                requiresSequentialGlobalLoad: true
+            )
             return true
 
         case .image:
@@ -158,7 +188,13 @@ enum LocalWallpaperApplyService {
                 try await applyStaticImage(imageURL, to: screens)
                 return true
             }
-            try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            try await applyRenderer(
+                path: contentRoot.path,
+                to: screens,
+                options: options,
+                scheduleSceneCompanionBake: false,
+                requiresSequentialGlobalLoad: false
+            )
             return true
         }
     }
@@ -228,7 +264,8 @@ enum LocalWallpaperApplyService {
         path: String,
         to screens: [NSScreen],
         options: Options,
-        scheduleSceneCompanionBake: Bool
+        scheduleSceneCompanionBake: Bool,
+        requiresSequentialGlobalLoad: Bool
     ) async throws {
         guard FileManager.default.fileExists(atPath: path) else {
             throw ApplyError.missingFile(path)
@@ -241,11 +278,29 @@ enum LocalWallpaperApplyService {
         let userProps = (scheduleSceneCompanionBake && isRealtime)
             ? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path)
             : nil
-        try await WallpaperEngineXBridge.shared.setWallpaper(
-            path: path,
-            targetScreens: screens,
-            userProperties: userProps
-        )
+        let shouldSerialize = requiresSequentialGlobalLoad
+            && options.usesSharedVideoDecoder
+            && screens.count > 1
+
+        if shouldSerialize {
+            for screen in screensInDisplayOrder(screens) {
+                try await WallpaperEngineXBridge.shared.setWallpaper(
+                    path: path,
+                    targetScreens: [screen],
+                    userProperties: userProps
+                )
+                try await WallpaperEngineXBridge.shared.waitForRendererReady(
+                    on: screen,
+                    expectedPath: path
+                )
+            }
+        } else {
+            try await WallpaperEngineXBridge.shared.setWallpaper(
+                path: path,
+                targetScreens: screens,
+                userProperties: userProps
+            )
+        }
         // companion bake：有产物才推锁屏；无产物且关自动烘焙则不烘不推（设壁纸本身不强制烘）
         if scheduleSceneCompanionBake {
             SceneOfflineBakeService.scheduleRealtimeCompanionBake(
@@ -253,6 +308,14 @@ enum LocalWallpaperApplyService {
                 targetScreens: screens,
                 reason: options.reason
             )
+        }
+    }
+
+    private static func screensInDisplayOrder(_ screens: [NSScreen]) -> [NSScreen] {
+        let indexes = Dictionary(uniqueKeysWithValues: NSScreen.screens.enumerated().map { ($1.wallpaperScreenIdentifier, $0) })
+        return screens.sorted {
+            (indexes[$0.wallpaperScreenIdentifier] ?? .max)
+                < (indexes[$1.wallpaperScreenIdentifier] ?? .max)
         }
     }
 

@@ -22,8 +22,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
     var folderIDs: [String]?
     /// Web/Scene 壁纸在"播完即换"模式下的切换间隔（秒）。nil = 不启用（仅视频走播完通知）
     var webSceneSwitchSeconds: Int?
-    /// 外接显示器连接到电脑后是否立即从库里随机切换一张动态壁纸。
-    var autoChangeOnExternalConnect: Bool
 
     /// 判断是否为"播完即换"模式
     var isOnEndMode: Bool {
@@ -43,8 +41,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
             includeWallpapers: config.includeWallpapers,
             includeMedia: config.includeMedia,
             folderIDs: nil,
-            webSceneSwitchSeconds: nil,
-            autoChangeOnExternalConnect: false
+            webSceneSwitchSeconds: nil
         )
     }
 
@@ -57,7 +54,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         case includeMedia
         case folderIDs
         case webSceneSwitchSeconds
-        case autoChangeOnExternalConnect
     }
 
     init(
@@ -67,8 +63,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         includeWallpapers: Bool,
         includeMedia: Bool,
         folderIDs: [String]? = nil,
-        webSceneSwitchSeconds: Int? = nil,
-        autoChangeOnExternalConnect: Bool = false
+        webSceneSwitchSeconds: Int? = nil
     ) {
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
@@ -77,7 +72,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         self.includeMedia = includeMedia
         self.folderIDs = folderIDs
         self.webSceneSwitchSeconds = webSceneSwitchSeconds
-        self.autoChangeOnExternalConnect = autoChangeOnExternalConnect
     }
 
     init(from decoder: Decoder) throws {
@@ -87,7 +81,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         order = try container.decode(ScheduleOrder.self, forKey: .order)
         folderIDs = try container.decodeIfPresent([String].self, forKey: .folderIDs)
         webSceneSwitchSeconds = try container.decodeIfPresent(Int.self, forKey: .webSceneSwitchSeconds)
-        autoChangeOnExternalConnect = try container.decodeIfPresent(Bool.self, forKey: .autoChangeOnExternalConnect) ?? false
 
         if let includeWallpapers = try? container.decode(Bool.self, forKey: .includeWallpapers),
            let includeMedia = try? container.decode(Bool.self, forKey: .includeMedia) {
@@ -117,7 +110,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         try container.encode(includeMedia, forKey: .includeMedia)
         try container.encodeIfPresent(folderIDs, forKey: .folderIDs)
         try container.encodeIfPresent(webSceneSwitchSeconds, forKey: .webSceneSwitchSeconds)
-        try container.encode(autoChangeOnExternalConnect, forKey: .autoChangeOnExternalConnect)
     }
 }
 
