@@ -131,6 +131,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 当前是否由 wallpaper-wgpu 接管桌面壁纸
     @Published private(set) var isControllingExternalEngine = false
     @Published private(set) var isExternalPaused = false
+    /// 每次每屏渲染状态变化时递增，供依赖具体壁纸路径的 UI 刷新。
+    @Published private(set) var renderStateChangeCount: UInt64 = 0
 
     // MARK: - 进程管理
 
@@ -149,7 +151,11 @@ final class WallpaperEngineXBridge: ObservableObject {
         let userProperties: String?
     }
     private var activeRenderKind: RenderKind?
-    private var screenRenderStates: [String: ScreenRenderState] = [:]
+    private var screenRenderStates: [String: ScreenRenderState] = [:] {
+        didSet {
+            renderStateChangeCount &+= 1
+        }
+    }
     /// 每个进程的终止 watchdog（key = pid）
     private var screenWatchdogs: [pid_t: DispatchWorkItem] = [:]
     /// 非隔离存储所有活跃 PID，供 deinit 中安全清理

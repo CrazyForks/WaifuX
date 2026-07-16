@@ -407,7 +407,7 @@ struct MediaDetailSheet: View {
         .alert("Steam 登录已过期", isPresented: $showSessionExpiredAlert) {
             Button("确定", role: .cancel) {}
         } message: {
-            Text("Steam 会话已失效，凭据已自动清除。请前往设置页面重新登录后再试。")
+            Text("Steam 会话已失效，本地登录信息已清除。请前往设置页面重新登录后再试。")
         }
         .navigationBarBackButtonHidden(true)
         .task {
@@ -2395,7 +2395,7 @@ struct MediaDetailSheet: View {
                     showError = true
                 case .sessionExpired:
                     showSessionExpiredAlert = true
-                    AppLogger.error(.download, "Workshop 会话过期，已清除凭据", metadata:
+                    AppLogger.error(.download, "Workshop 会话过期，已清除本地登录信息", metadata:
                         ["id": itemID])
                 default:
                     presentWorkshopDownloadError(error.localizedDescription)
@@ -2471,7 +2471,14 @@ struct MediaDetailSheet: View {
     private func setAsDesktopWallpaper() {
         // Wallpaper Engine 类内容：Workshop 与本地入库（同一套路径解析）
         if let localURL = findLocalWorkshopFile(for: resolvedItem) {
-            viewModel.ensureMediaIsInLibrary(resolvedItem, localFileURL: localURL)
+            // 入库校验不得阻塞设壁纸热路径。
+            // sample 显示主线程会卡在 ensureDownloadRecord → hasSameLocalContent →
+            // canonicalWorkshopContentURL；旧壁纸若已停，桌面就会黑屏，RSS 同步顶高。
+            // 先把 apply 排进当前调用栈，再用 async 补入库，保证设壁纸先走。
+            let itemForLibrary = resolvedItem
+            DispatchQueue.main.async { [viewModel] in
+                viewModel.ensureMediaIsInLibrary(itemForLibrary, localFileURL: localURL)
+            }
             let contentRoot = sceneEngineContentRoot(for: localURL)
 
             // 检查并自动下载 Workshop 依赖项（预设壁纸的母壁纸）
