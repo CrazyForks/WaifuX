@@ -867,13 +867,13 @@ final class VideoOptimizationQueueService: ObservableObject {
                 await MainActor.run {
                     guard let self else { return }
                     switch loopResult {
-                    case .applied(let firstContentFrame, let matchFrame):
+                    case .applied(let firstContentFrame, let lastIncludedFrame):
                         VideoOptimizationRecordStore.shared.append(
                             .loopApplied,
                             for: videoURL,
                             metadata: [
                                 "firstContentFrame": String(firstContentFrame),
-                                "matchFrame": String(matchFrame),
+                                "lastIncludedFrame": String(lastIncludedFrame),
                             ]
                         )
                         NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)

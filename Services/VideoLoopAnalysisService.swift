@@ -10,7 +10,7 @@ import Foundation
 /// a natural-loop preflight, whole-file candidate scan, 20-frame refinement, and
 /// a `[start, end)` crop so the matching tail frame is excluded from the result.
 enum VideoLoopAnalysisOutcome: Sendable, Equatable {
-    case applied(firstContentFrame: Int, matchFrame: Int)
+    case applied(firstContentFrame: Int, lastIncludedFrame: Int)
     case notNeeded
     case noReliablePoint
 }
@@ -54,7 +54,7 @@ enum VideoLoopAnalysisService {
             progress(1)
             return .applied(
                 firstContentFrame: result.firstContentFrame,
-                matchFrame: result.matchFrame
+                lastIncludedFrame: result.lastIncludedFrame
             )
         case .notNeeded:
             progress(1)
@@ -67,9 +67,7 @@ enum VideoLoopAnalysisService {
 
     private struct LoopAnalysisResult: Sendable {
         let firstContentFrame: Int
-        let matchFrame: Int
-        let startTime: CMTime
-        let endTime: CMTime
+        let lastIncludedFrame: Int
     }
 
     private enum LoopAnalysisDecision: Sendable {
@@ -87,7 +85,10 @@ enum VideoLoopAnalysisService {
     private struct RefinedLoopBoundary: Sendable {
         let candidateFrame: Int
         let start: TimedFrameSignature
-        let end: TimedFrameSignature
+        /// The first frame of the next loop. This frame is never exported.
+        let loopFrame: TimedFrameSignature
+        /// The final frame retained in the trimmed video.
+        let lastIncludedFrame: TimedFrameSignature
         let difference: FrameWindowDifference
     }
 
@@ -192,12 +193,14 @@ enum VideoLoopAnalysisService {
                     activeCandidates = remainingCandidates
 
                     let elapsedFromStart = max(0, CMTimeGetSeconds(CMTimeSubtract(presentationTime, startTime)))
-                    if elapsedFromStart >= minimumLoopDuration {
+                    if elapsedFromStart >= minimumLoopDuration,
+                       let previousFrame = signatureWindow.dropLast().last {
                         let difference = signature.difference(to: referenceFrames[0].signature)
                         if difference.isPotentialLoopMatch {
                             activeCandidates.append(PendingLoopCandidate(
                                 frame: frameIndex,
                                 time: presentationTime,
+                                previousFrame: previousFrame,
                                 firstDifference: difference
                             ))
                         }
@@ -275,7 +278,7 @@ enum VideoLoopAnalysisService {
             .filter { candidateFrames.contains($0.candidateFrame) }
             .min { lhs, rhs in
                 if lhs.difference.qualityScore == rhs.difference.qualityScore {
-                    return CMTimeCompare(lhs.end.time, rhs.end.time) > 0
+                    return CMTimeCompare(lhs.loopFrame.time, rhs.loopFrame.time) > 0
                 }
                 return lhs.difference.qualityScore < rhs.difference.qualityScore
             }
@@ -283,12 +286,15 @@ enum VideoLoopAnalysisService {
             RefinedLoopBoundary(
                 candidateFrame: $0.frame,
                 start: firstReferenceFrame,
-                end: TimedFrameSignature(frame: $0.frame, time: $0.time, signature: firstReferenceFrame.signature),
+                loopFrame: TimedFrameSignature(frame: $0.frame, time: $0.time, signature: firstReferenceFrame.signature),
+                lastIncludedFrame: $0.previousFrame,
                 difference: $0.difference
             )
         }),
-        selectedBoundary.end.frame > selectedBoundary.start.frame,
-        CMTimeCompare(selectedBoundary.end.time, selectedBoundary.start.time) > 0 else {
+        selectedBoundary.lastIncludedFrame.frame >= selectedBoundary.start.frame,
+        selectedBoundary.loopFrame.frame == selectedBoundary.lastIncludedFrame.frame + 1,
+        CMTimeCompare(selectedBoundary.loopFrame.time, selectedBoundary.lastIncludedFrame.time) > 0,
+        CMTimeCompare(selectedBoundary.loopFrame.time, selectedBoundary.start.time) > 0 else {
             return .noReliablePoint
         }
 
@@ -296,9 +302,12 @@ enum VideoLoopAnalysisService {
             try FileManager.default.removeItem(at: outputURL)
         }
 
+        // AVFoundation time ranges are upper-bound exclusive. Ending exactly at
+        // `loopFrame.time` keeps `lastIncludedFrame` and never writes the first
+        // matching frame of the next loop into the exported asset.
         let sourceRange = CMTimeRange(
             start: selectedBoundary.start.time,
-            duration: CMTimeSubtract(selectedBoundary.end.time, selectedBoundary.start.time)
+            duration: CMTimeSubtract(selectedBoundary.loopFrame.time, selectedBoundary.start.time)
         )
         let composition = AVMutableComposition()
         guard let compositionVideoTrack = composition.addMutableTrack(
@@ -347,9 +356,7 @@ enum VideoLoopAnalysisService {
         progress(0.98)
         return .trim(LoopAnalysisResult(
             firstContentFrame: selectedBoundary.start.frame,
-            matchFrame: selectedBoundary.end.frame,
-            startTime: selectedBoundary.start.time,
-            endTime: selectedBoundary.end.time
+            lastIncludedFrame: selectedBoundary.lastIncludedFrame.frame
         ))
     }
 
@@ -505,16 +512,17 @@ enum VideoLoopAnalysisService {
         var bestBoundary: RefinedLoopBoundary?
         var bestScore = Double.greatestFiniteMagnitude
         for startIndex in starts.indices {
-            for endIndex in candidateFrames.indices {
-                let availableFrames = min(starts.count - startIndex, candidateFrames.count - endIndex)
+            for loopIndex in candidateFrames.indices {
+                guard loopIndex > candidateFrames.startIndex else { continue }
+                let availableFrames = min(starts.count - startIndex, candidateFrames.count - loopIndex)
                 guard availableFrames >= validationFrameCount,
-                      CMTimeCompare(candidateFrames[endIndex].time, starts[startIndex].time) > 0 else {
+                      CMTimeCompare(candidateFrames[loopIndex].time, starts[startIndex].time) > 0 else {
                     continue
                 }
                 var difference = FrameWindowDifference()
                 for offset in 0..<validationFrameCount {
                     let referenceIndex = startIndex + offset
-                    let candidateIndex = endIndex + offset
+                    let candidateIndex = loopIndex + offset
                     if let gpuDifferences {
                         difference.append(FrameDifference(
                             gpuDifferences[referenceIndex * candidateFrames.count + candidateIndex]
@@ -526,13 +534,17 @@ enum VideoLoopAnalysisService {
                     }
                 }
                 guard difference.isVisuallyReliableLoopMatch else { continue }
-                let score = difference.qualityScore + Double(abs(startIndex - endIndex)) * 0.015
+                // The verified candidate only bounds the refinement window.
+                // Keep every pairing here so the closest two real frames choose
+                // both the output start and the first excluded loop frame.
+                let score = difference.qualityScore + Double(abs(startIndex - loopIndex)) * 0.015
                 if score < bestScore {
                     bestScore = score
                     bestBoundary = RefinedLoopBoundary(
                         candidateFrame: candidate.frame,
                         start: starts[startIndex],
-                        end: candidateFrames[endIndex],
+                        loopFrame: candidateFrames[loopIndex],
+                        lastIncludedFrame: candidateFrames[loopIndex - 1],
                         difference: difference
                     )
                 }
@@ -639,12 +651,19 @@ enum VideoLoopAnalysisService {
     private struct PendingLoopCandidate: Sendable {
         let frame: Int
         let time: CMTime
+        let previousFrame: TimedFrameSignature
         private(set) var comparedFrameCount = 1
         private(set) var difference: FrameWindowDifference
 
-        init(frame: Int, time: CMTime, firstDifference: FrameDifference) {
+        init(
+            frame: Int,
+            time: CMTime,
+            previousFrame: TimedFrameSignature,
+            firstDifference: FrameDifference
+        ) {
             self.frame = frame
             self.time = time
+            self.previousFrame = previousFrame
             difference = FrameWindowDifference(firstDifference)
         }
 
@@ -654,13 +673,19 @@ enum VideoLoopAnalysisService {
         }
 
         func completed() -> LoopCandidate {
-            LoopCandidate(frame: frame, time: time, difference: difference)
+            LoopCandidate(
+                frame: frame,
+                time: time,
+                previousFrame: previousFrame,
+                difference: difference
+            )
         }
     }
 
     private struct LoopCandidate: Sendable {
         let frame: Int
         let time: CMTime
+        let previousFrame: TimedFrameSignature
         let difference: FrameWindowDifference
     }
 
