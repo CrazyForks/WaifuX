@@ -1431,7 +1431,6 @@ struct MediaDetailSheet: View {
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
-                moreOptionsDivider
             }
 
             copySourceLinkButton
@@ -1450,7 +1449,6 @@ struct MediaDetailSheet: View {
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
-                moreOptionsDivider
             }
 
             // 重新烘焙（仅 Scene 类型已下载壁纸）
