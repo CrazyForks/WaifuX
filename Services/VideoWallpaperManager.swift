@@ -445,7 +445,12 @@ final class VideoWallpaperManager: ObservableObject {
     /// 队列只报告文件被原地替换；播放器在这里确认该路径仍属于当前屏幕后才刷新。
     @objc private func handleVideoOptimizationFileReplacement(_ notification: Notification) {
         guard let videoURL = notification.object as? URL else { return }
-        reloadPlaybackAfterInPlaceInterpolation(videoURL: videoURL)
+        let replacementKind = (notification.userInfo?[VideoOptimizationFileReplacementKind.userInfoKey] as? String)
+            .flatMap(VideoOptimizationFileReplacementKind.init(rawValue:))
+        reloadPlaybackAfterInPlaceReplacement(
+            videoURL: videoURL,
+            markAsInterpolated: replacementKind == .frameInterpolation
+        )
     }
 
     @MainActor
@@ -1324,9 +1329,15 @@ final class VideoWallpaperManager: ObservableObject {
         resetFrameInterpolation(for: screenID, player: player, item: item)
     }
 
-    private func replacePlayerWithInterpolatedVideoIfNeeded(screenID: String, sourceURL: URL, outputURL: URL) {
-        guard frameInterpolationEnabled,
-              frameInterpolatedPlaybackURLByScreen[screenID]?.standardizedFileURL != outputURL.standardizedFileURL,
+    private func replacePlayerWithInterpolatedVideoIfNeeded(
+        screenID: String,
+        sourceURL: URL,
+        outputURL: URL,
+        forceReload: Bool = false,
+        markAsInterpolated: Bool = true
+    ) {
+        guard (frameInterpolationEnabled || forceReload),
+              forceReload || frameInterpolatedPlaybackURLByScreen[screenID]?.standardizedFileURL != outputURL.standardizedFileURL,
               let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
               windows[screenID] != nil,
               videoURLByScreen[screenID]?.standardizedFileURL == sourceURL.standardizedFileURL,
@@ -1355,7 +1366,11 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         players[screenID] = components.player
-        frameInterpolatedPlaybackURLByScreen[screenID] = outputURL
+        if markAsInterpolated {
+            frameInterpolatedPlaybackURLByScreen[screenID] = outputURL
+        } else {
+            frameInterpolatedPlaybackURLByScreen.removeValue(forKey: screenID)
+        }
         containerView.playerLayer.player = components.player
         containerView.playerLayer.videoGravity = .resizeAspectFill
         applyCropToScreen(screen)
@@ -1375,7 +1390,7 @@ final class VideoWallpaperManager: ObservableObject {
             oldPlayer.removeAllItems()
             retainPlayersTemporarily([oldPlayer])
         }
-        frameInterpolationDebugPrint("播放器已刷新：补帧源视频=\(sourceURL.lastPathComponent)，播放文件=\(outputURL.lastPathComponent)")
+        frameInterpolationDebugPrint("播放器已刷新：优化源视频=\(sourceURL.lastPathComponent)，播放文件=\(outputURL.lastPathComponent)")
     }
 
     func restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: URL, targetFPSs: Set<Int>) {
@@ -1394,6 +1409,10 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     func reloadPlaybackAfterInPlaceInterpolation(videoURL: URL) {
+        reloadPlaybackAfterInPlaceReplacement(videoURL: videoURL, markAsInterpolated: true)
+    }
+
+    private func reloadPlaybackAfterInPlaceReplacement(videoURL: URL, markAsInterpolated: Bool) {
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
             let currentSourceURL = videoURLByScreen[screenID]
@@ -1402,7 +1421,13 @@ final class VideoWallpaperManager: ObservableObject {
             guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL else {
                 continue
             }
-            replacePlayerWithInterpolatedVideoIfNeeded(screenID: screenID, sourceURL: videoURL, outputURL: videoURL)
+            replacePlayerWithInterpolatedVideoIfNeeded(
+                screenID: screenID,
+                sourceURL: videoURL,
+                outputURL: videoURL,
+                forceReload: true,
+                markAsInterpolated: markAsInterpolated
+            )
         }
     }
 

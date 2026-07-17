@@ -13,6 +13,13 @@ extension Notification.Name {
     static let videoOptimizationFileDidReplace = Notification.Name("videoOptimizationFileDidReplace")
 }
 
+enum VideoOptimizationFileReplacementKind: String {
+    case loopPreprocessing
+    case frameInterpolation
+
+    static let userInfoKey = "videoOptimizationFileReplacementKind"
+}
+
 struct VideoFrameInterpolationDecision: Sendable {
     let sourceFPS: Double?
     let targetFPS: Int
@@ -470,18 +477,39 @@ final class VideoOptimizationQueueService: ObservableObject {
             return nil
         }
 
-        if let coveredIndex = items.firstIndex(where: {
-            $0.videoURL.standardizedFileURL == videoURL.standardizedFileURL
-                && $0.targetFPS >= targetFPS
-                && !$0.isTerminalForCleanup
+        let matchingIndexes = items.indices.filter {
+            items[$0].videoURL.standardizedFileURL == videoURL.standardizedFileURL
+                && items[$0].targetFPS >= targetFPS
+                && !items[$0].isTerminalForCleanup
+        }
+        if let waitingIndex = matchingIndexes.first(where: {
+            if case .waiting = items[$0].status { return true }
+            return false
         }) {
-            if case .waiting = items[coveredIndex].status {
-                items[coveredIndex].operations = normalizedOperations(
-                    items[coveredIndex].operations + requestedOperations
-                )
+            items[waitingIndex].operations = normalizedOperations(
+                items[waitingIndex].operations + requestedOperations
+            )
+            frameInterpolationDebugPrint("补帧队列：已合并等待任务。任务 FPS=\(items[waitingIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
+            return items[waitingIndex].id
+        }
+        if let activeIndex = matchingIndexes.first {
+            let missingOperations = requestedOperations.filter { !items[activeIndex].operations.contains($0) }
+            guard !missingOperations.isEmpty else {
+                frameInterpolationDebugPrint("补帧队列：已有运行任务覆盖请求，跳过重复添加。任务 FPS=\(items[activeIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
+                return items[activeIndex].id
             }
-            frameInterpolationDebugPrint("补帧队列：已有任务覆盖目标 FPS，跳过重复添加。任务 FPS=\(items[coveredIndex].targetFPS)，目标 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
-            return items[coveredIndex].id
+
+            let successor = makeQueueItem(
+                videoURL: videoURL,
+                title: title,
+                targetFPS: targetFPS,
+                source: source,
+                operations: requestedOperations
+            )
+            items.append(successor)
+            frameInterpolationDebugPrint("补帧队列：运行中的任务无法追加新操作，已创建后继任务。当前任务=\(items[activeIndex].id)，后继任务=\(successor.id)，视频=\(videoURL.lastPathComponent)")
+            clearProgressForWaitingItems()
+            return successor.id
         }
 
         let lowerWaitingIDs = items.compactMap { item -> UUID? in
@@ -499,14 +527,34 @@ final class VideoOptimizationQueueService: ObservableObject {
             frameInterpolationDebugPrint("补帧队列：目标 FPS 已提高，移除低目标等待任务。旧 FPS=\(removedItem.targetFPS)，新 FPS=\(targetFPS)，视频=\(videoURL.lastPathComponent)")
         }
 
-        let id = UUID()
-        let item = FrameInterpolationQueueItem(
-            id: id,
+        let item = makeQueueItem(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: targetFPS,
+            source: source,
+            operations: requestedOperations
+        )
+        items.append(item)
+        frameInterpolationDebugPrint("补帧队列：已添加任务。来源=\(source.rawValue)，目标 FPS=\(targetFPS)，视频=\(videoURL.path)")
+        clearProgressForWaitingItems()
+        scheduleNext()
+        return item.id
+    }
+
+    private func makeQueueItem(
+        videoURL: URL,
+        title: String?,
+        targetFPS: Int,
+        source: FrameInterpolationQueueItem.Source,
+        operations: [FrameInterpolationQueueItem.Operation]
+    ) -> FrameInterpolationQueueItem {
+        FrameInterpolationQueueItem(
+            id: UUID(),
             videoURL: videoURL,
             title: title?.isEmpty == false ? title! : videoURL.deletingPathExtension().lastPathComponent,
             targetFPS: targetFPS,
             source: source,
-            operations: requestedOperations,
+            operations: operations,
             completedOperations: [],
             currentOperation: nil,
             sourceFPS: nil,
@@ -521,11 +569,6 @@ final class VideoOptimizationQueueService: ObservableObject {
             outputURL: nil,
             addedAt: Date()
         )
-        items.append(item)
-        frameInterpolationDebugPrint("补帧队列：已添加任务。来源=\(source.rawValue)，目标 FPS=\(targetFPS)，视频=\(videoURL.path)")
-        clearProgressForWaitingItems()
-        scheduleNext()
-        return id
     }
 
     private func scheduleNext() {
@@ -584,9 +627,19 @@ final class VideoOptimizationQueueService: ObservableObject {
                 case .failed(let message):
                     await MainActor.run { self?.finishFailed(id: id, message: message) }
                     return
+                case .cancelled:
+                    await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
+                    return
                 case .processed:
                     await MainActor.run {
-                        NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: videoURL)
+                        NotificationCenter.default.post(
+                            name: .videoOptimizationFileDidReplace,
+                            object: videoURL,
+                            userInfo: [
+                                VideoOptimizationFileReplacementKind.userInfoKey:
+                                    VideoOptimizationFileReplacementKind.loopPreprocessing.rawValue
+                            ]
+                        )
                     }
                 case .alreadyProcessed:
                     break
@@ -838,7 +891,14 @@ final class VideoOptimizationQueueService: ObservableObject {
             markCompleted(videoURL: outputURL, title: title, targetFPS: targetFPS)
             frameInterpolationDebugPrint("补帧队列：任务完成，已原地替换源视频。路径=\(outputURL.path)")
             archive(completedItem, outcome: .completed, message: nil)
-            NotificationCenter.default.post(name: .videoOptimizationFileDidReplace, object: outputURL)
+            NotificationCenter.default.post(
+                name: .videoOptimizationFileDidReplace,
+                object: outputURL,
+                userInfo: [
+                    VideoOptimizationFileReplacementKind.userInfoKey:
+                        VideoOptimizationFileReplacementKind.frameInterpolation.rawValue
+                ]
+            )
         } else {
             items[index].status = .failed("optical-flow 导出失败")
             let failedItem = items.remove(at: index)
@@ -1623,12 +1683,30 @@ enum VideoFrameInterpolationExporter {
 enum VideoLoopPreprocessingResult: Sendable {
     case alreadyProcessed
     case processed
+    case cancelled
     case failed(String)
 }
 
-/// 负责视频壁纸的离线 crossfade 预处理。
-/// 只在用户**设置壁纸时**触发，不会在下载时自动处理，也不做批量扫描。
-/// 处理完成后直接替换原始文件，并在对应下载记录中标记 `isLooped = true`。
+private struct VideoLoopProcessingRecord: Codable {
+    let fingerprint: String
+    let processedAt: Date
+}
+
+private final class VideoLoopExportCancellation: @unchecked Sendable {
+    private let exportSession: AVAssetExportSession
+
+    init(_ exportSession: AVAssetExportSession) {
+        self.exportSession = exportSession
+    }
+
+    // AVAssetExportSession is not Sendable, but cancelling an active export is thread-safe.
+    func cancel() {
+        exportSession.cancelExport()
+    }
+}
+
+/// 负责视频的离线 crossfade 预处理。
+/// 处理完成后直接替换原始文件，记录文件指纹，并更新已有下载记录的 `isLooped` 标记。
 @MainActor
 final class VideoLoopPreprocessingService: ObservableObject {
     static let shared = VideoLoopPreprocessingService()
@@ -1637,6 +1715,10 @@ final class VideoLoopPreprocessingService: ObservableObject {
     @Published private(set) var currentProcessingFile: String?
 
     private let tempDirectory: URL
+    private var processingRecords: [String: VideoLoopProcessingRecord] = [:]
+    private var processingRecordsLoaded = false
+
+    private static let processingRecordsKey = "video_loop_processing_records_v1"
 
     private init() {
         tempDirectory = FileManager.default.temporaryDirectory
@@ -1646,9 +1728,15 @@ final class VideoLoopPreprocessingService: ObservableObject {
 
     // MARK: - Query
 
-    /// 通过下载记录判断指定路径的视频是否已做 loop 预处理
+    /// 通过本地处理记录或既有下载记录判断指定视频是否已做 loop 预处理。
     func isProcessed(_ fileURL: URL) -> Bool {
-        let path = fileURL.path
+        let standardizedURL = fileURL.standardizedFileURL
+        let path = standardizedURL.path
+        ensureProcessingRecordsLoaded()
+        if let record = processingRecords[path] {
+            guard let fingerprint = fileFingerprint(for: standardizedURL) else { return false }
+            return record.fingerprint == fingerprint
+        }
         if let record = WallpaperLibraryService.shared.downloadRecord(forLocalFilePath: path) {
             return record.isLooped == true
         }
@@ -1663,6 +1751,7 @@ final class VideoLoopPreprocessingService: ObservableObject {
     /// 异步预处理指定视频。如果已处理则不重复导出。
     /// 处理完成后替换原始文件，并更新对应下载记录的 `isLooped` 标记。
     func preprocessIfNeeded(_ originalURL: URL) async -> VideoLoopPreprocessingResult {
+        guard !Task.isCancelled else { return .cancelled }
         guard !isProcessed(originalURL) else { return .alreadyProcessed }
 
         isProcessing = true
@@ -1672,9 +1761,10 @@ final class VideoLoopPreprocessingService: ObservableObject {
             currentProcessingFile = nil
         }
 
+        let tempURL = tempDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
         do {
-            let tempURL = tempDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
             try await exportLoopedVideo(from: originalURL, to: tempURL)
+            try Task.checkCancellation()
 
             guard FileManager.default.fileExists(atPath: tempURL.path) else {
                 throw NSError(domain: "VideoLoop", code: 6, userInfo: [NSLocalizedDescriptionKey: "Exported file not found"])
@@ -1687,20 +1777,54 @@ final class VideoLoopPreprocessingService: ObservableObject {
             let path = originalURL.path
             WallpaperLibraryService.shared.markAsLooped(localFilePath: path)
             MediaLibraryService.shared.markAsLooped(localFilePath: path)
+            markProcessed(originalURL)
 
             print("[VideoLoopPreprocessing] Replaced original with looped version: \(originalURL.lastPathComponent)")
             return .processed
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: tempURL)
+            return .cancelled
         } catch {
             print("[VideoLoopPreprocessing] Failed for \(originalURL.lastPathComponent): \(error)")
-            let tempURL = tempDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
             try? FileManager.default.removeItem(at: tempURL)
             return .failed(error.localizedDescription)
         }
     }
 
+    private func ensureProcessingRecordsLoaded() {
+        guard !processingRecordsLoaded else { return }
+        defer { processingRecordsLoaded = true }
+        guard let data = UserDefaults.standard.data(forKey: Self.processingRecordsKey),
+              let records = try? JSONDecoder().decode([String: VideoLoopProcessingRecord].self, from: data) else {
+            return
+        }
+        processingRecords = records
+    }
+
+    private func markProcessed(_ videoURL: URL) {
+        guard let fingerprint = fileFingerprint(for: videoURL) else { return }
+        ensureProcessingRecordsLoaded()
+        processingRecords[videoURL.standardizedFileURL.path] = VideoLoopProcessingRecord(
+            fingerprint: fingerprint,
+            processedAt: Date()
+        )
+        guard let data = try? JSONEncoder().encode(processingRecords) else { return }
+        UserDefaults.standard.set(data, forKey: Self.processingRecordsKey)
+    }
+
+    private func fileFingerprint(for videoURL: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: videoURL.path) else {
+            return nil
+        }
+        let size = attributes[.size] as? UInt64 ?? 0
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(size)|\(modifiedAt)"
+    }
+
     // MARK: - Export
 
     private func exportLoopedVideo(from originalURL: URL, to outputURL: URL) async throws {
+        try Task.checkCancellation()
         let asset = AVURLAsset(url: originalURL)
         let duration = try await asset.load(.duration)
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
@@ -1714,7 +1838,9 @@ final class VideoLoopPreprocessingService: ObservableObject {
 
         // 视频太短不做 crossfade，直接复制原文件
         guard duration > CMTimeMultiply(fadeCMTime, multiplier: 2) else {
-            try? FileManager.default.copyItem(at: originalURL, to: outputURL)
+            try Task.checkCancellation()
+            try FileManager.default.copyItem(at: originalURL, to: outputURL)
+            try Task.checkCancellation()
             return
         }
 
@@ -1780,7 +1906,14 @@ final class VideoLoopPreprocessingService: ObservableObject {
         exportSession.outputFileType = .mp4
         exportSession.shouldOptimizeForNetworkUse = false
 
-        await exportSession.export()
+        let cancellation = VideoLoopExportCancellation(exportSession)
+        await withTaskCancellationHandler(operation: {
+            await exportSession.export()
+        }, onCancel: {
+            cancellation.cancel()
+        })
+
+        try Task.checkCancellation()
 
         if let error = exportSession.error {
             throw error
