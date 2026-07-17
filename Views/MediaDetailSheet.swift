@@ -15,9 +15,8 @@ struct MediaDetailSheet: View {
 
     @ObservedObject private var wallpaperManager = VideoWallpaperManager.shared
     @ObservedObject private var mediaLibrary = MediaLibraryService.shared
-    @ObservedObject private var loopService = VideoLoopPreprocessingService.shared
     @ObservedObject private var displaySelectorManager = DisplaySelectorManager.shared
-    @ObservedObject private var frameInterpolationQueue = FrameInterpolationQueueService.shared
+    @ObservedObject private var frameInterpolationQueue = VideoOptimizationQueueService.shared
     @State private var resolvedItem: MediaItem
     @State private var downloadActivity = DetailDownloadActivity()
     @State private var isSettingWallpaper = false
@@ -1307,18 +1306,6 @@ struct MediaDetailSheet: View {
             .buttonStyle(.plain)
             .disabled(isSettingWallpaper)
 
-            // 循环视频预处理提示（已临时关闭自动预处理，待后续增加手动开关后恢复）
-            // if loopService.isProcessing {
-            //     HStack(spacing: 6) {
-            //         CustomProgressView(tint: .white.opacity(0.7))
-            //             .scaleEffect(0.6)
-            //         Text(t("loopProcessing"))
-            //             .font(.system(size: 11))
-            //             .foregroundStyle(.white.opacity(0.6))
-            //     }
-            //     .padding(.top, 4)
-            // }
-
             HStack(spacing: 16) {
                 Button {
                     let newMuted = !isMuted
@@ -1791,7 +1778,7 @@ struct MediaDetailSheet: View {
         frameInterpolationNeedCheckKey = key
         frameInterpolationNeedsInterpolation = nil
         frameInterpolationNeedCheckTask = Task {
-            let needsInterpolation = await FrameInterpolationQueueService.shared.needsInterpolation(
+            let needsInterpolation = await VideoOptimizationQueueService.shared.needsInterpolation(
                 videoURL: videoURL,
                 targetFPS: targetFPS
             )
