@@ -70,13 +70,14 @@ enum VideoFrameInterpolationAnalyzer {
 
 struct FrameInterpolationQueueItem: Identifiable, Equatable {
     enum Operation: String, CaseIterable, Codable, Hashable {
-        case loopAnalysis
+        // Keep the previous raw value so existing optimization history remains decodable.
+        case loopTransition = "loopAnalysis"
         case frameInterpolation
 
         var label: String {
             switch self {
-            case .loopAnalysis: return "循环分析"
-            case .frameInterpolation: return "补帧"
+            case .loopTransition: return t("videoOptimizationGenerateLoopTransition")
+            case .frameInterpolation: return t("videoOptimizationInterpolateVideo")
             }
         }
     }
@@ -237,9 +238,9 @@ final class VideoOptimizationQueueService: ObservableObject {
         UserDefaults.standard.set(false, forKey: Self.legacyAutoEnqueueKey)
     }
 
-    /// 将单个视频加入循环分析任务。若同一文件已有待处理任务，返回原任务 id。
+    /// 将单个视频加入循环过渡生成任务。若同一文件已有待处理任务，返回原任务 id。
     @discardableResult
-    func enqueueLoopAnalysis(
+    func enqueueLoopTransition(
         videoURL: URL,
         title: String? = nil,
         source: FrameInterpolationQueueItem.Source = .manual
@@ -249,13 +250,13 @@ final class VideoOptimizationQueueService: ObservableObject {
             title: title,
             targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             source: source,
-            operations: [.loopAnalysis]
+            operations: [.loopTransition]
         )
     }
 
-    /// 将同一个文件按“循环分析 -> 补帧”的顺序加入统一队列。
+    /// 将同一个文件按“生成循环过渡 -> 补帧”的顺序加入统一队列。
     @discardableResult
-    func enqueueLoopAnalysisThenInterpolation(
+    func enqueueLoopTransitionThenInterpolation(
         videoURL: URL,
         title: String? = nil,
         targetFPS: Int? = nil,
@@ -266,7 +267,7 @@ final class VideoOptimizationQueueService: ObservableObject {
             title: title,
             targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             source: source,
-            operations: [.loopAnalysis, .frameInterpolation]
+            operations: [.loopTransition, .frameInterpolation]
         )
     }
 
@@ -311,6 +312,72 @@ final class VideoOptimizationQueueService: ObservableObject {
             return (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
         }
         return enqueue(videoURLs: urls, operation: operation, targetFPS: targetFPS, source: source)
+    }
+
+    /// 从“我的库”的逻辑文件夹解析本地视频并批量入队；视图只传递文件夹与操作，不枚举或替换文件。
+    @discardableResult
+    func enqueueLibraryFolder(
+        _ folder: LibraryFolder,
+        operations: [FrameInterpolationQueueItem.Operation],
+        targetFPS: Int? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> [UUID] {
+        let effectiveTargetFPS = targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+        return libraryOptimizationTargets(in: folder).compactMap { target in
+            enqueue(
+                videoURL: target.videoURL,
+                title: target.title,
+                targetFPS: effectiveTargetFPS,
+                source: source,
+                operations: operations
+            )
+        }
+    }
+
+    /// 统一判断库条目是否能作为视频优化输入，避免各个视图各自猜测文件类型。
+    /// Web Wallpaper Engine 工程由 Web renderer 接管，不能替换其内部媒体资源。
+    func optimizableVideoURL(from localURL: URL?) -> URL? {
+        guard let localURL, localURL.isFileURL else {
+            return nil
+        }
+        guard !isWebWallpaperEngineAsset(at: localURL) else {
+            return nil
+        }
+        guard let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) else {
+            return nil
+        }
+        return videoURL
+    }
+
+    /// `localURL` 通常是工程根目录，但旧下载记录可能直接指向工程内的视频资源。
+    /// 向上检查有限层级，确保 Web 工程不会通过该兼容路径进入原地替换流程。
+    private func isWebWallpaperEngineAsset(at url: URL) -> Bool {
+        if MediaItem.localWorkshopProjectType(from: url) == "web" {
+            return true
+        }
+
+        let fileManager = FileManager.default
+        var candidate = url
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+           !isDirectory.boolValue {
+            candidate = candidate.deletingLastPathComponent()
+        }
+
+        for _ in 0..<8 {
+            let projectURL = candidate.appendingPathComponent("project.json")
+            if let data = try? Data(contentsOf: projectURL),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let type = json["type"] as? String,
+               type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "web" {
+                return true
+            }
+
+            let parent = candidate.deletingLastPathComponent()
+            guard parent.path != candidate.path else { break }
+            candidate = parent
+        }
+        return false
     }
 
     /// 下载完成后按设置决定是否入队补帧。调度/设壁纸路径不得调用。
@@ -604,10 +671,10 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].opticalFlowFrames = 0
         items[index].elapsedSeconds = 0
         items[index].remainingSeconds = nil
-        let operations = items[index].operations
-        items[index].currentOperation = operations.first
-        items[index].currentStage = operations.first == .loopAnalysis
-            ? "循环分析中"
+        let initialOperations = items[index].operations
+        items[index].currentOperation = initialOperations.first
+        items[index].currentStage = initialOperations.first == .loopTransition
+            ? t("videoOptimizationGeneratingLoopTransition")
             : t("frameInterpolationStageReadingFPS")
         let videoURL = items[index].videoURL
         let targetFPS = items[index].targetFPS
@@ -615,7 +682,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         frameInterpolationDebugPrint("补帧队列：开始任务。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
 
         let task = Task.detached(priority: .utility) { [weak self] in
-            if operations.contains(.loopAnalysis) {
+            if initialOperations.contains(.loopTransition) {
                 let loopResult = await VideoLoopPreprocessingService.shared.preprocessIfNeeded(videoURL)
 
                 guard !Task.isCancelled else {
@@ -646,12 +713,15 @@ final class VideoOptimizationQueueService: ObservableObject {
                 }
 
                 await MainActor.run {
-                    self?.markOperationCompleted(id: id, operation: .loopAnalysis)
+                    self?.markOperationCompleted(id: id, operation: .loopTransition)
                 }
             }
 
-            guard operations.contains(.frameInterpolation) else {
-                await MainActor.run { self?.finishCompleted(id: id, message: "循环分析完成") }
+            let shouldInterpolate = await MainActor.run {
+                self?.items.first(where: { $0.id == id })?.operations.contains(.frameInterpolation) ?? false
+            }
+            guard shouldInterpolate else {
+                await MainActor.run { self?.finishCompleted(id: id, message: "循环过渡生成完成") }
                 return
             }
 
@@ -912,7 +982,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].completedOperations.insert(operation)
         items[index].currentOperation = nil
-        items[index].progress = operation == .loopAnalysis ? 0.08 : items[index].progress
+        items[index].progress = operation == .loopTransition ? 0.08 : items[index].progress
     }
 
     private func finishCompleted(id: UUID, message: String?) {
@@ -945,6 +1015,46 @@ final class VideoOptimizationQueueService: ObservableObject {
 
     private func normalizedOperations(_ operations: [FrameInterpolationQueueItem.Operation]) -> [FrameInterpolationQueueItem.Operation] {
         FrameInterpolationQueueItem.Operation.allCases.filter { operations.contains($0) }
+    }
+
+    private struct LibraryOptimizationTarget {
+        let videoURL: URL
+        let title: String
+    }
+
+    private func libraryOptimizationTargets(in folder: LibraryFolder) -> [LibraryOptimizationTarget] {
+        switch (folder.contentType, folder.collection) {
+        case (.media, .downloads):
+            return MediaLibraryService.shared.downloadedItems(inFolder: folder.id).compactMap { record in
+                makeLibraryOptimizationTarget(localURL: record.localFileURL, title: record.item.title)
+            }
+        case (.media, .favorites):
+            return MediaLibraryService.shared.favoriteItems(inFolder: folder.id).compactMap { item in
+                makeLibraryOptimizationTarget(
+                    localURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item),
+                    title: item.title
+                )
+            }
+        case (.wallpaper, .downloads):
+            return WallpaperLibraryService.shared.downloadedWallpapers(inFolder: folder.id).compactMap { record in
+                makeLibraryOptimizationTarget(
+                    localURL: record.localFileURL,
+                    title: record.wallpaper.title ?? record.localFileURL.deletingPathExtension().lastPathComponent
+                )
+            }
+        case (.wallpaper, .favorites):
+            return WallpaperLibraryService.shared.favoriteWallpapers(inFolder: folder.id).compactMap { wallpaper in
+                makeLibraryOptimizationTarget(
+                    localURL: WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper),
+                    title: wallpaper.title ?? wallpaper.id
+                )
+            }
+        }
+    }
+
+    private func makeLibraryOptimizationTarget(localURL: URL?, title: String) -> LibraryOptimizationTarget? {
+        guard let videoURL = optimizableVideoURL(from: localURL) else { return nil }
+        return LibraryOptimizationTarget(videoURL: videoURL, title: title)
     }
 
     private func archive(

@@ -1521,6 +1521,45 @@ struct MediaDetailSheet: View {
                 .disabled(isTranscodingVideo)
             }
 
+            if let interpolationVideoURL = currentFrameInterpolationVideoURL {
+                let activeOptimization = frameInterpolationQueue.item(for: interpolationVideoURL)
+                if let activeOptimization,
+                   activeOptimization.operations.contains(.loopTransition) {
+                    Button {} label: {
+                        HStack {
+                            Image(systemName: "hourglass")
+                            Text(
+                                activeOptimization.currentOperation == .loopTransition
+                                    ? t("videoOptimizationGeneratingLoopTransition")
+                                    : activeOptimization.currentStage
+                            )
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(true)
+                } else {
+                    Button {
+                        showMoreOptionsPopover = false
+                        frameInterpolationQueue.enqueueLoopTransition(
+                            videoURL: interpolationVideoURL,
+                            title: resolvedItem.title
+                        )
+                    } label: {
+                        HStack {
+                            Image(systemName: "point.3.connected.trianglepath.dotted")
+                            Text(t("videoOptimizationGenerateLoopTransition"))
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
             if frameInterpolationSettingsEnabled,
                let interpolationVideoURL = currentFrameInterpolationVideoURL {
                 let targetFPS = currentFrameInterpolationTargetFPS
@@ -1596,11 +1635,10 @@ struct MediaDetailSheet: View {
                     } else {
                         Button {
                             showMoreOptionsPopover = false
-                            frameInterpolationQueue.enqueue(
+                            frameInterpolationQueue.enqueueLoopTransitionThenInterpolation(
                                 videoURL: interpolationVideoURL,
                                 title: resolvedItem.title,
-                                targetFPS: targetFPS,
-                                source: .manual
+                                targetFPS: targetFPS
                             )
                         } label: {
                             HStack {
@@ -1675,11 +1713,10 @@ struct MediaDetailSheet: View {
                 } else {
                     Button {
                         showMoreOptionsPopover = false
-                        frameInterpolationQueue.enqueue(
+                            frameInterpolationQueue.enqueueLoopTransitionThenInterpolation(
                             videoURL: interpolationVideoURL,
                             title: resolvedItem.title,
-                            targetFPS: targetFPS,
-                            source: .manual
+                            targetFPS: targetFPS
                         )
                     } label: {
                         HStack {
@@ -1733,11 +1770,12 @@ struct MediaDetailSheet: View {
 
     private var currentFrameInterpolationVideoURL: URL? {
         guard isAlreadyDownloaded else { return nil }
-        if let localURL = currentDownloadRecord?.localFileURL,
-           let videoURL = MediaItem.resolveLocalVideoFile(from: localURL) {
-            return videoURL
+        guard let localURL = currentDownloadRecord?.localFileURL else {
+            return findLocalWorkshopFile().flatMap {
+                frameInterpolationQueue.optimizableVideoURL(from: $0)
+            }
         }
-        return findLocalWorkshopFile()
+        return frameInterpolationQueue.optimizableVideoURL(from: localURL)
     }
 
     private var frameInterpolationSettingsEnabled: Bool {
