@@ -71,6 +71,7 @@ class SettingsViewModel: ObservableObject {
             }
             UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
             VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+            applyVideoOptimizationSettings()
         }
     }
     @Published var frameInterpolationTargetFPS: Double = 60 {
@@ -83,16 +84,35 @@ class SettingsViewModel: ObservableObject {
             }
             UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
             VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
+            applyVideoOptimizationSettings()
         }
     }
-    /// 下载完成时自动补帧（调度/设壁纸路径禁止触发补帧）。
+    /// 视频下载、烘焙或设为壁纸后，按公共策略自动补帧。
     @Published var frameInterpolationAutoEnqueue = false {
         didSet {
             guard !isBatchUpdating else { return }
             UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_on_download")
             // 旧 key 清理，防止被当成「切换时自动补帧」读回。
             UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
-            VideoOptimizationQueueService.shared.applySettings(autoOnDownload: frameInterpolationAutoEnqueue)
+            applyVideoOptimizationSettings()
+        }
+    }
+    @Published var loopPointAnalysisEnabled = true {
+        didSet {
+            guard !isBatchUpdating else { return }
+            if !loopPointAnalysisEnabled, autoAnalyzeLoopPoint {
+                autoAnalyzeLoopPoint = false
+            }
+            UserDefaults.standard.set(loopPointAnalysisEnabled, forKey: "loop_point_analysis_enabled")
+            applyVideoOptimizationSettings()
+        }
+    }
+    /// 新视频下载完成或成功设定后，优先进行循环点分析；若自动补帧也已开启，统一任务会在分析结束后再补帧。
+    @Published var autoAnalyzeLoopPoint = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(autoAnalyzeLoopPoint, forKey: "auto_analyze_loop_point")
+            applyVideoOptimizationSettings()
         }
     }
     @Published var showAllWorkshopContent = false { didSet { UserDefaults.standard.set(showAllWorkshopContent, forKey: "show_all_workshop_content") } }
@@ -264,6 +284,11 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
         let effectiveAutoOnDownload = frameInterpolationEnabled && frameInterpolationAutoEnqueue
         frameInterpolationAutoEnqueue = effectiveAutoOnDownload
+        let effectiveAutoAnalyzeLoopPoint = loopPointAnalysisEnabled && autoAnalyzeLoopPoint
+        autoAnalyzeLoopPoint = effectiveAutoAnalyzeLoopPoint
+        UserDefaults.standard.set(loopPointAnalysisEnabled, forKey: "loop_point_analysis_enabled")
+        UserDefaults.standard.set(autoAnalyzeLoopPoint, forKey: "auto_analyze_loop_point")
+        applyVideoOptimizationSettings()
         UserDefaults.standard.set(effectiveAutoOnDownload, forKey: "frame_interpolation_auto_on_download")
         UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
         UserDefaults.standard.set(sceneRealtimeRenderingEnabled, forKey: "scene_realtime_rendering_enabled")
@@ -379,6 +404,10 @@ class SettingsViewModel: ObservableObject {
             frameInterpolationAutoEnqueue = frameInterpolationEnabled
                 && (defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false)
             defaults.set(false, forKey: "frame_interpolation_auto_enqueue")
+            loopPointAnalysisEnabled = defaults.object(forKey: "loop_point_analysis_enabled") as? Bool ?? true
+            autoAnalyzeLoopPoint = loopPointAnalysisEnabled
+                && (defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false)
+            applyVideoOptimizationSettings()
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
             sceneRealtimeRenderingEnabled = defaults.bool(forKey: "scene_realtime_rendering_enabled")
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true
@@ -423,6 +452,18 @@ class SettingsViewModel: ObservableObject {
     }
 
     /// 同步自动暂停设置到 DynamicWallpaperAutoPauseManager
+    private func applyVideoOptimizationSettings() {
+        VideoOptimizationQueueService.shared.applySettings(
+            automaticPolicy: VideoOptimizationAutomaticPolicy(
+                loopAnalysisEnabled: loopPointAnalysisEnabled,
+                automaticallyAnalyzeLoopPoints: autoAnalyzeLoopPoint,
+                frameInterpolationEnabled: frameInterpolationEnabled,
+                automaticallyInterpolateFrames: frameInterpolationAutoEnqueue,
+                targetFPS: FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int(frameInterpolationTargetFPS.rounded()))
+            )
+        )
+    }
+
     func syncAutoPauseSettings() {
         DynamicWallpaperAutoPauseManager.shared.pauseWhenOtherAppForeground = pauseWhenOtherAppForeground
         DynamicWallpaperAutoPauseManager.shared.pauseWhenFullscreenCovers = pauseWhenFullscreenCovers

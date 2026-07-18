@@ -257,7 +257,8 @@ final class MediaLibraryService: ObservableObject {
 
         SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
 
-        // 视频文件下载完成后异步生成抽帧，供封面展示使用；
+        // 视频文件下载完成后异步生成**高清** poster（锁屏/桌面用，最大 3840×2160）；
+        // 列表 800×600 小图由 UI 侧按需 generateThumbnail，二者隔离。
         // 若开启「下载时自动补帧」，再入队离线补帧（不走调度/设壁纸路径）。
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
         let videoFileURL: URL? = if videoExts.contains(localFileURL.pathExtension.lowercased()) {
@@ -268,8 +269,13 @@ final class MediaLibraryService: ObservableObject {
         }
         if let videoFileURL {
             let title = item.title
+            let pageURL = item.pageURL
             Task { @MainActor in
                 _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL)
+                VideoOptimizationQueueService.shared.registerDownloadedSource(
+                    videoURL: videoFileURL,
+                    sourceURL: pageURL
+                )
                 VideoOptimizationQueueService.shared.enqueueAfterDownloadIfNeeded(
                     videoURL: videoFileURL,
                     title: title
@@ -495,6 +501,11 @@ final class MediaLibraryService: ObservableObject {
             sourceName = "Local"
         }
 
+        // 磁盘恢复的视频：异步补高清 poster，避免调度/设壁纸时只有列表小图
+        Task { @MainActor in
+            _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: fileURL)
+        }
+
         return MediaItem(
             slug: slug,
             title: fileName.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " "),
@@ -504,7 +515,7 @@ final class MediaLibraryService: ObservableObject {
             collectionTitle: sourceName,
             summary: nil,
             previewVideoURL: fileURL,
-            posterURL: nil,
+            posterURL: VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: fileURL),
             tags: ["local", fileURL.pathExtension.lowercased()],
             exactResolution: nil,
             durationSeconds: nil,

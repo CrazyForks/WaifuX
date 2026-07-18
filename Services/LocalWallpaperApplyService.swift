@@ -25,12 +25,20 @@ enum LocalWallpaperApplyService {
         /// 播完即换且未开 web/scene 定时：跳过无播放完成事件的类型
         var requirePlaybackEndSupport: Bool = false
         var muted: Bool = true
-        /// 视频 poster：已有缓存优先；手动可传入站点/工程预览图作 fallback
+        /// 视频高清 poster 的非视频 fallback（站点/工程预览图）。
+        /// 注意：这里只接受可直接当桌面/锁屏底图的图，不能塞列表 800×600 小图。
         var fallbackPosterURL: URL? = nil
-        /// true 时若无缓存 poster，允许从视频抽一帧（仅手动；调度保持 false）
+        /// true 时若无**高清** poster 缓存，允许从视频抽高清帧（最大 3840×2160）。
+        /// 手动设壁纸应 true；调度器默认 false（避免切换卡顿，依赖下载时预生成的 poster）。
+        /// **绝不**回退到 `generateThumbnail` 列表小图。
         var generatePosterFromVideoIfNeeded: Bool = false
         var sceneBakeItemID: String? = nil
         var bakedVideoPath: String? = nil
+        /// Prevents re-entry after the global coordinator has acquired its
+        /// serialized transaction slot.
+        var isGlobalTransaction: Bool = false
+        /// When true, all target screens share one AVQueuePlayer (global sync).
+        var usesSharedVideoDecoder: Bool = false
         var reason: String = "apply"
     }
 
@@ -56,6 +64,16 @@ enum LocalWallpaperApplyService {
         }
         guard !screens.isEmpty else { return false }
 
+        DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(for: screens)
+
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled,
+           !options.isGlobalTransaction {
+            return try await GlobalWallpaperSyncCoordinator.shared.apply(
+                localURL: localURL,
+                options: options
+            )
+        }
+
         let ext = localURL.pathExtension.lowercased()
         var isDirectory: ObjCBool = false
         FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory)
@@ -66,6 +84,7 @@ enum LocalWallpaperApplyService {
         // 1) 直接视频文件
         if !isDirectory.boolValue, videoExts.contains(ext) {
             try await applyVideo(localURL, to: screens, options: options)
+            VideoOptimizationAutomationService.considerAppliedVideo(localURL)
             return true
         }
 
@@ -166,38 +185,151 @@ enum LocalWallpaperApplyService {
         try await apply(localURL: localURL, targetScreens: [screen], options: options)
     }
 
+    // MARK: - Display ownership
+
+    static func isWallpaperEnabled(for screen: NSScreen, globally: Bool) -> Bool {
+        let scheduler = WallpaperSchedulerService.shared
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            return scheduler.globalDisplayConfig.isWallpaperEnabled
+        }
+        return scheduler.resolvedDisplayConfig(for: screen).isWallpaperEnabled
+    }
+
+    /// 开关显示器的 WaifuX 壁纸接管。自动更换配置仍由调度器单独保存。
+    static func setWallpaperEnabled(
+        _ enabled: Bool,
+        targetScreens: [NSScreen],
+        globally: Bool
+    ) {
+        let screens = targetScreens.isEmpty ? NSScreen.screens : targetScreens
+        guard !screens.isEmpty else { return }
+
+        let scheduler = WallpaperSchedulerService.shared
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            scheduler.updateGlobalDisplayWallpaperEnabled(enabled)
+        } else {
+            for screen in screens {
+                scheduler.updateDisplayWallpaperEnabled(enabled, for: screen.wallpaperScreenIdentifier)
+            }
+        }
+
+        guard !enabled else {
+            if globally || scheduler.isGlobalDisplaySyncEnabled {
+                scheduler.triggerNextGlobalWallpaperNow()
+            } else {
+                for screen in screens {
+                    scheduler.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)
+                }
+            }
+            return
+        }
+
+        if globally || scheduler.isGlobalDisplaySyncEnabled {
+            WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+            StaticImageWallpaperOverlayManager.shared.clearState()
+        } else {
+            for screen in screens {
+                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: screen)
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screen)
+                StaticImageWallpaperOverlayManager.shared.clearState(for: screen)
+            }
+        }
+
+        for screen in screens {
+            DesktopWallpaperSyncManager.shared.restoreOriginalSystemWallpaper(for: screen)
+        }
+    }
+
     // MARK: - Primitives
 
     private static func applyVideo(_ videoURL: URL, to screens: [NSScreen], options: Options) async throws {
-        var posterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
+        // 桌面/锁屏静态底图只认高清 poster（scene_bake_* / poster_wallpaper_*），
+        // existingWallpaperPosterURL 已与列表 generateThumbnail（800×600）隔离。
+        //
+        // 性能关键：只同步读取已有高清缓存；缺失时先起播视频，再后台抽帧补静帧，
+        // 避免 4K copyCGImage 阻塞「设为壁纸 / 调度切换」热路径（静态图很快、动态却很慢的主因）。
+        let cachedPosterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
             forLocalVideo: videoURL,
             sceneBakeItemID: options.sceneBakeItemID,
             fallbackPosterURL: options.fallbackPosterURL
         )
-        if posterURL == nil, options.generatePosterFromVideoIfNeeded {
-            if let itemID = options.sceneBakeItemID {
-                posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
-                    forLocalVideo: videoURL,
-                    itemID: itemID
-                )
-            }
-            if posterURL == nil {
-                posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
-            }
-            posterURL = posterURL ?? options.fallbackPosterURL
+        let needsBackgroundPoster = (cachedPosterURL == nil && options.generatePosterFromVideoIfNeeded)
+        // 没有缓存时先用调用方 fallback（站点/工程预览，不能是列表小图）；仍无则 nil，视频先起播
+        let immediatePosterURL = cachedPosterURL ?? options.fallbackPosterURL
+
+        // Full current-screen-set applies use the nil-target path so window rebuild
+        // and URL maps stay atomic across displays. Subsets still loop per screen.
+        let coversAllScreens = !screens.isEmpty
+            && screens.count == NSScreen.screens.count
+            && Set(screens.map(\.wallpaperScreenIdentifier))
+                == Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+        let useShared = options.usesSharedVideoDecoder
+            || ((options.isGlobalTransaction || WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled)
+                && screens.count > 1)
+        if useShared {
+            try VideoWallpaperManager.shared.applyVideoWallpaper(
+                from: videoURL,
+                posterURL: immediatePosterURL,
+                muted: options.muted,
+                targetScreens: screens,
+                animatedTransition: options.animatedTransition,
+                usesSharedVideoDecoder: true
+            )
+        } else if coversAllScreens {
+            try VideoWallpaperManager.shared.applyVideoWallpaper(
+                from: videoURL,
+                posterURL: immediatePosterURL,
+                muted: options.muted,
+                targetScreen: nil,
+                animatedTransition: options.animatedTransition,
+                usesSharedVideoDecoder: false
+            )
+        } else {
+            try VideoWallpaperManager.shared.applyVideoWallpaper(
+                from: videoURL,
+                posterURL: immediatePosterURL,
+                muted: options.muted,
+                targetScreens: screens,
+                animatedTransition: options.animatedTransition,
+                usesSharedVideoDecoder: false
+            )
         }
 
-        try VideoWallpaperManager.shared.applyVideoWallpaper(
-            from: videoURL,
-            posterURL: posterURL,
-            muted: options.muted,
-            targetScreens: screens,
-            animatedTransition: options.animatedTransition
-        )
         // 仅系统壁纸同步开启时注册桌面 poster；动态层（视频窗）不受影响
-        if let posterURL, VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
+        if let immediatePosterURL, VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled {
             for screen in screens {
-                DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(immediatePosterURL, for: screen)
+            }
+        }
+
+        // 后台补高清静帧：生成后回写各屏 poster，并更新系统桌面/锁屏静态底图
+        if needsBackgroundPoster {
+            let sceneBakeItemID = options.sceneBakeItemID
+            let targetScreenIDs = Set(screens.map(\.wallpaperScreenIdentifier))
+            let targetFingerprints = Set(screens.map(\.wallpaperScreenFingerprint))
+            let expectedVideoURL = videoURL.standardizedFileURL
+            Task(priority: .utility) { @MainActor in
+                var posterURL: URL?
+                if let itemID = sceneBakeItemID {
+                    posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                        forLocalVideo: videoURL,
+                        itemID: itemID
+                    )
+                }
+                if posterURL == nil {
+                    posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL)
+                }
+                guard let posterURL else { return }
+
+                let vm = VideoWallpaperManager.shared
+                for screen in NSScreen.screens {
+                    let id = screen.wallpaperScreenIdentifier
+                    let fp = screen.wallpaperScreenFingerprint
+                    guard targetScreenIDs.contains(id) || targetFingerprints.contains(fp) else { continue }
+                    // 用户已切到别的视频时不要回写旧 poster
+                    vm.updatePosterURL(posterURL, for: screen, expectedVideoURL: expectedVideoURL)
+                }
             }
         }
     }
@@ -206,11 +338,21 @@ enum LocalWallpaperApplyService {
         let vm = WallpaperViewModel()
         if screens.count == 1, let only = screens.first {
             try await vm.setWallpaper(from: imageURL, option: .desktop, for: only)
-        } else {
-            // 多屏：逐屏设置（与详情页静态图逻辑一致，含同步开关 / 动态锁屏）
+            return
+        }
+
+        // Multi-display: apply sequentially but fail the whole transaction if
+        // any screen fails so GlobalWallpaperSyncCoordinator can roll back.
+        var appliedScreens: [NSScreen] = []
+        do {
             for screen in screens {
                 try await vm.setWallpaper(from: imageURL, option: .desktop, for: screen)
+                appliedScreens.append(screen)
             }
+        } catch {
+            throw ApplyError.failed(
+                "静态壁纸多屏应用在 \(appliedScreens.count)/\(screens.count) 屏后失败：\(error.localizedDescription)"
+            )
         }
     }
 

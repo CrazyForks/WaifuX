@@ -64,6 +64,19 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         ])
         previousExternalFingerprints = currentFingerprints
 
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            // Only rebroadcast when the external set grows. Pure disconnects /
+            // resolution-only churn must not restart every display wallpaper.
+            if !connectedFingerprints.isEmpty {
+                // Prefer rebinding the shared decoder layer when already in that mode.
+                if VideoWallpaperManager.shared.isVideoWallpaperActive {
+                    VideoWallpaperManager.shared.refreshSharedDecoderTargets()
+                }
+                GlobalWallpaperSyncCoordinator.shared.reapplyToConnectedDisplays()
+            }
+            return
+        }
+
         guard !connectedFingerprints.isEmpty else { return }
 
         for fingerprint in connectedFingerprints {
@@ -129,6 +142,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         alert.informativeText = String(format: t("externalDisplay.connected.message"), display.name)
         alert.addButton(withTitle: t("externalDisplay.useRandomWallpaper"))
         alert.addButton(withTitle: t("externalDisplay.chooseWallpaper"))
+        alert.addButton(withTitle: t("externalDisplay.openSchedulerSettings"))
         alert.addButton(withTitle: t("externalDisplay.doNotUseWallpaper"))
 
         let autoSwitchCheckbox = NSButton(checkboxWithTitle: t("externalDisplay.autoSwitchOnConnect"), target: nil, action: nil)
@@ -167,6 +181,8 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
             WallpaperSchedulerService.shared.triggerRandomWallpaperNow(for: display.screenID)
         case .alertSecondButtonReturn:
             openLibrary()
+        case .alertThirdButtonReturn:
+            openSchedulerSettings()
         default:
             break
         }
@@ -185,6 +201,16 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         }
     }
 
+    private func openSchedulerSettings() {
+        UserDefaults.standard.set(true, forKey: "settings.openSchedulerOnNextAppearance")
+        NotificationCenter.default.post(name: .openSchedulerSettings, object: nil)
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.showSettingsWindow(nil)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
     private static func currentExternalScreensByFingerprint() -> [String: NSScreen] {
         var result: [String: NSScreen] = [:]
         for screen in NSScreen.screens where !screen.isBuiltInDisplay {
@@ -192,4 +218,9 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         }
         return result
     }
+}
+
+
+extension Notification.Name {
+    static let openSchedulerSettings = Notification.Name("com.waifux.openSchedulerSettings")
 }

@@ -520,7 +520,9 @@ struct MediaExploreContentView: View {
     }
 
     private var headerTitle: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let activeSource = workshopSourceManager.activeSource
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text(greetingText)
                     .font(.system(size: 14, weight: .semibold))
@@ -535,7 +537,7 @@ struct MediaExploreContentView: View {
                             HStack(spacing: 8) {
                                 Text(source.displayName)
                                     .font(.system(size: 13, weight: .semibold))
-                                if source == workshopSourceManager.activeSource {
+                                if source == activeSource {
                                     Image(systemName: "checkmark")
                                         .font(.system(size: 11, weight: .bold))
                                 }
@@ -543,10 +545,12 @@ struct MediaExploreContentView: View {
                         }
                     }
                 } label: {
-                    Text(workshopSourceManager.activeSource.displayName)
+                    Text(activeSource.displayName)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(arcSettings.primaryText.opacity(isSourceMenuHovered ? 0.92 : 0.78))
                 }
+                // AppKit 会缓存 Menu 的原生项；源切换后强制用新状态重新构建菜单。
+                .id(activeSource)
                 .menuStyle(.borderlessButton)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)

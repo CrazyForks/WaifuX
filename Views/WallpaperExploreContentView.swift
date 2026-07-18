@@ -262,6 +262,7 @@ struct WallpaperExploreContentView: View {
     var isVisible: Bool = true
     @StateObject private var exploreAtmosphere = ExploreAtmosphereController(wallpaperMode: true)
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
+    @ObservedObject private var sourceManager = WallpaperSourceManager.shared
     // 注意：VideoWallpaperManager / WallpaperEngineXBridge 不在顶层观察。
     // 它们各有多个 @Published（isPaused/isMuted/volume 等），若顶层观察会导致
     // 视频壁纸暂停/恢复时整个壁纸探索页 body 重算（含瀑布流布局重计算）。
@@ -786,7 +787,9 @@ struct WallpaperExploreContentView: View {
     }
 
     private var headerTitle: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let activeSource = sourceManager.activeSource
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text(greetingText)
                     .font(.system(size: 14, weight: .semibold))
@@ -796,12 +799,12 @@ struct WallpaperExploreContentView: View {
                 Menu {
                     ForEach(WallpaperSourceManager.SourceType.allCases, id: \.self) { source in
                         Button {
-                            WallpaperSourceManager.shared.switchTo(source)
+                            sourceManager.switchTo(source)
                         } label: {
                             HStack(spacing: 8) {
                                 Text(source.displayName)
                                     .font(.system(size: 13, weight: .semibold))
-                                if source == WallpaperSourceManager.shared.activeSource {
+                                if source == activeSource {
                                     Image(systemName: "checkmark")
                                         .font(.system(size: 11, weight: .bold))
                                 }
@@ -809,10 +812,12 @@ struct WallpaperExploreContentView: View {
                         }
                     }
                 } label: {
-                    Text(WallpaperSourceManager.shared.activeSource.displayName)
+                    Text(activeSource.displayName)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(arcSettings.primaryText.opacity(isSourceMenuHovered ? 0.92 : 0.78))
                 }
+                // AppKit 会缓存 Menu 的原生项；源切换后强制用新状态重新构建菜单。
+                .id(activeSource)
                 .menuStyle(.borderlessButton)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)

@@ -410,6 +410,9 @@ struct ContentView: View {
                         handleDownloadToastRetry(snapshot)
                     }
                 )
+                BackgroundDownloadProgressToastHost(
+                    onExpand: { DownloadTaskService.shared.restoreAllRunningToasts() }
+                )
                 WallpaperSourceSwitchToast()
                     .padding(.horizontal, 24)
                     .padding(.bottom, 8)
@@ -990,6 +993,80 @@ private struct DownloadProgressToastHost: View {
                 displayedSnapshot = nil
             }
         }
+    }
+}
+
+// MARK: - Compact background download surface
+private struct BackgroundDownloadProgressToastHost: View {
+    @ObservedObject private var downloadService = DownloadTaskService.shared
+    let onExpand: () -> Void
+
+    private var backgroundTasks: [DownloadTask] {
+        downloadService.runningTasks.filter { downloadService.isToastSuppressed(for: $0.id) }
+    }
+
+    var body: some View {
+        Group {
+            if let task = downloadService.compactOverlayTask {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("download.backgroundProgress"), Int((task.progress * 100).rounded())),
+                    detail: remainingDetail(backgroundTasks.count - 1),
+                    progress: task.progress,
+                    onTap: onExpand
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+private struct BackgroundTaskProgressToast: View {
+    let title: String
+    let detail: String?
+    let progress: Double
+    var onTap: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .fixedSize(horizontal: true, vertical: false)
+
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.12))
+                    .frame(width: 92, height: 5)
+
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.78))
+                    .frame(width: 92 * min(1, max(0, progress)), height: 5)
+            }
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .monospacedDigit()
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .liquidGlassSurface(.prominent, tint: Color.white.opacity(0.06), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        .contentShape(Capsule(style: .continuous))
+        .onTapGesture { onTap?() }
+        .accessibilityAddTraits(onTap == nil ? [] : .isButton)
     }
 }
 

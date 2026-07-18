@@ -906,20 +906,21 @@ final class ImportService: ObservableObject {
             print("[ImportService] Failed to load video metadata: \(error)")
         }
 
-        // 生成并缓存第一帧缩略图
+        // 列表小图与锁屏/桌面高清 poster 分开生成，禁止把 800×600 列表图塞进 posterURL
         _ = await VideoThumbnailCache.shared.thumbnailImage(for: fileURL)
-        let thumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        let listThumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        let hdPosterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: fileURL)
 
         return MediaItem(
             slug: slug,
             title: title,
             pageURL: fileURL,
-            thumbnailURL: thumbnailURL,
+            thumbnailURL: listThumbnailURL,
             resolutionLabel: resolutionLabel,
             collectionTitle: t("imported"),
             summary: nil,
             previewVideoURL: fileURL,
-            posterURL: thumbnailURL,
+            posterURL: hdPosterURL ?? listThumbnailURL,
             tags: [],
             exactResolution: resolutionLabel,
             durationSeconds: durationSeconds,

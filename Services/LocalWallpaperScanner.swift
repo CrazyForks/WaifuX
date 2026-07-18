@@ -472,19 +472,20 @@ struct LocalMediaItem: Identifiable, Hashable {
     func toMediaItem() -> MediaItem {
         let resolutionLabel = resolution ?? "HD"
         
-        // 获取缩略图 URL（如果有缓存则使用缓存，否则使用视频 URL 让 Kingfisher 生成）
-        let thumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        // 列表缩略图（800×600）；锁屏/桌面请用 posterJPEG / existingWallpaperPoster，不得复用列表小图
+        let listThumbnailURL = VideoThumbnailCache.shared.thumbnailURL(for: fileURL)
+        let hdPosterURL = VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: fileURL)
         
         return MediaItem(
             slug: id,
             title: title,
             pageURL: fileURL,
-            thumbnailURL: thumbnailURL,
+            thumbnailURL: listThumbnailURL,
             resolutionLabel: resolutionLabel,
             collectionTitle: t("local.files"),
             summary: t("local.imported.video"),
             previewVideoURL: fileURL,
-            posterURL: thumbnailURL,
+            posterURL: hdPosterURL,
             tags: ["local", fileURL.pathExtension.lowercased()],
             exactResolution: resolution,
             durationSeconds: duration,

@@ -2451,8 +2451,14 @@ struct MediaDetailSheet: View {
         }
 
         let targetFPS = currentFrameInterpolationTargetFPS
-        frameInterpolationQueue.removeCompleted(videoURL: videoURL)
-        frameInterpolationQueue.markBlacklisted(videoURL: videoURL, title: downloadingItem.title, targetFPS: targetFPS)
+        // Clear in-memory/queue state now; blacklist the *restored* source after download.
+        frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
+        frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
+        frameInterpolationQueue.requestBlacklistAfterSourceRestore(
+            videoURL: videoURL,
+            title: downloadingItem.title,
+            operation: .frameInterpolation
+        )
 
         do {
             if FileManager.default.fileExists(atPath: videoURL.path) {
@@ -2465,7 +2471,9 @@ struct MediaDetailSheet: View {
                 try await viewModel.download(downloadingItem)
             }
 
-            VideoWallpaperManager.shared.restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: videoURL, targetFPSs: [targetFPS])
+            // registerDownloadedSource runs on download completion and clears old state;
+            // then enqueueAfterDownloadIfNeeded consumes the blacklist restore request.
+            VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
             sceneBakeStatusFlash = "已重新下载原文件"
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -2489,8 +2497,51 @@ struct MediaDetailSheet: View {
     }
 
     private func presentWorkshopDownloadError(_ message: String) {
-        errorMessage = "\(t("workshopDownloadTroubleshooting"))\n\n\(Self.truncateErrorMessage(message))"
+        errorMessage = Self.truncateErrorMessage(Self.workshopDownloadUserFacingMessage(message))
         showError = true
+    }
+
+    /// 根据 SteamCMD/业务错误文本生成用户可读提示，避免一律套“检查 VPN”的无效话术。
+    private static func workshopDownloadUserFacingMessage(_ message: String) -> String {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        // WorkshopService 已给出结构化诊断时，直接展示，不再叠加泛化提示
+        if trimmed.contains("SteamCMD 原始信息")
+            || trimmed.contains("建议按顺序排查")
+            || trimmed.contains("可依次排查") {
+            return trimmed
+        }
+
+        if trimmed.localizedCaseInsensitiveContains("Access Denied")
+            || trimmed.localizedCaseInsensitiveContains("Permission denied") {
+            return "\(t("workshopError.accessDenied"))\n\n\(trimmed)"
+        }
+        if trimmed.localizedCaseInsensitiveContains("No subscriptions")
+            || trimmed.contains("没有可用的 Workshop 订阅权限") {
+            return "\(t("workshopError.noSubscription"))\n\n\(trimmed)"
+        }
+        if trimmed.localizedCaseInsensitiveContains("RateLimitExceeded")
+            || trimmed.contains("请求过于频繁")
+            || trimmed.localizedCaseInsensitiveContains("rate limit") {
+            return "\(t("workshopError.rateLimited"))\n\n\(trimmed)"
+        }
+        if trimmed.contains("需要登录")
+            || trimmed.contains("登录已过期")
+            || trimmed.contains("账号或密码错误")
+            || trimmed.localizedCaseInsensitiveContains("credentials")
+            || trimmed.localizedCaseInsensitiveContains("session") {
+            return "\(t("workshopError.login"))\n\n\(trimmed)"
+        }
+
+        let networkKeywords = [
+            "Timeout", "timed out", "Connection", "Network", "No route",
+            "unreachable", "VPN", "TUN", "connect to Steam"
+        ]
+        if networkKeywords.contains(where: { trimmed.localizedCaseInsensitiveContains($0) }) {
+            return "\(t("workshopError.network"))\n\n\(trimmed)"
+        }
+
+        // 未知错误：给简短可操作方向，而不是只甩原始日志
+        return "\(t("workshopError.generic"))\n\n\(trimmed)"
     }
 
     private func setAsDesktopWallpaper() {
@@ -2730,6 +2781,8 @@ struct MediaDetailSheet: View {
                         generatePosterFromVideoIfNeeded: true,
                         sceneBakeItemID: currentDownloadRecord?.item.id,
                         bakedVideoPath: currentDownloadRecord?.sceneBakeArtifact?.videoPath,
+                        usesSharedVideoDecoder: WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+                            && NSScreen.screens.count > 1,
                         reason: "manual-apply"
                     )
                     if let art = currentDownloadRecord?.sceneBakeArtifact,

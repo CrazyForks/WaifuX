@@ -578,6 +578,19 @@ enum SceneOfflineBakeService {
             await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
                 SceneOfflineBakeProgressTracker.shared.finish(itemID: trackedItemID, success: true)
+                let bakedURL = URL(fileURLWithPath: result.videoPath)
+                let title = persistArtifactToItemID.flatMap {
+                    MediaLibraryService.shared.downloadRecord(for: $0)?.item.title
+                } ?? bakedURL.deletingPathExtension().lastPathComponent
+                VideoOptimizationQueueService.shared.registerBakedSource(
+                    videoURL: bakedURL,
+                    sourcePath: contentRoot.path,
+                    artifact: result
+                )
+                _ = VideoOptimizationQueueService.shared.enqueueAfterBakeIfNeeded(
+                    videoURL: bakedURL,
+                    title: title
+                )
                 NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: result)
             }
             return result
