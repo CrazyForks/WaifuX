@@ -13,8 +13,6 @@ private enum LegacyWallpaperSource: String, Codable {
 }
 
 struct DisplaySchedulerConfig: Codable, Equatable {
-    /// 该显示器是否由 WaifuX 接管壁纸。与自动更换开关相互独立。
-    var isWallpaperEnabled: Bool
     var isEnabled: Bool
     var intervalMinutes: Int
     var order: ScheduleOrder
@@ -39,7 +37,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
 
     static func fromLegacy(_ config: SchedulerConfig) -> DisplaySchedulerConfig {
         DisplaySchedulerConfig(
-            isWallpaperEnabled: true,
             isEnabled: config.isEnabled,
             intervalMinutes: config.intervalMinutes,
             order: config.order,
@@ -52,7 +49,7 @@ struct DisplaySchedulerConfig: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isWallpaperEnabled
+        // isWallpaperEnabled 已废弃：旧配置若含此字段，解码时忽略
         case isEnabled
         case intervalMinutes
         case order
@@ -65,7 +62,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
     }
 
     init(
-        isWallpaperEnabled: Bool = true,
         isEnabled: Bool,
         intervalMinutes: Int,
         order: ScheduleOrder,
@@ -75,7 +71,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
         webSceneSwitchSeconds: Int? = nil,
         autoChangeOnExternalConnect: Bool = false
     ) {
-        self.isWallpaperEnabled = isWallpaperEnabled
         self.isEnabled = isEnabled
         self.intervalMinutes = intervalMinutes
         self.order = order
@@ -88,8 +83,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        // 旧配置没有该字段时，保持既有显示器可继续使用壁纸。
-        isWallpaperEnabled = try container.decodeIfPresent(Bool.self, forKey: .isWallpaperEnabled) ?? true
         isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
         intervalMinutes = try container.decode(Int.self, forKey: .intervalMinutes)
         order = try container.decode(ScheduleOrder.self, forKey: .order)
@@ -118,7 +111,6 @@ struct DisplaySchedulerConfig: Codable, Equatable {
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(isWallpaperEnabled, forKey: .isWallpaperEnabled)
         try container.encode(isEnabled, forKey: .isEnabled)
         try container.encode(intervalMinutes, forKey: .intervalMinutes)
         try container.encode(order, forKey: .order)

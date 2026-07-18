@@ -988,23 +988,6 @@ private struct SchedulerSettingsTab: View {
                         dividerLine
 
                         HStack(spacing: 12) {
-                            Text(t("scheduler.wallpaperEnabled"))
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Color.white.opacity(0.9))
-
-                            Spacer()
-
-                            MacToggle(isOn: Binding(
-                                get: { globalConfig.isWallpaperEnabled },
-                                set: { viewModel.schedulerViewModel.updateGlobalDisplayWallpaperEnabled($0) }
-                            ))
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-
-                        dividerLine
-
-                        HStack(spacing: 12) {
                             Text(t("autoSwitchEnabled"))
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(Color.white.opacity(0.9))
@@ -1050,23 +1033,6 @@ private struct SchedulerSettingsTab: View {
                             .padding(.vertical, 12)
 
                             if displayConfig.isEnabled {
-                                dividerLine
-
-                                HStack(spacing: 12) {
-                                    Text(t("scheduler.wallpaperEnabled"))
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundStyle(Color.white.opacity(0.9))
-
-                                    Spacer()
-
-                                    MacToggle(isOn: Binding(
-                                        get: { displayConfig.isWallpaperEnabled },
-                                        set: { viewModel.schedulerViewModel.updateDisplayWallpaperEnabled($0, for: screen) }
-                                    ))
-                                }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 12)
-
                                 dividerLine
 
                                 if !screen.isBuiltInDisplay {

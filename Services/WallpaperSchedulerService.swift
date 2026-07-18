@@ -183,10 +183,6 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
         let displayConfig = config.resolvedDisplayConfig(for: screenID)
-        guard displayConfig.isWallpaperEnabled else {
-            print("\(logTag) Skip next wallpaper for \(screenID): wallpaper ownership disabled")
-            return
-        }
         switch requiredMode {
         case .onEnd:
             guard displayConfig.isEnabled && displayConfig.isOnEndMode else {
@@ -260,10 +256,6 @@ class WallpaperSchedulerService: ObservableObject {
         guard !screens.isEmpty else { return }
 
         let displayConfig = config.globalDisplayConfig
-        guard displayConfig.isWallpaperEnabled else {
-            print("\(logTag) Skip global rotation: wallpaper ownership disabled")
-            return
-        }
         if case .onEnd? = requiredMode,
            !(displayConfig.isEnabled && displayConfig.isOnEndMode) {
             return
@@ -669,13 +661,11 @@ class WallpaperSchedulerService: ObservableObject {
     /// 是否有至少一个显示器开启了自动更换
     private var hasAnyEnabledDisplay: Bool {
         if config.isGlobalDisplaySyncEnabled {
-            return config.globalDisplayConfig.isWallpaperEnabled
-                && config.globalDisplayConfig.isEnabled
+            return config.globalDisplayConfig.isEnabled
                 && !NSScreen.screens.isEmpty
         }
         return NSScreen.screens.contains { screen in
-            let displayConfig = config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
-            return displayConfig.isWallpaperEnabled && displayConfig.isEnabled
+            config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier).isEnabled
         }
     }
 
@@ -693,10 +683,6 @@ class WallpaperSchedulerService: ObservableObject {
 
     func updateGlobalDisplayEnabled(_ enabled: Bool) {
         updateGlobalDisplayConfig { $0.isEnabled = enabled }
-    }
-
-    func updateGlobalDisplayWallpaperEnabled(_ enabled: Bool) {
-        updateGlobalDisplayConfig { $0.isWallpaperEnabled = enabled }
     }
 
     func updateGlobalDisplayInterval(_ minutes: Int) {
@@ -758,14 +744,6 @@ class WallpaperSchedulerService: ObservableObject {
                 }
             }
         }
-    }
-
-    func updateDisplayWallpaperEnabled(_ enabled: Bool, for screenID: String) {
-        var newConfig = config
-        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
-        displayConfig.isWallpaperEnabled = enabled
-        newConfig.displayConfigs[screenID] = displayConfig
-        updateConfig(newConfig)
     }
 
     func updateDisplayInterval(_ minutes: Int, for screenID: String) {

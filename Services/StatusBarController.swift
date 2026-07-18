@@ -167,8 +167,6 @@ final class StatusBarController: NSObject {
     private lazy var openLibraryItem = NSMenuItem(title: t("statusbar.openMyLibrary"), action: #selector(openMyLibrary), keyEquivalent: "")
     private lazy var openSettingsItem = NSMenuItem(title: t("settings"), action: #selector(openAppSettingsPanel), keyEquivalent: "")
     private lazy var releaseMemoryItem = NSMenuItem(title: t("statusbar.releaseMemory"), action: #selector(releaseForegroundMemory), keyEquivalent: "")
-    private lazy var toggleWallpaperItem = NSMenuItem(title: t("statusbar.enableWallpaper"), action: #selector(toggleDynamicWallpaper), keyEquivalent: "")
-    private lazy var playPauseItem = NSMenuItem(title: t("statusbar.pauseWallpaper"), action: #selector(togglePlayback), keyEquivalent: "")
     private lazy var muteItem = NSMenuItem(title: t("statusbar.muteWallpaper"), action: #selector(toggleMute), keyEquivalent: "")
     private lazy var desktopIconsItem = NSMenuItem(title: t("statusbar.hideDesktopIcons"), action: #selector(toggleDesktopIcons), keyEquivalent: "")
     private lazy var designWallpaperItem = NSMenuItem(title: t("design.designWallpaper"), action: #selector(openWebWallpaperDesignPanel), keyEquivalent: "")
@@ -277,7 +275,6 @@ final class StatusBarController: NSObject {
         menu.addItem(desktopIconsItem)
         menu.addItem(designWallpaperItem)
         menu.addItem(sceneConfigItem)
-        // toggleWallpaperItem 和 playPauseItem 在 refreshMenuState 中动态构建
         menu.addItem(muteItem)
         menu.addItem(.separator())
         menu.addItem(checkUpdateItem)
@@ -588,10 +585,6 @@ final class StatusBarController: NSObject {
             let schedulerConfig = isGlobalDisplaySyncEnabled
                 ? WallpaperSchedulerService.shared.globalDisplayConfig
                 : WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
-            let wallpaperEnabled = LocalWallpaperApplyService.isWallpaperEnabled(
-                for: screen,
-                globally: isGlobalDisplaySyncEnabled
-            )
             let screenHasManagedWallpaper: Bool
             if isGlobalDisplaySyncEnabled {
                 screenHasManagedWallpaper = screenHasWallpaper
@@ -612,7 +605,6 @@ final class StatusBarController: NSObject {
                 keyEquivalent: "")
             autoSwitchItem.target = self
             autoSwitchItem.representedObject = screen
-            autoSwitchItem.isEnabled = wallpaperEnabled
             screenSubMenu.addItem(autoSwitchItem)
 
             // 切换下一张壁纸
@@ -622,22 +614,12 @@ final class StatusBarController: NSObject {
                 keyEquivalent: "")
             nextWallpaperItem.target = self
             nextWallpaperItem.representedObject = screen
-            nextWallpaperItem.isEnabled = wallpaperEnabled
-                && WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier)
+            nextWallpaperItem.isEnabled = WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier)
             screenSubMenu.addItem(nextWallpaperItem)
 
             screenSubMenu.addItem(.separator())
 
-            // 壁纸接管控制。关闭后恢复系统壁纸，并且不显示暂停项目。
-            let disableItem = NSMenuItem(
-                title: wallpaperEnabled ? t("statusbar.disableWallpaper") : t("statusbar.enableWallpaper"),
-                action: #selector(perScreenToggleDynamicWallpaper(_:)),
-                keyEquivalent: "")
-            disableItem.target = self
-            disableItem.representedObject = screen
-            screenSubMenu.addItem(disableItem)
-
-            if wallpaperEnabled && screenHasManagedWallpaper {
+            if screenHasManagedWallpaper {
                 let pauseItem = NSMenuItem(
                     title: isScreenPaused ? t("statusbar.resumeWallpaper") : t("statusbar.pauseWallpaper"),
                     action: #selector(perScreenTogglePlayback(_:)),
@@ -736,8 +718,6 @@ final class StatusBarController: NSObject {
         openLibraryItem.title = t("statusbar.openMyLibrary")
         openSettingsItem.title = t("settings")
         releaseMemoryItem.title = t("statusbar.releaseMemory")
-        toggleWallpaperItem.title = t("statusbar.enableWallpaper")
-        playPauseItem.title = t("statusbar.pauseWallpaper")
         desktopIconsItem.title = t("statusbar.hideDesktopIcons")
         muteItem.title = videoWallpaperManager.isMuted ? t("statusbar.unmuteWallpaper") : t("statusbar.muteWallpaper")
         designWallpaperItem.title = t("design.designWallpaper")
@@ -878,29 +858,6 @@ final class StatusBarController: NSObject {
         }
     }
 
-    @objc private func perScreenToggleDynamicWallpaper(_ sender: NSMenuItem) {
-        guard let screen = sender.representedObject as? NSScreen else {
-            toggleDynamicWallpaper()
-            return
-        }
-
-        let isGlobal = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
-        if isGlobal {
-            // 全局同步：用现有 enable/disable 链路统一开关全部显示器。
-            toggleDynamicWallpaper()
-            refreshMenuState()
-            return
-        }
-
-        let enabled = LocalWallpaperApplyService.isWallpaperEnabled(for: screen, globally: false)
-        LocalWallpaperApplyService.setWallpaperEnabled(
-            !enabled,
-            targetScreens: [screen],
-            globally: false
-        )
-        refreshMenuState()
-    }
-
     @objc private func togglePlayback() {
         // 如果当前由 Wallpaper Engine X 接管，走 URL Scheme
         if weBridge.isControllingExternalEngine {
@@ -944,55 +901,6 @@ final class StatusBarController: NSObject {
                 DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             } else {
                 videoWallpaperManager.pauseWallpaper()
-            }
-        }
-    }
-
-    @objc private func toggleDynamicWallpaper() {
-        if weBridge.isControllingExternalEngine {
-            // 关闭外部引擎壁纸，但保留恢复记录，便于再次点击开启
-            weBridge.disableWallpaperKeepingRestoreState()
-            return
-        }
-
-        // macOS 26+：扩展控制模式下停止视频壁纸，但仍需保留 WE 恢复链
-        if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
-            if videoWallpaperManager.isVideoWallpaperActive {
-                videoWallpaperManager.stopWallpaper()
-                return
-            }
-            // 视频壁纸未播放时，走正常恢复链（WE → 视频 → 静态 overlay）
-        }
-
-        if videoWallpaperManager.isVideoWallpaperActive {
-            // 关闭动态壁纸
-            videoWallpaperManager.stopWallpaper()
-        } else {
-            // 优先恢复实时渲染壁纸（WE 状态存在时跳过视频恢复，避免视频壁纸遗留状态抢占 WE 恢复机会）
-            if weBridge.hasPersistedRestoreState() {
-                Task { [weak self] in
-                    guard let self else { return }
-                    await self.weBridge.restoreIfNeeded()
-                    if !self.weBridge.isControllingExternalEngine {
-                        self.showWindowHandler?()
-                    }
-                }
-            } else {
-                videoWallpaperManager.restoreIfNeeded()
-                if !videoWallpaperManager.isVideoWallpaperActive {
-                    Task { [weak self] in
-                        guard let self else { return }
-                        await self.weBridge.restoreIfNeeded()
-                        if !self.weBridge.isControllingExternalEngine {
-                            self.showWindowHandler?()
-                        }
-                    }
-                }
-                // 动态壁纸均无可恢复状态时，尝试恢复静态图 overlay（sync 关闭场景）
-                if !videoWallpaperManager.isVideoWallpaperActive
-                    && !weBridge.hasPersistedRestoreState() {
-                    StaticImageWallpaperOverlayManager.shared.restoreIfNeeded()
-                }
             }
         }
     }

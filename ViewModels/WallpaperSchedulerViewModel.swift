@@ -112,14 +112,6 @@ class WallpaperSchedulerViewModel: ObservableObject {
         schedulerService.updateDisplayEnabled(enabled, for: screenID)
     }
 
-    func updateDisplayWallpaperEnabled(_ enabled: Bool, for screen: NSScreen) {
-        LocalWallpaperApplyService.setWallpaperEnabled(
-            enabled,
-            targetScreens: [screen],
-            globally: false
-        )
-    }
-
     func updateDisplayInterval(_ minutes: Int, for screenID: String) {
         schedulerService.updateDisplayInterval(minutes, for: screenID)
     }
@@ -168,14 +160,6 @@ class WallpaperSchedulerViewModel: ObservableObject {
 
     func updateGlobalDisplayEnabled(_ enabled: Bool) {
         schedulerService.updateGlobalDisplayEnabled(enabled)
-    }
-
-    func updateGlobalDisplayWallpaperEnabled(_ enabled: Bool) {
-        LocalWallpaperApplyService.setWallpaperEnabled(
-            enabled,
-            targetScreens: NSScreen.screens,
-            globally: true
-        )
     }
 
     func updateGlobalDisplayInterval(_ minutes: Int) {
