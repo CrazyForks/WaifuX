@@ -452,6 +452,23 @@ final class StatusBarController: NSObject {
         return item
     }
 
+    /// 全局同步模式下的统一音量滑块（写入全局音量，覆盖各屏独立音量）
+    private func buildGlobalVolumeMenuItem() -> NSMenuItem {
+        // 父菜单标题已是「全部显示器」，这里不再重复显示屏名
+        let controlView = ScreenVolumeControlView(screenName: "")
+        controlView.onVolumeChanged = { [weak self] volume in
+            guard let self = self else { return }
+            self.videoWallpaperManager.setVolume(volume)
+            if self.weBridge.isControllingExternalEngine {
+                self.weBridge.setVolume(volume)
+            }
+        }
+        let item = NSMenuItem()
+        item.view = controlView
+        controlView.setVolume(videoWallpaperManager.volume, isMuted: false)
+        return item
+    }
+
     private func refreshMenuState() {
         refreshLocalizedTitles()
 
@@ -499,11 +516,7 @@ final class StatusBarController: NSObject {
         }
         wallpaperControlItems.removeAll()
 
-        // 构建各屏幕独立的暂停/关闭/音量 + 可视区域调节，收进「显示器」父菜单。
-        let activeScreens = videoWallpaperManager.activeScreens
-
-        // macOS 26+：扩展控制模式下，activeScreens 为空但壁纸仍活跃
-        // 使用所有屏幕 + per-display prefs 来构建控件
+        // macOS 26+：扩展控制模式下，动态壁纸由扩展偏好控制。
         let isExtensionMode: Bool
         if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
             isExtensionMode = true
@@ -511,32 +524,32 @@ final class StatusBarController: NSObject {
             isExtensionMode = false
         }
 
-        let screensToShow: [NSScreen]
-        if isExtensionMode {
-            screensToShow = NSScreen.screens
-        } else if hasExternalWallpaper {
-            let nativeScreenIDs = Set(activeScreens.map(\.wallpaperScreenIdentifier))
-            screensToShow = NSScreen.screens.filter { screen in
-                nativeScreenIDs.contains(screen.wallpaperScreenIdentifier) || weBridge.isManaging(screen: screen)
-            }
+        let isGlobalDisplaySyncEnabled = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+        // 状态栏始终列出当前连接的所有显示器，不再以“当前是否播放动态壁纸”作为可见条件。
+        // 全局同步开启时合并为单一入口，避免同一份全局配置重复出现。
+        let displayScreens: [NSScreen]
+        if isGlobalDisplaySyncEnabled {
+            displayScreens = NSScreen.screens.first.map { [$0] } ?? []
         } else {
-            screensToShow = activeScreens
+            displayScreens = NSScreen.screens
         }
-
-        // 兜底：没有任何活跃屏时，至少展示主屏（保证「显示器」菜单始终可见，单屏也显示）。
-        let displayScreens = screensToShow.isEmpty
-            ? (NSScreen.screens.isEmpty ? [] : [NSScreen.screens[0]])
-            : screensToShow
 
         // 每屏一个顶层子菜单（多屏直接平铺，无外层「显示器」包裹）
         let hasWallpaperOnAnyScreen = hasWallpaper || hasNativeWallpaper || hasExternalWallpaper
 
         for screen in displayScreens {
-            let screenName = screen.localizedName
+            let screenName = isGlobalDisplaySyncEnabled
+                ? t("statusbar.globalDisplaySettings")
+                : screen.localizedName
 
             // 该屏是否有壁纸（决定控件是否启用）
             let screenHasWallpaper: Bool
-            if isExtensionMode {
+            if isGlobalDisplaySyncEnabled {
+                screenHasWallpaper = hasWallpaperOnAnyScreen
+                    || NSScreen.screens.contains {
+                        videoWallpaperManager.hasActiveWallpaper(on: $0) || weBridge.isManaging(screen: $0)
+                    }
+            } else if isExtensionMode {
                 screenHasWallpaper = hasWallpaperOnAnyScreen
             } else if weBridge.isManaging(screen: screen) {
                 screenHasWallpaper = true
@@ -545,11 +558,22 @@ final class StatusBarController: NSObject {
             }
 
             // 该屏壁纸是否为 web（web 暂不支持可视区域调节）
-            let isWebWallpaper = weBridge.isWebWallpaperOn(screen: screen)
+            let isWebWallpaper: Bool
+            if isGlobalDisplaySyncEnabled {
+                isWebWallpaper = NSScreen.screens.contains { weBridge.isWebWallpaperOn(screen: $0) }
+            } else {
+                isWebWallpaper = weBridge.isWebWallpaperOn(screen: screen)
+            }
 
             // 暂停状态
             let isScreenPaused: Bool
-            if isExtensionMode, #available(macOS 26.0, *),
+            if isGlobalDisplaySyncEnabled {
+                if weBridge.isControllingExternalEngine {
+                    isScreenPaused = weBridge.isExternalPaused
+                } else {
+                    isScreenPaused = videoWallpaperManager.isPaused
+                }
+            } else if isExtensionMode, #available(macOS 26.0, *),
                let displayID = Self.cgDisplayID(for: screen) {
                 isScreenPaused = LockScreenWallpaperService.shared.isDisplayPaused(displayID)
             } else if weBridge.isManaging(screen: screen) {
@@ -561,7 +585,6 @@ final class StatusBarController: NSObject {
             let screenMenuItem = NSMenuItem(title: screenName, action: nil, keyEquivalent: "")
             let screenSubMenu = NSMenu(title: screenName)
             screenMenuItem.submenu = screenSubMenu
-            let isGlobalDisplaySyncEnabled = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
             let schedulerConfig = isGlobalDisplaySyncEnabled
                 ? WallpaperSchedulerService.shared.globalDisplayConfig
                 : WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
@@ -569,9 +592,18 @@ final class StatusBarController: NSObject {
                 for: screen,
                 globally: isGlobalDisplaySyncEnabled
             )
-            let screenHasManagedWallpaper = screenHasWallpaper
-                || StaticImageWallpaperOverlayManager.shared.imageURL(for: screen) != nil
-                || DesktopWallpaperSyncManager.shared.imageURL(for: screen) != nil
+            let screenHasManagedWallpaper: Bool
+            if isGlobalDisplaySyncEnabled {
+                screenHasManagedWallpaper = screenHasWallpaper
+                    || NSScreen.screens.contains {
+                        StaticImageWallpaperOverlayManager.shared.imageURL(for: $0) != nil
+                            || DesktopWallpaperSyncManager.shared.imageURL(for: $0) != nil
+                    }
+            } else {
+                screenHasManagedWallpaper = screenHasWallpaper
+                    || StaticImageWallpaperOverlayManager.shared.imageURL(for: screen) != nil
+                    || DesktopWallpaperSyncManager.shared.imageURL(for: screen) != nil
+            }
 
             // 自动切换开关
             let autoSwitchItem = NSMenuItem(
@@ -618,7 +650,11 @@ final class StatusBarController: NSObject {
 
             // 音量（扩展模式跳过，与原逻辑一致）
             if !isExtensionMode {
-                screenSubMenu.addItem(buildVolumeMenuItem(for: screen))
+                if isGlobalDisplaySyncEnabled {
+                    screenSubMenu.addItem(buildGlobalVolumeMenuItem())
+                } else {
+                    screenSubMenu.addItem(buildVolumeMenuItem(for: screen))
+                }
             }
 
             screenSubMenu.addItem(.separator())
@@ -758,6 +794,12 @@ final class StatusBarController: NSObject {
 
     @objc private func togglePerScreenAutoSwitch(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else { return }
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            let isEnabled = WallpaperSchedulerService.shared.globalDisplayConfig.isEnabled
+            WallpaperSchedulerService.shared.updateGlobalDisplayEnabled(!isEnabled)
+            refreshMenuState()
+            return
+        }
         let screenID = screen.wallpaperScreenIdentifier
         let isEnabled = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screenID).isEnabled
         WallpaperSchedulerService.shared.updateDisplayEnabled(!isEnabled, for: screenID)
@@ -766,6 +808,16 @@ final class StatusBarController: NSObject {
 
     @objc private func nextWallpaperForScreen(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else { return }
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier)
+            print("[StatusBar] nextWallpaperForScreen global hasItems=\(hasItems)")
+            guard hasItems else {
+                print("[StatusBar] nextWallpaper ignored: no schedulable items in global mode")
+                return
+            }
+            WallpaperSchedulerService.shared.triggerNextGlobalWallpaperNow()
+            return
+        }
         let screenID = screen.wallpaperScreenIdentifier
         let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screenID)
         print("[StatusBar] nextWallpaperForScreen screen=\(screen.localizedName) id=\(screenID) hasItems=\(hasItems)")
@@ -779,6 +831,23 @@ final class StatusBarController: NSObject {
     @objc private func perScreenTogglePlayback(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else {
             togglePlayback()
+            return
+        }
+
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            if weBridge.isControllingExternalEngine {
+                if weBridge.isExternalPaused {
+                    weBridge.resumeWallpaper()
+                    DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+                } else {
+                    weBridge.pauseWallpaper()
+                }
+            } else if videoWallpaperManager.isPaused {
+                videoWallpaperManager.resumeWallpaper()
+                DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+            } else {
+                videoWallpaperManager.pauseWallpaper()
+            }
             return
         }
 
@@ -816,11 +885,18 @@ final class StatusBarController: NSObject {
         }
 
         let isGlobal = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
-        let enabled = LocalWallpaperApplyService.isWallpaperEnabled(for: screen, globally: isGlobal)
+        if isGlobal {
+            // 全局同步：用现有 enable/disable 链路统一开关全部显示器。
+            toggleDynamicWallpaper()
+            refreshMenuState()
+            return
+        }
+
+        let enabled = LocalWallpaperApplyService.isWallpaperEnabled(for: screen, globally: false)
         LocalWallpaperApplyService.setWallpaperEnabled(
             !enabled,
-            targetScreens: isGlobal ? NSScreen.screens : [screen],
-            globally: isGlobal
+            targetScreens: [screen],
+            globally: false
         )
         refreshMenuState()
     }

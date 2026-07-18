@@ -149,6 +149,41 @@ struct CustomWindowControls: View {
             )
         }
     }
+
+    /// 主窗口红绿灯（关闭=隐藏主窗口，黄=最小化，绿=全屏）
+    static func mainWindow() -> CustomWindowControls {
+        CustomWindowControls(
+            onClose: {
+                (NSApp.delegate as? AppDelegate)?.hideMainWindow()
+            },
+            onMinimize: {
+                NSApp.mainWindow?.miniaturize(nil)
+            },
+            onMaximize: {
+                NSApp.mainWindow?.toggleFullScreen(nil)
+            }
+        )
+    }
+}
+
+// MARK: - 详情页左上角：红绿灯 + 返回
+/// 与主顶栏对齐：leading 12、红绿灯 80×34，返回按钮紧随其后，避免盖住右侧工具与 hero 内容。
+struct DetailSheetTopLeadingControls<BackButton: View>: View {
+    let topBarTopInset: CGFloat
+    @ViewBuilder let backButton: () -> BackButton
+
+    private let controlHeight: CGFloat = 34
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            CustomWindowControls.mainWindow()
+                .frame(width: 80, height: controlHeight, alignment: .center)
+
+            backButton()
+        }
+        .padding(.top, topBarTopInset + 18)
+        .padding(.leading, 12)
+    }
 }
 
 struct WindowControlButton: View {

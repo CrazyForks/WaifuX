@@ -150,10 +150,10 @@ struct AnimeDetailSheet: View {
                         }
                 }
 
-                floatingBackButton
-                    .padding(.top, topBarTopInset + 18)
-                    .padding(.leading, 28)
-                    .zIndex(100)
+                DetailSheetTopLeadingControls(topBarTopInset: topBarTopInset) {
+                    floatingBackButton
+                }
+                .zIndex(100)
 
                 floatingInfoOverlay(
                     viewportWidth: viewW,
@@ -406,8 +406,9 @@ struct AnimeDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
+            // 预留给左上红绿灯 + 返回按钮行，避免标题区与顶栏控件垂直贴死
             Spacer()
-                .frame(height: max(topBarTopInset + 44, 68))
+                .frame(height: max(topBarTopInset + 56, 72))
 
             VStack(spacing: 18) {
                 if !isHeroContentHidden {
@@ -508,8 +509,9 @@ struct AnimeDetailSheet: View {
                     )
             }
         }
+        // 与左侧红绿灯/返回同一顶栏基线；右侧略多留白避免贴边
         .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 28)
+        .padding(.trailing, 20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }
