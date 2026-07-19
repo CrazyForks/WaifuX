@@ -198,6 +198,14 @@ final class DesktopWallpaperSyncManager {
         persistFingerprintState()
     }
 
+    func clearRegistration(screenID: String, fingerprint: String) {
+        lastSetImageURLByScreen.removeValue(forKey: screenID)
+        lastSetImageURLByFingerprint.removeValue(forKey: fingerprint)
+        lastOptionsByScreen.removeValue(forKey: screenID)
+        lastOptionsByFingerprint.removeValue(forKey: fingerprint)
+        persistFingerprintState()
+    }
+
     /// 应用变为活跃时的备用同步入口（处理 activeSpaceDidChangeNotification 丢失的情况）
     func syncOnAppActivation() {
         let screenCount = NSScreen.screens.count

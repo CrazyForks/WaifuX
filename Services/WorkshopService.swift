@@ -1515,6 +1515,24 @@ class WorkshopService: ObservableObject {
         return components.queryItems?.first(where: { $0.name.lowercased() == "id" })?.value
     }
 
+    /// 查询创意工坊条目的远端元数据（用于已下载项更新检测）
+    /// - Returns: `(updatedAt, fileSize)`；条目不存在或字段缺失时返回 nil
+    func fetchWorkshopRemoteUpdateInfo(workshopID: String) async throws -> (updatedAt: Date, fileSize: Int64?)? {
+        let details = try await fetchPublishedFileDetails(ids: [workshopID])
+        guard let detail = details.first,
+              let timeUpdated = detail.time_updated else {
+            return nil
+        }
+        let updatedAt = Date(timeIntervalSince1970: TimeInterval(timeUpdated))
+        let fileSize: Int64? = {
+            guard let sizeStr = detail.file_size, let size = Int64(sizeStr), size > 0 else {
+                return nil
+            }
+            return size
+        }()
+        return (updatedAt, fileSize)
+    }
+
     /// 通过 Workshop URL 获取单个项目详情并转换为 MediaItem
     func resolveWorkshopItemByURL(_ urlString: String) async throws -> MediaItem {
         guard let workshopID = Self.extractWorkshopID(from: urlString) else {

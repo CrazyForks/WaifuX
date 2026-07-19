@@ -150,10 +150,13 @@ struct AnimeDetailSheet: View {
                         }
                 }
 
-                DetailSheetTopLeadingControls(topBarTopInset: topBarTopInset) {
-                    floatingBackButton
-                }
-                .zIndex(100)
+                DetailSheetWindowControls()
+                    .zIndex(110)
+
+                floatingBackButton
+                    .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+                    .padding(.leading, DetailSheetTopBarLayout.actionRowLeading)
+                    .zIndex(100)
 
                 floatingInfoOverlay(
                     viewportWidth: viewW,
@@ -406,9 +409,9 @@ struct AnimeDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
-            // 预留给左上红绿灯 + 返回按钮行，避免标题区与顶栏控件垂直贴死
+            // 预留给标题栏红绿灯 + 下方返回/工具行，避免标题区与顶栏控件重叠
             Spacer()
-                .frame(height: max(topBarTopInset + 56, 72))
+                .frame(height: max(topBarTopInset, DetailSheetTopBarLayout.heroContentTop))
 
             VStack(spacing: 18) {
                 if !isHeroContentHidden {
@@ -509,9 +512,9 @@ struct AnimeDetailSheet: View {
                     )
             }
         }
-        // 与左侧红绿灯/返回同一顶栏基线；右侧略多留白避免贴边
-        .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 20)
+        // 与左侧返回按钮同一动作行基线（红绿灯单独在上方）
+        .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+        .padding(.trailing, DetailSheetTopBarLayout.actionRowTrailing)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }

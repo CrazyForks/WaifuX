@@ -306,6 +306,17 @@ final class StaticImageWallpaperOverlayManager {
         return true
     }
 
+    /// Removes persistence for one disconnected display without touching the
+    /// overlay windows or image registrations of other displays.
+    func discardPersistedImageState(screenID: String, fingerprint: String) {
+        imageByScreen.removeValue(forKey: screenID)
+        imageByScreenFingerprint.removeValue(forKey: fingerprint)
+        imageSizes.removeValue(forKey: screenID)
+        imageLetterboxContentCrops.removeValue(forKey: screenID)
+        imageLetterboxAnalysisTasks.removeValue(forKey: screenID)?.cancel()
+        persistState()
+    }
+
     // MARK: - 窗口创建
 
     private func createWindow(for screen: NSScreen, imageURL: URL) {

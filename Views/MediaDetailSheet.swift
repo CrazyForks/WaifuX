@@ -81,11 +81,17 @@ struct MediaDetailSheet: View {
     @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
     @State private var isDeletingBake = false
     @State private var isDeletingFrameInterpolation = false
+    @State private var isResettingVideoOptimization = false
     @State private var frameInterpolationNeedCheckKey: String?
     @State private var frameInterpolationNeedsInterpolation: Bool?
     @State private var frameInterpolationNeedCheckTask: Task<Void, Never>?
     @State private var isTranscodingVideo = false
     @State private var transcodeVideoProgress: Double = 0
+    /// Workshop 已下载项是否有远端更新
+    @State private var hasWorkshopUpdateAvailable: Bool = false
+    @State private var remoteWorkshopUpdatedAt: Date?
+    /// 当前下载流程是否为「更新重下」（用于 Steam Guard 重试）
+    @State private var isWorkshopUpdateFlow: Bool = false
 
     // 挤压动画配置
     private let squeezeThreshold: CGFloat = 80
@@ -128,6 +134,21 @@ struct MediaDetailSheet: View {
     /// 是否已下载（包括网络下载和本地文件）
     private var isAlreadyDownloaded: Bool {
         isLocalFile || viewModel.isDownloaded(resolvedItem)
+    }
+
+    /// 已下载 Workshop 项且检测到远端更新
+    private var canUpdateWorkshopDownload: Bool {
+        isAlreadyDownloaded
+            && !isLocalFile
+            && resolvedItem.id.hasPrefix("workshop_")
+            && hasWorkshopUpdateAvailable
+    }
+
+    private var downloadActionSystemName: String {
+        if canUpdateWorkshopDownload || isWorkshopUpdateFlow {
+            return "arrow.triangle.2.circlepath"
+        }
+        return isAlreadyDownloaded ? "checkmark" : "arrow.down"
     }
 
     private var currentDownloadRecord: MediaDownloadRecord? {
@@ -248,10 +269,13 @@ struct MediaDetailSheet: View {
                         }
                 }
 
-                DetailSheetTopLeadingControls(topBarTopInset: topBarTopInset) {
-                    floatingBackButton
-                }
-                .zIndex(100)
+                DetailSheetWindowControls()
+                    .zIndex(110)
+
+                floatingBackButton
+                    .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+                    .padding(.leading, DetailSheetTopBarLayout.actionRowLeading)
+                    .zIndex(100)
 
                 floatingInfoOverlay(
                     viewportWidth: viewW,
@@ -345,7 +369,11 @@ struct MediaDetailSheet: View {
             Button("取消", role: .cancel) {}
             Button("确认下载") {
                 WorkshopSourceManager.shared.updateGuardCode(pendingSteamGuardCode)
-                downloadWorkshop(guardCode: pendingSteamGuardCode)
+                if isWorkshopUpdateFlow {
+                    updateWorkshopDownload(guardCode: pendingSteamGuardCode)
+                } else {
+                    downloadWorkshop(guardCode: pendingSteamGuardCode)
+                }
             }
         } message: {
             Text("当前账号启用了 Steam Guard，请输入 Authenticator 应用中的验证码以继续下载。")
@@ -420,6 +448,10 @@ struct MediaDetailSheet: View {
         }
         .onChange(of: resolvedItem.id) { _, _ in
             restoreSceneBakeProgressIfNeeded()
+            hasWorkshopUpdateAvailable = false
+            remoteWorkshopUpdatedAt = nil
+            isWorkshopUpdateFlow = false
+            Task { await checkWorkshopUpdateIfNeeded() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeProgressDidUpdate)) { notification in
             guard let notifItemID = notification.object as? String,
@@ -561,9 +593,9 @@ struct MediaDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
-            // 预留给左上红绿灯 + 返回按钮行，避免标题区与顶栏控件垂直贴死
+            // 预留给标题栏红绿灯 + 下方返回/工具行，避免标题区与顶栏控件重叠
             Spacer()
-                .frame(height: max(topBarTopInset + 56, 72))
+                .frame(height: max(topBarTopInset, DetailSheetTopBarLayout.heroContentTop))
 
             VStack(spacing: 18) {
                 if !isHeroContentHidden {
@@ -693,9 +725,9 @@ struct MediaDetailSheet: View {
                     )
             }
         }
-        // 与左侧红绿灯/返回同一顶栏基线；右侧略多留白避免贴边
-        .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 20)
+        // 与左侧返回按钮同一动作行基线（红绿灯单独在上方）
+        .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+        .padding(.trailing, DetailSheetTopBarLayout.actionRowTrailing)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }
@@ -1321,7 +1353,10 @@ struct MediaDetailSheet: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    if !isAlreadyDownloaded && !isDownloading {
+                    if isDownloading { return }
+                    if canUpdateWorkshopDownload {
+                        updateWorkshopDownload()
+                    } else if !isAlreadyDownloaded {
                         downloadMedia()
                     }
                 } label: {
@@ -1330,15 +1365,24 @@ struct MediaDetailSheet: View {
                             CustomProgressView(tint: .white)
                                 .scaleEffect(0.7)
                         }
-                        DetailSheetCircleIconLabel(systemName: isAlreadyDownloaded ? "checkmark" : "arrow.down")
+                        DetailSheetCircleIconLabel(systemName: downloadActionSystemName)
                             .opacity(isDownloading ? 0 : 1)
                     }
                     .frame(width: 42, height: 42)
                     .contentShape(Circle())
-                    .detailGlassCircleChrome()
+                    .detailGlassCircleChrome(
+                        tint: (canUpdateWorkshopDownload || isWorkshopUpdateFlow)
+                            ? Color.accentColor.opacity(0.28)
+                            : nil
+                    )
                 }
                 .buttonStyle(.plain)
-                .disabled(isDownloading || isAlreadyDownloaded)
+                .disabled(isDownloading || (isAlreadyDownloaded && !canUpdateWorkshopDownload))
+                .help(
+                    (canUpdateWorkshopDownload || isWorkshopUpdateFlow)
+                        ? t("workshop.updateAvailable")
+                        : (isAlreadyDownloaded ? t("downloaded") : t("download"))
+                )
 
                 Button {
                     showMoreOptionsPopover = true
@@ -1400,56 +1444,24 @@ struct MediaDetailSheet: View {
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
-                .background(
-                    Rectangle()
-                        .fill(Color.white.opacity(0.15))
-                        .frame(height: 1),
-                    alignment: .bottom
-                )
+            }
 
+            copySourceLinkButton
+
+            if let finderURL = currentShowInFinderURL {
                 Button {
                     showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(resolvedItem.pageURL.absoluteString, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
+                    NSWorkspace.shared.activateFileViewerSelecting([finderURL])
                 } label: {
                     HStack {
-                        Image(systemName: "link")
-                        Text("复制链接")
+                        Image(systemName: "folder")
+                        Text(t("showInFinder"))
                         Spacer()
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
-                    .opacity(hasValidSteamPageURL ? 1 : 0.4)
                 }
                 .buttonStyle(.plain)
-                .disabled(!hasValidSteamPageURL)
-            } else {
-                Button {
-                    showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(resolvedItem.pageURL.absoluteString, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
-                } label: {
-                    HStack {
-                        Image(systemName: "link")
-                        Text("复制链接")
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .opacity(hasValidSteamPageURL ? 1 : 0.4)
-                }
-                .buttonStyle(.plain)
-                .disabled(!hasValidSteamPageURL)
             }
 
             // 重新烘焙（仅 Scene 类型已下载壁纸）
@@ -1523,49 +1535,46 @@ struct MediaDetailSheet: View {
                 .disabled(isTranscodingVideo)
             }
 
-            if let interpolationVideoURL = currentFrameInterpolationVideoURL {
-                let activeOptimization = frameInterpolationQueue.item(for: interpolationVideoURL)
-                if let activeOptimization,
-                   activeOptimization.operations.contains(.loopTransition) {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "hourglass")
-                            Text(
-                                activeOptimization.currentOperation == .loopTransition
-                                    ? t("videoOptimizationGeneratingLoopTransition")
-                                    : activeOptimization.currentStage
-                            )
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
-                } else {
-                    Button {
-                        showMoreOptionsPopover = false
-                        frameInterpolationQueue.enqueueLoopTransition(
-                            videoURL: interpolationVideoURL,
-                            title: resolvedItem.title
-                        )
-                    } label: {
-                        HStack {
-                            Image(systemName: "point.3.connected.trianglepath.dotted")
-                            Text(t("videoOptimizationGenerateLoopTransition"))
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                }
+            if let optimizationVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isLoopAnalysisEnabled
+                || frameInterpolationQueue.isFrameInterpolationEnabled
+                || VideoOptimizationRecordStore.shared.loopState(for: optimizationVideoURL) != .idle
+                || VideoOptimizationRecordStore.shared.frameState(for: optimizationVideoURL) != .idle) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
             }
 
-            if frameInterpolationSettingsEnabled,
-               let interpolationVideoURL = currentFrameInterpolationVideoURL {
+            if let loopVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isLoopAnalysisEnabled
+                || VideoOptimizationRecordStore.shared.loopState(for: loopVideoURL) != .idle) {
+                Button {
+                    showMoreOptionsPopover = false
+                    handleLoopAnalysisStatusTap(videoURL: loopVideoURL)
+                } label: {
+                    HStack {
+                        Image(systemName: loopAnalysisIconName(videoURL: loopVideoURL))
+                        Text(loopAnalysisButtonTitle(videoURL: loopVideoURL))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(loopAnalysisForegroundStyle(videoURL: loopVideoURL))
+                .disabled(loopAnalysisActionDisabled(videoURL: loopVideoURL))
+            }
+
+            if let interpolationVideoURL = currentOptimizationVideoURL,
+               (frameInterpolationQueue.isFrameInterpolationEnabled
+                || VideoOptimizationRecordStore.shared.frameState(for: interpolationVideoURL) != .idle) {
                 let targetFPS = currentFrameInterpolationTargetFPS
-                if frameInterpolationQueue.hasActiveInterpolation(videoURL: interpolationVideoURL, satisfying: targetFPS) {
+                let frameState = VideoOptimizationRecordStore.shared.frameState(for: interpolationVideoURL)
+                // 仅当当前/待处理操作确实是补帧时显示「补帧队列处理中」。
+                // hasActiveInterpolation 会把「只在跑循环分析」也算进去，会误导。
+                if isFrameInterpolationWorkActive(videoURL: interpolationVideoURL, targetFPS: targetFPS) {
                     Button {} label: {
                         HStack {
                             Image(systemName: "clock")
@@ -1577,67 +1586,18 @@ struct MediaDetailSheet: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(true)
-                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL, satisfying: targetFPS) != nil {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "checkmark.circle")
-                            Text(t("frameInterpolationAlreadyCompleted"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
+                } else if case .applied = frameState {
+                    optimizationTerminalStatusButton(
+                        iconName: "checkmark.circle",
+                        title: t("frameInterpolationAlreadyCompleted"),
+                        foregroundStyle: Color.white.opacity(0.72)
+                    )
 
-                    Button {
-                        showMoreOptionsPopover = false
-                        pendingDeleteFrameInterpolationURL = interpolationVideoURL
-                        showDeleteFrameInterpolationConfirm = true
-                    } label: {
-                        HStack {
-                            Image(systemName: "trash")
-                            Text(t("frameInterpolationDeleteFile"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color(hex: "FF453A"))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isDeletingFrameInterpolation)
-                } else if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL) != nil {
-                    if frameInterpolationNeedsInterpolation == false {
-                        Button {} label: {
-                            HStack {
-                                Image(systemName: "checkmark.circle")
-                                Text(t("frameInterpolationNotNeeded"))
-                                Spacer()
-                            }
-                            .foregroundStyle(Color.white.opacity(0.46))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(true)
-                    } else if frameInterpolationNeedsInterpolation == nil {
-                        Button {} label: {
-                            HStack {
-                                Image(systemName: "hourglass")
-                                Text(t("frameInterpolationChecking"))
-                                Spacer()
-                            }
-                            .foregroundStyle(Color.white.opacity(0.46))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(true)
-                    } else {
+                    if frameInterpolationQueue.completedRecord(videoURL: interpolationVideoURL, satisfying: targetFPS) == nil,
+                       frameInterpolationNeedsInterpolation == true {
                         Button {
                             showMoreOptionsPopover = false
-                            frameInterpolationQueue.enqueueLoopTransitionThenInterpolation(
+                            frameInterpolationQueue.enqueueFrameInterpolation(
                                 videoURL: interpolationVideoURL,
                                 title: resolvedItem.title,
                                 targetFPS: targetFPS
@@ -1670,7 +1630,32 @@ struct MediaDetailSheet: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(isDeletingFrameInterpolation)
-                } else if frameInterpolationQueue.isBlacklisted(videoURL: interpolationVideoURL) {
+                } else if case .notNeeded = frameState {
+                    optimizationTerminalStatusButton(
+                        iconName: "checkmark.circle",
+                        title: t("frameInterpolationNotNeeded"),
+                        foregroundStyle: Color.white.opacity(0.72)
+                    )
+                } else if case .failed = frameState {
+                    Button {
+                        showMoreOptionsPopover = false
+                        frameInterpolationQueue.enqueueFrameInterpolation(
+                            videoURL: interpolationVideoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS
+                        )
+                    } label: {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle")
+                            Text(t("frameInterpolationFailed"))
+                            Spacer()
+                        }
+                        .foregroundStyle(Color(hex: "FF9F0A"))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
+                } else if case .blacklisted = frameState {
                     Button {
                         showMoreOptionsPopover = false
                         pendingRemoveFrameInterpolationBlacklistURL = interpolationVideoURL
@@ -1686,19 +1671,6 @@ struct MediaDetailSheet: View {
                         .padding(.vertical, 10)
                     }
                     .buttonStyle(.plain)
-                } else if frameInterpolationNeedsInterpolation == false {
-                    Button {} label: {
-                        HStack {
-                            Image(systemName: "checkmark.circle")
-                            Text(t("frameInterpolationNotNeeded"))
-                            Spacer()
-                        }
-                        .foregroundStyle(Color.white.opacity(0.46))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(true)
                 } else if frameInterpolationNeedsInterpolation == nil {
                     Button {} label: {
                         HStack {
@@ -1712,10 +1684,16 @@ struct MediaDetailSheet: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(true)
+                } else if frameInterpolationNeedsInterpolation == false {
+                    optimizationTerminalStatusButton(
+                        iconName: "checkmark.circle",
+                        title: t("frameInterpolationNotNeeded"),
+                        foregroundStyle: Color.white.opacity(0.72)
+                    )
                 } else {
                     Button {
                         showMoreOptionsPopover = false
-                            frameInterpolationQueue.enqueueLoopTransitionThenInterpolation(
+                        frameInterpolationQueue.enqueueFrameInterpolation(
                             videoURL: interpolationVideoURL,
                             title: resolvedItem.title,
                             targetFPS: targetFPS
@@ -1731,6 +1709,35 @@ struct MediaDetailSheet: View {
                     }
                     .buttonStyle(.plain)
                 }
+            }
+
+            if frameInterpolationQueue.isLoopAnalysisEnabled,
+               frameInterpolationQueue.isFrameInterpolationEnabled,
+               let optimizationVideoURL = currentOptimizationVideoURL {
+                Button {
+                    showMoreOptionsPopover = false
+                    if isCurrentOptimizationBakedSceneVideo {
+                        reoptimizeBakedSceneVideo()
+                    } else {
+                        deleteAndRedownloadCurrentItem()
+                    }
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text(t("videoOptimizationReoptimizeVideo"))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .disabled(
+                    isResettingVideoOptimization
+                        || (isCurrentOptimizationBakedSceneVideo
+                            ? isBakingScene
+                            : (frameInterpolationQueue.hasActiveInterpolation(videoURL: optimizationVideoURL)
+                                || isLocalFile))
+                )
             }
 
             // 复制静态图片
@@ -1770,18 +1777,83 @@ struct MediaDetailSheet: View {
         .frame(width: 192)
     }
 
-    private var currentFrameInterpolationVideoURL: URL? {
-        guard isAlreadyDownloaded else { return nil }
-        guard let localURL = currentDownloadRecord?.localFileURL else {
-            return findLocalWorkshopFile().flatMap {
-                frameInterpolationQueue.optimizableVideoURL(from: $0)
+    private var copySourceLinkButton: some View {
+        Button {
+            guard let link = copyableSourceLinkString else {
+                NSSound.beep()
+                return
+            }
+            showMoreOptionsPopover = false
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(link, forType: .string)
+            showCopyLinkToast = true
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                showCopyLinkToast = false
+            }
+        } label: {
+            HStack {
+                Image(systemName: "link")
+                Text(t("wallpaperDetail.copyLink"))
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .opacity(hasCopyableSourceLink ? 1 : 0.4)
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasCopyableSourceLink)
+    }
+
+    /// Prefer the concrete local video (or workshop root) so Finder can select it.
+    private var currentShowInFinderURL: URL? {
+        let candidates = [
+            cachedSceneBakeVideoURL,
+            currentDownloadRecord?.localFileURL,
+            findLocalWorkshopFile()
+        ].compactMap { $0 }
+
+        for localURL in candidates {
+            if FileManager.default.fileExists(atPath: localURL.path) {
+                return localURL
             }
         }
-        return frameInterpolationQueue.optimizableVideoURL(from: localURL)
+        return nil
+    }
+
+    /// Optimization actions resolve the physical local video (not just the UI download marker).
+    /// Prefer baked scene MP4 when present: desktop often plays that artifact, and local
+    /// bake policy already skips auto loop while still allowing manual optimize actions.
+    /// Uses queue-side `optimizableVideoURL` so web Workshop assets never surface here.
+    private var currentOptimizationVideoURL: URL? {
+        let candidates = [
+            cachedSceneBakeVideoURL,
+            currentDownloadRecord?.localFileURL,
+            findLocalWorkshopFile()
+        ].compactMap { $0 }
+
+        for localURL in candidates {
+            if let videoURL = frameInterpolationQueue.optimizableVideoURL(from: localURL) {
+                return videoURL
+            }
+        }
+        return nil
+    }
+
+    private var isCurrentOptimizationBakedSceneVideo: Bool {
+        guard let bakedVideoURL = cachedSceneBakeVideoURL,
+              let optimizationVideoURL = currentOptimizationVideoURL else {
+            return false
+        }
+        return bakedVideoURL.standardizedFileURL == optimizationVideoURL.standardizedFileURL
+    }
+
+    private var currentFrameInterpolationVideoURL: URL? {
+        currentOptimizationVideoURL
     }
 
     private var frameInterpolationSettingsEnabled: Bool {
-        UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
+        frameInterpolationQueue.isFrameInterpolationEnabled
     }
 
     private var currentFrameInterpolationTargetFPS: Int {
@@ -1793,9 +1865,180 @@ struct MediaDetailSheet: View {
         return count > 0 ? String(format: t("frameInterpolationRemainingCount"), count) : nil
     }
 
+    private func loopAnalysisButtonTitle(videoURL: URL) -> String {
+        if loopAnalysisIsActive(videoURL: videoURL) {
+            return t("videoOptimizationLoopAnalyzing")
+        }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .applied:
+            return t("videoOptimizationLoopApplied")
+        case .notNeeded:
+            return t("videoOptimizationLoopNotNeeded")
+        case .noReliablePoint:
+            return t("videoOptimizationLoopNoReliablePoint")
+        case .failed:
+            return t("videoOptimizationLoopFailed")
+        case .idle:
+            return t("videoOptimizationAnalyzeLoop")
+        }
+    }
+
+    private func loopAnalysisIconName(videoURL: URL) -> String {
+        if loopAnalysisIsActive(videoURL: videoURL) {
+            return "hourglass"
+        }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .applied, .notNeeded:
+            return "checkmark.circle"
+        case .noReliablePoint, .failed:
+            return "exclamationmark.triangle"
+        case .idle:
+            return "point.3.connected.trianglepath.dotted"
+        }
+    }
+
+    private func loopAnalysisIsActive(videoURL: URL) -> Bool {
+        guard let activeItem = frameInterpolationQueue.item(for: videoURL) else { return false }
+        return activeItem.operations.contains(.loopTransition)
+            && !activeItem.completedOperations.contains(.loopTransition)
+    }
+
+    private func loopAnalysisActionDisabled(videoURL: URL) -> Bool {
+        if loopAnalysisIsActive(videoURL: videoURL) { return true }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .applied, .notNeeded:
+            // 终态成功：仅展示状态，重新分析走「重新优化视频」
+            return true
+        case .idle, .failed, .noReliablePoint:
+            return false
+        }
+    }
+
+    /// True only when frame-interpolation work is current or next for this file.
+    /// Unlike `hasActiveInterpolation`, pure loop-analysis work does not count.
+    private func isFrameInterpolationWorkActive(videoURL: URL, targetFPS: Int) -> Bool {
+        guard let item = frameInterpolationQueue.item(for: videoURL),
+              !item.isTerminalForCleanup,
+              item.operations.contains(.frameInterpolation),
+              !item.completedOperations.contains(.frameInterpolation),
+              item.targetFPS >= targetFPS else {
+            return false
+        }
+        if item.currentOperation == .frameInterpolation {
+            return true
+        }
+        // Waiting, and loop step is done or not requested → frame is the pending work.
+        if case .waiting = item.status {
+            return !item.operations.contains(.loopTransition)
+                || item.completedOperations.contains(.loopTransition)
+        }
+        return false
+    }
+
+    private func loopAnalysisForegroundStyle(videoURL: URL) -> Color {
+        if loopAnalysisActionDisabled(videoURL: videoURL) {
+            return Color.white.opacity(0.46)
+        }
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .noReliablePoint, .failed:
+            return Color(hex: "FF9F0A")
+        case .applied, .notNeeded:
+            return Color.white.opacity(0.72)
+        case .idle:
+            return .white
+        }
+    }
+
+    private func handleLoopAnalysisStatusTap(videoURL: URL) {
+        guard !loopAnalysisIsActive(videoURL: videoURL) else { return }
+
+        switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+        case .idle, .failed, .noReliablePoint:
+            frameInterpolationQueue.enqueueLoopAnalysis(
+                videoURL: videoURL,
+                title: resolvedItem.title
+            )
+        case .applied, .notNeeded:
+            // Terminal success states are informational; re-run only via reoptimize.
+            break
+        }
+    }
+
+    private func optimizationTerminalStatusButton(
+        iconName: String,
+        title: String,
+        foregroundStyle: Color
+    ) -> some View {
+        Button {} label: {
+            HStack {
+                Image(systemName: iconName)
+                Text(title)
+                Spacer()
+            }
+            .foregroundStyle(foregroundStyle)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+        .disabled(true)
+    }
+
+    private func reoptimizeBakedSceneVideo() {
+        presentSceneBakeRendererDialog(clearCachedArtifact: true)
+    }
+
+    /// Clears durable optimization state, removes library files, then re-downloads source.
+    /// 对齐本地 `deleteFrameInterpolationFileAndRedownload`：先清队列/sidecar，
+    /// 再 `removeDownloads`（含物理文件 + 烘焙产物），最后重下。
+    private func deleteAndRedownloadCurrentItem() {
+        guard !isResettingVideoOptimization, !isLocalFile else { return }
+
+        let downloadingItem = resolvedItem
+        let itemID = downloadingItem.id
+        let videoURLs = [
+            currentOptimizationVideoURL,
+            cachedSceneBakeVideoURL
+        ].compactMap { $0 }
+
+        isResettingVideoOptimization = true
+        errorMessage = ""
+        downloadActivity.start(itemID: itemID)
+
+        for videoURL in Set(videoURLs.map(\.standardizedFileURL)) {
+            frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
+            frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
+        }
+
+        // removeDownloads 会删下载记录 + 物理文件 + 烘焙产物，必须在 re-download 之前。
+        viewModel.removeDownloads(withIDs: [itemID])
+
+        Task { @MainActor in
+            defer {
+                isResettingVideoOptimization = false
+                downloadActivity.finish(itemID: itemID)
+            }
+            do {
+                if itemID.hasPrefix("workshop_") {
+                    try await viewModel.downloadWorkshopWallpaper(downloadingItem)
+                } else {
+                    try await viewModel.download(downloadingItem)
+                }
+                if let videoURL = videoURLs.first {
+                    VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
+                }
+                sceneBakeStatusFlash = "已重新下载原文件"
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                sceneBakeStatusFlash = nil
+            } catch {
+                errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                showError = true
+            }
+        }
+    }
+
     private func refreshFrameInterpolationNeedCheck(force: Bool = false) {
         guard frameInterpolationSettingsEnabled,
-              let videoURL = currentFrameInterpolationVideoURL else {
+              let videoURL = currentOptimizationVideoURL else {
             clearFrameInterpolationNeedCheck()
             return
         }
@@ -1824,13 +2067,21 @@ struct MediaDetailSheet: View {
             )
             await MainActor.run {
                 guard frameInterpolationNeedCheckKey == key else { return }
-                if !needsInterpolation,
-                   frameInterpolationQueue.completedRecord(videoURL: videoURL) != nil {
-                    frameInterpolationQueue.markCompleted(
-                        videoURL: videoURL,
-                        title: resolvedItem.title,
-                        targetFPS: targetFPS
-                    )
+                if !needsInterpolation {
+                    if frameInterpolationQueue.completedRecord(videoURL: videoURL) != nil {
+                        frameInterpolationQueue.markCompleted(
+                            videoURL: videoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS
+                        )
+                    } else {
+                        frameInterpolationQueue.markInterpolationNotNeeded(
+                            videoURL: videoURL,
+                            title: resolvedItem.title,
+                            targetFPS: targetFPS,
+                            reason: "原始 FPS 已达到或高于目标 FPS"
+                        )
+                    }
                     clearFrameInterpolationNeedCheck()
                     return
                 }
@@ -2089,7 +2340,12 @@ struct MediaDetailSheet: View {
             return String(format: t("transcodingToast"), Int(transcodeVideoProgress * 100))
         }
         if isDownloading {
-            return t("downloadingMedia")
+            return (canUpdateWorkshopDownload || isWorkshopUpdateFlow)
+                ? t("workshop.updating")
+                : t("downloadingMedia")
+        }
+        if canUpdateWorkshopDownload || isWorkshopUpdateFlow {
+            return t("workshop.updateAvailable")
         }
         if isAlreadyDownloaded {
             return t("savedToDownloads")
@@ -2138,8 +2394,128 @@ struct MediaDetailSheet: View {
             }
         }
 
+        await checkWorkshopUpdateIfNeeded()
+
         withAnimation(.easeInOut(duration: 0.3)) {
             isSourcesReady = true
+        }
+    }
+
+    /// 已下载 Workshop 项：对比远端 time_updated 与本地下载记录
+    private func checkWorkshopUpdateIfNeeded() async {
+        guard isAlreadyDownloaded,
+              !isLocalFile,
+              resolvedItem.id.hasPrefix("workshop_") else {
+            hasWorkshopUpdateAvailable = false
+            remoteWorkshopUpdatedAt = nil
+            return
+        }
+
+        let itemID = resolvedItem.id
+        guard let result = await viewModel.checkWorkshopUpdateAvailability(for: resolvedItem) else {
+            // 网络失败时保留现有状态，不把“有更新”误清掉
+            return
+        }
+        guard resolvedItem.id == itemID else { return }
+        hasWorkshopUpdateAvailable = result.hasUpdate
+        remoteWorkshopUpdatedAt = result.remoteUpdatedAt
+        if result.hasUpdate {
+            AppLogger.info(.download, "检测到 Workshop 更新", metadata: [
+                "id": itemID,
+                "remoteUpdatedAt": result.remoteUpdatedAt.map { "\($0.timeIntervalSince1970)" } ?? "nil"
+            ])
+        }
+    }
+
+    /// 删除本地包后重新下载最新 Workshop 内容
+    private func updateWorkshopDownload(guardCode: String? = nil) {
+        // guardCode 重试时本地可能已删除，允许继续；首次点击需确认有更新
+        guard canUpdateWorkshopDownload || isWorkshopUpdateFlow || guardCode != nil else { return }
+        let updatingItem = resolvedItem
+        let itemID = updatingItem.id
+        isWorkshopUpdateFlow = true
+
+        AppLogger.info(.download, "开始更新 Workshop 内容", metadata: [
+            "id": itemID,
+            "title": updatingItem.title,
+            "remoteUpdatedAt": remoteWorkshopUpdatedAt.map { "\($0.timeIntervalSince1970)" } ?? "nil"
+        ])
+
+        // 若该壁纸正在桌面播放，先停掉，避免删文件占用
+        stopPlayingWallpaperIfNeeded(for: updatingItem)
+
+        downloadActivity.start(itemID: itemID)
+        errorMessage = ""
+        let start = Date()
+        Task { @MainActor in
+            defer { downloadActivity.finish(itemID: itemID) }
+            do {
+                try await viewModel.updateWorkshopWallpaper(updatingItem, guardCode: guardCode)
+                hasWorkshopUpdateAvailable = false
+                remoteWorkshopUpdatedAt = nil
+                isWorkshopUpdateFlow = false
+                // 刷新详情侧元数据（updatedAt 已写入下载记录）
+                if let record = mediaLibrary.downloadRecord(for: itemID) {
+                    resolvedItem = record.item
+                }
+                sceneBakeStatusFlash = t("workshop.updated")
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if sceneBakeStatusFlash == t("workshop.updated") {
+                    sceneBakeStatusFlash = nil
+                }
+                AppLogger.info(.download, "Workshop 更新成功", metadata: [
+                    "id": itemID,
+                    "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))
+                ])
+            } catch let error as WorkshopError {
+                switch error {
+                case .guardCodeRequired:
+                    // 保留 isWorkshopUpdateFlow，便于 Guard 码确认后继续更新
+                    pendingSteamGuardCode = ""
+                    showSteamGuardAlert = true
+                case .confirmationRequired(let msg):
+                    isWorkshopUpdateFlow = false
+                    errorMessage = msg
+                    showError = true
+                case .sessionExpired:
+                    isWorkshopUpdateFlow = false
+                    showSessionExpiredAlert = true
+                default:
+                    isWorkshopUpdateFlow = false
+                    presentWorkshopDownloadError(error.localizedDescription)
+                }
+                AppLogger.error(.download, "Workshop 更新失败", metadata: [
+                    "id": itemID,
+                    "error": error.localizedDescription
+                ])
+            } catch {
+                isWorkshopUpdateFlow = false
+                presentWorkshopDownloadError(error.localizedDescription)
+                AppLogger.error(.download, "Workshop 更新失败", metadata: [
+                    "id": itemID,
+                    "error": error.localizedDescription
+                ])
+            }
+        }
+    }
+
+    /// 若当前详情对应的壁纸正在被桌面/外部引擎使用，先停止再删包
+    private func stopPlayingWallpaperIfNeeded(for item: MediaItem) {
+        guard item.id.hasPrefix("workshop_") else { return }
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        let bridge = WallpaperEngineXBridge.shared
+
+        if bridge.isControllingExternalEngine,
+           let path = bridge.currentWallpaperPathForDesign,
+           path.contains(workshopID) {
+            bridge.stopWallpaper()
+            return
+        }
+
+        // 本机视频路径命中 workshop 目录时也停掉
+        if let currentURL = VideoWallpaperManager.shared.currentVideoURL,
+           currentURL.path.contains(workshopID) || currentURL.path.contains("workshop_\(workshopID)") {
+            VideoWallpaperManager.shared.stopWallpaper()
         }
     }
 
@@ -2300,6 +2676,7 @@ struct MediaDetailSheet: View {
         let updated = itemWithLocalWorkshopVideo(mediaItemByMergingAuthorMetadata(detail, fallback: item))
         resolvedItem = updated
         viewModel.recordViewed(resolvedItem)
+        await checkWorkshopUpdateIfNeeded()
         withAnimation(.easeInOut(duration: 0.3)) {
             isSourcesReady = true
         }
@@ -2652,7 +3029,26 @@ struct MediaDetailSheet: View {
 
         // 检测多显示器
         let screens = NSScreen.screens
-        if screens.count > 1 {
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            applyingWallpaperStatusKey = "applyingWallpaper.video"
+            isSettingWallpaper = true
+            errorMessage = ""
+            Task { @MainActor in
+                do {
+                    try await viewModel.applyDynamicWallpaper(
+                        resolvedItem,
+                        muted: isMuted,
+                        targetScreens: NSScreen.screens,
+                        usesSharedVideoDecoder: true
+                    )
+                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(screenID: nil)
+                } catch {
+                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                    showError = true
+                }
+                isSettingWallpaper = false
+            }
+        } else if screens.count > 1 {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
@@ -2774,7 +3170,10 @@ struct MediaDetailSheet: View {
             }
             Task { @MainActor in
                 do {
-                    let targetScreens = selectedScreen.map { [$0] }
+                    let isGlobalDisplaySyncEnabled = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+                    let targetScreens = isGlobalDisplaySyncEnabled
+                        ? NSScreen.screens
+                        : selectedScreen.map { [$0] }
                     var options = LocalWallpaperApplyService.Options(
                         animatedTransition: false,
                         requirePlaybackEndSupport: false,
@@ -2783,8 +3182,7 @@ struct MediaDetailSheet: View {
                         generatePosterFromVideoIfNeeded: true,
                         sceneBakeItemID: currentDownloadRecord?.item.id,
                         bakedVideoPath: currentDownloadRecord?.sceneBakeArtifact?.videoPath,
-                        usesSharedVideoDecoder: WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
-                            && NSScreen.screens.count > 1,
+                        usesSharedVideoDecoder: isGlobalDisplaySyncEnabled,
                         reason: "manual-apply"
                     )
                     if let art = currentDownloadRecord?.sceneBakeArtifact,
@@ -2797,7 +3195,7 @@ struct MediaDetailSheet: View {
                         options: options
                     )
                     WallpaperSchedulerService.shared.notifyManualWallpaperChange(
-                        screenID: selectedScreen?.wallpaperScreenIdentifier
+                        screenID: isGlobalDisplaySyncEnabled ? nil : selectedScreen?.wallpaperScreenIdentifier
                     )
                 } catch {
                     errorMessage = Self.truncateErrorMessage(error.localizedDescription)
@@ -2807,7 +3205,9 @@ struct MediaDetailSheet: View {
             }
         }
 
-        if screens.count > 1 {
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            run(nil)
+        } else if screens.count > 1 {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
                 message: t("multiDisplayDetected")
@@ -3768,9 +4168,34 @@ struct MediaDetailSheet: View {
         return nil
     }
 
-    /// 当前详情项是否有合法 Steam 链接（用于「复制链接」按钮启用/置灰）
+    /// 当前详情项是否有合法 Steam 链接（用于修正本地 workshop 的 pageURL）
     private var hasValidSteamPageURL: Bool {
         hasValidSteamPageURL(resolvedItem)
+    }
+
+    /// 任意源可复制的远程链接：优先合法 Steam pageURL；
+    /// 其余源（MotionBG / Wallsflow / 动态桌面 OSS 等）只要 pageURL 是 http(s) 即可复制。
+    private func copyableSourceLinkString(for item: MediaItem) -> String? {
+        let url = item.pageURL
+        if url.isFileURL { return nil }
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" else { return nil }
+        let absolute = url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !absolute.isEmpty else { return nil }
+        // Workshop 源：只复制合法纯数字 ID 的 Steam 链接，避免假链接
+        if item.id.hasPrefix("workshop_") || item.sourceName == t("wallpaperEngine") {
+            return hasValidSteamPageURL(item) ? absolute : nil
+        }
+        return absolute
+    }
+
+    private var copyableSourceLinkString: String? {
+        copyableSourceLinkString(for: resolvedItem)
+    }
+
+    /// 当前详情项是否有可复制的来源链接（用于「复制链接」按钮启用/置灰）
+    private var hasCopyableSourceLink: Bool {
+        copyableSourceLinkString != nil
     }
 
     private func scheduleSceneBakeSuccessFlash() {

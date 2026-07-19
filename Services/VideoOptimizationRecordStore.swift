@@ -115,6 +115,14 @@ final class VideoOptimizationRecordStore {
         }
     }
 
+    enum LoopState: Equatable {
+        case idle
+        case applied
+        case notNeeded
+        case noReliablePoint
+        case failed
+    }
+
     enum FrameState: Equatable {
         case idle
         case applied(targetFPS: Int?)
@@ -249,6 +257,19 @@ final class VideoOptimizationRecordStore {
         _ = write(record, for: videoURL)
     }
 
+    func latestLoopEvent(for videoURL: URL) -> Event? {
+        record(for: videoURL)?.events.reversed().first {
+            switch $0.kind {
+            case .loopApplied, .loopNotNeeded, .loopNoReliablePoint, .loopFailed:
+                return true
+            case .sourceDownloaded, .bakeCompleted, .loopCancelled,
+                 .frameQueued, .frameStarted, .frameApplied, .frameNotNeeded,
+                 .frameFailed, .frameCancelled, .frameBlacklisted:
+                return false
+            }
+        }
+    }
+
     func latestFrameEvent(for videoURL: URL) -> Event? {
         record(for: videoURL)?.events.reversed().first {
             switch $0.kind {
@@ -260,6 +281,25 @@ final class VideoOptimizationRecordStore {
                  .frameQueued, .frameStarted, .frameCancelled:
                 return false
             }
+        }
+    }
+
+    /// Converts durable loop terminal events into the state shown outside the queue.
+    func loopState(for videoURL: URL) -> LoopState {
+        guard let event = latestLoopEvent(for: videoURL) else { return .idle }
+        switch event.kind {
+        case .loopApplied:
+            return .applied
+        case .loopNotNeeded:
+            return .notNeeded
+        case .loopNoReliablePoint:
+            return .noReliablePoint
+        case .loopFailed:
+            return .failed
+        case .sourceDownloaded, .bakeCompleted, .loopCancelled,
+             .frameQueued, .frameStarted, .frameApplied, .frameNotNeeded,
+             .frameFailed, .frameCancelled, .frameBlacklisted:
+            return .idle
         }
     }
 

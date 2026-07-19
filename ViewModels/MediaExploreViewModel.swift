@@ -1114,14 +1114,27 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
-    func applyDynamicWallpaper(_ item: MediaItem, muted: Bool, targetScreen: NSScreen? = nil) async throws {
+    func applyDynamicWallpaper(
+        _ item: MediaItem,
+        muted: Bool,
+        targetScreen: NSScreen? = nil,
+        targetScreens: [NSScreen]? = nil,
+        usesSharedVideoDecoder: Bool = false
+    ) async throws {
+        let resolvedTargetScreens = targetScreens ?? targetScreen.map { [$0] }
         // Workshop 项：优先查找本地已下载的视频文件
         if item.id.hasPrefix("workshop_"),
            let localVideoURL = findLocalWorkshopVideo(for: item) {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
             mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-            try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+            try videoWallpaperManager.applyVideoWallpaper(
+                from: localVideoURL,
+                posterURL: posterURL,
+                muted: muted,
+                targetScreens: resolvedTargetScreens,
+                usesSharedVideoDecoder: usesSharedVideoDecoder
+            )
             return
         }
 
@@ -1132,7 +1145,13 @@ final class MediaExploreViewModel: ObservableObject {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
                 mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
                 let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
-                try videoWallpaperManager.applyVideoWallpaper(from: localURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+                try videoWallpaperManager.applyVideoWallpaper(
+                    from: localURL,
+                    posterURL: posterURL,
+                    muted: muted,
+                    targetScreens: resolvedTargetScreens,
+                    usesSharedVideoDecoder: usesSharedVideoDecoder
+                )
                 return
             }
         }
@@ -1144,7 +1163,13 @@ final class MediaExploreViewModel: ObservableObject {
             saveToDownloads: true
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-        try videoWallpaperManager.applyVideoWallpaper(from: localVideoURL, posterURL: posterURL, muted: muted, targetScreens: targetScreen.map { [$0] })
+        try videoWallpaperManager.applyVideoWallpaper(
+            from: localVideoURL,
+            posterURL: posterURL,
+            muted: muted,
+            targetScreens: resolvedTargetScreens,
+            usesSharedVideoDecoder: usesSharedVideoDecoder
+        )
     }
 
     /// Registers an already-local item before it is applied from the detail sheet.
@@ -2359,6 +2384,103 @@ final class MediaExploreViewModel: ObservableObject {
         return url
     }
 
+    // MARK: - Workshop 更新检测 / 重下
+
+    /// 检查已下载 Workshop 条目是否有远端更新。
+    /// - Returns: `(hasUpdate, remoteUpdatedAt)`；网络失败时返回 `nil`（保持当前 UI）。
+    func checkWorkshopUpdateAvailability(for item: MediaItem) async -> (hasUpdate: Bool, remoteUpdatedAt: Date?)? {
+        guard item.id.hasPrefix("workshop_") else { return nil }
+        guard let record = mediaLibrary.downloadRecord(for: item.id), record.isActive else {
+            return (false, nil)
+        }
+
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        do {
+            guard let remote = try await workshopService.fetchWorkshopRemoteUpdateInfo(workshopID: workshopID) else {
+                return (false, nil)
+            }
+
+            // 优先对比下载时记录的 Steam time_updated；老记录无此字段时退回 downloadedAt。
+            let baseline = record.item.updatedAt ?? record.downloadedAt
+            let hasUpdate = remote.updatedAt > baseline.addingTimeInterval(1)
+
+            if !hasUpdate, record.item.updatedAt == nil || record.item.fileSize == nil {
+                // 历史记录补齐元数据，后续比较更稳
+                let patched = mediaItemByUpdatingRemoteMetadata(
+                    record.item,
+                    updatedAt: remote.updatedAt,
+                    fileSize: remote.fileSize
+                )
+                mediaLibrary.upsert(patched)
+            }
+
+            return (hasUpdate, remote.updatedAt)
+        } catch {
+            AppLogger.info(.download, "Workshop 更新检查失败", metadata: [
+                "id": item.id,
+                "error": error.localizedDescription
+            ])
+            return nil
+        }
+    }
+
+    /// 删除本地 Workshop 包后重新下载（覆盖为最新版）。
+    /// 调用方应先停掉正在播放的该壁纸。
+    func updateWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil) async throws {
+        guard item.id.hasPrefix("workshop_") else {
+            throw WorkshopError.workshopNotSupported
+        }
+
+        let folderID = mediaLibrary.downloadRecord(for: item.id)?.folderID
+        // 先拉远端元数据，下载成功后写入最新 updatedAt
+        var itemToDownload = item
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        if let remote = try? await workshopService.fetchWorkshopRemoteUpdateInfo(workshopID: workshopID) {
+            itemToDownload = mediaItemByUpdatingRemoteMetadata(
+                item,
+                updatedAt: remote.updatedAt,
+                fileSize: remote.fileSize
+            )
+        }
+
+        mediaLibrary.removeDownloadRecord(withID: item.id)
+        try await downloadWorkshopWallpaper(itemToDownload, guardCode: guardCode, folderID: folderID)
+    }
+
+    private func mediaItemByUpdatingRemoteMetadata(
+        _ item: MediaItem,
+        updatedAt: Date?,
+        fileSize: Int64?
+    ) -> MediaItem {
+        MediaItem(
+            slug: item.slug,
+            title: item.title,
+            pageURL: item.pageURL,
+            thumbnailURL: item.thumbnailURL,
+            resolutionLabel: item.resolutionLabel,
+            collectionTitle: item.collectionTitle,
+            summary: item.summary,
+            previewVideoURL: item.previewVideoURL,
+            posterURL: item.posterURL,
+            tags: item.tags,
+            exactResolution: item.exactResolution,
+            durationSeconds: item.durationSeconds,
+            downloadOptions: item.downloadOptions,
+            sourceName: item.sourceName,
+            isAnimatedImage: item.isAnimatedImage,
+            subscriptionCount: item.subscriptionCount,
+            favoriteCount: item.favoriteCount,
+            viewCount: item.viewCount,
+            ratingScore: item.ratingScore,
+            authorName: item.authorName,
+            authorSteamID: item.authorSteamID,
+            authorAvatarURL: item.authorAvatarURL,
+            fileSize: fileSize ?? item.fileSize,
+            createdAt: item.createdAt,
+            updatedAt: updatedAt ?? item.updatedAt
+        )
+    }
+
     // MARK: - 通过 URL 解析项目
 
     /// 解析 Steam Workshop 链接并返回 MediaItem，失败时抛出错误
@@ -2387,6 +2509,19 @@ final class MediaExploreViewModel: ObservableObject {
     func resolveDongTaiItemByURL(_ urlString: String) async throws -> MediaItem {
         let item = try await dynamicWallpaperService.resolveItemByOSSURL(urlString)
         print("[MediaExploreViewModel] resolveDongTaiItemByURL success: \(item.id) - \(item.title)")
+        return item
+    }
+
+    /// 解析 Wallsflow 详情页链接并返回 MediaItem
+    func resolveWallsflowItemByURL(_ urlString: String) async throws -> MediaItem {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("wallsflow.com") else {
+            throw WorkshopError.invalidURL
+        }
+        let item = try await wallsflowService.fetchDetail(url: url)
+        print("[MediaExploreViewModel] resolveWallsflowItemByURL success: \(item.id) - \(item.title)")
         return item
     }
 

@@ -481,7 +481,10 @@ struct WallpaperExploreContentView: View {
                 errorMessage: wallpaperURLError,
                 isLoading: isResolvingWallpaperURL,
                 onSubmit: { handleWallpaperURLSubmit() },
-                onDismiss: { showWallpaperURLSheet = false }
+                onDismiss: { showWallpaperURLSheet = false },
+                title: "通过链接打开壁纸",
+                placeholder: "粘贴壁纸链接...",
+                supportedFormatsHint: "支持格式：wallhaven.cc/w/{id}、4kwallpapers.com/…/{name}-{id}.html、konachan.net/post/show/{id}、pixiv.net/artworks/{id}"
             )
         }
     }

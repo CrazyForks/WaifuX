@@ -15,6 +15,12 @@ class WallpaperSchedulerService: ObservableObject {
     private var lastChangeTimes: [String: Date] = [:]
     /// Tracks already-used item IDs per screen in the current random round to avoid duplicates within a full cycle.
     private var usedItemIDs: [String: Set<String>] = [:]
+    /// Per-screen in-flight set for "播完即换" — blocks concurrent applies.
+    private var onEndSwitchInFlightScreens = Set<String>()
+    /// Earliest time another on-end apply is allowed for a screen (post-apply cooldown).
+    private var onEndSwitchCooldownUntilByScreen: [String: Date] = [:]
+    /// Ignore another on-end trigger for the same screen within this window after apply returns.
+    private let onEndSwitchCooldown: TimeInterval = 1.5
 
     private var dispatchTimer: DispatchSourceTimer?
     private var pendingCleanupWorkItem: DispatchWorkItem?
@@ -189,6 +195,19 @@ class WallpaperSchedulerService: ObservableObject {
                 print("\(logTag) Skip on-end next for \(screenID): enabled=\(displayConfig.isEnabled) onEnd=\(displayConfig.isOnEndMode)")
                 return
             }
+            // 同一屏切换进行中 / 冷却中：吞掉重复 end 事件，避免“连着切两张”。
+            // 冷却命中时必须恢复当前视频，否则 end observer 已 pause+seek 会停在 poster 上。
+            if onEndSwitchInFlightScreens.contains(screenID) {
+                print("\(logTag) Skip on-end next for \(screenID): switch already in flight")
+                return
+            }
+            if let cooldownUntil = onEndSwitchCooldownUntilByScreen[screenID],
+               Date() < cooldownUntil {
+                print("\(logTag) Skip on-end next for \(screenID): within post-switch cooldown; resume current video")
+                recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
+                return
+            }
+            onEndSwitchInFlightScreens.insert(screenID)
         case nil:
             break
         }
@@ -196,6 +215,7 @@ class WallpaperSchedulerService: ObservableObject {
         let items = getSchedulableItems(for: displayConfig, screenID: screenID)
         guard !items.isEmpty else {
             print("\(logTag) Screen \(screenID): no schedulable items for next-wallpaper request (includeMedia=\(displayConfig.includeMedia) includeWallpapers=\(displayConfig.includeWallpapers) onEnd=\(displayConfig.isOnEndMode))")
+            finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
             recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             return
         }
@@ -206,14 +226,18 @@ class WallpaperSchedulerService: ObservableObject {
         let order = overrideOrder ?? displayConfig.order
         guard let item = selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: order) else {
             print("\(logTag) Screen \(screenID): item selection returned nil for on-end mode")
+            finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
             recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             return
         }
 
         Task { @MainActor in
+            var didApply = false
+            defer { self.finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: didApply) }
             print("\(logTag) Applying next wallpaper '\(item.title)' (\(item.fileURL.lastPathComponent)) to screen \(screenID)")
             let success = await applyItem(item, toScreenID: screenID)
             if success {
+                didApply = true
                 self.lastChangeTimes[screenID] = now
                 self.lastChangedItemIDs[screenID] = item.id
                 self.persistSchedulerState()
@@ -227,6 +251,7 @@ class WallpaperSchedulerService: ObservableObject {
                     remaining.removeAll { $0.id == retryItem.id }
                     let retrySuccess = await applyItem(retryItem, toScreenID: screenID)
                     if retrySuccess {
+                        didApply = true
                         self.lastChangeTimes[screenID] = now
                         self.lastChangedItemIDs[screenID] = retryItem.id
                         self.persistSchedulerState()
@@ -238,6 +263,22 @@ class WallpaperSchedulerService: ObservableObject {
                 print("\(logTag) All next-wallpaper candidates exhausted for screen \(screenID), no wallpaper applied")
                 self.recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
             }
+        }
+    }
+
+    private func finishOnEndSwitch(
+        for screenID: String,
+        requiredMode: RequiredSwitchMode?,
+        applied: Bool
+    ) {
+        guard case .onEnd? = requiredMode else { return }
+        onEndSwitchInFlightScreens.remove(screenID)
+        // Only arm cooldown after a successful apply. Failed recovery should
+        // allow the next real end event to try again immediately.
+        if applied {
+            onEndSwitchCooldownUntilByScreen[screenID] = Date().addingTimeInterval(onEndSwitchCooldown)
+        } else {
+            onEndSwitchCooldownUntilByScreen.removeValue(forKey: screenID)
         }
     }
 
@@ -859,6 +900,65 @@ class WallpaperSchedulerService: ObservableObject {
         displayConfig.autoChangeOnExternalConnect = enabled
         newConfig.displayConfigs[screenID] = displayConfig
         updateConfig(newConfig)
+    }
+
+    /// 外接显示器变更后，重新把当前全局壁纸覆盖到完整的屏幕集合。
+    /// 调度器只发起统一应用；媒体类型分发不在此处实现。
+    func synchronizeCurrentGlobalWallpaperToConnectedDisplays() {
+        guard config.isGlobalDisplaySyncEnabled else { return }
+        if VideoWallpaperManager.shared.isVideoWallpaperActive {
+            VideoWallpaperManager.shared.refreshSharedDecoderTargets()
+        } else {
+            GlobalWallpaperSyncCoordinator.shared.reapplyToConnectedDisplays()
+        }
+    }
+
+    /// Configures a newly connected external display to use the same schedulable
+    /// range as the primary display while choosing its first item randomly.
+    func configureExternalDisplayForRandomAllWallpapers(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
+        var newConfig = config
+        let primary = NSScreen.screens.first
+        var displayConfig = primary.map { resolvedDisplayConfig(for: $0) }
+            ?? newConfig.storedDisplayConfig(for: screenID)
+        displayConfig.isEnabled = true
+        displayConfig.order = .random
+        displayConfig.folderIDs = nil
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+        triggerRandomWallpaperNow(for: screenID)
+    }
+
+    /// Keeps the display outside automatic rotation until the user explicitly
+    /// chooses a wallpaper or enables its scheduler settings.
+    func configureExternalDisplayWithoutAutoSwitch(_ screen: NSScreen) {
+        guard !config.isGlobalDisplaySyncEnabled else { return }
+        let screenID = displayConfigScreenID(for: screen)
+        var newConfig = config
+        var displayConfig = newConfig.storedDisplayConfig(for: screenID)
+        displayConfig.isEnabled = false
+        newConfig.displayConfigs[screenID] = displayConfig
+        updateConfig(newConfig)
+    }
+
+    /// Removes scheduler-only state for a disconnected display that the user did
+    /// not choose to retain. Rendering services own cleanup of their own states.
+    func discardPersistedDisplayState(screenID: String, fingerprint: String) {
+        var newConfig = config
+        let matchingIDs = Set(newConfig.displayConfigs.keys.filter {
+            $0 == screenID || displayFingerprints[$0] == fingerprint
+        })
+        for id in matchingIDs {
+            newConfig.displayConfigs.removeValue(forKey: id)
+            displayFingerprints.removeValue(forKey: id)
+            lastChangedItemIDs.removeValue(forKey: id)
+            lastChangeTimes.removeValue(forKey: id)
+            usedItemIDs.removeValue(forKey: id)
+        }
+        updateConfig(newConfig)
+        persistSchedulerState()
+        saveDisplayFingerprints()
     }
 
     // MARK: - Scheduling

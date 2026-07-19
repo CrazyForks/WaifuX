@@ -413,6 +413,8 @@ struct ContentView: View {
                 BackgroundDownloadProgressToastHost(
                     onExpand: { DownloadTaskService.shared.restoreAllRunningToasts() }
                 )
+                VideoOptimizationProgressToastHost()
+                BakeProgressToastHost()
                 WallpaperSourceSwitchToast()
                     .padding(.horizontal, 24)
                     .padding(.bottom, 8)
@@ -1013,6 +1015,81 @@ private struct BackgroundDownloadProgressToastHost: View {
                     detail: remainingDetail(backgroundTasks.count - 1),
                     progress: task.progress,
                     onTap: onExpand
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+/// Reads the unified optimization queue without owning or changing any task.
+/// The same compact layer is visible in the library and on detail pages.
+private struct VideoOptimizationProgressToastHost: View {
+    @ObservedObject private var queue = VideoOptimizationQueueService.shared
+
+    private var loopItem: FrameInterpolationQueueItem? {
+        queue.activeItem(for: .loopTransition)
+            ?? queue.pendingItems(for: .loopTransition).first
+    }
+
+    private var interpolationItem: FrameInterpolationQueueItem? {
+        queue.activeItem(for: .frameInterpolation)
+            ?? queue.pendingItems(for: .frameInterpolation).first
+    }
+
+    private var loopCount: Int {
+        queue.pendingItems(for: .loopTransition).count
+    }
+
+    private var interpolationCount: Int {
+        queue.pendingItems(for: .frameInterpolation).count
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let item = loopItem {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("loopAnalysis.toastRunning"), Int((item.progress * 100).rounded())),
+                    detail: remainingDetail(loopCount - 1),
+                    progress: item.progress
+                )
+            }
+
+            if let item = interpolationItem {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("frameInterpolationToastRunning"), Int((item.progress * 100).rounded())),
+                    detail: remainingDetail(interpolationCount - 1),
+                    progress: item.progress
+                )
+            }
+        }
+        .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private func remainingDetail(_ count: Int) -> String? {
+        count > 0 ? String(format: t("progress.remainingCount"), count) : nil
+    }
+}
+
+/// Compact bake progress for scene offline bake and standalone BakeService work.
+private struct BakeProgressToastHost: View {
+    @ObservedObject private var taskQueue = TaskQueueStatusService.shared
+
+    private var bakeEntries: [TaskQueueStatusService.Entry] {
+        taskQueue.entries.filter { $0.category == .bake }
+    }
+
+    var body: some View {
+        Group {
+            if let entry = bakeEntries.first {
+                BackgroundTaskProgressToast(
+                    title: String(format: t("bake.backgroundProgress"), Int((entry.progress * 100).rounded())),
+                    detail: remainingDetail(bakeEntries.count - 1),
+                    progress: entry.progress
                 )
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
             }

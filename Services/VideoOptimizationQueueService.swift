@@ -635,6 +635,15 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
 
+    var isLoopAnalysisEnabled: Bool {
+        automaticPolicy.loopAnalysisEnabled
+    }
+
+    var isFrameInterpolationEnabled: Bool {
+        automaticPolicy.frameInterpolationEnabled
+            || (UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false)
+    }
+
     @discardableResult
     func enqueueLoopTransition(
         videoURL: URL,
@@ -647,6 +656,33 @@ final class VideoOptimizationQueueService: ObservableObject {
             targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             source: source,
             operations: [.loopTransition]
+        )
+    }
+
+    /// Alias used by detail-status UI (same as loop transition / loop analysis).
+    @discardableResult
+    func enqueueLoopAnalysis(
+        videoURL: URL,
+        title: String? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> UUID? {
+        enqueueLoopTransition(videoURL: videoURL, title: title, source: source)
+    }
+
+    /// Explicit frame interpolation without a preceding loop step.
+    @discardableResult
+    func enqueueFrameInterpolation(
+        videoURL: URL,
+        title: String? = nil,
+        targetFPS: Int? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> UUID? {
+        enqueue(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+            source: source,
+            operations: [.frameInterpolation]
         )
     }
 
@@ -665,6 +701,34 @@ final class VideoOptimizationQueueService: ObservableObject {
             source: source,
             operations: [.loopTransition, .frameInterpolation]
         )
+    }
+
+    func markInterpolationNotNeeded(
+        videoURL: URL,
+        title: String,
+        targetFPS: Int,
+        reason: String
+    ) {
+        ensureInterpolationRecordsLoaded()
+        let record = makeInterpolationRecord(videoURL: videoURL, title: title, targetFPS: targetFPS)
+        _ = VideoOptimizationRecordStore.shared.removeEvents(
+            matching: [.frameApplied, .frameBlacklisted],
+            for: videoURL
+        )
+        _ = VideoOptimizationRecordStore.shared.append(
+            .frameNotNeeded,
+            for: videoURL,
+            detail: reason,
+            metadata: [
+                "targetFPS": String(targetFPS),
+                "title": record.title,
+            ]
+        )
+        completedInterpolationItems.removeAll { $0.id == record.id }
+        completedInterpolationItems.append(record)
+        completedInterpolationItems.sort { $0.recordedAt > $1.recordedAt }
+        blacklistedInterpolationItems.removeAll { $0.id == record.id }
+        saveInterpolationRecords()
     }
 
     /// 批量入口只接受本地视频，文件枚举与任务去重均由服务负责。
@@ -989,8 +1053,10 @@ final class VideoOptimizationQueueService: ObservableObject {
         }
         let requestedOperations = normalizedOperations(operations)
         guard !requestedOperations.isEmpty else { return nil }
-        guard !isBlacklisted(videoURL: videoURL) else {
-            frameInterpolationDebugPrint("补帧队列：视频在黑名单中，跳过添加。视频=\(videoURL.lastPathComponent)")
+        // 本地黑名单只记「补帧」终态，不应挡住纯循环分析。
+        // 若请求里含补帧且已在补帧黑名单，整单跳过（与旧行为一致）。
+        if requestedOperations.contains(.frameInterpolation), isBlacklisted(videoURL: videoURL) {
+            frameInterpolationDebugPrint("补帧队列：视频在补帧黑名单中，跳过添加。视频=\(videoURL.lastPathComponent)")
             return nil
         }
 
@@ -1412,7 +1478,27 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     func item(for videoURL: URL) -> VideoOptimizationQueueItem? {
-        items.first { $0.videoURL.standardizedFileURL == videoURL.standardizedFileURL }
+        let standardizedURL = videoURL.standardizedFileURL
+        return items.first { item in
+            item.videoURL.standardizedFileURL == standardizedURL && item.currentOperation != nil
+        } ?? items.first { item in
+            item.videoURL.standardizedFileURL == standardizedURL && !item.isTerminalForCleanup
+        }
+    }
+
+    /// Read-only operation lanes for status surfaces (status bar / compact toasts).
+    func pendingItems(for operation: FrameInterpolationQueueItem.Operation) -> [VideoOptimizationQueueItem] {
+        items
+            .filter {
+                !$0.isTerminalForCleanup
+                    && $0.operations.contains(operation)
+                    && !$0.completedOperations.contains(operation)
+            }
+            .sorted { $0.addedAt < $1.addedAt }
+    }
+
+    func activeItem(for operation: FrameInterpolationQueueItem.Operation) -> VideoOptimizationQueueItem? {
+        pendingItems(for: operation).first { $0.currentOperation == operation }
     }
 
     func history(for videoURL: URL) -> [VideoOptimizationHistoryRecord] {

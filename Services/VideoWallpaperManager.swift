@@ -99,6 +99,8 @@ final class VideoWallpaperManager: ObservableObject {
     private var posterTasks: [String: Task<Void, Never>] = [:]
     /// 每个屏幕当前有效的 poster 加载令牌，防止旧封面在异步加载完成后盖回新播放器。
     private var posterDisplayTokens: [String: UUID] = [:]
+    /// 本地 poster 同步缓存（fileURL path → image），播完即换时必须立刻盖住结束帧，不能等 URLSession。
+    private var posterImageCache: [String: NSImage] = [:]
     /// 每个屏幕的独立音量（key 为 screenID），未设置时回退到全局 `volume`
     private var volumeByScreen: [String: Double] = [:]
     /// 音量的物理显示器指纹索引，用于 screenID 变化后的恢复。
@@ -289,6 +291,7 @@ final class VideoWallpaperManager: ObservableObject {
         posterURLByScreen[screenID] = posterURL
         posterURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = posterURL
         currentPosterURL = posterURL
+        _ = loadPosterImageSync(from: posterURL)
         setPosterAsDesktopWallpaper(posterURL, targetScreen: screen)
         DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
         persistState()
@@ -337,6 +340,23 @@ final class VideoWallpaperManager: ObservableObject {
             print("[VideoWallpaperManager] Failed to restore previous video wallpaper for \(screen.localizedName): \(error.localizedDescription)")
             return false
         }
+    }
+
+    /// Drops only the disconnected display's persisted association. This must not
+    /// stop players or alter mappings for any remaining display.
+    func discardPersistedWallpaperState(screenID: String, fingerprint: String) {
+        videoTargetScreenIDs.remove(screenID)
+        videoTargetScreenFingerprints.remove(fingerprint)
+        videoURLByScreen.removeValue(forKey: screenID)
+        videoURLByScreenFingerprint.removeValue(forKey: fingerprint)
+        posterURLByScreen.removeValue(forKey: screenID)
+        posterURLByScreenFingerprint.removeValue(forKey: fingerprint)
+        volumeByScreen.removeValue(forKey: screenID)
+        volumeByScreenFingerprint.removeValue(forKey: fingerprint)
+        onEndModeScreens.remove(screenID)
+        syncCurrentVideoURL()
+        currentPosterURL = posterURLByScreen.values.first ?? posterURLByScreenFingerprint.values.first
+        persistState()
     }
 
     /// 是否有任何屏幕正在运行视频壁纸（内部 guard 使用，不依赖全局单例）
@@ -890,7 +910,12 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         // 设视频壁纸时关闭并清除静态图 overlay（视频窗口本身覆盖桌面，静态 overlay 无意义且浪费窗口）
-        StaticImageWallpaperOverlayManager.shared.clearState()
+        // 单屏切换只清目标屏，避免副屏自动轮换时误拆掉其它屏的静态 overlay。
+        if let targetScreen {
+            StaticImageWallpaperOverlayManager.shared.clearState(for: targetScreen)
+        } else {
+            StaticImageWallpaperOverlayManager.shared.clearState()
+        }
         let captureScreens: [NSScreen]
         if let targetScreen {
             captureScreens = [targetScreen]
@@ -1000,14 +1025,18 @@ final class VideoWallpaperManager: ObservableObject {
                 videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint] = localFileURL
             }
         }
+        // 预热 poster 缓存：播完即换结束瞬间需要同步盖图，不能再走 URLSession。
+        if let posterURL {
+            _ = loadPosterImageSync(from: posterURL)
+        }
         currentPosterURL = posterURL  // 兼容旧代码
         isMuted = muted
         isPaused = false
 
+        // 直接沿用调用方传入的 NSScreen，避免再按 screenID 反查失败时
+        // 误走 targetScreen == nil 分支、teardown 所有视频窗（副屏会表现为“软件壁纸退出”）。
         try rebuildWindows(
-            targetScreen: targetScreenID.flatMap { id in
-                NSScreen.screens.first { $0.wallpaperScreenIdentifier == id }
-            },
+            targetScreen: targetScreen,
             animatedTransition: animatedTransition
         )
         updateAudioSession()
@@ -3006,8 +3035,15 @@ final class VideoWallpaperManager: ObservableObject {
         } else {
             guard let targetScreen = targetScreen else { return }
             let targetScreenID = targetScreen.wallpaperScreenIdentifier
-            if let existingWindow = windows[targetScreenID],
-               let containerView = existingWindow.contentView as? WallpaperVideoContainerView {
+            // 优先按 screenID 命中；失败时再按窗口 frame 匹配，防止 screenID 短暂变化时
+            // 副屏误走 createWindow（alpha=0）路径，看起来像软件壁纸退出。
+            let resolvedWindowEntry = existingVideoWindowEntry(for: targetScreen)
+            if let resolvedWindowEntry,
+               let containerView = resolvedWindowEntry.window.contentView as? WallpaperVideoContainerView {
+                if resolvedWindowEntry.screenID != targetScreenID {
+                    rekeyVideoWindowState(from: resolvedWindowEntry.screenID, to: targetScreenID)
+                }
+                let existingWindow = resolvedWindowEntry.window
                 synchronizeWindow(existingWindow, to: targetScreen)
                 // 复用窗口：尽量保留旧层直到新层首帧就绪，避免自动切换时硬闪。
                 let oldPlayer = players[targetScreenID]
@@ -3042,11 +3078,19 @@ final class VideoWallpaperManager: ObservableObject {
 
                 // 2. 更新字典
                 players[targetScreenID] = components.player
-                // 播放器替换后，先让已在途的旧 poster 加载失效；现有封面保留到淡入结束再移除。
-                invalidatePosterDisplay(for: targetScreenID)
+                // 动画切换：旧 poster 继续盖住结束帧直到新视频淡入完成。
+                // 非动画切换：先失效旧异步加载，避免旧 poster 回盖新播放器。
+                let shouldAnimateReplacement = animatedTransition && oldPlayer != nil && oldPlayer !== components.player
+                if shouldAnimateReplacement {
+                    // 确保结束瞬间有封面（播完即换路径通常已显示；定时切换也补一层）。
+                    showPosterImage(for: targetScreenID)
+                } else {
+                    invalidatePosterDisplay(for: targetScreenID)
+                }
 
                 let finalizeReplacement: @MainActor @Sendable () -> Void = { [weak self, weak containerView] in
                     guard let self, let containerView else { return }
+                    // crossfade 完成时已把 player 写进主层；这里再写一次保持非动画路径一致。
                     containerView.playerLayer.player = components.player
                     containerView.playerLayer.videoGravity = .resizeAspectFill
                     self.hidePosterImage(for: targetScreenID)
@@ -3082,7 +3126,6 @@ final class VideoWallpaperManager: ObservableObject {
                     }
                 }
 
-                let shouldAnimateReplacement = animatedTransition && oldPlayer != nil && oldPlayer !== components.player
                 if shouldAnimateReplacement {
                     playerItemObservers[targetScreenID]?.invalidate()
                     playerItemObservers.removeValue(forKey: targetScreenID)
@@ -3093,35 +3136,7 @@ final class VideoWallpaperManager: ObservableObject {
                     let readinessToken = UUID()
                     playerItemObserverTokens[targetScreenID] = readinessToken
 
-                    let observer = components.item.observe(\.status, options: [.initial]) { [weak self, weak containerView] item, _ in
-                        guard item.status == .readyToPlay else { return }
-                        DispatchQueue.main.async { [weak self, weak containerView] in
-                            guard let self, let containerView else { return }
-                            guard self.playerItemObserverTokens[targetScreenID] == readinessToken else { return }
-                            self.playerItemObservers[targetScreenID]?.invalidate()
-                            self.playerItemObservers.removeValue(forKey: targetScreenID)
-                            self.playerItemObserverTokens.removeValue(forKey: targetScreenID)
-                            self.fadeInTimeouts[targetScreenID]?.cancel()
-                            self.fadeInTimeouts.removeValue(forKey: targetScreenID)
-
-                            // AVPlayerLooper 可能在 ready 前后插入新的循环 item，播放前重新应用音频策略。
-                            let screenVolume = self.volumeByScreen[targetScreenID] ?? self.volume
-                            self.applyPlayerAudioPolicy(components.player, muted: self.isMuted, volume: screenVolume)
-                            if !self.isPaused {
-                                components.player.play()
-                            }
-                            containerView.crossfadeToPlayer(
-                                components.player,
-                                duration: self.automaticSwitchTransitionDuration
-                            ) {
-                                finalizeReplacement()
-                                self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementReady")
-                            }
-                        }
-                    }
-                    playerItemObservers[targetScreenID] = observer
-
-                    let timeout = DispatchWorkItem { [weak self, weak containerView] in
+                    let beginAnimatedSwap: @MainActor @Sendable (String) -> Void = { [weak self, weak containerView] reason in
                         guard let self, let containerView else { return }
                         guard self.playerItemObserverTokens[targetScreenID] == readinessToken else { return }
                         self.playerItemObservers[targetScreenID]?.invalidate()
@@ -3130,19 +3145,33 @@ final class VideoWallpaperManager: ObservableObject {
                         self.fadeInTimeouts[targetScreenID]?.cancel()
                         self.fadeInTimeouts.removeValue(forKey: targetScreenID)
 
-                        // 超时兜底路径也要在 play() 前重新禁用静音状态下的音频轨。
+                        // AVPlayerLooper 可能在 ready 前后插入新的循环 item，播放前重新应用音频策略。
                         let screenVolume = self.volumeByScreen[targetScreenID] ?? self.volume
                         self.applyPlayerAudioPolicy(components.player, muted: self.isMuted, volume: screenVolume)
                         if !self.isPaused {
                             components.player.play()
                         }
+                        // 封面保留到 crossfade 完成；finalizeReplacement 里再 hide，
+                        // 防止旧 player 结束帧清空时露出桌面。
                         containerView.crossfadeToPlayer(
                             components.player,
                             duration: self.automaticSwitchTransitionDuration
                         ) {
                             finalizeReplacement()
-                            self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementTimeout")
+                            self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: reason)
                         }
+                    }
+
+                    let observer = components.item.observe(\.status, options: [.initial]) { item, _ in
+                        guard item.status == .readyToPlay else { return }
+                        DispatchQueue.main.async {
+                            beginAnimatedSwap("replacementReady")
+                        }
+                    }
+                    playerItemObservers[targetScreenID] = observer
+
+                    let timeout = DispatchWorkItem {
+                        beginAnimatedSwap("replacementTimeout")
                     }
                     fadeInTimeouts[targetScreenID] = timeout
                     DispatchQueue.main.asyncAfter(deadline: .now() + automaticSwitchReadyTimeout, execute: timeout)
@@ -3192,6 +3221,116 @@ final class VideoWallpaperManager: ObservableObject {
             videoTargetScreenFingerprints.contains(screen.wallpaperScreenFingerprint)
         }
         return matched
+    }
+
+    private struct ExistingVideoWindowEntry {
+        let screenID: String
+        let window: WallpaperVideoWindow
+    }
+
+    /// 查找目标屏已有的视频窗：先 screenID，再按 frame 容差匹配（处理 screenID 抖动）。
+    private func existingVideoWindowEntry(for screen: NSScreen) -> ExistingVideoWindowEntry? {
+        let screenID = screen.wallpaperScreenIdentifier
+        if let window = windows[screenID] {
+            return ExistingVideoWindowEntry(screenID: screenID, window: window)
+        }
+
+        let targetFrame = screen.frame
+        for (existingID, window) in windows {
+            if framesApproximatelyEqual(window.frame, targetFrame) {
+                return ExistingVideoWindowEntry(screenID: existingID, window: window)
+            }
+        }
+        return nil
+    }
+
+    private func framesApproximatelyEqual(_ lhs: NSRect, _ rhs: NSRect, tolerance: CGFloat = 2) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) <= tolerance
+            && abs(lhs.origin.y - rhs.origin.y) <= tolerance
+            && abs(lhs.size.width - rhs.size.width) <= tolerance
+            && abs(lhs.size.height - rhs.size.height) <= tolerance
+    }
+
+    /// 把运行时窗口/播放器字典从旧 screenID 迁到新 screenID，避免副屏切换时误重建窗口。
+    private func rekeyVideoWindowState(from oldScreenID: String, to newScreenID: String) {
+        guard oldScreenID != newScreenID else { return }
+
+        if let window = windows.removeValue(forKey: oldScreenID) {
+            windows[newScreenID] = window
+        }
+        if let player = players.removeValue(forKey: oldScreenID) {
+            players[newScreenID] = player
+        }
+        if let looper = loopers.removeValue(forKey: oldScreenID) {
+            loopers[newScreenID] = looper
+        }
+        if let observer = playbackEndObservers.removeValue(forKey: oldScreenID) {
+            playbackEndObservers[newScreenID] = observer
+        }
+        if let itemObserver = playerItemObservers.removeValue(forKey: oldScreenID) {
+            playerItemObservers[newScreenID] = itemObserver
+        }
+        if let token = playerItemObserverTokens.removeValue(forKey: oldScreenID) {
+            playerItemObserverTokens[newScreenID] = token
+        }
+        if let timeout = fadeInTimeouts.removeValue(forKey: oldScreenID) {
+            fadeInTimeouts[newScreenID] = timeout
+        }
+        if let posterToken = posterDisplayTokens.removeValue(forKey: oldScreenID) {
+            posterDisplayTokens[newScreenID] = posterToken
+        }
+        if let size = videoSizes.removeValue(forKey: oldScreenID) {
+            videoSizes[newScreenID] = size
+        }
+        if let crop = videoLetterboxContentCrops.removeValue(forKey: oldScreenID) {
+            videoLetterboxContentCrops[newScreenID] = crop
+        }
+        if let task = videoLetterboxAnalysisTasks.removeValue(forKey: oldScreenID) {
+            videoLetterboxAnalysisTasks[newScreenID] = task
+        }
+        if let decision = frameInterpolationDecisionsByScreen.removeValue(forKey: oldScreenID) {
+            frameInterpolationDecisionsByScreen[newScreenID] = decision
+        }
+        if let analysisTask = frameInterpolationAnalysisTasks.removeValue(forKey: oldScreenID) {
+            frameInterpolationAnalysisTasks[newScreenID] = analysisTask
+        }
+        if let interpolatedURL = frameInterpolatedPlaybackURLByScreen.removeValue(forKey: oldScreenID) {
+            frameInterpolatedPlaybackURLByScreen[newScreenID] = interpolatedURL
+        }
+        if onEndModeScreens.remove(oldScreenID) != nil {
+            onEndModeScreens.insert(newScreenID)
+        }
+        if let volume = volumeByScreen.removeValue(forKey: oldScreenID) {
+            volumeByScreen[newScreenID] = volume
+        }
+        if let videoURL = videoURLByScreen.removeValue(forKey: oldScreenID) {
+            videoURLByScreen[newScreenID] = videoURL
+        }
+        if let posterURL = posterURLByScreen.removeValue(forKey: oldScreenID) {
+            posterURLByScreen[newScreenID] = posterURL
+        }
+        if videoTargetScreenIDs.remove(oldScreenID) != nil {
+            videoTargetScreenIDs.insert(newScreenID)
+        }
+        if activeDisplaySwitchScreenID == oldScreenID {
+            activeDisplaySwitchScreenID = newScreenID
+        }
+        if let pending = pendingDisplaySwitches.removeValue(forKey: oldScreenID) {
+            pendingDisplaySwitches[newScreenID] = PendingDisplayVideoSwitch(
+                videoURL: pending.videoURL,
+                posterURL: pending.posterURL,
+                muted: pending.muted,
+                screenID: newScreenID,
+                fingerprint: pending.fingerprint,
+                screenName: pending.screenName,
+                requestedAt: pending.requestedAt
+            )
+        }
+        if let posterTask = posterTasks.removeValue(forKey: oldScreenID) {
+            posterTasks[newScreenID] = posterTask
+        }
+
+        NSLog("[VideoWallpaperManager] Rekeyed runtime video state \(oldScreenID) → \(newScreenID)")
     }
 
     /// 创建并配置 AVPlayer + AVPlayerLooper，供 `createWindow` 与窗口复用路径共享。
@@ -3674,7 +3813,8 @@ final class VideoWallpaperManager: ObservableObject {
 
     // MARK: - 预览图管理
 
-    /// 显示预览图（用于锁屏或无权限时）
+    /// 显示预览图（用于锁屏、播完即换结束帧覆盖等）。
+    /// 本地 fileURL 优先同步加载，避免结束瞬间 AVPlayerLayer 清空时露出桌面。
     private func showPosterImage(for screenID: String) {
         guard let posterURL = posterURLByScreen[screenID],
               let window = windows[screenID],
@@ -3686,7 +3826,16 @@ final class VideoWallpaperManager: ObservableObject {
         let token = UUID()
         posterDisplayTokens[screenID] = token
 
-        // 异步加载预览图
+        if let cached = loadPosterImageSync(from: posterURL) {
+            guard posterDisplayTokens[screenID] == token,
+                  windows[screenID]?.contentView === containerView else {
+                return
+            }
+            containerView.showPoster(cached)
+            return
+        }
+
+        // 非本地 / 同步失败时再异步兜底
         Task { [weak self, weak containerView] in
             guard let self,
                   let image = await self.loadPosterImage(from: posterURL),
@@ -3712,11 +3861,35 @@ final class VideoWallpaperManager: ObservableObject {
         posterDisplayTokens[screenID] = UUID()
     }
 
+    /// 同步读取本地 poster（fileURL）。失败返回 nil，由调用方决定是否异步回退。
+    private func loadPosterImageSync(from url: URL) -> NSImage? {
+        let cacheKey = url.standardizedFileURL.path
+        if let cached = posterImageCache[cacheKey] {
+            return cached
+        }
+        guard url.isFileURL else { return nil }
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        posterImageCache[cacheKey] = image
+        // 简单上限：避免长期轮换把整份 poster 都留在内存。
+        if posterImageCache.count > 24 {
+            let overflow = posterImageCache.count - 24
+            for key in posterImageCache.keys.prefix(overflow) {
+                posterImageCache.removeValue(forKey: key)
+            }
+        }
+        return image
+    }
+
     /// 从 URL 加载预览图
     private func loadPosterImage(from url: URL) async -> NSImage? {
+        if let cached = loadPosterImageSync(from: url) {
+            return cached
+        }
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
-            return NSImage(data: data)
+            guard let image = NSImage(data: data) else { return nil }
+            posterImageCache[url.standardizedFileURL.path] = image
+            return image
         } catch {
             print("[VideoWallpaperManager] Failed to load poster image: \(error)")
             return nil
@@ -4072,7 +4245,8 @@ private final class WallpaperVideoContainerView: NSView {
             currentWallpaperCropRect = nil
             avPlayerLayer.videoGravity = .resizeAspectFill
             avPlayerLayer.frame = viewBounds
-            transitionPlayerLayer?.frame = avPlayerLayer.bounds
+            // 过渡层与主视频层同坐标系（父 layer），必须用 frame 而非 bounds。
+            transitionPlayerLayer?.frame = avPlayerLayer.frame
             blackTransitionLayer?.frame = viewBounds
             // 回退：mask 清除，poster/grain 恢复全 bounds
             layer?.mask = nil
@@ -4105,7 +4279,7 @@ private final class WallpaperVideoContainerView: NSView {
         let computedLayerFrame = CGRect(x: layerX, y: layerY, width: layerW, height: layerH)
         avPlayerLayer.frame = computedLayerFrame
         currentLayerFrame = computedLayerFrame
-        transitionPlayerLayer?.frame = avPlayerLayer.bounds
+        transitionPlayerLayer?.frame = avPlayerLayer.frame
 
         // ⚠️ 关键：当 cropRect 不是正方形时（如 viewport 比例窗口），avPlayerLayer 在某个方向
         // 被放大后会超出 viewport 边界。容器 backing layer 的 masksToBounds 只裁到 view bounds（全屏），
@@ -4140,49 +4314,46 @@ private final class WallpaperVideoContainerView: NSView {
         blackTransitionLayer = nil
     }
 
+    /// 双层交叉淡入：旧 AVPlayerLayer 保持可见，新 player 在上层从透明淡入。
+    /// 绝不能走纯黑中间帧，否则系统壁纸同步关闭时会露出桌面，副屏表现为“软件壁纸退出”。
     func crossfadeToPlayer(_ newPlayer: AVQueuePlayer, duration: TimeInterval, completion: @escaping () -> Void) {
         cancelPlayerTransitionIfNeeded()
-        _ = newPlayer
 
-        let blackLayer = CALayer()
-        blackLayer.backgroundColor = NSColor.black.cgColor
-        blackLayer.frame = bounds
-        blackLayer.opacity = 0
-        layer?.addSublayer(blackLayer)
-        blackTransitionLayer = blackLayer
+        let incoming = AVPlayerLayer(player: newPlayer)
+        incoming.videoGravity = avPlayerLayer.videoGravity
+        incoming.needsDisplayOnBoundsChange = true
+        // 与当前主层同 frame（含 crop/pan/zoom），避免 letterbox 区域闪黑。
+        incoming.frame = avPlayerLayer.frame
+        incoming.opacity = 0
+        // 始终盖在 poster / 旧 player 之上，淡入过程可见；黑场中间帧已去掉。
+        layer?.addSublayer(incoming)
+        transitionPlayerLayer = incoming
         let fadeDuration = max(0.12, duration)
 
         CATransaction.begin()
         CATransaction.setAnimationDuration(fadeDuration)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-        CATransaction.setCompletionBlock { [weak self, weak blackLayer] in
-            guard let self, let blackLayer, self.blackTransitionLayer === blackLayer else {
+        CATransaction.setCompletionBlock { [weak self, weak incoming] in
+            guard let self, let incoming, self.transitionPlayerLayer === incoming else {
                 completion()
                 return
             }
 
-            completion()
-
+            // 新层已盖住旧层：把主 playerLayer 切到新 player，再卸下过渡层。
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            blackLayer.opacity = 1
-            blackLayer.removeFromSuperlayer()
-            self.layer?.addSublayer(blackLayer)
-            blackLayer.frame = self.bounds
+            self.avPlayerLayer.player = newPlayer
+            self.avPlayerLayer.videoGravity = incoming.videoGravity
+            incoming.player = nil
+            incoming.removeFromSuperlayer()
+            if self.transitionPlayerLayer === incoming {
+                self.transitionPlayerLayer = nil
+            }
             CATransaction.commit()
 
-            CATransaction.begin()
-            CATransaction.setAnimationDuration(fadeDuration)
-            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-            CATransaction.setCompletionBlock { [weak self, weak blackLayer] in
-                guard let self, let blackLayer, self.blackTransitionLayer === blackLayer else { return }
-                blackLayer.removeFromSuperlayer()
-                self.blackTransitionLayer = nil
-            }
-            blackLayer.opacity = 0
-            CATransaction.commit()
+            completion()
         }
-        blackLayer.opacity = 1
+        incoming.opacity = 1
         CATransaction.commit()
     }
 
@@ -4236,7 +4407,7 @@ private final class WallpaperVideoContainerView: NSView {
         if currentWallpaperCropRect == nil {
             avPlayerLayer.frame = bounds
         }
-        transitionPlayerLayer?.frame = avPlayerLayer.bounds
+        transitionPlayerLayer?.frame = avPlayerLayer.frame
         blackTransitionLayer?.frame = bounds
 
         // poster 是 sublayer，和 avPlayerLayer 同级，容器 mask 自动裁剪。

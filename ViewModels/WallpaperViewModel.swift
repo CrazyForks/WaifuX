@@ -517,7 +517,7 @@ class WallpaperViewModel: ObservableObject {
 
     /// 提取 Wallhaven 壁纸 ID（支持 wallhaven.cc/w/{id} 和 wallhaven.cc/wallpaper/{id}）
     static func extractWallhavenID(from urlString: String) -> String? {
-        guard let url = URL(string: urlString),
+        guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)),
               url.host?.contains("wallhaven") == true else { return nil }
         let pathComponents = url.pathComponents
         // 格式: /w/{id} 或 /wallpaper/{id}
@@ -528,13 +528,86 @@ class WallpaperViewModel: ObservableObject {
         return nil
     }
 
-    /// 通过链接解析壁纸，支持 Wallhaven / 4KWallpapers
+    /// 提取 4KWallpapers 详情页 URL（4kwallpapers.com/.../{name}-{id}.html）
+    static func extract4KWallpapersDetailURL(from urlString: String) -> URL? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("4kwallpapers.com") else { return nil }
+        let path = url.path.lowercased()
+        guard path.hasSuffix(".html"), path.contains("-") else { return nil }
+        return url
+    }
+
+    /// 提取 Konachan post ID（konachan.com|net/post/show/{id}）
+    static func extractKonachanID(from urlString: String) -> String? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("konachan") else { return nil }
+        let components = url.pathComponents
+        // /post/show/{id}
+        if let showIndex = components.firstIndex(of: "show"),
+           showIndex + 1 < components.count {
+            let id = components[showIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 兜底：路径末段为纯数字
+        if let last = components.last, last.allSatisfy(\.isNumber) {
+            return last
+        }
+        return nil
+    }
+
+    /// 提取 Pixiv 作品 ID（pixiv.net/artworks/{id} 或 /i/{id}）
+    static func extractPixivID(from urlString: String) -> String? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let host = url.host?.lowercased(),
+              host.contains("pixiv.net") else { return nil }
+        let components = url.pathComponents
+        if let artworksIndex = components.firstIndex(of: "artworks"),
+           artworksIndex + 1 < components.count {
+            let id = components[artworksIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 旧式 /i/{id}
+        if let iIndex = components.firstIndex(of: "i"),
+           iIndex + 1 < components.count {
+            let id = components[iIndex + 1]
+            if id.allSatisfy(\.isNumber) { return id }
+        }
+        // 查询参数 illust_id=
+        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let illustID = comps.queryItems?.first(where: { $0.name == "illust_id" })?.value,
+           illustID.allSatisfy(\.isNumber) {
+            return illustID
+        }
+        return nil
+    }
+
+    /// 通过链接解析壁纸，支持 Wallhaven / 4KWallpapers / Konachan / Pixiv
     func resolveWallpaperByURL(_ urlString: String) async throws -> Wallpaper {
-        // 尝试 Wallhaven
-        if let wallpaperID = Self.extractWallhavenID(from: urlString) {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let wallpaperID = Self.extractWallhavenID(from: trimmed) {
             return try await resolveWallhavenWallpaperByID(wallpaperID)
         }
-        throw NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法解析此链接，仅支持 Wallhaven 链接（wallhaven.cc/w/{id}）"])
+        if let detailURL = Self.extract4KWallpapersDetailURL(from: trimmed) {
+            return try await resolve4KWallpaperByDetailURL(detailURL)
+        }
+        if let konachanID = Self.extractKonachanID(from: trimmed) {
+            return try await resolveKonachanWallpaperByID(konachanID)
+        }
+        if let pixivID = Self.extractPixivID(from: trimmed) {
+            return try await resolvePixivWallpaperByID(pixivID)
+        }
+
+        throw NSError(
+            domain: "WaifuX",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "无法解析此链接，仅支持 Wallhaven / 4KWallpapers / Konachan / Pixiv 详情页链接"]
+        )
     }
 
     /// 通过 Wallhaven API 按 ID 获取壁纸详情
@@ -548,6 +621,100 @@ class WallpaperViewModel: ObservableObject {
             headers: WallhavenAPI.authenticationHeaders(apiKey: normalizedAPIKey)
         )
         return response.data
+    }
+
+    /// 通过 4KWallpapers 详情页 URL 构造可打开的 Wallpaper
+    private func resolve4KWallpaperByDetailURL(_ detailURL: URL) async throws -> Wallpaper {
+        // 先用详情页 URL 构造最小可用模型，再尝试解析原图
+        let fileName = detailURL.deletingPathExtension().lastPathComponent
+        let idPart = fileName.split(separator: "-").last.map(String.init) ?? fileName
+        var wallpaper = Wallpaper(
+            id: "4k_\(idPart)",
+            title: nil,
+            url: detailURL.absoluteString,
+            shortUrl: nil,
+            views: 0,
+            favorites: 0,
+            downloads: nil,
+            source: "4kwallpapers",
+            purity: "sfw",
+            category: "general",
+            dimensionX: 3840,
+            dimensionY: 2160,
+            resolution: "3840x2160",
+            ratio: "1.78",
+            fileSize: nil,
+            fileType: "image/jpeg",
+            createdAt: nil,
+            colors: [],
+            path: detailURL.absoluteString,
+            thumbs: Wallpaper.Thumbs(
+                large: detailURL.absoluteString,
+                original: detailURL.absoluteString,
+                small: detailURL.absoluteString
+            ),
+            tags: nil,
+            uploader: nil
+        )
+
+        if let originalURL = await FourKWallpapersService.shared.fetchOriginalImageURL(for: wallpaper),
+           !originalURL.isEmpty {
+            wallpaper = Wallpaper(
+                id: wallpaper.id,
+                title: wallpaper.title,
+                url: wallpaper.url,
+                shortUrl: wallpaper.shortUrl,
+                views: wallpaper.views,
+                favorites: wallpaper.favorites,
+                downloads: wallpaper.downloads,
+                source: wallpaper.source,
+                purity: wallpaper.purity,
+                category: wallpaper.category,
+                dimensionX: wallpaper.dimensionX,
+                dimensionY: wallpaper.dimensionY,
+                resolution: wallpaper.resolution,
+                ratio: wallpaper.ratio,
+                fileSize: wallpaper.fileSize,
+                fileType: wallpaper.fileType,
+                createdAt: wallpaper.createdAt,
+                colors: wallpaper.colors,
+                path: originalURL,
+                thumbs: Wallpaper.Thumbs(
+                    large: originalURL,
+                    original: originalURL,
+                    small: originalURL
+                ),
+                tags: wallpaper.tags,
+                uploader: wallpaper.uploader
+            )
+        }
+        return wallpaper
+    }
+
+    /// 通过 Konachan post ID 获取壁纸
+    private func resolveKonachanWallpaperByID(_ id: String) async throws -> Wallpaper {
+        // purity rawValue=0：不附加 rating 标签，避免 id 精确查询被分级筛选误杀
+        let response = try await KonachanService.shared.search(
+            query: "id:\(id)",
+            page: 1,
+            perPage: 1,
+            purity: KonachanPuritySelection(rawValue: 0),
+            sorting: .dateAdded
+        )
+        if let wallpaper = response.data.first {
+            return wallpaper
+        }
+        throw NSError(
+            domain: "WaifuX",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "未找到 Konachan 壁纸（id=\(id)）"]
+        )
+    }
+
+    /// 通过 Pixiv 作品 ID 获取壁纸
+    private func resolvePixivWallpaperByID(_ id: String) async throws -> Wallpaper {
+        let detail = try await PixivService.shared.illustDetail(id: id)
+        return detail.toWallpaper()
     }
 
     /// 对外公开的壁纸详情获取接口（供 WallpaperDetailSheet 调用以补充 uploader 数据）

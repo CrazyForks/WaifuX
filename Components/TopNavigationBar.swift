@@ -166,23 +166,34 @@ struct CustomWindowControls: View {
     }
 }
 
-// MARK: - 详情页左上角：红绿灯 + 返回
-/// 与主顶栏对齐：leading 12、红绿灯 80×34，返回按钮紧随其后，避免盖住右侧工具与 hero 内容。
-struct DetailSheetTopLeadingControls<BackButton: View>: View {
-    let topBarTopInset: CGFloat
-    @ViewBuilder let backButton: () -> BackButton
+// MARK: - 详情页顶部栏布局
+/// 红绿灯独占窗口标题栏一行；返回/右侧工具在其下方，避免并排。
+enum DetailSheetTopBarLayout {
+    static let windowControlsTop: CGFloat = 12
+    static let windowControlsLeading: CGFloat = 12
+    static let windowControlsHeight: CGFloat = 34
+    /// 红绿灯行底边 + 与主顶栏 bottom 10 对齐的间距
+    static let actionRowTop: CGFloat = windowControlsTop + windowControlsHeight + 10 // 56
+    static let actionRowLeading: CGFloat = 28
+    static let actionRowTrailing: CGFloat = 20
+    /// Hero 内容相对窗口顶部的预留（动作行 + 按钮高度余量）
+    static let heroContentTop: CGFloat = actionRowTop + 44 // 100
+}
 
-    private let controlHeight: CGFloat = 34
-
+// MARK: - 详情页顶部红绿灯
+/// 贴在窗口标题栏区域；返回按钮等动作控件使用 `DetailSheetTopBarLayout.actionRowTop` 另起一行。
+struct DetailSheetWindowControls: View {
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            CustomWindowControls.mainWindow()
-                .frame(width: 80, height: controlHeight, alignment: .center)
-
-            backButton()
-        }
-        .padding(.top, topBarTopInset + 18)
-        .padding(.leading, 12)
+        CustomWindowControls.mainWindow()
+            .frame(
+                width: 80,
+                height: DetailSheetTopBarLayout.windowControlsHeight,
+                alignment: .center
+            )
+            .padding(.top, DetailSheetTopBarLayout.windowControlsTop)
+            .padding(.leading, DetailSheetTopBarLayout.windowControlsLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .allowsHitTesting(true)
     }
 }
 

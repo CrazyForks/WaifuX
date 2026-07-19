@@ -193,10 +193,13 @@ struct WallpaperDetailSheet: View {
                         }
                 }
 
-                DetailSheetTopLeadingControls(topBarTopInset: topBarTopInset) {
-                    floatingBackButton
-                }
-                .zIndex(100)
+                DetailSheetWindowControls()
+                    .zIndex(110)
+
+                floatingBackButton
+                    .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+                    .padding(.leading, DetailSheetTopBarLayout.actionRowLeading)
+                    .zIndex(100)
 
                 floatingInfoOverlay(
                     viewportWidth: viewW,
@@ -482,9 +485,9 @@ struct WallpaperDetailSheet: View {
         let opacity = 1 - (squeezeProgress * 0.3)
 
         return VStack(spacing: 0) {
-            // 预留给左上红绿灯 + 返回按钮行，避免标题区与顶栏控件垂直贴死
+            // 预留给标题栏红绿灯 + 下方返回/工具行，避免标题区与顶栏控件重叠
             Spacer()
-                .frame(height: max(topBarTopInset + 56, 72))
+                .frame(height: max(topBarTopInset, DetailSheetTopBarLayout.heroContentTop))
             centerInfoSection
                 .padding(.horizontal, max(28, min(96, viewportWidth * 0.08)))
         }
@@ -586,9 +589,9 @@ struct WallpaperDetailSheet: View {
                     )
             }
         }
-        // 与左侧红绿灯/返回同一顶栏基线；右侧略多留白避免贴边
-        .padding(.top, topBarTopInset + 18)
-        .padding(.trailing, 20)
+        // 与左侧返回按钮同一动作行基线（红绿灯单独在上方）
+        .padding(.top, max(topBarTopInset, DetailSheetTopBarLayout.actionRowTop))
+        .padding(.trailing, DetailSheetTopBarLayout.actionRowTrailing)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
         .zIndex(2)
     }
@@ -766,49 +769,55 @@ struct WallpaperDetailSheet: View {
                         .frame(height: 1),
                     alignment: .bottom
                 )
-
-                Button {
-                    showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(wallpaper.url, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
-                } label: {
-                    HStack {
-                        Image(systemName: "link")
-                        Text(t("wallpaperDetail.copyLink"))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
-            } else {
-                Button {
-                    showMoreOptionsPopover = false
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(wallpaper.url, forType: .string)
-                    showCopyLinkToast = true
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        showCopyLinkToast = false
-                    }
-                } label: {
-                    HStack {
-                        Image(systemName: "link")
-                        Text(t("wallpaperDetail.copyLink"))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
             }
+
+            Button {
+                guard let link = copyableSourceLinkString else {
+                    NSSound.beep()
+                    return
+                }
+                showMoreOptionsPopover = false
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(link, forType: .string)
+                showCopyLinkToast = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    showCopyLinkToast = false
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "link")
+                    Text(t("wallpaperDetail.copyLink"))
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .opacity(hasCopyableSourceLink ? 1 : 0.4)
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasCopyableSourceLink)
         }
         .frame(width: 192)
+    }
+
+    /// 可复制的来源页链接：优先 shortUrl（Wallhaven），否则用 url（各源详情页）。
+    private var copyableSourceLinkString: String? {
+        let candidates = [wallpaper.shortUrl, wallpaper.url]
+        for raw in candidates {
+            guard let raw else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let url = URL(string: trimmed),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  !url.isFileURL else { continue }
+            return trimmed
+        }
+        return nil
+    }
+
+    private var hasCopyableSourceLink: Bool {
+        copyableSourceLinkString != nil
     }
 
     // 横线分隔符

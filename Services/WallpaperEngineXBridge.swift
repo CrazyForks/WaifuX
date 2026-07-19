@@ -2319,6 +2319,19 @@ final class WallpaperEngineXBridge: ObservableObject {
         return restored
     }
 
+    /// Forget a disconnected display while leaving every other Scene/Web render
+    /// and the shared Web daemon intact. Stopping the daemon here would blank
+    /// unrelated Web wallpaper screens.
+    func discardPersistedWallpaperState(screenID: String, fingerprint: String) async {
+        screenRenderStates = screenRenderStates.filter {
+            $0.value.screenID != screenID && $0.value.screenFingerprint != fingerprint
+        }
+        targetScreenIDs.remove(screenID)
+        targetScreenFingerprints.remove(fingerprint)
+        updateControlStateFromScreenStates()
+        persistState()
+    }
+
     // MARK: - 二进制查找
 
     /// 解析 bundled `wallpaper-wgpu` 可执行文件路径
