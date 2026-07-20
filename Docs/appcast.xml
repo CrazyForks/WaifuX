@@ -6,18 +6,37 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.134</title>
-      <sparkle:version>38.0.134</sparkle:version>
-      <sparkle:shortVersionString>38.0.134</sparkle:shortVersionString>
-      <pubDate>Thu, 16 Jul 2026 19:27:30 +0800</pubDate>
+      <title>Version 38.0.135</title>
+      <sparkle:version>38.0.135</sparkle:version>
+      <sparkle:shortVersionString>38.0.135</sparkle:shortVersionString>
+      <pubDate>Mon, 20 Jul 2026 21:03:29 +0800</pubDate>
       <description><![CDATA[
-        <h3>WaifuX 38.0.134</h3>
+        <h3>WaifuX 38.0.135</h3>
         <ul>
-          <li>feat: 优化探索页滚动体验，完善动态壁纸自动暂停与 Workshop 登录/路径稳定性 探索页滚动交互、动态壁纸在休眠/解锁后的自动暂停可靠性，以及 Workshop 下载登录与设壁纸链路稳定性。 探索页与网格 - 壁纸探索页改为“先收 header、再滚网格”的两阶段滚动，header 区域滚轮也可驱动，避免筛选栏与列表一起错位滚动 - 探索网格彻底隐藏滚动条，减少视觉干扰 - 细/粗粒度滚动上报分离，header 折叠更跟手，回顶等 UI 阈值仍保持稳定 - 恢复之前丢失的比例搜索 - 封面图缩放与缩略图重解码策略优化，降低半截图/模糊图问题 - Kingfisher 内存缓存下调，缓解探索页长期滚动后 RSS 偏高 动态壁纸自动暂停 - 补齐关屏/休眠/唤醒/解锁过渡处理：宽限期 + 延迟重检 + 已有暂停原因强制重施 - 避免 CGWindowList 空快照、Finder 短暂前台等误判导致覆盖暂停被清掉后继续播放 - 原生视频与 WE 外部引擎路径统一兜底，唤醒后暂停状态更一致 Workshop / 本地壁纸 - 收紧 SteamCMD 登录失败清理策略：真实登录/会话错误清本地账号；网络超时、等手机确认、限流、无订阅权限不清账号 - 修复 loginusers.vdf 解析，正确提取最近登录 SteamID64，改善 Profile 自动回填 - 优化 Workshop 路径标准化与同源判断，减少下载后立即设壁纸时主线程卡顿/黑屏 - 当前壁纸状态同步外部引擎路径切换；相关设壁纸/媒体库匹配逻辑更稳 手势与导航 - 抽出统一的触控板右滑返回识别与优先级路由，降低普通纵向滚动误触返回 (2147661)</li>
+          <li>feat: 优化壁纸应用逻辑，确保实时模式下优先使用实时渲染，增强视频壁纸管理 (05014fd)</li>
+          <li>feat: 竖图模糊填充、多屏动态壁纸策略、Web 壁纸离线烘焙 (b444f58)</li>
+          <li>feat: 更新壁纸引擎CLI并增强视频壁纸管理中的多屏支持 (210b13e)</li>
+          <li>feat: ship workshop updates, multi-display polish, and wgpu renderer refresh (98a6faa)</li>
+          <li>refactor: remove redundant wallpaper ownership toggles (b5b7f40)</li>
+          <li>feat: complete global display and detail window controls (5d3f079)</li>
+          <li>feat: extract PR #66 optimization lifecycle, display sync, and task surfaces (ca4591a)</li>
+          <li>feat: add library video optimization actions (0b09870)</li>
+          <li>fix: harden video optimization replacement (a8fd939)</li>
+          <li>refactor: extract video optimization queue service (#64) (adbd46c)</li>
+          <li>fix: exclude loop match frame from trim (d394d80)</li>
+          <li>fix: restart video optimization from source (7d17d7c)</li>
+          <li>fix: simplify video detail option separators (ba245a2)</li>
+          <li>feat: persist display wallpaper ownership (98435e6)</li>
+          <li>feat: optimize video processing queue (27314c6)</li>
+          <li>feat: complete optimization lifecycle and display sync (c90dda2)</li>
+          <li>feat: add global display scheduler sync (cb8804a)</li>
+          <li>feat: persist video optimization lifecycle (1301005)</li>
+          <li>feat: add video optimization library actions (9661f89)</li>
+          <li>refactor: extract video optimization queue service (886b506)</li>
         </ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.134/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.135/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
