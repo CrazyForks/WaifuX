@@ -7,9 +7,10 @@ import Foundation
 ///
 /// The renderer runs in a dedicated CLI process with an offscreen WKWebView, so
 /// baking neither replaces nor pauses the user's currently applied wallpaper.
+///
+/// Cache naming matches scene bake:
+/// `{analysisId}_{renderer}_{w}x{h}_{fps}fps_{duration}s[_props-{hash}].mp4`
 enum WebOfflineBakeService {
-    private static let cacheFilePrefix = "web_v2_"
-
     private struct VideoInspection {
         let duration: TimeInterval
         let width: Int
@@ -31,8 +32,21 @@ enum WebOfflineBakeService {
         return type.caseInsensitiveCompare("web") == .orderedSame
     }
 
-    static func isCurrentCacheArtifactURL(_ url: URL) -> Bool {
-        url.lastPathComponent.hasPrefix(cacheFilePrefix)
+    /// Stable id derived from project.json (+ mtime), same role as scene eligibility analysisId.
+    static func stableAnalysisId(for contentRoot: URL) -> UUID {
+        let projectURL = contentRoot.appendingPathComponent("project.json")
+        var data = (try? Data(contentsOf: projectURL)) ?? Data(contentRoot.path.utf8)
+        if let date = try? projectURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            data.append(Data(String(date.timeIntervalSince1970).utf8))
+        }
+        let digest = Array(SHA256.hash(data: data))
+        return UUID(uuid: (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5],
+            (digest[6] & 0x0f) | 0x50, digest[7],
+            (digest[8] & 0x3f) | 0x80, digest[9],
+            digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]
+        ))
     }
 
     static func bake(
@@ -49,6 +63,7 @@ enum WebOfflineBakeService {
             throw SceneOfflineBakeError.webCliNotFound
         }
 
+        let analysisId = stableAnalysisId(for: contentRoot)
         let effectiveFPS = resolvedFPS(requested: fps)
         let effectiveDuration = resolvedDuration(requested: durationSeconds)
         let targetSize = mainDisplayPixelSize()
@@ -59,7 +74,7 @@ enum WebOfflineBakeService {
             makeCacheURL(
                 root: DownloadPathManager.shared.sceneBakesFolderURL,
                 itemID: record.id,
-                contentRoot: contentRoot,
+                analysisId: analysisId,
                 width: targetSize.width,
                 height: targetSize.height,
                 fps: Int(effectiveFPS),
@@ -104,7 +119,7 @@ enum WebOfflineBakeService {
             ) {
                 let bakedAt = fileCreationDate(for: cacheURL) ?? .now
                 let artifact = SceneBakeArtifact(
-                    analysisId: UUID(),
+                    analysisId: analysisId,
                     videoPath: cacheURL.path,
                     width: inspection.width,
                     height: inspection.height,
@@ -159,7 +174,7 @@ enum WebOfflineBakeService {
             try? FileManager.default.removeItem(at: cacheURL)
             try FileManager.default.moveItem(at: temporaryURL, to: cacheURL)
             let artifact = SceneBakeArtifact(
-                analysisId: UUID(),
+                analysisId: analysisId,
                 videoPath: cacheURL.path,
                 width: inspection.width,
                 height: inspection.height,
@@ -268,10 +283,11 @@ enum WebOfflineBakeService {
         return (width - (width % 2), height - (height % 2))
     }
 
+    /// Same layout as `SceneOfflineBakeService.cacheVideoURL`.
     private static func makeCacheURL(
         root: URL,
         itemID: String,
-        contentRoot: URL,
+        analysisId: UUID,
         width: Int,
         height: Int,
         fps: Int,
@@ -279,38 +295,28 @@ enum WebOfflineBakeService {
         userPropertiesJSON: String?
     ) -> URL {
         let safeItemID = itemID.replacingOccurrences(of: "/", with: "_")
-        let revision = projectRevision(for: contentRoot)
-        let propertiesRevision = propertiesRevision(for: userPropertiesJSON)
-        let durationLabel = Int(duration.rounded())
-        let name = "\(cacheFilePrefix)\(revision)_p\(propertiesRevision)_\(width)x\(height)_\(fps)fps_\(durationLabel)s.mp4"
-        return root
-            .appendingPathComponent(safeItemID, isDirectory: true)
-            .appendingPathComponent(name)
+        let dir = root.appendingPathComponent(safeItemID, isDirectory: true)
+        let propertiesSuffix = propertiesCacheKey(for: userPropertiesJSON).map { "_props-\($0)" } ?? ""
+        let name =
+            "\(analysisId.uuidString)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
+        return dir.appendingPathComponent(name)
     }
 
-    private static func projectRevision(for contentRoot: URL) -> String {
-        let projectURL = contentRoot.appendingPathComponent("project.json")
-        var data = (try? Data(contentsOf: projectURL)) ?? Data(contentRoot.path.utf8)
-        if let date = try? projectURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
-            data.append(Data(String(date.timeIntervalSince1970).utf8))
-        }
-        return SHA256.hash(data: data)
-            .prefix(10)
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
-
-    private static func propertiesRevision(for userPropertiesJSON: String?) -> String {
+    /// Same as scene bake: empty properties → no suffix; otherwise SHA256 prefix.
+    private static func propertiesCacheKey(for userPropertiesJSON: String?) -> String? {
         guard let userPropertiesJSON,
-              let input = userPropertiesJSON.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: input),
-              let canonical = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
-            return "default"
+              !userPropertiesJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
         }
-        return SHA256.hash(data: canonical)
-            .prefix(10)
-            .map { String(format: "%02x", $0) }
-            .joined()
+        let data: Data
+        if let source = userPropertiesJSON.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: source),
+           let canonical = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) {
+            data = canonical
+        } else {
+            data = Data(userPropertiesJSON.utf8)
+        }
+        return SHA256.hash(data: data).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func fileCreationDate(for url: URL) -> Date? {

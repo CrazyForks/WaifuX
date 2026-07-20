@@ -491,14 +491,107 @@ struct MediaDetailSheet: View {
         if let cachedSceneBakeVideoURL {
             return cachedSceneBakeVideoURL
         }
-        // 已下载的视频文件优先使用本地路径，避免从网络加载
-        // 使用 FileExistenceCache 避免主线程 FileManager.fileExists(atPath:)
-        if let localURL = currentDownloadRecord?.localFileURL,
-           FileExistenceCache.shared.fileExists(atPath: localURL.path),
-           ["mp4", "mov", "webm", "m4v"].contains(localURL.pathExtension.lowercased()) {
-            return localURL
+
+        // 已下载：优先解析本地可播视频（Workshop 目录 / 直链 mp4 等）。
+        // 记录路径常是 content 根目录而非文件，不能只看 pathExtension。
+        if let localVideo = resolvedLocalPreviewVideoURL() {
+            return localVideo
+        }
+
+        // resolvedItem 可能已在下载完成后注入本地 previewVideoURL
+        if let preview = resolvedItem.previewVideoURL,
+           preview.isFileURL,
+           FileExistenceCache.shared.fileExists(atPath: preview.path),
+           Self.previewVideoExtensions.contains(preview.pathExtension.lowercased()) {
+            return preview
         }
         return resolvedItem.previewVideoURL
+    }
+
+    private static let previewVideoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
+
+    /// 从下载记录 / Workshop 本地路径解析可用于详情页背景循环的视频文件。
+    private func resolvedLocalPreviewVideoURL() -> URL? {
+        let fileCache = FileExistenceCache.shared
+        var candidates: [URL] = []
+        if let recordURL = currentDownloadRecord?.localFileURL {
+            candidates.append(recordURL)
+        }
+        if let workshop = findLocalWorkshopFile(for: resolvedItem) {
+            candidates.append(workshop)
+        }
+
+        var seen = Set<String>()
+        for candidate in candidates {
+            let path = candidate.standardizedFileURL.path
+            guard seen.insert(path).inserted else { continue }
+            guard fileCache.fileExists(atPath: path) else { continue }
+
+            if Self.previewVideoExtensions.contains(candidate.pathExtension.lowercased()) {
+                return candidate
+            }
+            // Workshop content 目录 / project 根：解析内嵌视频
+            if let videoURL = MediaItem.resolveLocalVideoFile(from: candidate),
+               fileCache.fileExists(atPath: videoURL.path) {
+                return videoURL
+            }
+        }
+        return nil
+    }
+
+    /// 下载 / 更新完成后：注入本地视频与预览图，让详情页背景立刻切到本地资源。
+    @MainActor
+    private func refreshResolvedItemAfterLocalDownload() {
+        let merged = mediaItemByMergingAuthorMetadata(resolvedItem, fallback: resolvedItem)
+        var item = itemWithLocalWorkshopVideo(merged)
+        item = itemWithCorrectedWorkshopPageURL(item)
+
+        // 普通媒体直链下载：下载记录是 mp4 时也写入 previewVideoURL
+        if item.previewVideoURL == nil || !(item.previewVideoURL?.isFileURL ?? false),
+           let localVideo = resolvedLocalPreviewVideoURL() {
+            item = MediaItem(
+                slug: item.slug,
+                title: item.title,
+                pageURL: item.pageURL,
+                thumbnailURL: item.thumbnailURL,
+                resolutionLabel: item.resolutionLabel,
+                collectionTitle: item.collectionTitle,
+                summary: item.summary,
+                previewVideoURL: localVideo,
+                posterURL: item.posterURL,
+                tags: item.tags,
+                exactResolution: item.exactResolution,
+                durationSeconds: item.durationSeconds,
+                downloadOptions: item.downloadOptions,
+                sourceName: item.sourceName,
+                isAnimatedImage: item.isAnimatedImage,
+                subscriptionCount: item.subscriptionCount,
+                favoriteCount: item.favoriteCount,
+                viewCount: item.viewCount,
+                ratingScore: item.ratingScore,
+                authorName: item.authorName,
+                authorSteamID: item.authorSteamID,
+                authorAvatarURL: item.authorAvatarURL,
+                fileSize: item.fileSize,
+                createdAt: item.createdAt,
+                updatedAt: item.updatedAt
+            )
+        }
+
+        // 新落盘路径可能尚未进 FileExistenceCache，标记存在以免本帧仍判不存在
+        if let recordURL = currentDownloadRecord?.localFileURL {
+            FileExistenceCache.shared.markExisting(atPath: recordURL.path)
+            if let nestedVideo = MediaItem.resolveLocalVideoFile(from: recordURL) {
+                FileExistenceCache.shared.markExisting(atPath: nestedVideo.path)
+            }
+        }
+        if let localVideo = resolvedLocalPreviewVideoURL() {
+            FileExistenceCache.shared.markExisting(atPath: localVideo.path)
+        }
+
+        // 强制背景视图按新 URL 重建（.id 依赖 preview 路径）
+        isMediaLoaded = false
+        resolvedItem = item
     }
 
     private func detailScrollTopInset(viewportHeight: CGFloat, heroHidden: Bool) -> CGFloat {
@@ -836,10 +929,10 @@ struct MediaDetailSheet: View {
             }
 
             Button {
-                if cachedSceneBakeVideoURL != nil,
-                   let local = findLocalWorkshopFile(for: resolvedItem) {
-                    // 与「设为壁纸」同一方法
-                    applyWorkshopWallpaperFromLocalURL(local)
+                // 「预渲染循环视频」= 应用/生成烘焙 MP4，不走实时 Web/Scene。
+                // 有成片时直接把 MP4 设为视频壁纸（与 scene 非实时路径一致）。
+                if let bakedURL = cachedSceneBakeVideoURL {
+                    applyBakedLoopVideoAsWallpaper(bakedURL)
                 } else if isCurrentDownloadedWebProject {
                     runWebOfflineBake(clearCachedArtifact: false)
                 } else {
@@ -1203,8 +1296,9 @@ struct MediaDetailSheet: View {
                         isBakingScene = false
                         bakeProgress = 0
                         if shouldAutoApplyAfterBake,
-                           let local = findLocalWorkshopFile(for: resolvedItem) {
-                            applyWorkshopWallpaperFromLocalURL(local)
+                           SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) {
+                            // 预渲染意图：直接应用烘焙 MP4，不走实时 renderer
+                            applyBakedLoopVideoAsWallpaper(videoURL)
                         } else {
                             sceneBakeStatusFlash = t("sceneBake.cached")
                         }
@@ -1224,13 +1318,13 @@ struct MediaDetailSheet: View {
                     isBakingScene = false
                     bakeProgress = 0
                     if shouldAutoApplyAfterBake {
-                        // 实时渲染：桌面已由 wgpu 渲染，不自动把烘焙 MP4 设到桌面
+                        // 实时渲染：桌面已由实时引擎渲染，不自动覆盖；仅缓存
                         if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
                             sceneBakeStatusFlash = t("sceneBake.cached")
                             print("[MediaDetailSheet] 实时渲染模式：烘焙完成，产物已缓存（锁屏/companion 由统一 apply 路径处理）")
-                        } else if let local = findLocalWorkshopFile(for: resolvedItem) {
+                        } else if SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) {
                             scheduleSceneBakeSuccessFlash()
-                            applyWorkshopWallpaperFromLocalURL(local)
+                            applyBakedLoopVideoAsWallpaper(videoURL)
                         } else {
                             scheduleSceneBakeSuccessFlash()
                         }
@@ -1280,9 +1374,9 @@ struct MediaDetailSheet: View {
                 await MainActor.run {
                     isBakingScene = false
                     bakeProgress = 0
-                    if shouldAutoApplyAfterBake,
-                       let local = findLocalWorkshopFile(for: resolvedItem) {
-                        applyWorkshopWallpaperFromLocalURL(local)
+                    if shouldAutoApplyAfterBake {
+                        // 与 scene 缓存命中一致：预渲染意图 → 应用烘焙 MP4
+                        applyBakedLoopVideoAsWallpaper(videoURL)
                     } else {
                         sceneBakeStatusFlash = t("sceneBake.cached")
                     }
@@ -1291,16 +1385,24 @@ struct MediaDetailSheet: View {
             }
 
             do {
-                _ = try await WebOfflineBakeService.bake(record: record) { progress in
+                let artifact = try await WebOfflineBakeService.bake(record: record) { progress in
                     updateSceneBakeProgress(progress)
                 }
+                let videoURL = URL(fileURLWithPath: artifact.videoPath)
                 await MainActor.run {
                     isBakingScene = false
                     bakeProgress = 0
-                    if shouldAutoApplyAfterBake,
-                       let local = findLocalWorkshopFile(for: resolvedItem) {
-                        scheduleSceneBakeSuccessFlash()
-                        applyWorkshopWallpaperFromLocalURL(local)
+                    if shouldAutoApplyAfterBake {
+                        // 与 scene 一致：实时开着只缓存；非实时则应用烘焙循环视频
+                        if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
+                            sceneBakeStatusFlash = t("sceneBake.cached")
+                            print("[MediaDetailSheet] 实时渲染模式：Web 烘焙完成，产物已缓存（不覆盖当前实时壁纸）")
+                        } else if SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) {
+                            scheduleSceneBakeSuccessFlash()
+                            applyBakedLoopVideoAsWallpaper(videoURL)
+                        } else {
+                            scheduleSceneBakeSuccessFlash()
+                        }
                     } else {
                         scheduleSceneBakeSuccessFlash()
                     }
@@ -1313,6 +1415,70 @@ struct MediaDetailSheet: View {
                     showError = true
                 }
             }
+        }
+    }
+
+    /// 将已烘焙的循环 MP4 设为视频壁纸（预渲染按钮 / 烘焙完成后的非实时路径）。
+    /// 直接传视频文件，避免再走 Workshop 根路径触发实时 Web/Scene。
+    private func applyBakedLoopVideoAsWallpaper(_ bakedVideoURL: URL) {
+        guard SceneOfflineBakeService.isUsableBakedVideo(at: bakedVideoURL) else {
+            sceneBakeStatusFlash = t("sceneBake.cached")
+            return
+        }
+        let screens = NSScreen.screens
+        let run: (NSScreen?) -> Void = { [self] selectedScreen in
+            applyingWallpaperStatusKey = "applyingWallpaper.video"
+            isSettingWallpaper = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in
+                guard isSettingWallpaper else { return }
+                isSettingWallpaper = false
+            }
+            Task { @MainActor in
+                do {
+                    let isGlobalDisplaySyncEnabled = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+                    let targetScreens = isGlobalDisplaySyncEnabled
+                        ? NSScreen.screens
+                        : selectedScreen.map { [$0] }
+                    var options = LocalWallpaperApplyService.Options(
+                        animatedTransition: false,
+                        requirePlaybackEndSupport: false,
+                        muted: isMuted,
+                        fallbackPosterURL: preferredWorkshopPosterForVideo,
+                        generatePosterFromVideoIfNeeded: true,
+                        sceneBakeItemID: currentDownloadRecord?.item.id,
+                        bakedVideoPath: bakedVideoURL.path,
+                        usesSharedVideoDecoder: isGlobalDisplaySyncEnabled,
+                        reason: "baked-loop-apply"
+                    )
+                    options.bakedVideoPath = bakedVideoURL.path
+                    _ = try await LocalWallpaperApplyService.apply(
+                        localURL: bakedVideoURL,
+                        targetScreens: targetScreens,
+                        options: options
+                    )
+                    WallpaperSchedulerService.shared.notifyManualWallpaperChange(
+                        screenID: isGlobalDisplaySyncEnabled ? nil : selectedScreen?.wallpaperScreenIdentifier
+                    )
+                    sceneBakeStatusFlash = t("sceneBake.cached")
+                } catch {
+                    errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                    showError = true
+                }
+                isSettingWallpaper = false
+            }
+        }
+
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            run(nil)
+        } else if screens.count > 1 {
+            DisplaySelectorManager.shared.showSelector(
+                title: t("setWallpaper"),
+                message: t("multiDisplayDetected")
+            ) { selected in
+                run(selected)
+            }
+        } else {
+            run(screens.first)
         }
     }
 
@@ -1919,6 +2085,7 @@ struct MediaDetailSheet: View {
                 } else {
                     try await viewModel.download(downloadingItem)
                 }
+                refreshResolvedItemAfterLocalDownload()
                 if let videoURL = videoURLs.first {
                     VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
                 }
@@ -2292,6 +2459,7 @@ struct MediaDetailSheet: View {
                 if let record = mediaLibrary.downloadRecord(for: itemID) {
                     resolvedItem = record.item
                 }
+                refreshResolvedItemAfterLocalDownload()
                 sceneBakeStatusFlash = t("workshop.updated")
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if sceneBakeStatusFlash == t("workshop.updated") {
@@ -2591,6 +2759,7 @@ struct MediaDetailSheet: View {
                 }
                 if let targetOption {
                     _ = try await viewModel.downloadMedia(downloadingItem, option: targetOption)
+                    refreshResolvedItemAfterLocalDownload()
                     AppLogger.info(.download, "媒体下载成功", metadata:
                         ["id": itemID, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start)),
                          "选中选项": targetOption.label])
@@ -2621,6 +2790,7 @@ struct MediaDetailSheet: View {
 
             do {
                 try await viewModel.downloadWorkshopWallpaper(downloadingItem, guardCode: guardCode)
+                refreshResolvedItemAfterLocalDownload()
                 AppLogger.info(.download, "Workshop 下载成功", metadata:
                     ["id": itemID, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
             } catch let error as WorkshopError {
@@ -2683,6 +2853,7 @@ struct MediaDetailSheet: View {
             } else {
                 try await viewModel.download(downloadingItem)
             }
+            refreshResolvedItemAfterLocalDownload()
 
             // registerDownloadedSource runs on download completion and clears old state;
             // then enqueueAfterDownloadIfNeeded consumes the blacklist restore request.
@@ -2828,6 +2999,7 @@ struct MediaDetailSheet: View {
                     try await viewModel.downloadWorkshopWallpaper(resolvedItem)
                     // 下载被取消则不再继续设置壁纸
                     if Task.isCancelled { return }
+                    refreshResolvedItemAfterLocalDownload()
                     // 下载完成后，查找本地文件并设置壁纸
                     if let localURL = findLocalWorkshopFile(for: resolvedItem) {
                         isSettingWallpaper = false
@@ -3844,11 +4016,26 @@ struct MediaDetailSheet: View {
 
         var updatedPreviewVideoURL = item.previewVideoURL
         var updatedPosterURL = item.posterURL
+        let videoExts = Self.previewVideoExtensions
 
-        if let localVideoURL = findLocalWorkshopFile(for: item) {
-        let videoExts = ["mp4", "mov", "webm"]
-            if updatedPreviewVideoURL == nil, videoExts.contains(localVideoURL.pathExtension.lowercased()) {
-                updatedPreviewVideoURL = localVideoURL
+        // 1) 可播放文件路径（pickWorkshopPlayableFile 可能直接返回 mp4）
+        if let localPlayable = findLocalWorkshopFile(for: item) {
+            if videoExts.contains(localPlayable.pathExtension.lowercased()) {
+                updatedPreviewVideoURL = localPlayable
+            } else if let nestedVideo = MediaItem.resolveLocalVideoFile(from: localPlayable) {
+                // 2) content 目录 / project 根内嵌视频
+                updatedPreviewVideoURL = nestedVideo
+            }
+        }
+
+        // 3) 下载记录路径再兜底扫一遍（与 findLocal 偶发路径不一致时）
+        if updatedPreviewVideoURL == nil || !(updatedPreviewVideoURL?.isFileURL ?? false),
+           let record = MediaLibraryService.shared.downloadedItems.first(where: { $0.item.id == item.id }) {
+            let recorded = record.localFileURL
+            if videoExts.contains(recorded.pathExtension.lowercased()) {
+                updatedPreviewVideoURL = recorded
+            } else if let nestedVideo = MediaItem.resolveLocalVideoFile(from: recorded) {
+                updatedPreviewVideoURL = nestedVideo
             }
         }
 

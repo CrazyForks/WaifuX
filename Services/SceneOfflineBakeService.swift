@@ -265,11 +265,13 @@ enum SceneOfflineBakeService {
               isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)) else {
             return nil
         }
+        // Web bake: no eligibility snapshot; file presence is enough (same as recovery path).
         if artifact.renderer == .wallpaperEngineWeb {
-            let videoURL = URL(fileURLWithPath: artifact.videoPath)
-            return WebOfflineBakeService.isCurrentCacheArtifactURL(videoURL) ? artifact : nil
+            return artifact
         }
-        guard artifact.analysisId == record.sceneBakeEligibility?.analysisId else {
+        // Scene bake: analysisId must still match eligibility when present.
+        if let eligibilityId = record.sceneBakeEligibility?.analysisId,
+           artifact.analysisId != eligibilityId {
             return nil
         }
         return artifact

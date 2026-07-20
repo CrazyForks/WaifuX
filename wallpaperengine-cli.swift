@@ -644,6 +644,174 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         forMainFrameOnly: false
     )
 
+    /// Offline bake 虚拟时钟：把动画时间与墙钟解耦。
+    ///
+    /// 关键：Spine 等用 **rAF 回调参数 timestamp**（不是 performance.now）算 delta。
+    /// 因此 documentStart 即包装 rAF：仍走浏览器调度，但回调拿到的是虚拟 contentMs。
+    /// - setContentTime 推进 contentMs 后，下一次真实 rAF 看到非零 dt → 动画前进一步
+    /// - 抓帧等待期间 contentMs 不变 → 多次 rAF 的 dt=0 → 动画冻结，不会超速
+    /// - 同时对齐 performance.now / Date.now / timer / media
+    private static let offlineBakeClockScript = WKUserScript(
+        source: """
+        (function() {
+          'use strict';
+          if (window.__wxBakeClock) return;
+          var contentMs = 0;
+          var startMs = 0;
+          /// Real wall epoch ms corresponding to contentMs==startMs (Date.now must stay epoch-based).
+          var epochAtStart = 0;
+          var running = false;
+          var timerId = 1;
+          var timers = Object.create(null);
+          var origRAF = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
+          var origCAF = window.cancelAnimationFrame ? window.cancelAnimationFrame.bind(window) : null;
+          var origSTO = window.setTimeout.bind(window);
+          var origDateNow = Date.now.bind(Date);
+          var origPerfNow = (window.performance && performance.now)
+            ? performance.now.bind(performance) : function() { return origDateNow(); };
+
+          function nowMs() {
+            return running ? contentMs : origPerfNow();
+          }
+
+          function epochNowMs() {
+            return running ? (epochAtStart + (contentMs - startMs)) : origDateNow();
+          }
+
+          function flushTimers() {
+            var ids = Object.keys(timers);
+            for (var i = 0; i < ids.length; i++) {
+              var id = ids[i];
+              var t = timers[id];
+              if (!t) continue;
+              if (contentMs + 1e-6 < t.fireAt) continue;
+              try { t.fn.apply(null, t.args || []); } catch (e) {}
+              if (t.interval > 0) {
+                t.fireAt = contentMs + t.interval;
+                while (t.fireAt <= contentMs) t.fireAt += t.interval;
+              } else {
+                delete timers[id];
+              }
+            }
+          }
+
+          function syncMedia() {
+            var sec = (contentMs - startMs) / 1000.0;
+            try {
+              var nodes = document.querySelectorAll('video,audio');
+              for (var i = 0; i < nodes.length; i++) {
+                var el = nodes[i];
+                try {
+                  if (el.paused) {
+                    var p = el.play();
+                    if (p && typeof p.catch === 'function') p.catch(function(){});
+                  }
+                  if (isFinite(el.duration) && el.duration > 0) {
+                    var target = sec % el.duration;
+                    if (!isFinite(el.currentTime) || Math.abs(el.currentTime - target) > 0.04) {
+                      el.currentTime = target;
+                    }
+                  } else if (!isFinite(el.currentTime) || Math.abs(el.currentTime - sec) > 0.04) {
+                    el.currentTime = sec;
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          }
+
+          // Always wrap rAF so bake mode can inject virtual timestamps.
+          // Before enable: pass browser timestamp through. After: pass contentMs.
+          if (origRAF) {
+            window.requestAnimationFrame = function(cb) {
+              return origRAF(function(realT) {
+                var t = running ? contentMs : realT;
+                try { cb(t); } catch (e) {}
+              });
+            };
+          }
+          if (origCAF) {
+            window.cancelAnimationFrame = function(id) {
+              try { origCAF(id); } catch (e) {}
+            };
+          }
+
+          window.__wxBakeClock = {
+            enable: function() {
+              if (running) return true;
+              // Freeze content timeline at current wall time; subsequent setContentTime advances both.
+              contentMs = origPerfNow();
+              startMs = contentMs;
+              epochAtStart = origDateNow();
+              running = true;
+              try {
+                if (window.performance && typeof Object.defineProperty === 'function') {
+                  Object.defineProperty(window.performance, 'now', {
+                    configurable: true,
+                    writable: true,
+                    value: function() { return nowMs(); }
+                  });
+                }
+              } catch (e) {
+                try { performance.now = function() { return nowMs(); }; } catch (e2) {}
+              }
+              // Spine TimeKeeper uses Date.now()/1e3 — must remain epoch milliseconds.
+              try { Date.now = function() { return Math.floor(epochNowMs()); }; } catch (e) {}
+              window.setTimeout = function(fn, delay) {
+                var id = timerId++;
+                var ms = (typeof delay === 'number' && isFinite(delay)) ? Math.max(0, delay) : 0;
+                var args = [].slice.call(arguments, 2);
+                timers[id] = { fn: fn, fireAt: contentMs + ms, interval: 0, args: args };
+                return id;
+              };
+              window.clearTimeout = function(id) { delete timers[id]; };
+              window.setInterval = function(fn, delay) {
+                var id = timerId++;
+                var ms = (typeof delay === 'number' && isFinite(delay) && delay > 0) ? delay : 1;
+                var args = [].slice.call(arguments, 2);
+                timers[id] = { fn: fn, fireAt: contentMs + ms, interval: ms, args: args };
+                return id;
+              };
+              window.clearInterval = function(id) { delete timers[id]; };
+              return true;
+            },
+            /// Absolute content timeline offset from enable (ms). Frame N → N * (1000/fps).
+            setContentTime: function(ms) {
+              if (!running) this.enable();
+              var offset = Math.max(0, Number(ms) || 0);
+              contentMs = startMs + offset;
+              flushTimers();
+              syncMedia();
+              return contentMs - startMs;
+            },
+            /// Wait for `count` real animation frames after time advance (lets Spine/WebGL paint).
+            afterFrames: function(count, token) {
+              count = Math.max(1, count | 0);
+              return new Promise(function(resolve) {
+                if (!origRAF) {
+                  origSTO(function() { resolve(token || 0); }, 16);
+                  return;
+                }
+                var left = count;
+                function step() {
+                  left -= 1;
+                  if (left <= 0) {
+                    resolve(token || 0);
+                    return;
+                  }
+                  origRAF(step);
+                }
+                origRAF(step);
+              });
+            },
+            getContentTime: function() { return contentMs - startMs; },
+            isEnabled: function() { return running; }
+          };
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
     /// documentStart 注入：包装 AudioContext / webkitAudioContext，把 ctx.destination 路由到一个
     /// master GainNode；同时维护 window.__waifuxAudioMuted / __waifuxAudioVolume 状态，
     /// 暴露 window.__waifuxSetAudio({muted?, volume?}) 供 native 通过 evaluateJavaScript 调用。
@@ -876,6 +1044,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         ucc.addUserScript(Self.localFileCompatScript)
         ucc.addUserScript(Self.mouseEventBridgeScript)
         ucc.addUserScript(Self.audioWrapperScript)
+        // Offline bake: virtual content clock so sparse wall-clock snapshots still yield dense animation frames.
+        if offscreen {
+            ucc.addUserScript(Self.offlineBakeClockScript)
+        }
         config.userContentController = ucc
         if #available(macOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -1302,6 +1474,55 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         snapshotWebView(screen: screen, completion: completion)
     }
 
+    /// Enable offline-bake virtual clock (no-op if script missing).
+    func enableOfflineBakeClock(screen: Int, completion: (() -> Void)? = nil) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion?()
+            return
+        }
+        webView.evaluateJavaScript(
+            "(function(){try{if(window.__wxBakeClock){window.__wxBakeClock.enable();return true;}return false;}catch(e){return false;}})();"
+        ) { _, _ in
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
+    /// Advance wallpaper content time to `seconds`, then wait for real rAF paints.
+    /// Real rAF keeps Spine/WebGL loops alive; virtual `performance.now` makes dt match content step.
+    func setOfflineBakeContentTime(
+        screen: Int,
+        seconds: Double,
+        paintFrames: Int = 2,
+        completion: (() -> Void)? = nil
+    ) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion?()
+            return
+        }
+        let ms = max(0, seconds) * 1000.0
+        let frames = max(1, paintFrames)
+        // setContentTime then wait N real animation frames so the pose is painted before snapshot.
+        let js = String(
+            format: """
+            (function(){
+              try {
+                if (!window.__wxBakeClock) return Promise.resolve(-1);
+                window.__wxBakeClock.setContentTime(%.3f);
+                if (typeof window.__wxBakeClock.afterFrames === 'function') {
+                  return window.__wxBakeClock.afterFrames(%d, 1);
+                }
+                return Promise.resolve(0);
+              } catch (e) { return Promise.resolve(-2); }
+            })();
+            """,
+            ms,
+            frames
+        )
+        webView.evaluateJavaScript(js) { _, _ in
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
 }
 
 // MARK: - Offline Web Bake
@@ -1338,6 +1559,8 @@ private final class WebOfflineBakeRunner {
     private let renderer = WebRendererBridge.shared
     /// 目标成片帧数（固定 PTS = index/fps，保证均匀帧间隔）。
     private let totalFrameCount: Int
+    /// 内容时间步长（秒）。虚拟时钟按此推进，与墙钟无关。
+    private let contentFrameInterval: TimeInterval
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -1345,13 +1568,25 @@ private final class WebOfflineBakeRunner {
     private var temporaryOutputURL: URL?
     private var captureStartedAt: Date?
     private var nextFrameIndex = 0
+    private var writtenFrameCount = 0
     private var isFinishing = false
     private var didComplete = false
+    private var bakeClockEnabled = false
+
+    /// 4K60 下约 50Mbps（~0.1 bpp），明显优于旧的 width×height×3（~25Mbps）。
+    private static func averageBitRate(width: Int, height: Int, fps: Int) -> Int {
+        let pixels = max(1, width) * max(1, height)
+        let safeFPS = max(15, fps)
+        // ~0.10 bit/pixel/frame，并按分辨率夹紧，避免 1080p 过低或 5K 失控。
+        let raw = Double(pixels) * Double(safeFPS) * 0.10
+        return Int(min(max(raw, 8_000_000), 100_000_000))
+    }
 
     init(options: Options, completion: @escaping (Result<Void, Error>) -> Void) {
         self.options = options
         self.completion = completion
         self.totalFrameCount = max(1, Int((options.duration * Double(options.fps)).rounded(.up)))
+        self.contentFrameInterval = 1.0 / Double(max(1, options.fps))
     }
 
     func start() {
@@ -1370,6 +1605,7 @@ private final class WebOfflineBakeRunner {
             try? FileManager.default.removeItem(at: temporaryURL)
             temporaryOutputURL = temporaryURL
 
+            let bitrate = Self.averageBitRate(width: options.width, height: options.height, fps: options.fps)
             let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: .mp4)
             let input = AVAssetWriterInput(
                 mediaType: .video,
@@ -1378,14 +1614,16 @@ private final class WebOfflineBakeRunner {
                     AVVideoWidthKey: options.width,
                     AVVideoHeightKey: options.height,
                     AVVideoCompressionPropertiesKey: [
-                        AVVideoAverageBitRateKey: options.width * options.height * 3,
+                        AVVideoAverageBitRateKey: bitrate,
                         AVVideoExpectedSourceFrameRateKey: options.fps,
-                        AVVideoMaxKeyFrameIntervalKey: options.fps * 2
+                        AVVideoMaxKeyFrameIntervalKey: options.fps * 2,
+                        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                        AVVideoAllowFrameReorderingKey: false
                     ] as [String: Any]
                 ]
             )
-            // Offline bake is not a live capture pipeline: allow the encoder to accept
-            // frames as fast as we can produce them when snapshot lags real time.
+            // Offline bake is not a live capture pipeline: accept frames as soon as
+            // snapshots are ready. Content timing is driven by the virtual clock.
             input.expectsMediaDataInRealTime = false
             let adaptor = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: input,
@@ -1408,6 +1646,18 @@ private final class WebOfflineBakeRunner {
             videoInput = input
             pixelBufferAdaptor = adaptor
             emitProgress(phase: "准备", progress: 0)
+            fputs(
+                String(
+                    format: "[web-bake] encoder bitrate=%d target=%dx%d@%dfps duration=%.1fs dense+virtual-clock\n",
+                    bitrate,
+                    options.width,
+                    options.height,
+                    options.fps,
+                    options.duration
+                ),
+                stderr
+            )
+            fflush(stderr)
 
             renderer.loadWallpaper(
                 path: options.path,
@@ -1422,8 +1672,32 @@ private final class WebOfflineBakeRunner {
                     self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
                     return
                 }
-                self.captureStartedAt = Date()
-                self.captureNextFrame()
+                // Wait for Spine/WebGL init + property reapply (bootstrap uses ~0.5s reapply).
+                // Wait for Spine/WebGL init + property reapply (~0.5s in bootstrap).
+                // Then enable virtual clock and allow one real rAF turn so the page
+                // re-registers its loop under the hooked requestAnimationFrame.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self, !self.isFinishing else { return }
+                    self.renderer.enableOfflineBakeClock(screen: WebRendererBridge.offlineBakeScreen) { [weak self] in
+                        guard let self, !self.isFinishing else { return }
+                        self.bakeClockEnabled = true
+                        fputs("[web-bake] virtual clock enabled; waiting for loop rebind\n", stderr)
+                        fflush(stderr)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                            guard let self, !self.isFinishing else { return }
+                            self.renderer.setOfflineBakeContentTime(
+                                screen: WebRendererBridge.offlineBakeScreen,
+                                seconds: 0
+                            ) { [weak self] in
+                                guard let self, !self.isFinishing else { return }
+                                self.captureStartedAt = Date()
+                                fputs("[web-bake] capturing dense frames (virtual content clock)\n", stderr)
+                                fflush(stderr)
+                                self.captureNextFrame()
+                            }
+                        }
+                    }
+                }
             }
         } catch {
             finish(.failure(error))
@@ -1431,20 +1705,20 @@ private final class WebOfflineBakeRunner {
     }
 
     private func captureNextFrame() {
-        guard !isFinishing, let startedAt = captureStartedAt else { return }
+        guard !isFinishing else { return }
         if nextFrameIndex >= totalFrameCount {
             finishWriting()
             return
         }
 
-        // Real-time sampling: only capture when wall clock reaches the slot for
-        // nextFrameIndex. When takeSnapshot lags we skip intermediate indices
-        // (see append) so content time stays aligned with PTS — no 2x speed-up.
-        let frameInterval = 1.0 / Double(options.fps)
-        let targetWallSeconds = Double(nextFrameIndex) * frameInterval
-        let elapsed = Date().timeIntervalSince(startedAt)
-        let delay = max(0, targetWallSeconds - elapsed)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        let contentSeconds = Double(nextFrameIndex) * contentFrameInterval
+        // Advance virtual clock, wait for real rAF paints, then snapshot.
+        // paintFrames=2: one frame consumes the content dt, second ensures GL presents.
+        renderer.setOfflineBakeContentTime(
+            screen: WebRendererBridge.offlineBakeScreen,
+            seconds: contentSeconds,
+            paintFrames: 2
+        ) { [weak self] in
             guard let self, !self.isFinishing else { return }
             self.renderer.captureImage(screen: WebRendererBridge.offlineBakeScreen) { [weak self] image in
                 guard let self, !self.isFinishing else { return }
@@ -1485,7 +1759,8 @@ private final class WebOfflineBakeRunner {
             return
         }
 
-        // Fixed grid PTS at nextFrameIndex/fps (even spacing while we keep up).
+        // Dense capture: every index is written. Content time is virtual-clock driven,
+        // so wall-clock snapshot lag no longer drops intermediate frames.
         let writtenIndex = nextFrameIndex
         let timescale = CMTimeScale(options.fps * 100)
         let presentationTime = CMTime(
@@ -1497,21 +1772,27 @@ private final class WebOfflineBakeRunner {
             return
         }
 
-        // Align next sample to wall clock. If snapshot took longer than 1/fps,
-        // skip intermediate indices instead of packing late content into early PTS
-        // (that compresses animation and looks like playback is too fast).
-        let elapsed = captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
-        let fps = Double(options.fps)
-        let wallNextIndex = Int(floor(elapsed * fps)) + 1
-        nextFrameIndex = max(writtenIndex + 1, min(wallNextIndex, totalFrameCount))
+        writtenFrameCount += 1
+        nextFrameIndex = writtenIndex + 1
 
+        let wallElapsed = captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         emitProgress(
             phase: "录制",
-            progress: min(0.99, max(
-                Double(nextFrameIndex) / Double(totalFrameCount),
-                elapsed / max(options.duration, 0.001)
-            ))
+            progress: min(0.99, Double(nextFrameIndex) / Double(totalFrameCount))
         )
+        if writtenFrameCount == 1 || writtenFrameCount % max(1, options.fps) == 0 || nextFrameIndex >= totalFrameCount {
+            fputs(
+                String(
+                    format: "[web-bake] dense frame %d/%d content=%.3fs wall=%.1fs\n",
+                    writtenFrameCount,
+                    totalFrameCount,
+                    Double(writtenIndex) * contentFrameInterval,
+                    wallElapsed
+                ),
+                stderr
+            )
+            fflush(stderr)
+        }
         captureNextFrame()
     }
 
@@ -1560,6 +1841,17 @@ private final class WebOfflineBakeRunner {
             guard let self else { return }
             let result: Result<Void, Error>
             if writer.status == .completed {
+                let wall = self.captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                fputs(
+                    String(
+                        format: "[web-bake] finished frames=%d expected=%d wall=%.1fs\n",
+                        self.writtenFrameCount,
+                        self.totalFrameCount,
+                        wall
+                    ),
+                    stderr
+                )
+                fflush(stderr)
                 result = .success(())
             } else {
                 result = .failure(
@@ -2637,7 +2929,8 @@ struct WallpaperEngineCLI {
         Commands:
           set <path> [screen_index]   Set wallpaper
           bake <path> --size WxH --fps N --duration S --out <path>
-                                     Export a Web wallpaper as H.264 MP4
+                                     Export a Web wallpaper as dense H.264 MP4
+                                     (virtual content clock; no wall-clock frame drops)
           pause                       Pause wallpaper
           resume                      Resume wallpaper
           stop-screen <screen_index>  Stop wallpaper on one display

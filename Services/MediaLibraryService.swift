@@ -548,33 +548,71 @@ final class MediaLibraryService: ObservableObject {
             return
         }
 
-        let videoURL = candidates
+        let isWeb = WebOfflineBakeService.isWebProject(at: record.localFileURL)
+        // Prefer scene-style names (`…_wallpaperEngineWeb_…` / `…_wallpaperWgpu_…`),
+        // then fall back to any usable mp4 (including legacy `web_v*` filenames).
+        let ranked = candidates
             .filter {
                 $0.pathExtension.lowercased() == "mp4"
                     && !$0.lastPathComponent.hasPrefix(".")
                     && ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 1_024
             }
-            .max {
-                ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
-                    < ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+            .sorted { lhs, rhs in
+                let lName = lhs.lastPathComponent
+                let rName = rhs.lastPathComponent
+                let lPreferred = isPreferredBakeFileName(lName, isWeb: isWeb)
+                let rPreferred = isPreferredBakeFileName(rName, isWeb: isWeb)
+                if lPreferred != rPreferred { return lPreferred && !rPreferred }
+                let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lDate > rDate
             }
-        guard let videoURL else { return }
+        guard let videoURL = ranked.first else { return }
 
         let attributes = try? fileManager.attributesOfItem(atPath: videoURL.path)
         let bakedAt = attributes?[.creationDate] as? Date ?? .now
+        let name = videoURL.lastPathComponent
+        let renderer: SceneBakeRenderer = {
+            if name.contains("_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_")
+                || name.hasPrefix("web_v") {
+                return .wallpaperEngineWeb
+            }
+            if name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_") {
+                return .wallpaperWgpu
+            }
+            return isWeb ? .wallpaperEngineWeb : .wallpaperWgpu
+        }()
+        let analysisId: UUID = {
+            if let eligibilityId = record.sceneBakeEligibility?.analysisId {
+                return eligibilityId
+            }
+            if isWeb {
+                return WebOfflineBakeService.stableAnalysisId(for: record.localFileURL)
+            }
+            // Parse leading UUID from scene-style filename when present.
+            let prefix = name.split(separator: "_", maxSplits: 1, omittingEmptySubsequences: true).first
+                .map(String.init) ?? ""
+            return UUID(uuidString: prefix) ?? UUID()
+        }()
         let artifact = SceneBakeArtifact(
-            analysisId: record.sceneBakeEligibility?.analysisId ?? UUID(),
+            analysisId: analysisId,
             videoPath: videoURL.path,
             width: 0,
             height: 0,
             fps: 0,
             durationSeconds: 0,
             bakedAt: bakedAt,
-            renderer: WebOfflineBakeService.isWebProject(at: record.localFileURL)
-                ? .wallpaperEngineWeb
-                : .wallpaperWgpu
+            renderer: renderer
         )
         attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: false)
+    }
+
+    /// Scene-style cache names rank above legacy `web_v*` / orphan files.
+    private func isPreferredBakeFileName(_ name: String, isWeb: Bool) -> Bool {
+        if isWeb {
+            return name.contains("_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_")
+        }
+        return name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_")
     }
 
     private func restoreDownloadRecord(recordID: String, localFileURL: URL) {
