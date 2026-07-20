@@ -300,6 +300,20 @@ final class DesktopWallpaperSyncManager {
     }
 
     private func relinkScreenStateForCurrentDisplays() {
+        let currentScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+
+        // 清掉已断屏的 screenID 键；fingerprint 级注册保留，供重插 / Space 同步
+        let orphanScreenIDs = Set(lastSetImageURLByScreen.keys)
+            .union(lastOptionsByScreen.keys)
+            .subtracting(currentScreenIDs)
+        for screenID in orphanScreenIDs {
+            lastSetImageURLByScreen.removeValue(forKey: screenID)
+            lastOptionsByScreen.removeValue(forKey: screenID)
+        }
+        if !orphanScreenIDs.isEmpty {
+            print("[DesktopWallpaperSyncManager] Dropped \(orphanScreenIDs.count) orphaned screenID registration(s) after disconnect")
+        }
+
         var relinkedCount = 0
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier

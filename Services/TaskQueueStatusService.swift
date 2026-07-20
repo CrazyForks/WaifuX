@@ -55,8 +55,7 @@ final class TaskQueueStatusService: ObservableObject {
             Self.makeEntries(
                 downloads: downloads,
                 optimizations: optimizations,
-                sceneBakeItemID: SceneOfflineBakeProgressTracker.shared.activeItemID,
-                sceneBakeProgress: SceneOfflineBakeProgressTracker.shared.progress,
+                sceneBakeEntries: SceneOfflineBakeProgressTracker.shared.entries,
                 standaloneBakeIsRunning: bake.0,
                 standaloneBakeProgress: bake.1,
                 standaloneBakeStatus: bake.2
@@ -90,8 +89,7 @@ final class TaskQueueStatusService: ObservableObject {
         entries = Self.makeEntries(
             downloads: DownloadTaskService.shared.tasks,
             optimizations: VideoOptimizationQueueService.shared.items,
-            sceneBakeItemID: SceneOfflineBakeProgressTracker.shared.activeItemID,
-            sceneBakeProgress: SceneOfflineBakeProgressTracker.shared.progress,
+            sceneBakeEntries: SceneOfflineBakeProgressTracker.shared.entries,
             standaloneBakeIsRunning: BakeService.shared.isBaking,
             standaloneBakeProgress: BakeService.shared.progress,
             standaloneBakeStatus: BakeService.shared.statusText
@@ -101,8 +99,7 @@ final class TaskQueueStatusService: ObservableObject {
     private static func makeEntries(
         downloads: [DownloadTask],
         optimizations: [FrameInterpolationQueueItem],
-        sceneBakeItemID: String?,
-        sceneBakeProgress: Double,
+        sceneBakeEntries: [SceneOfflineBakeProgressTracker.Entry],
         standaloneBakeIsRunning: Bool,
         standaloneBakeProgress: Double,
         standaloneBakeStatus: String
@@ -132,15 +129,16 @@ final class TaskQueueStatusService: ObservableObject {
             }
 
         var bakeEntries: [Entry] = []
-        if let itemID = sceneBakeItemID {
-            let title = MediaLibraryService.shared.downloadRecord(for: itemID)?.item.title
-                ?? LocalizationService.shared.t("statusbar.taskQueue.bakeRunning")
+        for sceneBake in sceneBakeEntries {
+            let title = sceneBake.itemID.flatMap {
+                MediaLibraryService.shared.downloadRecord(for: $0)?.item.title
+            } ?? LocalizationService.shared.t("statusbar.taskQueue.bakeRunning")
             bakeEntries.append(
                 Entry(
-                    id: "scene-bake-\(itemID)",
+                    id: "scene-bake-\(sceneBake.id.uuidString)",
                     category: .bake,
                     title: title,
-                    progress: sceneBakeProgress
+                    progress: sceneBake.progress
                 )
             )
         }

@@ -950,23 +950,6 @@ class WallpaperSchedulerService: ObservableObject {
         updateConfig(newConfig)
     }
 
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screenID: String) {
-        var newConfig = config
-        var displayConfig = newConfig.resolvedDisplayConfig(for: screenID)
-        displayConfig.autoChangeOnExternalConnect = enabled
-        newConfig.displayConfigs[screenID] = displayConfig
-        updateConfig(newConfig)
-    }
-
-    func updateDisplayAutoChangeOnExternalConnect(_ enabled: Bool, for screen: NSScreen) {
-        let screenID = displayConfigScreenID(for: screen)
-        var newConfig = config
-        var displayConfig = resolvedDisplayConfig(for: screen)
-        displayConfig.autoChangeOnExternalConnect = enabled
-        newConfig.displayConfigs[screenID] = displayConfig
-        updateConfig(newConfig)
-    }
-
     /// 外接显示器变更后，重新把当前全局壁纸覆盖到完整的屏幕集合。
     /// 调度器只发起统一应用；媒体类型分发不在此处实现。
     func synchronizeCurrentGlobalWallpaperToConnectedDisplays() {
@@ -1105,11 +1088,13 @@ class WallpaperSchedulerService: ObservableObject {
             guard displayConfig.isEnabled else { continue }
             guard !displayConfig.isOnUnlockMode else { continue }
 
-            // "播完即换"模式的屏幕：设置了 webSceneSwitchSeconds 时由定时器调度（仅 Web/Scene 壁纸）
-            // 视频壁纸仍由播放完成通知触发，不走定时器
+            // "播完即换"模式设置了秒级兜底时，Web/Scene/静态图都由定时器继续轮换。
+            // 本机视频仍必须等播放完成通知，不能被秒级定时器中途切走。
             if displayConfig.isOnEndMode {
                 guard let wsSec = displayConfig.webSceneSwitchSeconds,
-                      WallpaperEngineXBridge.shared.isManaging(screen: screen) else { continue }
+                      !VideoWallpaperManager.shared.hasActiveWallpaper(on: screen) else {
+                    continue
+                }
                 let items = getSchedulableItems(for: displayConfig)
                 if items.isEmpty {
                     print("\(logTag) Screen \(screenID): no schedulable items for on-end mode with webSceneSwitchSeconds")
@@ -1316,7 +1301,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         if global.isOnEndMode {
             guard let seconds = global.webSceneSwitchSeconds,
-                  WallpaperEngineXBridge.shared.isControllingExternalEngine else {
+                  !VideoWallpaperManager.shared.isVideoWallpaperActive else {
                 return
             }
             if let lastChange = lastChangeTimes[globalSchedulerStateKey],
@@ -1625,8 +1610,10 @@ class WallpaperSchedulerService: ObservableObject {
                 let preferRealtimeForScene = isRealtimeRenderingEnabled && (!onEndMode || webSceneSwitchEnabled)
                 var bakedVideoPath: String? = nil
                 var sceneBakeItemID: String? = nil
-                if isWorkshop, !preferRealtimeForScene, let art = record.sceneBakeArtifact {
-                    if SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
+                if isWorkshop,
+                   let art = SceneOfflineBakeService.usableArtifact(from: record) {
+                    let isWebBake = art.renderer == .wallpaperEngineWeb
+                    if isWebBake || !preferRealtimeForScene {
                         bakedVideoPath = art.videoPath
                         sceneBakeItemID = record.item.id
                     }

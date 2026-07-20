@@ -644,6 +644,17 @@ final class VideoOptimizationQueueService: ObservableObject {
             || (UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false)
     }
 
+    var enabledManualOptimizationOperations: [FrameInterpolationQueueItem.Operation] {
+        var operations: [FrameInterpolationQueueItem.Operation] = []
+        if isLoopAnalysisEnabled {
+            operations.append(.loopTransition)
+        }
+        if isFrameInterpolationEnabled {
+            operations.append(.frameInterpolation)
+        }
+        return operations
+    }
+
     @discardableResult
     func enqueueLoopTransition(
         videoURL: URL,

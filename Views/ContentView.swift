@@ -1031,43 +1031,33 @@ private struct BackgroundDownloadProgressToastHost: View {
 private struct VideoOptimizationProgressToastHost: View {
     @ObservedObject private var queue = VideoOptimizationQueueService.shared
 
-    private var loopItem: FrameInterpolationQueueItem? {
-        queue.activeItem(for: .loopTransition)
-            ?? queue.pendingItems(for: .loopTransition).first
-    }
-
-    private var interpolationItem: FrameInterpolationQueueItem? {
-        queue.activeItem(for: .frameInterpolation)
-            ?? queue.pendingItems(for: .frameInterpolation).first
-    }
-
-    private var loopCount: Int {
-        queue.pendingItems(for: .loopTransition).count
-    }
-
-    private var interpolationCount: Int {
-        queue.pendingItems(for: .frameInterpolation).count
+    private var activeItem: FrameInterpolationQueueItem? {
+        queue.activeProcessingItem
     }
 
     var body: some View {
-        VStack(spacing: 8) {
-            if let item = loopItem {
+        Group {
+            if let item = activeItem {
                 BackgroundTaskProgressToast(
-                    title: String(format: t("loopAnalysis.toastRunning"), Int((item.progress * 100).rounded())),
-                    detail: remainingDetail(loopCount - 1),
-                    progress: item.progress
-                )
-            }
-
-            if let item = interpolationItem {
-                BackgroundTaskProgressToast(
-                    title: String(format: t("frameInterpolationToastRunning"), Int((item.progress * 100).rounded())),
-                    detail: remainingDetail(interpolationCount - 1),
+                    title: title(for: item),
+                    detail: remainingDetail(queue.remainingWorkCount),
                     progress: item.progress
                 )
             }
         }
         .transition(.opacity.combined(with: .move(edge: .bottom)))
+    }
+
+    private func title(for item: FrameInterpolationQueueItem) -> String {
+        let progress = Int((item.progress * 100).rounded())
+        switch item.currentOperation {
+        case .loopTransition:
+            return String(format: t("loopAnalysis.toastRunning"), progress)
+        case .frameInterpolation:
+            return String(format: t("frameInterpolationToastRunning"), progress)
+        case nil:
+            return t("videoOptimizationOptimizingVideo")
+        }
     }
 
     private func remainingDetail(_ count: Int) -> String? {

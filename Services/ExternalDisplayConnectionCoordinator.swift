@@ -19,7 +19,8 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         let fingerprint: String
     }
 
-    private let retainedDisplayFingerprintsKey = "external_display_retained_fingerprints_v1"
+    private let knownDisplayFingerprintsKey = "external_display_known_fingerprints_v1"
+    private let legacyRetainedDisplayFingerprintsKey = "external_display_retained_fingerprints_v1"
     private var isStarted = false
     private var previousExternalDisplays: [String: ExternalDisplaySnapshot] = [:]
     private var pendingWorkItem: DispatchWorkItem?
@@ -33,7 +34,9 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     func start() {
         guard !isStarted else { return }
         isStarted = true
+        migrateLegacyRetainedDisplayFingerprintsIfNeeded()
         previousExternalDisplays = Self.currentExternalDisplaySnapshots()
+        markDisplaysAsKnown(previousExternalDisplays.keys)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleScreenParametersChanged),
@@ -65,21 +68,13 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         let currentFingerprints = Set(current.keys)
         let previousFingerprints = Set(previousExternalDisplays.keys)
         let connectedFingerprints = currentFingerprints.subtracting(previousFingerprints)
-        let disconnectedFingerprints = previousFingerprints.subtracting(currentFingerprints)
 
         AppLogger.error(.wallpaper, "ExternalDisplay processed display change", metadata: [
             "currentExternal": currentFingerprints.count,
             "connected": connectedFingerprints.count,
-            "disconnected": disconnectedFingerprints.count,
-            "connectedFingerprints": connectedFingerprints.joined(separator: ","),
-            "disconnectedFingerprints": disconnectedFingerprints.joined(separator: ",")
+            "known": knownDisplayFingerprints.count,
+            "connectedFingerprints": connectedFingerprints.joined(separator: ",")
         ])
-
-        for fingerprint in disconnectedFingerprints {
-            guard !retainedDisplayFingerprints.contains(fingerprint),
-                  let display = previousExternalDisplays[fingerprint] else { continue }
-            discardUnretainedDisplayPersistence(display)
-        }
 
         previousExternalDisplays = Self.currentExternalDisplaySnapshots()
 
@@ -93,11 +88,12 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         Task { @MainActor in
             if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
                 // A synchronized display has no independent connect decision.
+                markDisplayAsKnown(screen.externalConnectionFingerprint)
                 WallpaperSchedulerService.shared.synchronizeCurrentGlobalWallpaperToConnectedDisplays()
                 return
             }
 
-            if retainedDisplayFingerprints.contains(screen.externalConnectionFingerprint) {
+            if knownDisplayFingerprints.contains(screen.externalConnectionFingerprint) {
                 if await restorePreviousDisplayStateIfAvailable(for: screen) {
                     return
                 }
@@ -145,20 +141,9 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         alert.addButton(withTitle: t("externalDisplay.openLibraryWithoutAuto"))
         alert.addButton(withTitle: t("externalDisplay.doNotUseAnyWallpaper"))
 
-        let retainState = NSButton(checkboxWithTitle: t("externalDisplay.retainState"), target: nil, action: nil)
-        retainState.state = retainedDisplayFingerprints.contains(display.fingerprint) ? .on : .off
-        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        retainState.translatesAutoresizingMaskIntoConstraints = false
-        accessory.addSubview(retainState)
-        NSLayoutConstraint.activate([
-            retainState.leadingAnchor.constraint(equalTo: accessory.leadingAnchor),
-            retainState.centerYAnchor.constraint(equalTo: accessory.centerYAnchor)
-        ])
-        alert.accessoryView = accessory
-
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        setRetainsDisplayState(retainState.state == .on, fingerprint: display.fingerprint)
+        markDisplayAsKnown(display.fingerprint)
 
         if let screen = NSScreen.screens.first(where: {
             $0.wallpaperScreenIdentifier == display.screenID
@@ -182,43 +167,31 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         presentNextPromptIfNeeded()
     }
 
-    private var retainedDisplayFingerprints: Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: retainedDisplayFingerprintsKey) ?? [])
+    private var knownDisplayFingerprints: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: knownDisplayFingerprintsKey) ?? [])
     }
 
-    private func setRetainsDisplayState(_ retains: Bool, fingerprint: String) {
-        var values = retainedDisplayFingerprints
-        if retains {
-            values.insert(fingerprint)
-        } else {
-            values.remove(fingerprint)
-        }
-        UserDefaults.standard.set(values.sorted(), forKey: retainedDisplayFingerprintsKey)
+    private func markDisplayAsKnown(_ fingerprint: String) {
+        var fingerprints = knownDisplayFingerprints
+        guard fingerprints.insert(fingerprint).inserted else { return }
+        UserDefaults.standard.set(fingerprints.sorted(), forKey: knownDisplayFingerprintsKey)
     }
 
-    private func discardUnretainedDisplayPersistence(_ display: ExternalDisplaySnapshot) {
-        WallpaperSchedulerService.shared.discardPersistedDisplayState(
-            screenID: display.screenID,
-            fingerprint: display.fingerprint
-        )
-        VideoWallpaperManager.shared.discardPersistedWallpaperState(
-            screenID: display.screenID,
-            fingerprint: display.fingerprint
-        )
-        Task {
-            await WallpaperEngineXBridge.shared.discardPersistedWallpaperState(
-                screenID: display.screenID,
-                fingerprint: display.fingerprint
-            )
-        }
-        StaticImageWallpaperOverlayManager.shared.discardPersistedImageState(
-            screenID: display.screenID,
-            fingerprint: display.fingerprint
-        )
-        DesktopWallpaperSyncManager.shared.clearRegistration(
-            screenID: display.screenID,
-            fingerprint: display.fingerprint
-        )
+    private func markDisplaysAsKnown(_ fingerprints: Dictionary<String, ExternalDisplaySnapshot>.Keys) {
+        var known = knownDisplayFingerprints
+        let originalCount = known.count
+        known.formUnion(fingerprints)
+        guard known.count != originalCount else { return }
+        UserDefaults.standard.set(known.sorted(), forKey: knownDisplayFingerprintsKey)
+    }
+
+    private func migrateLegacyRetainedDisplayFingerprintsIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: knownDisplayFingerprintsKey) == nil else { return }
+
+        let retained = Set(defaults.stringArray(forKey: legacyRetainedDisplayFingerprintsKey) ?? [])
+        guard !retained.isEmpty else { return }
+        defaults.set(retained.sorted(), forKey: knownDisplayFingerprintsKey)
     }
 
     private func openLibrary() {

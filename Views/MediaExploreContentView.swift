@@ -1364,6 +1364,7 @@ struct MediaExploreContentView: View {
     // MARK: - Actions
 
     private func handleInitialLoad() async {
+        syncExploreSortStateFromViewModel()
 
         let restoredFeed = viewModel.restoreExploreFeedIfNeededAfterDetailReturn()
         if viewModel.items.isEmpty {
@@ -1372,6 +1373,8 @@ struct MediaExploreContentView: View {
         if !restoredFeed {
             await viewModel.initialLoadIfNeeded()
         }
+        // 加载完成后再次同步（兜底：restore 可能发生在 onAppear 之后）
+        syncExploreSortStateFromViewModel()
         if searchText.isEmpty {
             searchText = viewModel.currentQuery
         }
@@ -1382,11 +1385,13 @@ struct MediaExploreContentView: View {
     private func performFirstAppearanceLoad() async {
         // ⚠️ 防止 NavigationStack pop 后视图被重建导致丢失已加载的多页数据
         guard viewModel.items.isEmpty else {
+            syncExploreSortStateFromViewModel()
             isFirstAppearance = false
             return
         }
 
         isInitialLoading = true
+        syncExploreSortStateFromViewModel()
         searchText = ""
         mediaSearchQuery = ""
         translationBridge.reset()
@@ -1395,7 +1400,7 @@ struct MediaExploreContentView: View {
         selectedWorkshopType = .all
         selectedWorkshopContentLevel = .everyone
         selectedWorkshopResolution = nil
-        selectedWorkshopSort = .trendWeek
+        // 保留用户持久化过的排序，不强制回默认
         selectedCategory = .all
         selectedSort = .newest
         lastSyncedFirstItemID = nil
@@ -1403,10 +1408,22 @@ struct MediaExploreContentView: View {
         viewModel.errorMessage = nil
 
         await viewModel.initialLoadIfNeeded()
+        syncExploreSortStateFromViewModel()
 
         syncAtmosphereIfNeeded()
         isInitialLoading = false
         isFirstAppearance = false
+    }
+
+    /// 从 ViewModel 恢复的排序同步到本地 @State
+    private func syncExploreSortStateFromViewModel() {
+        let workshop = WorkshopSortOption(rawValue: viewModel.workshopSortMenuRawValue) ?? .trendWeek
+        if selectedWorkshopSort != workshop {
+            selectedWorkshopSort = workshop
+        }
+        if selectedDongTaiSort != viewModel.dongtaiSortBy {
+            selectedDongTaiSort = viewModel.dongtaiSortBy
+        }
     }
 
     private func selectCategory(_ category: MediaCategory) {
@@ -1548,6 +1565,12 @@ struct MediaExploreContentView: View {
 
     private func handleWorkshopSortChange() {
         guard !isApplyingProgrammaticReset else { return }
+        // 与 ViewModel 已恢复值一致时不重复写回/重载
+        guard selectedWorkshopSort.rawValue != viewModel.workshopSortMenuRawValue
+            || selectedWorkshopSort.sortBy != viewModel.workshopSortBy
+            || selectedWorkshopSort.days != viewModel.workshopDays else {
+            return
+        }
 
         AppLogger.info(.wallpaper, "Workshop 排序变化", metadata: ["排序": selectedWorkshopSort.rawValue])
         // 仅在 Workshop 模式下实际重载数据；MotionBG 下仅更新 UI 不触发加载
@@ -1559,13 +1582,15 @@ struct MediaExploreContentView: View {
             defer { searchTask = nil }
             await viewModel.setWorkshopSort(
                 sortBy: selectedWorkshopSort.sortBy,
-                days: selectedWorkshopSort.days
+                days: selectedWorkshopSort.days,
+                menuRawValue: selectedWorkshopSort.rawValue
             )
         }
     }
 
     private func handleDongTaiSortChange() {
         guard !isApplyingProgrammaticReset else { return }
+        guard selectedDongTaiSort != viewModel.dongtaiSortBy else { return }
 
         guard workshopSourceManager.activeSource == .dongtai else { return }
         prepareForFeedReplacement()
@@ -1701,10 +1726,11 @@ struct MediaExploreContentView: View {
         selectedWorkshopType = .all
         selectedWorkshopContentLevel = .everyone
         selectedWorkshopResolution = nil
-        selectedWorkshopSort = .trendWeek
+        // 切换源 / 清除筛选时保留用户持久化过的排序
+        selectedWorkshopSort = WorkshopSortOption(rawValue: viewModel.workshopSortMenuRawValue) ?? .trendWeek
         selectedDongTaiCategories = []
         selectedDongTaiListType = .all
-        selectedDongTaiSort = .popular
+        selectedDongTaiSort = viewModel.dongtaiSortBy
         dongtaiFilterAudio = nil
         dongtaiFilterFourK = nil
         selectedWallsflowCategorySlug = "live-wallpapers"

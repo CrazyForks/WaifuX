@@ -256,6 +256,7 @@ final class MediaLibraryService: ObservableObject {
         upsert(item)
 
         SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
+        WebOfflineBakeService.scheduleAutoBakeAfterDownload(itemID: item.id, localFileURL: localFileURL)
 
         // 视频文件下载完成后异步生成**高清** poster（锁屏/桌面用，最大 3840×2160）；
         // 列表 800×600 小图由 UI 侧按需 generateThumbnail，二者隔离。
@@ -569,7 +570,9 @@ final class MediaLibraryService: ObservableObject {
             fps: 0,
             durationSeconds: 0,
             bakedAt: bakedAt,
-            renderer: .wallpaperWgpu
+            renderer: WebOfflineBakeService.isWebProject(at: record.localFileURL)
+                ? .wallpaperEngineWeb
+                : .wallpaperWgpu
         )
         attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: false)
     }

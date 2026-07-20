@@ -447,6 +447,7 @@ private func readWebWallpaperUserPropertiesJSON(contentDir: URL) -> String? {
 // MARK: - Web Renderer Bridge (WKWebView-based HTML wallpaper)
 private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     static let shared = WebRendererBridge()
+    static let offlineBakeScreen = -1
 
     /// 对齐 [Wallpaper Engine Web 文档](https://docs.wallpaperengine.io/en/web/api/propertylistener.html) 等：提供 `wallpaperRegisterAudioListener`、
     /// 媒体集成注册函数与 `wallpaperMediaIntegration` 命名空间。无系统音频捕获时音频为全零；媒体集成默认 `enabled: false`。
@@ -755,6 +756,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         var injectedPropertiesJSON: String?
         var firstFrameSettleGeneration: UInt64 = 0
         var isLoaded: Bool = false
+        var isOffscreen: Bool = false
         var mouseEventMonitors: [Any] = []
         var lastMouseMoveTime: TimeInterval = 0
     }
@@ -775,11 +777,21 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         static let thumbDimension: Int = 48
     }
 
-    func loadWallpaper(path: String, width: Int, height: Int, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
+    func loadWallpaper(
+        path: String,
+        width: Int,
+        height: Int,
+        screen: Int? = nil,
+        offscreen: Bool = false,
+        userPropertiesJSON: String? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         // 解析目标屏幕索引
         let screens = NSScreen.screens
         let screenIdx: Int
-        if let s = screen, s >= 0, s < screens.count {
+        if offscreen {
+            screenIdx = Self.offlineBakeScreen
+        } else if let s = screen, s >= 0, s < screens.count {
             screenIdx = s
         } else if let main = NSScreen.main, let mainIdx = screens.firstIndex(of: main) {
             screenIdx = mainIdx
@@ -790,6 +802,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         stop(screen: screenIdx) // 只清理目标屏幕的旧状态
         screenStates[screenIdx] = ScreenState()
         screenStates[screenIdx]?.pendingCompletion = completion
+        screenStates[screenIdx]?.isOffscreen = offscreen
 
         // 超时安全网：30 秒后如果 pendingCompletion 仍在，强制回调防止 IPC 响应永远不发回
         // （与 App 侧 WallpaperEngineXBridge 的 30s 超时对齐）
@@ -807,9 +820,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             return
         }
 
-        screenStates[screenIdx]?.injectedPropertiesJSON = readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
+        screenStates[screenIdx]?.injectedPropertiesJSON = userPropertiesJSON
+            ?? readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
         if screenStates[screenIdx]?.injectedPropertiesJSON != nil {
-            dlog("[WebRendererBridge] Loaded user properties from project.json for injection")
+            dlog("[WebRendererBridge] Loaded user properties for injection")
         }
 
         // 记录临时目录以便 stop 时清理
@@ -837,14 +851,21 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             defer: false
         )
         let desktopLevel = CGWindowLevelForKey(.desktopWindow)
-        w.level = .init(rawValue: Int(desktopLevel))
+        w.level = .init(rawValue: Int(desktopLevel) + (offscreen ? 1 : 0))
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
-        w.setFrame(targetScreen.frame, display: true)
+        if offscreen {
+            // WebGL needs a display-backed surface. Keep it fully transparent
+            // above the desktop so Finder's desktop contents are never replaced.
+            w.setFrame(targetScreen.frame, display: false)
+            w.alphaValue = 0
+        } else {
+            w.setFrame(targetScreen.frame, display: true)
+        }
         w.acceptsMouseMovedEvents = true
-        w.ignoresMouseEvents = false
+        w.ignoresMouseEvents = offscreen
         w.isReleasedWhenClosed = false
 
         // 配置 WKWebView
@@ -882,7 +903,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         web.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
         w.orderBack(nil)
 
-        dlog("[WebRendererBridge] Loading web wallpaper: \(fileURL.path) on screen \(screenIdx) (\(targetScreen.localizedName))")
+        let destination = offscreen ? "offscreen bake surface" : "screen \(screenIdx) (\(targetScreen.localizedName))"
+        dlog("[WebRendererBridge] Loading web wallpaper: \(fileURL.path) on \(destination)")
     }
 
     /// 自动检测并修复 Spine 动画壁纸缺失的 .config.json。
@@ -946,7 +968,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         runWebWallpaperBootstrap(screen: s) { [weak self] in
             guard let self = self else { return }
             self.beginSettlingFirstFrame(screen: s)
-            self.startMouseEventBridge(for: s)
+            // Offline bake surfaces are full-screen transparent windows; never bridge
+            // mouse into them or the bake will follow the cursor / parallax props.
+            if self.screenStates[s]?.isOffscreen != true {
+                self.startMouseEventBridge(for: s)
+            }
         }
         NSApp.setActivationPolicy(.prohibited)
     }
@@ -1000,7 +1026,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             });
             window.dispatchEvent(new Event('resize'));
         """) { _, _ in }
-        startMouseEventBridge(for: screen)
+        if state.isOffscreen != true {
+            startMouseEventBridge(for: screen)
+        }
         NSApp.setActivationPolicy(.prohibited)
     }
 
@@ -1090,6 +1118,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private func startMouseEventBridge(for screen: Int) {
         guard screenStates[screen]?.window != nil, screenStates[screen]?.webView != nil else { return }
+        // Bake / offscreen surfaces must not receive cursor parallax or click injection.
+        guard screenStates[screen]?.isOffscreen != true else { return }
         if !globalMouseMonitors.isEmpty { return }
         let eventTypes: [(NSEvent.EventTypeMask, String)] = [
             (.leftMouseDown, "mousedown"), (.leftMouseUp, "mouseup"),
@@ -1120,6 +1150,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
         let mouseLocation = NSEvent.mouseLocation
         for (_, state) in screenStates {
+            // Offline bake uses a full-screen transparent window; never inject into it.
+            guard !state.isOffscreen else { continue }
             guard state.isLoaded, let window = state.window, let webView = state.webView else { continue }
             guard window.frame.contains(mouseLocation) else { continue }
             let relX = mouseLocation.x - window.frame.origin.x
@@ -1265,6 +1297,324 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             completion?(self?.saveImage(image, screen: screen) ?? false)
         }
     }
+
+    func captureImage(screen: Int, completion: @escaping (NSImage?) -> Void) {
+        snapshotWebView(screen: screen, completion: completion)
+    }
+
+}
+
+// MARK: - Offline Web Bake
+
+private enum WebOfflineBakeError: LocalizedError {
+    case invalidArguments(String)
+    case rendererFailed(String)
+    case writerFailed(String)
+    case captureFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidArguments(let message): return message
+        case .rendererFailed(let message): return message
+        case .writerFailed(let message): return message
+        case .captureFailed: return "无法从 Web 渲染器捕获画面"
+        }
+    }
+}
+
+private final class WebOfflineBakeRunner {
+    struct Options {
+        let path: String
+        let width: Int
+        let height: Int
+        let fps: Int
+        let duration: TimeInterval
+        let outputURL: URL
+        let userPropertiesJSON: String?
+    }
+
+    private let options: Options
+    private let completion: (Result<Void, Error>) -> Void
+    private let renderer = WebRendererBridge.shared
+    /// 目标成片帧数（固定 PTS = index/fps，保证均匀帧间隔）。
+    private let totalFrameCount: Int
+
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var temporaryOutputURL: URL?
+    private var captureStartedAt: Date?
+    private var nextFrameIndex = 0
+    private var isFinishing = false
+    private var didComplete = false
+
+    init(options: Options, completion: @escaping (Result<Void, Error>) -> Void) {
+        self.options = options
+        self.completion = completion
+        self.totalFrameCount = max(1, Int((options.duration * Double(options.fps)).rounded(.up)))
+    }
+
+    func start() {
+        guard options.width >= 2, options.height >= 2, options.fps >= 1, options.duration > 0 else {
+            finish(.failure(WebOfflineBakeError.invalidArguments("烘焙尺寸、帧率或时长无效")))
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: options.outputURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let temporaryURL = options.outputURL.deletingLastPathComponent()
+                .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).tmp.mp4")
+            try? FileManager.default.removeItem(at: temporaryURL)
+            temporaryOutputURL = temporaryURL
+
+            let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: .mp4)
+            let input = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: options.width,
+                    AVVideoHeightKey: options.height,
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoAverageBitRateKey: options.width * options.height * 3,
+                        AVVideoExpectedSourceFrameRateKey: options.fps,
+                        AVVideoMaxKeyFrameIntervalKey: options.fps * 2
+                    ] as [String: Any]
+                ]
+            )
+            // Offline bake is not a live capture pipeline: allow the encoder to accept
+            // frames as fast as we can produce them when snapshot lags real time.
+            input.expectsMediaDataInRealTime = false
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: input,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferWidthKey as String: options.width,
+                    kCVPixelBufferHeightKey as String: options.height
+                ]
+            )
+            guard writer.canAdd(input) else {
+                throw WebOfflineBakeError.writerFailed("无法添加视频编码输入")
+            }
+            writer.add(input)
+            guard writer.startWriting() else {
+                throw WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "无法启动视频编码")
+            }
+            writer.startSession(atSourceTime: .zero)
+
+            self.writer = writer
+            videoInput = input
+            pixelBufferAdaptor = adaptor
+            emitProgress(phase: "准备", progress: 0)
+
+            renderer.loadWallpaper(
+                path: options.path,
+                width: options.width,
+                height: options.height,
+                screen: nil,
+                offscreen: true,
+                userPropertiesJSON: options.userPropertiesJSON
+            ) { [weak self] success in
+                guard let self else { return }
+                guard success else {
+                    self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
+                    return
+                }
+                self.captureStartedAt = Date()
+                self.captureNextFrame()
+            }
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    private func captureNextFrame() {
+        guard !isFinishing, let startedAt = captureStartedAt else { return }
+        if nextFrameIndex >= totalFrameCount {
+            finishWriting()
+            return
+        }
+
+        // Real-time sampling: only capture when wall clock reaches the slot for
+        // nextFrameIndex. When takeSnapshot lags we skip intermediate indices
+        // (see append) so content time stays aligned with PTS — no 2x speed-up.
+        let frameInterval = 1.0 / Double(options.fps)
+        let targetWallSeconds = Double(nextFrameIndex) * frameInterval
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let delay = max(0, targetWallSeconds - elapsed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.isFinishing else { return }
+            self.renderer.captureImage(screen: WebRendererBridge.offlineBakeScreen) { [weak self] image in
+                guard let self, !self.isFinishing else { return }
+                guard let image else {
+                    self.finish(.failure(WebOfflineBakeError.captureFailed))
+                    return
+                }
+                self.append(image: image)
+            }
+        }
+    }
+
+    private func append(image: NSImage) {
+        guard let writer,
+              let videoInput,
+              let pixelBufferAdaptor,
+              let pool = pixelBufferAdaptor.pixelBufferPool else {
+            finish(.failure(WebOfflineBakeError.writerFailed("视频编码器未准备好")))
+            return
+        }
+        guard writer.status == .writing else {
+            finish(.failure(WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "视频编码器异常退出")))
+            return
+        }
+
+        guard videoInput.isReadyForMoreMediaData else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+                self?.append(image: image)
+            }
+            return
+        }
+
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pixelBuffer,
+              draw(image: image, into: pixelBuffer) else {
+            finish(.failure(WebOfflineBakeError.writerFailed("无法转换 Web 帧为视频像素缓冲区")))
+            return
+        }
+
+        // Fixed grid PTS at nextFrameIndex/fps (even spacing while we keep up).
+        let writtenIndex = nextFrameIndex
+        let timescale = CMTimeScale(options.fps * 100)
+        let presentationTime = CMTime(
+            value: CMTimeValue(writtenIndex * 100),
+            timescale: timescale
+        )
+        guard pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+            finish(.failure(WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "写入视频帧失败")))
+            return
+        }
+
+        // Align next sample to wall clock. If snapshot took longer than 1/fps,
+        // skip intermediate indices instead of packing late content into early PTS
+        // (that compresses animation and looks like playback is too fast).
+        let elapsed = captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let fps = Double(options.fps)
+        let wallNextIndex = Int(floor(elapsed * fps)) + 1
+        nextFrameIndex = max(writtenIndex + 1, min(wallNextIndex, totalFrameCount))
+
+        emitProgress(
+            phase: "录制",
+            progress: min(0.99, max(
+                Double(nextFrameIndex) / Double(totalFrameCount),
+                elapsed / max(options.duration, 0.001)
+            ))
+        )
+        captureNextFrame()
+    }
+
+    private func draw(image: NSImage, into pixelBuffer: CVPixelBuffer) -> Bool {
+        guard let cgImage = image.cgImage(
+            forProposedRect: nil,
+            context: nil,
+            hints: nil
+        ) else {
+            return false
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let context = CGContext(
+                data: baseAddress,
+                width: options.width,
+                height: options.height,
+                bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue
+              ) else {
+            return false
+        }
+
+        context.setFillColor(NSColor.black.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: options.width, height: options.height))
+        context.interpolationQuality = .high
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: options.width, height: options.height))
+        return true
+    }
+
+    private func finishWriting() {
+        guard !isFinishing else { return }
+        isFinishing = true
+        emitProgress(phase: "编码", progress: 0.99)
+        guard let writer, let videoInput else {
+            finish(.failure(WebOfflineBakeError.writerFailed("视频编码器未初始化")))
+            return
+        }
+        videoInput.markAsFinished()
+        writer.finishWriting { [weak self] in
+            guard let self else { return }
+            let result: Result<Void, Error>
+            if writer.status == .completed {
+                result = .success(())
+            } else {
+                result = .failure(
+                    WebOfflineBakeError.writerFailed(
+                        writer.error?.localizedDescription ?? "完成视频编码失败"
+                    )
+                )
+            }
+            DispatchQueue.main.async {
+                self.finish(result)
+            }
+        }
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        guard !didComplete else { return }
+        didComplete = true
+        isFinishing = true
+        renderer.stop(screen: WebRendererBridge.offlineBakeScreen)
+
+        switch result {
+        case .success:
+            guard let temporaryOutputURL else {
+                completion(.failure(WebOfflineBakeError.writerFailed("烘焙临时文件丢失")))
+                return
+            }
+            do {
+                try? FileManager.default.removeItem(at: options.outputURL)
+                try FileManager.default.moveItem(at: temporaryOutputURL, to: options.outputURL)
+                emitProgress(phase: "完成", progress: 1)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        case .failure(let error):
+            writer?.cancelWriting()
+            if let temporaryOutputURL {
+                try? FileManager.default.removeItem(at: temporaryOutputURL)
+            }
+            completion(.failure(error))
+        }
+    }
+
+    private func emitProgress(phase: String, progress: Double) {
+        let currentFrame = min(totalFrameCount, max(0, nextFrameIndex))
+        let line = String(
+            format: "[web-bake] %@ %d/%d [%.1f%%]\n",
+            phase,
+            currentFrame,
+            totalFrameCount,
+            min(100, max(0, progress * 100))
+        )
+        fputs(line, stderr)
+        fflush(stderr)
+    }
 }
 
 // MARK: - Desktop Wallpaper Manager (Web renderer)
@@ -1288,8 +1638,42 @@ private final class DesktopWallpaperManager {
 
     private let originalWallpaperKey = "renderer_original_wallpaper_v1"
     private(set) var lastErrorMessage: String?
+    private var screenChangeObserver: NSObjectProtocol?
 
-    private init() {}
+    private init() {
+        // 外接屏拔插：回收 index 已越界 / 窗口 frame 不再对应任何屏的 web 渲染
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.cleanupOrphanedScreensAfterDisplayChange()
+        }
+    }
+
+    deinit {
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+    }
+
+    /// 停掉已不对应任何 NSScreen 的 web 槽位（断线后 index 越界，或窗口落在虚空）。
+    private func cleanupOrphanedScreensAfterDisplayChange() {
+        let screens = NSScreen.screens
+        let screenCount = screens.count
+        let orphanIndices = screenStates.keys.filter { idx in
+            if idx < 0 { return true }
+            if idx >= screenCount { return true }
+            // 索引仍合法但窗口 frame 已不与该屏匹配（排列变化 / 短暂错位）时不主动停，
+            // 由后续 set/resize 路径处理；此处只清明确越界的槽。
+            return false
+        }
+        guard !orphanIndices.isEmpty else { return }
+        dlog("[DesktopWallpaperManager] cleaning orphaned web screens after display change: \(orphanIndices.sorted()) (screenCount=\(screenCount))")
+        for idx in orphanIndices.sorted(by: >) {
+            stopWallpaper(screen: idx)
+        }
+    }
 
     func setWallpaper(path: String, width: Int = 1920, height: Int = 1080, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
         let path = resolveSteamWorkshopDirectoryIfNeeded(path)
@@ -1962,6 +2346,9 @@ struct WallpaperEngineCLI {
         }
 
         switch command {
+        case "bake":
+            runOfflineBake(arguments: Array(remainingArgs.dropFirst()))
+
         case "set", "pause", "resume", "stop", "stop-screen", "exit", "apply-properties":
             if command == "stop" || command == "exit" {
                 stopDaemonIfRunning()
@@ -2093,6 +2480,98 @@ struct WallpaperEngineCLI {
         app.run()
     }
 
+    private static var offlineBakeRunner: WebOfflineBakeRunner?
+
+    private static func runOfflineBake(arguments: [String]) {
+        guard let options = parseOfflineBakeOptions(arguments) else {
+            printUsage()
+            exit(1)
+        }
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        offlineBakeRunner = WebOfflineBakeRunner(options: options) { result in
+            switch result {
+            case .success:
+                exit(0)
+            case .failure(let error):
+                fputs("Web bake failed: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        offlineBakeRunner?.start()
+        app.run()
+    }
+
+    private static func parseOfflineBakeOptions(_ arguments: [String]) -> WebOfflineBakeRunner.Options? {
+        guard let path = arguments.first, !path.hasPrefix("--") else {
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            return nil
+        }
+
+        var width: Int?
+        var height: Int?
+        var fps: Int?
+        var duration: TimeInterval?
+        var outputPath: String?
+        var userPropertiesJSON: String?
+        var index = 1
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            guard index + 1 < arguments.count else {
+                fputs("Missing value for \(argument)\n", stderr)
+                return nil
+            }
+            let value = arguments[index + 1]
+            switch argument {
+            case "--size":
+                let parts = value.lowercased().split(separator: "x")
+                guard parts.count == 2,
+                      let parsedWidth = Int(parts[0]),
+                      let parsedHeight = Int(parts[1]) else {
+                    fputs("Invalid --size value: \(value)\n", stderr)
+                    return nil
+                }
+                width = max(2, parsedWidth - (parsedWidth % 2))
+                height = max(2, parsedHeight - (parsedHeight % 2))
+            case "--fps":
+                fps = Int(value)
+            case "--duration":
+                duration = Double(value)
+            case "--out":
+                outputPath = value
+            case "--properties-base64":
+                guard let data = Data(base64Encoded: value),
+                      let json = String(data: data, encoding: .utf8) else {
+                    fputs("Invalid --properties-base64 value\n", stderr)
+                    return nil
+                }
+                userPropertiesJSON = json
+            default:
+                fputs("Unknown bake option: \(argument)\n", stderr)
+                return nil
+            }
+            index += 2
+        }
+
+        guard let width, let height, let fps, fps > 0,
+              let duration, duration > 0,
+              let outputPath, !outputPath.isEmpty else {
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            return nil
+        }
+        return WebOfflineBakeRunner.Options(
+            path: path,
+            width: width,
+            height: height,
+            fps: fps,
+            duration: duration,
+            outputURL: URL(fileURLWithPath: outputPath),
+            userPropertiesJSON: userPropertiesJSON
+        )
+    }
+
     private static func swizzleActivateIgnoringOtherApps() {
         let sel = #selector(NSApplication.activate(ignoringOtherApps:))
         guard let method = class_getInstanceMethod(NSApplication.self, sel) else { return }
@@ -2157,6 +2636,8 @@ struct WallpaperEngineCLI {
         Usage: wallpaperengine-cli <command>
         Commands:
           set <path> [screen_index]   Set wallpaper
+          bake <path> --size WxH --fps N --duration S --out <path>
+                                     Export a Web wallpaper as H.264 MP4
           pause                       Pause wallpaper
           resume                      Resume wallpaper
           stop-screen <screen_index>  Stop wallpaper on one display

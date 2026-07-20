@@ -2686,14 +2686,17 @@ final class VideoWallpaperManager: ObservableObject {
             if #available(macOS 26.0, *) {
                 LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
             }
+            // 立刻拆掉已断屏窗口，避免 1.5s 防抖窗口内残留 AVPlayer/窗口
+            self.teardownOrphanedVideoWindowsPreservingRestoreState()
             guard self.hasActiveVideoWallpaper else { return }
 
-            // 防抖：延迟 300ms 执行，避免屏幕参数变化时的频繁重建
+            // 防抖：延迟执行，避免屏幕参数变化时的频繁重建
             self.pendingRebuildWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self, self.hasActiveVideoWallpaper else { return }
 
                 self.relinkDisplayStateForCurrentScreens()
+                self.teardownOrphanedVideoWindowsPreservingRestoreState()
 
                 guard self.hasEffectiveTargetDisplayChange() else {
                     if self.synchronizeExistingWindowFramesToCurrentScreens() {
@@ -2712,6 +2715,46 @@ final class VideoWallpaperManager: ObservableObject {
             self.pendingRebuildWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
         }
+    }
+
+    /// 拆掉已断开显示器上的视频窗口/播放器，但保留 fingerprint 级 URL 映射供重插恢复。
+    /// 与 `discardPersistedWallpaperState` 不同：后者会忘掉该屏关联。
+    private func teardownOrphanedVideoWindowsPreservingRestoreState() {
+        let currentScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+        let orphanWindowIDs = windows.keys.filter { !currentScreenIDs.contains($0) }
+        guard !orphanWindowIDs.isEmpty else {
+            // 目标 ID 仍可能指着已断屏；收敛到在线集合，fingerprint 映射保留
+            videoTargetScreenIDs = videoTargetScreenIDs.intersection(currentScreenIDs)
+            for screen in NSScreen.screens {
+                if videoTargetScreenFingerprints.contains(screen.wallpaperScreenFingerprint) {
+                    videoTargetScreenIDs.insert(screen.wallpaperScreenIdentifier)
+                }
+            }
+            return
+        }
+
+        AppLogger.error(.wallpaper, "Video tearing down orphaned windows after disconnect", metadata: [
+            "orphanScreens": orphanWindowIDs.sorted().joined(separator: ","),
+            "currentScreens": currentScreenIDs.sorted().joined(separator: ",")
+        ])
+
+        for screenID in orphanWindowIDs {
+            teardownWindow(for: screenID)
+            // 运行时 screenID 映射可清；fingerprint 级保留以便重插
+            videoURLByScreen.removeValue(forKey: screenID)
+            posterURLByScreen.removeValue(forKey: screenID)
+            volumeByScreen.removeValue(forKey: screenID)
+            videoTargetScreenIDs.remove(screenID)
+            onEndModeScreens.remove(screenID)
+        }
+
+        for screen in NSScreen.screens {
+            if videoTargetScreenFingerprints.contains(screen.wallpaperScreenFingerprint) {
+                videoTargetScreenIDs.insert(screen.wallpaperScreenIdentifier)
+            }
+        }
+        syncCurrentVideoURL()
+        currentPosterURL = posterURLByScreen.values.first ?? posterURLByScreenFingerprint.values.first
     }
 
     @objc private func handleScreensDidSleep() {

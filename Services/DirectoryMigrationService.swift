@@ -296,6 +296,12 @@ final class DirectoryMigrationService {
         WallpaperEngineXBridge.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         await UserLibrary.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         VideoThumbnailCache.shared.migrateCacheKeys(fromOldPrefix: oldPath, toNewPrefix: newPath)
+        await PortraitBlurFillWallpaperService.shared.rebaseArtifacts(
+            from: defaultRoot,
+            to: currentRoot,
+            derivedWallpapersDirectory: currentRoot
+                .appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        )
         print("[DirectoryMigrationService] Orphaned path repair completed")
     }
 
@@ -442,6 +448,12 @@ final class DirectoryMigrationService {
         WallpaperEngineXBridge.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         await UserLibrary.shared.bulkUpdatePaths(oldPrefix: oldPath, newPrefix: newPath)
         VideoThumbnailCache.shared.migrateCacheKeys(fromOldPrefix: oldPath, toNewPrefix: newPath)
+        await PortraitBlurFillWallpaperService.shared.rebaseArtifacts(
+            from: URL(fileURLWithPath: oldPath),
+            to: URL(fileURLWithPath: newPath),
+            derivedWallpapersDirectory: URL(fileURLWithPath: newPath)
+                .appendingPathComponent("DerivedWallpapers", isDirectory: true)
+        )
         print("[DirectoryMigrationService] Updated all persisted paths: \(oldPath) -> \(newPath)")
     }
 

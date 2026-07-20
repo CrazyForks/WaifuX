@@ -305,7 +305,7 @@ final class GlobalWallpaperSyncCoordinator {
             return candidate == path
                 || path.hasPrefix(candidate + "/")
                 || candidate.hasPrefix(path + "/")
-        }), let art = record.sceneBakeArtifact {
+        }), let art = SceneOfflineBakeService.usableArtifact(from: record) {
             sceneBakeItemID = record.item.id
             if SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
                 bakedVideoPath = art.videoPath

@@ -69,6 +69,11 @@ final class DownloadPathManager {
         rootFolderURL.appendingPathComponent("SceneBakes", isDirectory: true)
     }
 
+    /// 静态壁纸派生文件目录（例如竖图模糊填充），不参与本地壁纸扫描。
+    var derivedWallpapersFolderURL: URL {
+        rootFolderURL.appendingPathComponent("DerivedWallpapers", isDirectory: true)
+    }
+
     private init() {}
 
     // MARK: - 自定义目录解析
@@ -227,7 +232,13 @@ final class DownloadPathManager {
     func createDirectoryStructure() -> Bool {
         // 通过 rootFolderURL 触发自定义目录的 security-scoped 恢复
         let root = rootFolderURL
-        let directories = [root, wallpapersFolderURL, mediaFolderURL, sceneBakesFolderURL]
+        let directories = [
+            root,
+            wallpapersFolderURL,
+            mediaFolderURL,
+            sceneBakesFolderURL,
+            derivedWallpapersFolderURL
+        ]
         var ok = true
 
         for directory in directories {

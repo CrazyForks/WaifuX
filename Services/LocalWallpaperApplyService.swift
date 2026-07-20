@@ -140,8 +140,12 @@ enum LocalWallpaperApplyService {
             return true
 
         case .web:
+            if let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
+                try await applyVideo(bakedURL, to: screens, options: options)
+                return true
+            }
             guard allowNonVideoInOnEnd else { return false }
-            // web 永不走 scene companion bake
+            // No baked artifact yet: keep the existing daemon renderer path.
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
             return true
 
@@ -347,8 +351,7 @@ enum LocalWallpaperApplyService {
             if SceneOfflineBakeService.isUsableBakedVideo(at: url) { return url }
         }
         if let record = mediaRecord(for: contentRoot),
-           let art = record.sceneBakeArtifact,
-           art.analysisId == record.sceneBakeEligibility?.analysisId {
+           let art = SceneOfflineBakeService.usableArtifact(from: record) {
             let url = URL(fileURLWithPath: art.videoPath)
             if SceneOfflineBakeService.isUsableBakedVideo(at: url) { return url }
         }

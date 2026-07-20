@@ -79,8 +79,7 @@ struct LibraryFolderCard: View {
     let onRename: () -> Void
     let onToggleLock: (() -> Void)?
     let onRelock: (() -> Void)?
-    let onGenerateLoopTransition: (() -> Void)?
-    let onInterpolateVideos: (() -> Void)?
+    let onOptimizeVideos: (() -> Void)?
 
     @State private var isHovered = false
     @State private var isDropTarget = false
@@ -203,15 +202,10 @@ struct LibraryFolderCard: View {
                     }
                 }
             }
-            if let onGenerateLoopTransition {
+            if let onOptimizeVideos {
                 Divider()
-                Button(action: onGenerateLoopTransition) {
-                    Label(t("videoOptimizationBatchGenerateLoopTransition"), systemImage: "point.3.connected.trianglepath.dotted")
-                }
-            }
-            if let onInterpolateVideos {
-                Button(action: onInterpolateVideos) {
-                    Label(t("videoOptimizationBatchInterpolate"), systemImage: "rectangle.stack.badge.play")
+                Button(action: onOptimizeVideos) {
+                    Label(t("videoOptimizationBatchOptimizeVideos"), systemImage: "sparkles")
                 }
             }
             Button(role: .destructive, action: onDisband) {

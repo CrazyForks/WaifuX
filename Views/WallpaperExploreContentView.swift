@@ -279,6 +279,7 @@ struct WallpaperExploreContentView: View {
     // MARK: State
     @State private var category: CategoryFilter = .all
     @State private var fourKCategory: FourKCategory?
+    /// 与 ViewModel 持久化的 4K/Konachan 排序同步；首次出现时从 VM 恢复
     @State private var fourKSorting: FourKSortingOption = .latest
     @State private var konachanSorting: KonachanSorting = .dateAdded
     @State private var konachanCategory: KonachanService.KonachanCategory?
@@ -298,8 +299,6 @@ struct WallpaperExploreContentView: View {
     /// 氛围图仅在实际首张 id 变化时更新
     @State private var lastSyncedFirstWallpaperID: String?
     @State private var loadMoreTask: Task<Void, Never>?
-
-
     @State private var showWallpaperURLSheet = false
     @State private var wallpaperURLInput = ""
     @State private var isResolvingWallpaperURL = false
@@ -380,6 +379,7 @@ struct WallpaperExploreContentView: View {
             }
         }
         .onAppear {
+            syncExploreSortStateFromViewModel()
             if isFirstAppearance {
                 // 如果 viewModel 已有数据（由 ContentView.task 的 initialLoad 加载完成），
                 // 不要重置筛选，避免双重 search() 竞态
@@ -394,6 +394,12 @@ struct WallpaperExploreContentView: View {
             } else {
                 handleAppear()
             }
+        }
+        .onChange(of: viewModel.selected4KSorting) { _, newValue in
+            if fourKSorting != newValue { fourKSorting = newValue }
+        }
+        .onChange(of: viewModel.selectedKonachanSorting) { _, newValue in
+            if konachanSorting != newValue { konachanSorting = newValue }
         }
         .onChange(of: isVisible) { _, visible in
             if !visible {
@@ -1481,6 +1487,16 @@ struct WallpaperExploreContentView: View {
         }
     }
 
+    /// 把 ViewModel 已恢复的排序同步到本地 @State（4K / Konachan 菜单绑定本地状态）
+    private func syncExploreSortStateFromViewModel() {
+        if fourKSorting != viewModel.selected4KSorting {
+            fourKSorting = viewModel.selected4KSorting
+        }
+        if konachanSorting != viewModel.selectedKonachanSorting {
+            konachanSorting = viewModel.selectedKonachanSorting
+        }
+    }
+
     private func handleDataSourceChange() {
         if !viewModel.currentSourceSupportsNSFW {
             viewModel.puritySFW = true
@@ -1488,10 +1504,10 @@ struct WallpaperExploreContentView: View {
             viewModel.purityNSFW = false
         }
         fourKCategory = nil
-        konachanSorting = .dateAdded
+        // 切换源时保留用户持久化过的各源排序，仅同步 UI 绑定
+        syncExploreSortStateFromViewModel()
         konachanCategory = nil
         konachanHotTagName = nil
-        viewModel.selectedPixivRankingMode = .weekly
         category = .all
         if WallpaperSourceManager.shared.activeSource == .konachan {
             loadKonachanHotTags()
@@ -1547,12 +1563,15 @@ struct WallpaperExploreContentView: View {
     }
 
     private func handle4KSortingChange() {
+        // 与 ViewModel 同步时不要重复写回/重载
+        guard viewModel.selected4KSorting != fourKSorting else { return }
         AppLogger.info(.wallpaper, "4K 排序方式变化", metadata: ["排序": fourKSorting.rawValue])
         viewModel.selected4KSorting = fourKSorting
         reloadData()
     }
 
     private func handleKonachanSortingChange() {
+        guard viewModel.selectedKonachanSorting != konachanSorting else { return }
         AppLogger.info(.wallpaper, "Konachan 排序方式变化", metadata: ["排序": konachanSorting.rawValue])
         viewModel.selectedKonachanSorting = konachanSorting
         reloadData()
@@ -1745,7 +1764,7 @@ struct WallpaperExploreContentView: View {
         viewModel.puritySFW = true
         viewModel.puritySketchy = false
         viewModel.purityNSFW = false
-        viewModel.sortingOption = .dateAdded
+        // 排序单独由用户选择并持久化，清除筛选时不重置
         viewModel.orderDescending = true
         viewModel.selectedColors = []
         viewModel.selectedRatios = []

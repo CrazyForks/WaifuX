@@ -519,6 +519,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
             LocalizationService.shared.restoreSavedSettings()
             ThemeManager.shared.restoreSavedSettings()
+            // 探索排序需尽早恢复，赶在 ContentView 首次 initialLoad 之前
+            self?.wallpaperViewModel.restoreExploreSortPreferences()
+            self?.mediaViewModel.restoreExploreSortPreferences()
 
             // 第2帧：权限和库数据
             DispatchQueue.main.async {

@@ -51,6 +51,7 @@ class SettingsViewModel: ObservableObject {
         }
     }
     @Published var pauseWhenOtherAppForeground = false { didSet { UserDefaults.standard.set(pauseWhenOtherAppForeground, forKey: "pause_when_other_app_foreground") } }
+    @Published var pauseInactiveDisplays = false { didSet { UserDefaults.standard.set(pauseInactiveDisplays, forKey: "pause_inactive_displays") } }
     @Published var pauseWhenFullscreenCovers = false { didSet { UserDefaults.standard.set(pauseWhenFullscreenCovers, forKey: "pause_when_fullscreen_covers") } }
     @Published var pauseOnBatteryPower = false { didSet { UserDefaults.standard.set(pauseOnBatteryPower, forKey: "pause_on_battery_power") } }
     @Published var pauseWhenWindowCoverage = false { didSet { UserDefaults.standard.set(pauseWhenWindowCoverage, forKey: "pause_when_window_coverage") } }
@@ -62,6 +63,13 @@ class SettingsViewModel: ObservableObject {
             UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
             VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
             StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
+        }
+    }
+    /// 为竖向静态图生成适配显示器比例的模糊延伸版本；原图保持不变。
+    @Published var portraitBlurFillEnabled = false {
+        didSet {
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
         }
     }
     @Published var frameInterpolationEnabled = false {
@@ -373,6 +381,7 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(grainIntensity, forKey: "arc_grain_intensity")
         UserDefaults.standard.set(hideNotch, forKey: "hide_notch")
         UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
+        UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
         UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
         UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
         let effectiveAutoOnDownload = frameInterpolationEnabled && frameInterpolationAutoEnqueue
@@ -484,6 +493,7 @@ class SettingsViewModel: ObservableObject {
             grainIntensity = savedGrainIntensity > 0 ? savedGrainIntensity : 0.5
             hideNotch = defaults.bool(forKey: "hide_notch")
             pauseWhenOtherAppForeground = defaults.bool(forKey: "pause_when_other_app_foreground")
+            pauseInactiveDisplays = defaults.bool(forKey: "pause_inactive_displays")
             pauseWhenFullscreenCovers = defaults.bool(forKey: "pause_when_fullscreen_covers")
             pauseOnBatteryPower = defaults.bool(forKey: "pause_on_battery_power")
             pauseWhenWindowCoverage = defaults.bool(forKey: "pause_when_window_coverage")
@@ -491,6 +501,7 @@ class SettingsViewModel: ObservableObject {
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50
             hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
             autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
+            portraitBlurFillEnabled = defaults.object(forKey: "portrait_blur_fill_enabled") as? Bool ?? false
             frameInterpolationEnabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
             frameInterpolationTargetFPS = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int((defaults.object(forKey: "frame_interpolation_target_fps") as? Double ?? 60.0).rounded())))
             // 新语义：下载时自动补帧。旧 key「切换时自动」不再迁移为开启。
@@ -559,6 +570,7 @@ class SettingsViewModel: ObservableObject {
 
     func syncAutoPauseSettings() {
         DynamicWallpaperAutoPauseManager.shared.pauseWhenOtherAppForeground = pauseWhenOtherAppForeground
+        DynamicWallpaperAutoPauseManager.shared.pauseInactiveDisplays = pauseInactiveDisplays
         DynamicWallpaperAutoPauseManager.shared.pauseWhenFullscreenCovers = pauseWhenFullscreenCovers
         DynamicWallpaperAutoPauseManager.shared.pauseOnBatteryPower = pauseOnBatteryPower
         DynamicWallpaperAutoPauseManager.shared.pauseWhenWindowCoverage = pauseWhenWindowCoverage

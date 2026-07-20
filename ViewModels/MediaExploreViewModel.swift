@@ -106,10 +106,12 @@ final class MediaExploreViewModel: ObservableObject {
     private var workshopCurrentContentLevel: WorkshopSourceManager.WorkshopContentLevel? = .everyone
     /// Workshop 分辨率/比例筛选
     private var workshopCurrentResolution: String? = nil
-    /// Workshop 排序方式
+    /// Workshop 排序方式（用户选择过则跨启动持久化）
     private(set) var workshopSortBy: WorkshopSearchParams.SortOption = .ranked
     /// Workshop 热门趋势时间范围（仅对 trend 排序有效），nil = 全部时间
     private(set) var workshopDays: Int? = nil
+    /// UI 层 Workshop 排序菜单 rawValue（含 trend_7 等细分）
+    private(set) var workshopSortMenuRawValue: String = "trend_7"
 
     // MARK: - Dynamic Wallpaper (DongTai) 分页状态
     private var dongtaiCurrentPage = 1
@@ -117,11 +119,17 @@ final class MediaExploreViewModel: ObservableObject {
     private var dongtaiSearchQuery = ""
     private var dongtaiCurrentCategories: Set<DynamicWallpaperCategory> = []
     private var dongtaiCurrentListType: DynamicWallpaperListType = .all
-    private var dongtaiSortBy: DynamicWallpaperSortOption = .popular
+    private(set) var dongtaiSortBy: DynamicWallpaperSortOption = .popular
     private var dongtaiFilterAudio: Bool? = nil
     private var dongtaiFilterFourK: Bool? = nil
     /// 加载世代计数器，用于丢弃旧请求的结果
     private var dongtaiLoadGeneration: UInt = 0
+
+    // MARK: - Explore 排序持久化
+    // ⚠️ 不在 init 读 UserDefaults（macOS 26+ _CFXPreferences 栈溢出风险），由 restoreExploreSortPreferences() 延迟恢复
+    private static let workshopSortMenuDefaultsKey = "explore.media.workshopSortMenu"
+    private static let dongtaiSortDefaultsKey = "explore.media.dongtaiSort"
+    private var hasRestoredExploreSort = false
 
     // MARK: - Wallsflow 分页状态
     private var wallsflowCurrentPage = 1
@@ -144,6 +152,7 @@ final class MediaExploreViewModel: ObservableObject {
 
     init() {
         // 缓存 UserDefaults 值，避免后台线程访问触发 _CFXPreferences 递归崩溃
+        // 注意：此读取本身也有风险，但为既有路径；探索排序改为 restoreExploreSortPreferences() 延迟恢复
         persistDownloadedMediaToAppLibrary = UserDefaults.standard.object(forKey: DownloadPathManager.persistDownloadsToAppLibraryDefaultsKey) as? Bool ?? true
 
         // 注册内存压力通知（由 WaifuXApp.configureKingfisher 中的 DispatchSource 触发）
@@ -402,6 +411,8 @@ final class MediaExploreViewModel: ObservableObject {
 
     func initialLoadIfNeeded() async {
         print("[MediaExploreViewModel] initialLoadIfNeeded called, items.count=\(items.count)")
+        // 兜底：确保探索排序在首次加载前已从 UserDefaults 恢复
+        restoreExploreSortPreferences()
         if restoreExploreFeedIfNeededAfterDetailReturn() {
             print("[MediaExploreViewModel] restored preserved explore feed, skipping initial load")
             return
@@ -1698,7 +1709,7 @@ final class MediaExploreViewModel: ObservableObject {
         )
     }
 
-    /// 重置 Workshop 浏览状态并强制加载默认趋势列表。
+    /// 重置 Workshop 浏览状态并加载列表（保留用户持久化的排序）。
     @MainActor
     func resetAndLoadDefaultWorkshopFeed() async {
         invalidatePreservedExploreFeed()
@@ -1708,8 +1719,7 @@ final class MediaExploreViewModel: ObservableObject {
         workshopCurrentType = .all
         workshopCurrentContentLevel = .everyone
         workshopCurrentResolution = nil
-        workshopSortBy = .ranked
-        workshopDays = 7
+        // 保留用户持久化过的排序，不强制回默认 trend_7
         workshopCurrentPage = 1
         workshopHasMore = true
         hasMorePages = true
@@ -1769,10 +1779,19 @@ final class MediaExploreViewModel: ObservableObject {
     }
 
     /// 设置 Workshop 排序方式
-    func setWorkshopSort(sortBy: WorkshopSearchParams.SortOption, days: Int? = nil) async {
+    /// - Parameter menuRawValue: UI 菜单项 rawValue（如 `trend_7`），用于跨启动恢复细分趋势
+    func setWorkshopSort(
+        sortBy: WorkshopSearchParams.SortOption,
+        days: Int? = nil,
+        menuRawValue: String? = nil
+    ) async {
         invalidatePreservedExploreFeed()
         workshopSortBy = sortBy
         workshopDays = days
+        if let menuRawValue {
+            workshopSortMenuRawValue = menuRawValue
+            UserDefaults.standard.set(menuRawValue, forKey: Self.workshopSortMenuDefaultsKey)
+        }
         await loadWorkshopFeedInternal(
             query: workshopSearchQuery,
             tags: workshopCurrentTags,
@@ -1780,6 +1799,60 @@ final class MediaExploreViewModel: ObservableObject {
             contentLevel: workshopCurrentContentLevel,
             resolution: workshopCurrentResolution
         )
+    }
+
+    /// 从 UserDefaults 恢复媒体探索排序；仅在用户曾选择过时覆盖默认值。
+    /// 必须在 applicationDidFinishLaunching 之后调用，不可在 init 中调用。
+    func restoreExploreSortPreferences() {
+        guard !hasRestoredExploreSort else { return }
+        hasRestoredExploreSort = true
+
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.workshopSortMenuDefaultsKey) {
+            applyWorkshopSortMenuRawValue(raw)
+        }
+        if let raw = defaults.string(forKey: Self.dongtaiSortDefaultsKey),
+           let option = DynamicWallpaperSortOption(rawValue: raw) {
+            dongtaiSortBy = option
+        }
+    }
+
+    /// 将 Workshop 排序菜单 rawValue 映射到 API 参数（与 MediaExploreContentView.WorkshopSortOption 对齐）
+    private func applyWorkshopSortMenuRawValue(_ raw: String) {
+        workshopSortMenuRawValue = raw
+        switch raw {
+        case "trend_1":
+            workshopSortBy = .ranked
+            workshopDays = 1
+        case "trend_7":
+            workshopSortBy = .ranked
+            workshopDays = 7
+        case "trend_30":
+            workshopSortBy = .ranked
+            workshopDays = 30
+        case "trend_90":
+            workshopSortBy = .ranked
+            workshopDays = 90
+        case "trend_365":
+            workshopSortBy = .ranked
+            workshopDays = 365
+        case "trend":
+            workshopSortBy = .ranked
+            workshopDays = nil
+        case "updated":
+            workshopSortBy = .updated
+            workshopDays = nil
+        case "created":
+            workshopSortBy = .created
+            workshopDays = nil
+        case "toprated":
+            workshopSortBy = .topRated
+            workshopDays = nil
+        default:
+            workshopSortBy = .ranked
+            workshopDays = 7
+            workshopSortMenuRawValue = "trend_7"
+        }
     }
 
     /// 内部方法：加载 Workshop 数据
@@ -1930,7 +2003,7 @@ final class MediaExploreViewModel: ObservableObject {
         currentQuery = ""
         dongtaiCurrentCategories = []
         dongtaiCurrentListType = .all
-        dongtaiSortBy = .popular
+        // 保留用户持久化过的排序，不强制回默认 popular
         dongtaiFilterAudio = nil
         dongtaiFilterFourK = nil
         dongtaiCurrentPage = 1
@@ -1949,7 +2022,7 @@ final class MediaExploreViewModel: ObservableObject {
             query: "",
             categories: [],
             listType: .all,
-            sortBy: .popular,
+            sortBy: dongtaiSortBy,
             hasAudio: nil,
             isFourK: nil
         )
@@ -2006,6 +2079,7 @@ final class MediaExploreViewModel: ObservableObject {
     func setDongTaiSort(sortBy: DynamicWallpaperSortOption) async {
         invalidatePreservedExploreFeed()
         dongtaiSortBy = sortBy
+        UserDefaults.standard.set(sortBy.rawValue, forKey: Self.dongtaiSortDefaultsKey)
         await loadDongTaiFeedInternal(
             query: dongtaiSearchQuery,
             categories: dongtaiCurrentCategories,

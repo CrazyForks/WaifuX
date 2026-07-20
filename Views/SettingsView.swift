@@ -425,9 +425,17 @@ private struct GeneralSettingsTab: View {
                 MacSettingsRow(
                     title: t("autoRemoveVideoLetterbox"),
                     subtitle: t("autoRemoveVideoLetterboxDesc"),
-                    showDivider: false
+                    showDivider: true
                 ) {
                     MacToggle(isOn: $viewModel.autoRemoveVideoLetterbox)
+                }
+
+                MacSettingsRow(
+                    title: t("portraitBlurFill"),
+                    subtitle: t("portraitBlurFillDesc"),
+                    showDivider: false
+                ) {
+                    MacToggle(isOn: $viewModel.portraitBlurFillEnabled)
                 }
             }
 
@@ -452,6 +460,20 @@ private struct GeneralSettingsTab: View {
                         get: { viewModel.pauseWhenOtherAppForeground },
                         set: { newValue in
                             viewModel.pauseWhenOtherAppForeground = newValue
+                            viewModel.syncAutoPauseSettings()
+                        }
+                    ))
+                }
+
+                MacSettingsRow(
+                    title: t("pauseInactiveDisplays"),
+                    subtitle: t("pauseInactiveDisplaysDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: Binding(
+                        get: { viewModel.pauseInactiveDisplays },
+                        set: { newValue in
+                            viewModel.pauseInactiveDisplays = newValue
                             viewModel.syncAutoPauseSettings()
                         }
                     ))
@@ -1034,30 +1056,6 @@ private struct SchedulerSettingsTab: View {
 
                             if displayConfig.isEnabled {
                                 dividerLine
-
-                                if !screen.isBuiltInDisplay {
-                                    HStack(spacing: 12) {
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            Text(t("externalDisplay.autoSwitchOnConnect"))
-                                                .font(.system(size: 13, weight: .medium))
-                                                .foregroundStyle(Color.white.opacity(0.9))
-                                            Text(t("externalDisplay.autoSwitchOnConnectDesc"))
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(Color.white.opacity(0.48))
-                                        }
-
-                                        Spacer()
-
-                                        MacToggle(isOn: Binding(
-                                            get: { viewModel.schedulerViewModel.displayConfig(for: screen).autoChangeOnExternalConnect },
-                                            set: { viewModel.schedulerViewModel.updateDisplayAutoChangeOnExternalConnect($0, for: screen) }
-                                        ))
-                                    }
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 12)
-
-                                    dividerLine
-                                }
 
                                 perDisplaySchedulerControls(
                                     config: displayConfig,

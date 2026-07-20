@@ -17,6 +17,14 @@ final class DynamicWallpaperAutoPauseManager {
     private var cancellables = Set<AnyCancellable>()
     /// 当前因前台存在其他应用而需要暂停的屏幕 ID 集合（按屏幕追踪）
     private var foregroundPausedScreenIDs: Set<String> = []
+    /// 当前因「仅播放活动屏幕」应保持暂停的显示器。
+    private var inactiveDisplayPausedScreenIDs: Set<String> = []
+    /// 开启「仅播放活动屏幕」前已经手动暂停的显示器。策略解除时不应恢复这些屏幕。
+    private var inactiveDisplayManuallyPausedScreenIDs: Set<String> = []
+    /// 鼠标当前所在的显示器，用作活动屏幕。
+    private var activeDisplayScreenID: String?
+    /// 鼠标事件监听。全局监听覆盖 App 非前台时的移动，本地监听覆盖 App 前台时的移动。
+    private var activeDisplayEventMonitors: [Any] = []
     /// 当前是否存在"电池供电"这一自动暂停原因。
     private var batteryPauseRequested = false
     /// 全局自动暂停（电池）前，原生视频壁纸里真实处于播放中的屏幕。
@@ -81,6 +89,7 @@ final class DynamicWallpaperAutoPauseManager {
     private static let windowCoverageHysteresisGap: CGFloat = 0.03
 
     private let pauseWhenOtherAppKey = "pause_when_other_app_foreground"
+    private let pauseInactiveDisplaysKey = "pause_inactive_displays"
     private let pauseWhenFullscreenKey = "pause_when_fullscreen_covers"
     private let pauseOnBatteryKey = "pause_on_battery_power"
     private let pauseWhenWindowCoverageKey = "pause_when_window_coverage"
@@ -91,6 +100,15 @@ final class DynamicWallpaperAutoPauseManager {
         get { UserDefaults.standard.bool(forKey: pauseWhenOtherAppKey) }
         set {
             UserDefaults.standard.set(newValue, forKey: pauseWhenOtherAppKey)
+            updateTimer()
+        }
+    }
+
+    /// 仅让鼠标当前所在显示器继续播放动态壁纸，其他显示器暂停。
+    var pauseInactiveDisplays: Bool {
+        get { UserDefaults.standard.bool(forKey: pauseInactiveDisplaysKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: pauseInactiveDisplaysKey)
             updateTimer()
         }
     }
@@ -204,6 +222,13 @@ final class DynamicWallpaperAutoPauseManager {
             name: Notification.Name("com.apple.screenIsUnlocked"),
             object: nil
         )
+        // 外接屏拔插：清掉已断屏的覆盖/非活动暂停记账，避免对幽灵 screenID 反复 pause
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleScreenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     func restoreSettings() {
@@ -248,6 +273,44 @@ final class DynamicWallpaperAutoPauseManager {
         // DistributedNotificationCenter 回调不保证主线程
         DispatchQueue.main.async { [weak self] in
             self?.handleDisplayBecameAvailable(reason: "screenUnlocked")
+        }
+    }
+
+    @objc private func handleScreenParametersChanged() {
+        DispatchQueue.main.async { [weak self] in
+            self?.pruneOrphanedPerScreenPauseState()
+            self?.enterDisplayTransitionGrace()
+            self?.schedulePostDisplayTransitionReevaluation()
+        }
+    }
+
+    /// 丢弃已不在 `NSScreen.screens` 上的按屏暂停记账（运行时窗口/进程由各壁纸服务自行回收）。
+    private func pruneOrphanedPerScreenPauseState() {
+        let currentIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+        let beforeCoverage = windowCoveragePausedScreenIDs.count
+            + windowCoverageCoveredScreenIDs.count
+        let beforeForeground = foregroundPausedScreenIDs.count
+            + inactiveDisplayPausedScreenIDs.count
+            + fullscreenAutoPausedScreenIDs.count
+
+        windowCoveragePausedScreenIDs = windowCoveragePausedScreenIDs.intersection(currentIDs)
+        windowCoverageCoveredScreenIDs = windowCoverageCoveredScreenIDs.intersection(currentIDs)
+        foregroundPausedScreenIDs = foregroundPausedScreenIDs.intersection(currentIDs)
+        inactiveDisplayPausedScreenIDs = inactiveDisplayPausedScreenIDs.intersection(currentIDs)
+        inactiveDisplayManuallyPausedScreenIDs = inactiveDisplayManuallyPausedScreenIDs.intersection(currentIDs)
+        fullscreenAutoPausedScreenIDs = fullscreenAutoPausedScreenIDs.intersection(currentIDs)
+
+        if let activeDisplayScreenID, !currentIDs.contains(activeDisplayScreenID) {
+            self.activeDisplayScreenID = nil
+        }
+
+        let afterCoverage = windowCoveragePausedScreenIDs.count
+            + windowCoverageCoveredScreenIDs.count
+        let afterForeground = foregroundPausedScreenIDs.count
+            + inactiveDisplayPausedScreenIDs.count
+            + fullscreenAutoPausedScreenIDs.count
+        if beforeCoverage != afterCoverage || beforeForeground != afterForeground {
+            print("[AutoPause] pruned orphan per-screen pause state after display change (coverage \(beforeCoverage)→\(afterCoverage), other \(beforeForeground)→\(afterForeground))")
         }
     }
 
@@ -336,6 +399,7 @@ final class DynamicWallpaperAutoPauseManager {
 
         let ids = windowCoveragePausedScreenIDs
             .union(foregroundPausedScreenIDs)
+            .union(inactiveDisplayPausedScreenIDs)
             .union(fullscreenAutoPausedScreenIDs)
         guard !ids.isEmpty else { return }
 
@@ -365,8 +429,11 @@ final class DynamicWallpaperAutoPauseManager {
     /// 新启动的 wallpaper-wgpu 进程不应被旧的前台暂停状态误杀（SIGSTOP）。
     /// 当用户之后切走应用时，NSWorkspace app activation 通知会重新施加前台暂停。
     func clearForegroundPauseForWallpaperSwitch() {
-        let pausedIDs = foregroundPausedScreenIDs
+        let pausedIDs = foregroundPausedScreenIDs.union(inactiveDisplayPausedScreenIDs)
         foregroundPausedScreenIDs.removeAll()
+        inactiveDisplayPausedScreenIDs.removeAll()
+        inactiveDisplayManuallyPausedScreenIDs.removeAll()
+        activeDisplayScreenID = nil
 
         // 同理：壁纸切换后旧的 coverage 状态对新进程无意义，清掉等下一轮 checkAndApply 重建
         windowCoveragePausedScreenIDs.removeAll()
@@ -392,7 +459,9 @@ final class DynamicWallpaperAutoPauseManager {
     }
 
     private func updateTimer() {
-        let needsPollingForFullscreenOrForeground = pauseWhenFullscreenCovers || pauseWhenOtherAppForeground
+        let needsPollingForFullscreenOrForeground = pauseWhenFullscreenCovers
+            || pauseWhenOtherAppForeground
+            || pauseInactiveDisplays
         let needsPollingForWindowCoverage = pauseWhenWindowCoverage && !AXIsProcessTrusted()
         let needsTimer = needsPollingForFullscreenOrForeground || needsPollingForWindowCoverage
         if needsTimer {
@@ -408,6 +477,7 @@ final class DynamicWallpaperAutoPauseManager {
             stopTimer()
         }
         syncForegroundPauseRequest()
+        syncInactiveDisplayPauseRequest()
         syncBatteryPauseRequest()
 
         if !pauseWhenFullscreenCovers {
@@ -419,7 +489,9 @@ final class DynamicWallpaperAutoPauseManager {
                 let screenIDs = fullscreenAutoPausedScreenIDs
                 fullscreenAutoPausedScreenIDs.removeAll()
                 if !hasActiveGlobalPauseReason {
-                    let stillPausedByOther = foregroundPausedScreenIDs.union(windowCoveragePausedScreenIDs)
+                    let stillPausedByOther = foregroundPausedScreenIDs
+                        .union(inactiveDisplayPausedScreenIDs)
+                        .union(windowCoveragePausedScreenIDs)
                     let canResume = screenIDs.subtracting(stillPausedByOther)
                     if !canResume.isEmpty {
                         resumeScreens(byIDs: canResume)
@@ -445,7 +517,9 @@ final class DynamicWallpaperAutoPauseManager {
                 let screenIDs = windowCoveragePausedScreenIDs
                 windowCoveragePausedScreenIDs.removeAll()
                 if !hasActiveGlobalPauseReason {
-                    let stillPausedByOther = foregroundPausedScreenIDs.union(fullscreenAutoPausedScreenIDs)
+                    let stillPausedByOther = foregroundPausedScreenIDs
+                        .union(inactiveDisplayPausedScreenIDs)
+                        .union(fullscreenAutoPausedScreenIDs)
                     let canResume = screenIDs.subtracting(stillPausedByOther)
                     if !canResume.isEmpty {
                         resumeScreens(byIDs: canResume)
@@ -498,6 +572,9 @@ final class DynamicWallpaperAutoPauseManager {
         let hasExternal = WallpaperEngineXBridge.shared.isControllingExternalEngine
         guard hasNative || hasExternal else {
             foregroundPausedScreenIDs.removeAll()
+            inactiveDisplayPausedScreenIDs.removeAll()
+            inactiveDisplayManuallyPausedScreenIDs.removeAll()
+            activeDisplayScreenID = nil
             batteryPauseRequested = false
             globalAutoPausedNativePlayingScreenIDs.removeAll()
             globalAutoPausedNativeManuallyPausedScreenIDs.removeAll()
@@ -520,6 +597,10 @@ final class DynamicWallpaperAutoPauseManager {
         // 这里用 timer 周期同步重检。
         if pauseWhenOtherAppForeground {
             reevaluateForegroundCoverage()
+        }
+
+        if pauseInactiveDisplays {
+            reevaluateInactiveDisplayPause()
         }
 
         // 窗口覆盖比例检测（按屏）
@@ -576,6 +657,7 @@ final class DynamicWallpaperAutoPauseManager {
             // 排除当前被前台暂停或窗口覆盖比例暂停的屏幕（独立机制，不应被全屏恢复 override）
             let filteredResumeIDs = screenIDsToResume
                 .subtracting(foregroundPausedScreenIDs)
+                .subtracting(inactiveDisplayPausedScreenIDs)
                 .subtracting(windowCoveragePausedScreenIDs)
             if !filteredResumeIDs.isEmpty, !hasActiveGlobalPauseReason, !isInDisplayTransitionGrace {
                 resumeScreens(byIDs: filteredResumeIDs)
@@ -648,7 +730,7 @@ final class DynamicWallpaperAutoPauseManager {
 
     /// 前台应用切换时由通知驱动，无需轮询
     private func handleAppActivationChange() {
-        guard pauseWhenOtherAppForeground || pauseWhenWindowCoverage else { return }
+        guard pauseWhenOtherAppForeground || pauseInactiveDisplays || pauseWhenWindowCoverage else { return }
         guard !isForegroundPauseSuppressed else { return }
         let hasNative = VideoWallpaperManager.shared.isVideoWallpaperActive
         let hasExternal = WallpaperEngineXBridge.shared.isControllingExternalEngine
@@ -667,6 +749,10 @@ final class DynamicWallpaperAutoPauseManager {
             // 前台覆盖检测（保持原逻辑）
             if self.pauseWhenOtherAppForeground {
                 self.reevaluateForegroundCoverage()
+            }
+
+            if self.pauseInactiveDisplays {
+                self.reevaluateInactiveDisplayPause()
             }
 
             // AXObserver 管理（窗口覆盖事件驱动）
@@ -791,6 +877,7 @@ final class DynamicWallpaperAutoPauseManager {
             if videoManager.isVideoWallpaperActive {
                 for screen in NSScreen.screens where screen.wallpaperScreenIdentifier == screenID {
                     if !fullscreenAutoPausedScreenIDs.contains(screenID) &&
+                        !inactiveDisplayPausedScreenIDs.contains(screenID) &&
                         !windowCoveragePausedScreenIDs.contains(screenID) {
                         videoManager.resumeWallpaper(for: screen)
                     }
@@ -801,6 +888,7 @@ final class DynamicWallpaperAutoPauseManager {
             // 恢复外部引擎（排除窗口覆盖比例暂停）
             if weBridge.isControllingExternalEngine &&
                 weBridge.isManaging(screenID: screenID) &&
+                !inactiveDisplayPausedScreenIDs.contains(screenID) &&
                 !windowCoveragePausedScreenIDs.contains(screenID) {
                 weBridge.resumeWallpaper(for: screenID)
             }
@@ -890,6 +978,10 @@ final class DynamicWallpaperAutoPauseManager {
         // 切到 Space 2 有覆盖也不暂停。
         if pauseWhenOtherAppForeground {
             handleAppActivationChange()
+        }
+
+        if pauseInactiveDisplays {
+            reevaluateInactiveDisplayPause()
         }
 
         // Space 切换（进出全屏）时立即重新检测，不等 3s 轮询
@@ -1264,6 +1356,151 @@ final class DynamicWallpaperAutoPauseManager {
         handleAppActivationChange()
     }
 
+    private func syncInactiveDisplayPauseRequest() {
+        guard pauseInactiveDisplays else {
+            clearInactiveDisplayPause()
+            return
+        }
+        updateActiveDisplayEventMonitoring()
+        reevaluateInactiveDisplayPause()
+    }
+
+    private func updateActiveDisplayEventMonitoring() {
+        guard pauseInactiveDisplays else {
+            for monitor in activeDisplayEventMonitors {
+                NSEvent.removeMonitor(monitor)
+            }
+            activeDisplayEventMonitors.removeAll()
+            return
+        }
+        guard activeDisplayEventMonitors.isEmpty else { return }
+
+        let mask: NSEvent.EventTypeMask = [
+            .mouseMoved,
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown,
+            .leftMouseDragged,
+            .rightMouseDragged,
+            .otherMouseDragged,
+            .scrollWheel
+        ]
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.reevaluateInactiveDisplayPause()
+            }
+        }) {
+            activeDisplayEventMonitors.append(globalMonitor)
+        }
+
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: mask,
+            handler: { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.reevaluateInactiveDisplayPause()
+            }
+            return event
+        }) {
+            activeDisplayEventMonitors.append(localMonitor)
+        }
+    }
+
+    private func clearInactiveDisplayPause() {
+        activeDisplayScreenID = nil
+        guard !inactiveDisplayPausedScreenIDs.isEmpty else { return }
+
+        let screenIDs = inactiveDisplayPausedScreenIDs
+        let manuallyPausedScreenIDs = inactiveDisplayManuallyPausedScreenIDs
+        inactiveDisplayPausedScreenIDs.removeAll()
+        inactiveDisplayManuallyPausedScreenIDs.removeAll()
+        guard !hasActiveGlobalPauseReason else { return }
+
+        let blockedByOtherReasons = foregroundPausedScreenIDs
+            .union(fullscreenAutoPausedScreenIDs)
+            .union(windowCoveragePausedScreenIDs)
+        let screenIDsToResume = screenIDs
+            .subtracting(manuallyPausedScreenIDs)
+            .subtracting(blockedByOtherReasons)
+        resumeScreens(byIDs: screenIDsToResume)
+    }
+
+    private func reevaluateInactiveDisplayPause() {
+        guard pauseInactiveDisplays else { return }
+        let videoManager = VideoWallpaperManager.shared
+        let weBridge = WallpaperEngineXBridge.shared
+        guard videoManager.isVideoWallpaperActive || weBridge.isControllingExternalEngine else { return }
+        guard !videoManager.isScreenLocked else { return }
+        guard let activeScreen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first else {
+            return
+        }
+
+        let activeScreenID = activeScreen.wallpaperScreenIdentifier
+        self.activeDisplayScreenID = activeScreenID
+
+        var managedScreenIDs = Set(videoManager.activeScreens.map(\.wallpaperScreenIdentifier))
+        for screen in NSScreen.screens where weBridge.isManaging(screen: screen) {
+            managedScreenIDs.insert(screen.wallpaperScreenIdentifier)
+        }
+        guard !managedScreenIDs.isEmpty else { return }
+
+        let desiredPausedIDs = managedScreenIDs.subtracting(Set([activeScreenID]))
+        let previouslyPausedIDs = inactiveDisplayPausedScreenIDs
+        let screenIDsToResume = previouslyPausedIDs.subtracting(desiredPausedIDs)
+        let manuallyPausedScreenIDs = inactiveDisplayManuallyPausedScreenIDs
+        inactiveDisplayPausedScreenIDs = desiredPausedIDs
+        inactiveDisplayManuallyPausedScreenIDs.subtract(screenIDsToResume)
+
+        if !batteryPauseRequested {
+            let blockedByOtherReasons = foregroundPausedScreenIDs
+                .union(fullscreenAutoPausedScreenIDs)
+                .union(windowCoveragePausedScreenIDs)
+            resumeScreens(
+                byIDs: screenIDsToResume
+                    .subtracting(manuallyPausedScreenIDs)
+                    .subtracting(blockedByOtherReasons)
+            )
+        }
+
+        if batteryPauseRequested {
+            // 电池全局暂停期间不重复控制播放器；恢复供电时会按当前策略重新施加。
+            return
+        }
+
+        let newlyInactiveScreenIDs = desiredPausedIDs.subtracting(previouslyPausedIDs)
+        let pausedByOtherAutomaticReasons = foregroundPausedScreenIDs
+            .union(fullscreenAutoPausedScreenIDs)
+            .union(windowCoveragePausedScreenIDs)
+
+        for screenID in desiredPausedIDs {
+            let shouldRecordManualPause = newlyInactiveScreenIDs.contains(screenID)
+                && !pausedByOtherAutomaticReasons.contains(screenID)
+
+            if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+               videoManager.hasActiveWallpaper(on: screen) {
+                if videoManager.isPaused(on: screen) {
+                    if shouldRecordManualPause {
+                        inactiveDisplayManuallyPausedScreenIDs.insert(screenID)
+                    }
+                } else {
+                    videoManager.pauseWallpaper(for: screen)
+                }
+            }
+
+            if weBridge.isManaging(screenID: screenID) {
+                if weBridge.isPaused(screenID: screenID) {
+                    if shouldRecordManualPause {
+                        inactiveDisplayManuallyPausedScreenIDs.insert(screenID)
+                    }
+                } else {
+                    weBridge.pauseWallpaper(for: screenID)
+                }
+            }
+        }
+    }
+
     private func syncBatteryPauseRequest() {
         if pauseOnBatteryPower {
             PowerSourceMonitor.shared.startMonitoring()
@@ -1318,6 +1555,8 @@ final class DynamicWallpaperAutoPauseManager {
             .subtracting(playingScreenIDs)
             .subtracting(fullscreenAutoPausedScreenIDs)
             .subtracting(foregroundPausedScreenIDs.intersection(managedScreenIDs))
+            .subtracting(inactiveDisplayPausedScreenIDs.intersection(managedScreenIDs))
+            .union(inactiveDisplayManuallyPausedScreenIDs.intersection(managedScreenIDs))
 
         if !videoManager.isPaused {
             videoManager.pauseWallpaper()
@@ -1344,6 +1583,7 @@ final class DynamicWallpaperAutoPauseManager {
             if weBridge.isControllingExternalEngine {
                 let weStillNeedPause = fullscreenCoveredScreenIDs
                     .union(foregroundPausedScreenIDs)
+                    .union(inactiveDisplayPausedScreenIDs)
                     .union(windowCoveragePausedScreenIDs)
                 for screenID in weStillNeedPause where weBridge.isManaging(screenID: screenID) {
                     weBridge.pauseWallpaper(for: screenID)
@@ -1370,10 +1610,12 @@ final class DynamicWallpaperAutoPauseManager {
         // 电池恢复时，保留：手动暂停的屏幕 + 全屏覆盖的屏幕 + 前台暂停的屏幕 + 窗口覆盖比例暂停的屏幕
         // 前台/窗口覆盖暂停使用当前状态（电池期间可能已变化）
         let currentForegroundNativePausedIDs = foregroundPausedScreenIDs.intersection(managedScreenIDs)
+        let currentInactiveDisplayPausedIDs = inactiveDisplayPausedScreenIDs.intersection(managedScreenIDs)
         let currentWindowCoverageNativePausedIDs = windowCoveragePausedScreenIDs.intersection(managedScreenIDs)
         let screenIDsToKeepPaused = globalAutoPausedNativeManuallyPausedScreenIDs
             .union(coveredManagedScreenIDs)
             .union(currentForegroundNativePausedIDs)
+            .union(currentInactiveDisplayPausedIDs)
             .union(currentWindowCoverageNativePausedIDs)
 
         if videoManager.isPaused {
@@ -1580,7 +1822,9 @@ final class DynamicWallpaperAutoPauseManager {
         windowCoveragePausedScreenIDs.subtract(screenIDs)
         guard !hasActiveGlobalPauseReason else { return }
 
-        let stillPausedByOther = foregroundPausedScreenIDs.union(fullscreenAutoPausedScreenIDs)
+        let stillPausedByOther = foregroundPausedScreenIDs
+            .union(inactiveDisplayPausedScreenIDs)
+            .union(fullscreenAutoPausedScreenIDs)
         let canResume = screenIDs.subtracting(stillPausedByOther)
         guard !canResume.isEmpty else { return }
 
@@ -1640,7 +1884,9 @@ final class DynamicWallpaperAutoPauseManager {
         windowCoveragePausedScreenIDs.removeAll()
         windowCoverageCoveredScreenIDs.removeAll()
         guard !hasActiveGlobalPauseReason else { return }
-        let stillPaused = foregroundPausedScreenIDs.union(fullscreenAutoPausedScreenIDs)
+        let stillPaused = foregroundPausedScreenIDs
+            .union(inactiveDisplayPausedScreenIDs)
+            .union(fullscreenAutoPausedScreenIDs)
         let canResume = toResume.subtracting(stillPaused)
         if !canResume.isEmpty {
             resumeScreens(byIDs: canResume)

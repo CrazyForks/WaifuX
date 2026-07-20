@@ -6,6 +6,7 @@ import Kingfisher
 
 enum SceneOfflineBakeError: LocalizedError {
     case cliNotFound
+    case webCliNotFound
     case ineligible
     case contentRootMissing
     case insufficientMemory
@@ -15,6 +16,7 @@ enum SceneOfflineBakeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .cliNotFound: return "未找到 wallpaper-wgpu"
+        case .webCliNotFound: return "未找到 wallpaperengine-cli"
         case .ineligible: return "当前 Scene 不适合离线烘焙（资格不足）"
         case .contentRootMissing: return "内容目录不存在，请重新下载"
         case .insufficientMemory: return LocalizationService.shared.t("sceneBake.error.insufficientMemory.bake")
@@ -26,10 +28,12 @@ enum SceneOfflineBakeError: LocalizedError {
 
 enum SceneBakeRenderer: String, CaseIterable, Codable, Hashable, Sendable {
     case wallpaperWgpu
+    case wallpaperEngineWeb
 
     var displayName: String {
         switch self {
         case .wallpaperWgpu: return "1. wallpaper-wgpu"
+        case .wallpaperEngineWeb: return "2. wallpaperengine-cli Web"
         }
     }
 }
@@ -69,28 +73,40 @@ func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> 
     return posterURL
 }
 
-/// 全局只允许一个 `wallpaper-wgpu bake` 子进程，避免重叠渲染导致内存成倍上涨。
-private actor SceneOfflineBakeConcurrencyGate {
-    static let shared = SceneOfflineBakeConcurrencyGate()
-    private var busy = false
-    private var busySince: Date?
+/// 所有离线烘焙共用的串行 FIFO 队列。
+///
+/// Scene / Web 烘焙都会占用大量 GPU、内存和编码资源。这里允许用户连续提交任务，
+/// 但始终只放行一个实际子进程，避免重叠渲染导致内存成倍上涨。
+actor OfflineBakeSerialQueue {
+    static let shared = OfflineBakeSerialQueue()
 
-    func tryEnter() -> Bool {
-        // 安全重置：如果门控卡死超过 10 分钟，自动重置
-        if busy, let since = busySince, Date().timeIntervalSince(since) > 600 {
-            print("[SceneOfflineBakeConcurrencyGate] ⚠️ 门控卡死超过 10 分钟，自动重置")
-            busy = false
-            busySince = nil
-        }
-        if busy { return false }
-        busy = true
-        busySince = Date()
-        return true
+    private struct Waiter {
+        let jobID: UUID
+        let continuation: CheckedContinuation<Void, Never>
     }
 
-    func leave() {
-        busy = false
-        busySince = nil
+    private var activeJobID: UUID?
+    private var waiters: [Waiter] = []
+
+    func waitForTurn(jobID: UUID) async {
+        if activeJobID == nil, waiters.isEmpty {
+            activeJobID = jobID
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(Waiter(jobID: jobID, continuation: continuation))
+        }
+    }
+
+    func leave(jobID: UUID) {
+        guard activeJobID == jobID else { return }
+        activeJobID = nil
+
+        guard !waiters.isEmpty else { return }
+        let next = waiters.removeFirst()
+        activeJobID = next.jobID
+        next.continuation.resume()
     }
 }
 
@@ -100,54 +116,70 @@ private actor SceneOfflineBakeConcurrencyGate {
 final class SceneOfflineBakeProgressTracker {
     static let shared = SceneOfflineBakeProgressTracker()
 
-    private(set) var activeItemID: String?
-    private(set) var progress: Double = 0
-
-    var isBaking: Bool { activeItemID != nil }
-
-    func begin(itemID: String?) {
-        activeItemID = itemID
-        progress = 0
-        guard let itemID else { return }
-        NotificationCenter.default.post(
-            name: .sceneOfflineBakeProgressDidUpdate,
-            object: itemID,
-            userInfo: ["progress": 0.0]
-        )
+    enum State: Equatable {
+        case queued
+        case running
     }
 
-    func update(itemID: String?, progress value: Double) {
+    struct Entry: Identifiable, Equatable {
+        let id: UUID
+        let itemID: String?
+        var state: State
+        var progress: Double
+    }
+
+    private(set) var entries: [Entry] = []
+
+    var activeItemID: String? {
+        entries.first(where: { $0.state == .running })?.itemID
+    }
+
+    var progress: Double {
+        entries.first(where: { $0.state == .running })?.progress ?? 0
+    }
+
+    var isBaking: Bool { !entries.isEmpty }
+
+    func enqueue(itemID: String?) -> UUID {
+        let jobID = UUID()
+        entries.append(Entry(id: jobID, itemID: itemID, state: .queued, progress: 0))
+        notifyProgress(itemID: itemID, progress: 0)
+        return jobID
+    }
+
+    func begin(jobID: UUID) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
+        entries[index].state = .running
+        notifyProgress(itemID: entries[index].itemID, progress: entries[index].progress)
+    }
+
+    func update(jobID: UUID, progress value: Double) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
         let clamped = min(max(value, 0.0), 0.99)
-        if let itemID {
-            activeItemID = itemID
+        entries[index].progress = max(entries[index].progress, clamped)
+        notifyProgress(itemID: entries[index].itemID, progress: entries[index].progress)
+    }
+
+    func finish(jobID: UUID, success: Bool) {
+        guard let index = entries.firstIndex(where: { $0.id == jobID }) else { return }
+        let entry = entries[index]
+        if success {
+            notifyProgress(itemID: entry.itemID, progress: 1)
         }
-        progress = max(progress, clamped)
-        guard let itemID = itemID ?? activeItemID else { return }
+        entries.remove(at: index)
+    }
+
+    func progress(for itemID: String) -> Double? {
+        entries.first(where: { $0.itemID == itemID })?.progress
+    }
+
+    private func notifyProgress(itemID: String?, progress: Double) {
+        guard let itemID else { return }
         NotificationCenter.default.post(
             name: .sceneOfflineBakeProgressDidUpdate,
             object: itemID,
             userInfo: ["progress": progress]
         )
-    }
-
-    func finish(itemID: String?, success: Bool) {
-        let targetID = itemID ?? activeItemID
-        if success, let targetID {
-            NotificationCenter.default.post(
-                name: .sceneOfflineBakeProgressDidUpdate,
-                object: targetID,
-                userInfo: ["progress": 1.0]
-            )
-        }
-        if activeItemID == nil || activeItemID == targetID {
-            activeItemID = nil
-            progress = 0
-        }
-    }
-
-    func progress(for itemID: String) -> Double? {
-        guard activeItemID == itemID else { return nil }
-        return progress
     }
 }
 
@@ -227,11 +259,17 @@ enum SceneOfflineBakeService {
         }
     }
 
-    private static func usableArtifact(from record: MediaDownloadRecord?) -> SceneBakeArtifact? {
+    static func usableArtifact(from record: MediaDownloadRecord?) -> SceneBakeArtifact? {
         guard let record,
               let artifact = record.sceneBakeArtifact,
-              artifact.analysisId == record.sceneBakeEligibility?.analysisId,
               isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)) else {
+            return nil
+        }
+        if artifact.renderer == .wallpaperEngineWeb {
+            let videoURL = URL(fileURLWithPath: artifact.videoPath)
+            return WebOfflineBakeService.isCurrentCacheArtifactURL(videoURL) ? artifact : nil
+        }
+        guard artifact.analysisId == record.sceneBakeEligibility?.analysisId else {
             return nil
         }
         return artifact
@@ -321,8 +359,6 @@ enum SceneOfflineBakeService {
                 )
                 print("[SceneOfflineBake] realtime companion bake finished (\(reason)): \(artifact.videoPath)")
                 await syncRealtimeBakeToLockScreen(artifact: artifact, itemID: itemID, displayIDs: displayIDs, reason: reason)
-            } catch SceneOfflineBakeError.concurrentBakeInProgress {
-                print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): another bake is running")
             } catch {
                 print("[SceneOfflineBake] realtime companion bake failed (\(reason)): \(error.localizedDescription)")
             }
@@ -409,6 +445,8 @@ enum SceneOfflineBakeService {
         switch renderer {
         case .wallpaperWgpu:
             return WallpaperEngineXBridge.resolvedCLIExecutableURL() != nil
+        case .wallpaperEngineWeb:
+            return WallpaperEngineXBridge.resolvedLegacyCLIExecutableURL() != nil
         }
     }
 
@@ -457,6 +495,8 @@ enum SceneOfflineBakeService {
                 arguments: args,
                 renderer: renderer
             )
+        case .wallpaperEngineWeb:
+            throw SceneOfflineBakeError.ineligible
         }
     }
 
@@ -552,16 +592,16 @@ enum SceneOfflineBakeService {
             effectiveDuration = saved >= 5 ? min(max(saved, 5), 60) : 15
         }
         let trackedItemID = progressItemID ?? persistArtifactToItemID
-        // 并发门控：防止多个烘焙同时运行
-        let entered = await SceneOfflineBakeConcurrencyGate.shared.tryEnter()
-        guard entered else {
-            throw SceneOfflineBakeError.concurrentBakeInProgress
+        let jobID = await MainActor.run {
+            SceneOfflineBakeProgressTracker.shared.enqueue(itemID: trackedItemID)
         }
+
+        await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
         await MainActor.run {
-            SceneOfflineBakeProgressTracker.shared.begin(itemID: trackedItemID)
+            SceneOfflineBakeProgressTracker.shared.begin(jobID: jobID)
         }
         let trackedProgress: (@MainActor (Double) -> Void)? = { value in
-            SceneOfflineBakeProgressTracker.shared.update(itemID: trackedItemID, progress: value)
+            SceneOfflineBakeProgressTracker.shared.update(jobID: jobID, progress: value)
             progress?(value)
         }
         do {
@@ -575,9 +615,8 @@ enum SceneOfflineBakeService {
                 persistArtifactToItemID: persistArtifactToItemID,
                 progress: trackedProgress
             )
-            await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
-                SceneOfflineBakeProgressTracker.shared.finish(itemID: trackedItemID, success: true)
+                SceneOfflineBakeProgressTracker.shared.finish(jobID: jobID, success: true)
                 let bakedURL = URL(fileURLWithPath: result.videoPath)
                 let title = persistArtifactToItemID.flatMap {
                     MediaLibraryService.shared.downloadRecord(for: $0)?.item.title
@@ -593,13 +632,14 @@ enum SceneOfflineBakeService {
                 )
                 NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: result)
             }
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             return result
         } catch {
-            await SceneOfflineBakeConcurrencyGate.shared.leave()
             await MainActor.run {
-                SceneOfflineBakeProgressTracker.shared.finish(itemID: trackedItemID, success: false)
+                SceneOfflineBakeProgressTracker.shared.finish(jobID: jobID, success: false)
                 NotificationCenter.default.post(name: .sceneOfflineBakeDidComplete, object: nil)
             }
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             throw error
         }
     }
@@ -655,6 +695,8 @@ enum SceneOfflineBakeService {
             switch renderer {
             case .wallpaperWgpu:
                 return await inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH)
+            case .wallpaperEngineWeb:
+                return nil
             }
         }()
         if let cachedInspection,
@@ -703,6 +745,8 @@ enum SceneOfflineBakeService {
                 userProperties: effectiveUserProperties,
                 progress: progress
             )
+        case .wallpaperEngineWeb:
+            throw SceneOfflineBakeError.ineligible
         }
         if let itemID = persistArtifactToItemID {
             await MainActor.run {
@@ -1080,9 +1124,7 @@ enum SceneOfflineBakeService {
 
     /// 检查是否有缓存（不触发实际烘焙）
     static func hasCachedArtifact(record: MediaDownloadRecord, renderer: SceneBakeRenderer? = nil) -> Bool {
-        guard let art = record.sceneBakeArtifact,
-              art.analysisId == record.sceneBakeEligibility?.analysisId,
-              isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) else { return false }
+        guard let art = usableArtifact(from: record) else { return false }
         if let renderer {
             return art.renderer == renderer
         }
@@ -1132,10 +1174,6 @@ enum SceneOfflineBakeService {
             }
             guard let record,
                   let eligibility = record.sceneBakeEligibility else { return }
-            guard SystemMemoryPressure.hasRoomForSceneOfflineBake() else {
-                print("[SceneOfflineBake] auto-bake skipped: insufficient reclaimable memory")
-                return
-            }
             if let art = record.sceneBakeArtifact,
                art.analysisId == eligibility.analysisId,
                (art.renderer == nil || art.renderer == .wallpaperWgpu),
@@ -1147,11 +1185,7 @@ enum SceneOfflineBakeService {
                 _ = try await bake(record: record)
                 print("[SceneOfflineBake] auto-bake finished \(itemID)")
             } catch {
-                if case SceneOfflineBakeError.concurrentBakeInProgress = error {
-                    print("[SceneOfflineBake] auto-bake skipped (busy) \(itemID)")
-                } else {
-                    print("[SceneOfflineBake] auto-bake failed \(itemID): \(error.localizedDescription)")
-                }
+                print("[SceneOfflineBake] auto-bake failed \(itemID): \(error.localizedDescription)")
             }
         }
     }

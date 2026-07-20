@@ -818,6 +818,7 @@ struct MyLibraryContentView: View {
     private func wallpaperFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = wallpaperFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
+        let optimizationOperations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
@@ -843,16 +844,10 @@ struct MyLibraryContentView: View {
             onRelock: {
                 folderLockService.lockFolder(folder.id)
             },
-            onGenerateLoopTransition: {
+            onOptimizeVideos: optimizationOperations.isEmpty ? nil : {
                 VideoOptimizationQueueService.shared.enqueueLibraryFolder(
                     folder,
-                    operations: [.loopTransition]
-                )
-            },
-            onInterpolateVideos: {
-                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
-                    folder,
-                    operations: [.loopTransition, .frameInterpolation]
+                    operations: optimizationOperations
                 )
             }
         )
@@ -1184,22 +1179,20 @@ struct MyLibraryContentView: View {
                 }
             }
             if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
-                Divider()
-                Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopTransition(
-                        videoURL: videoURL,
-                        title: item.wallpaper.title
-                    )
-                } label: {
-                    Label(t("videoOptimizationGenerateLoopTransition"), systemImage: "point.3.connected.trianglepath.dotted")
-                }
-                Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopTransitionThenInterpolation(
-                        videoURL: videoURL,
-                        title: item.wallpaper.title
-                    )
-                } label: {
-                    Label(t("videoOptimizationInterpolateVideo"), systemImage: "rectangle.stack.badge.play")
+                let operations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
+                if !operations.isEmpty {
+                    Divider()
+                    Button {
+                        VideoOptimizationQueueService.shared.enqueue(
+                            videoURL: videoURL,
+                            title: item.wallpaper.title,
+                            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                            source: .manual,
+                            operations: operations
+                        )
+                    } label: {
+                        Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
+                    }
                 }
             }
         }
@@ -1259,6 +1252,7 @@ struct MyLibraryContentView: View {
     private func mediaFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = mediaFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
+        let optimizationOperations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
@@ -1284,16 +1278,10 @@ struct MyLibraryContentView: View {
             onRelock: {
                 folderLockService.lockFolder(folder.id)
             },
-            onGenerateLoopTransition: {
+            onOptimizeVideos: optimizationOperations.isEmpty ? nil : {
                 VideoOptimizationQueueService.shared.enqueueLibraryFolder(
                     folder,
-                    operations: [.loopTransition]
-                )
-            },
-            onInterpolateVideos: {
-                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
-                    folder,
-                    operations: [.loopTransition, .frameInterpolation]
+                    operations: optimizationOperations
                 )
             }
         )
@@ -1384,22 +1372,20 @@ struct MyLibraryContentView: View {
                 }
             }
             if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
-                Divider()
-                Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopTransition(
-                        videoURL: videoURL,
-                        title: item.mediaItem.title
-                    )
-                } label: {
-                    Label(t("videoOptimizationGenerateLoopTransition"), systemImage: "point.3.connected.trianglepath.dotted")
-                }
-                Button {
-                    VideoOptimizationQueueService.shared.enqueueLoopTransitionThenInterpolation(
-                        videoURL: videoURL,
-                        title: item.mediaItem.title
-                    )
-                } label: {
-                    Label(t("videoOptimizationInterpolateVideo"), systemImage: "rectangle.stack.badge.play")
+                let operations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
+                if !operations.isEmpty {
+                    Divider()
+                    Button {
+                        VideoOptimizationQueueService.shared.enqueue(
+                            videoURL: videoURL,
+                            title: item.mediaItem.title,
+                            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                            source: .manual,
+                            operations: operations
+                        )
+                    } label: {
+                        Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
+                    }
                 }
             }
         }
