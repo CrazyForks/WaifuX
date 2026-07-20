@@ -334,8 +334,15 @@ final class WallpaperEngineXBridge: ObservableObject {
             print("[WallpaperEngineXBridge] <<< setWallpaper END")
         }
 
-        // 设场景/web 壁纸时关闭并清除静态图 overlay（renderer 窗口本身覆盖桌面，静态 overlay 无意义且浪费窗口）
-        StaticImageWallpaperOverlayManager.shared.clearState()
+        // 设场景/web 壁纸时只清理目标屏的静态图 overlay。单屏自动轮换不能
+        // 误删其他显示器在“系统壁纸同步关闭”时维护的独立静态图。
+        if let screens = targetScreens, !screens.isEmpty {
+            for screen in screens {
+                StaticImageWallpaperOverlayManager.shared.clearState(for: screen)
+            }
+        } else {
+            StaticImageWallpaperOverlayManager.shared.clearState()
+        }
 
 	// 壁纸切换时使设计面板的缓存失效
 	WebWallpaperDesignService.shared.invalidateAllCaches()
@@ -386,9 +393,15 @@ final class WallpaperEngineXBridge: ObservableObject {
         if renderKind != .web && shouldStopWebForTargets {
             print("[WallpaperEngineXBridge] 目标屏幕原有 Web 壁纸，通过 daemon IPC 逐屏停止")
             for state in targetWebStates {
-                // 通过 daemon 的 stop 命令按屏幕停止 web 壁纸
-                let screenIdx = NSScreen.screens.firstIndex(where: { $0.wallpaperScreenIdentifier == state.screenID }) ?? 0
-                try? await Self.runLegacyCLIClientCommand(["stop", String(screenIdx)])
+                guard let screen = screenForPersistedState(state),
+                      let screenIdx = Self.legacyCLIScreenIndex(for: screen) else {
+                    print("[WallpaperEngineXBridge] ⚠️ Web 目标屏已变化，跳过按屏停止: \(state.screenID)")
+                    continue
+                }
+                if let status = try? await Self.runLegacyCLIClientCommand(["stop-screen", String(screenIdx)]),
+                   status != 0 {
+                    print("[WallpaperEngineXBridge] ⚠️ 按屏停止 Web 壁纸失败 screen=\(screenIdx) exit=\(status)")
+                }
             }
             webRenderer.stop()
             for state in targetWebStates {
@@ -521,13 +534,24 @@ final class WallpaperEngineXBridge: ObservableObject {
                     userProperties: userProperties
                 )
 
-                // 写壁纸控制文件触发热切换（包含超分辨率/性能模式参数）
+                // 准备热切换控制参数（包含超分辨率/性能模式参数）
                 let upscalingEnabled = UserDefaults.standard.bool(forKey: "upscaling_enabled")
                 let upscalingPercentValue: Int? = upscalingEnabled ? {
                     let percent = UserDefaults.standard.double(forKey: "upscaling_percent")
                     return percent > 0 ? max(30, min(100, Int(percent))) : 70
                 }() : nil
                 let effectReductionEnabled = upscalingEnabled ? UserDefaults.standard.bool(forKey: "effect_reduction_enabled") : false
+
+                // 热切换必须先清除旧裁切和旧 canvas-size，再通知 renderer 加载新壁纸。
+                // 否则等待新画布尺寸的任务会把仍可读取的旧文件误判为新场景尺寸，
+                // 在固定比例（如 16:9）下写入错误的 crop。
+                let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
+                if let ccURL = existingInfo.cropControlURL {
+                    writeCropControl(url: ccURL, crop: nil, viewport: nil)
+                }
+                if let csURL = existingInfo.canvasSizeURL {
+                    invalidateCanvasSizeFile(at: csURL)
+                }
 
                 writeWallpaperControl(
                     url: wcURL,
@@ -538,20 +562,6 @@ final class WallpaperEngineXBridge: ObservableObject {
                     upscalingPercent: upscalingPercentValue,
                     effectReduction: effectReductionEnabled
                 )
-
-                // 热切换时必须重置 crop-control 文件
-                // 注意：此时 canvas-size 文件还是旧壁纸的尺寸，不能 readCanvasSize！
-                // - 无裁切 → 写 null 清空
-                // - 有裁切 → 跳过初始写入，等异步 Task 拿到新 canvas_size 后重算
-                let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
-                if let ccURL = existingInfo.cropControlURL {
-                    if cropSettings.shouldApplyCrop {
-                        // 等 canvas_size 就绪后由下方的异步 Task 重算，这里先写 null 避免旧数据污染
-                        writeCropControl(url: ccURL, crop: nil, viewport: nil)
-                    } else {
-                        writeCropControl(url: ccURL, crop: nil, viewport: nil)
-                    }
-                }
                 if let acURL = existingInfo.audioControlURL {
                     writeAudioControl(
                         url: acURL,
@@ -1233,7 +1243,21 @@ final class WallpaperEngineXBridge: ObservableObject {
         let targetState = renderState(for: targetScreen)
         if targetState?.renderKind == .web || (targetState == nil && activeRenderKind == .web) {
             webRenderer.stop()
-            Task { await Self.killLegacyDaemonIfRunning(waitForExit: false) }
+            if let screenIndex = Self.legacyCLIScreenIndex(for: targetScreen) {
+                Task {
+                    do {
+                        let status = try await Self.runLegacyCLIClientCommand([
+                            "stop-screen",
+                            String(screenIndex)
+                        ])
+                        if status != 0 {
+                            print("[WallpaperEngineXBridge] ⚠️ 按屏停止 Web 壁纸失败 screen=\(screenIndex) exit=\(status)")
+                        }
+                    } catch {
+                        print("[WallpaperEngineXBridge] ⚠️ 按屏停止 Web 壁纸失败: \(error.localizedDescription)")
+                    }
+                }
+            }
         }
 
         if let info = screenProcesses[screenID] {
@@ -1338,34 +1362,46 @@ final class WallpaperEngineXBridge: ObservableObject {
     }
 
     private func setWebWallpaper(path: String, targetScreens: [NSScreen]?) async throws {
-        let screenIndex: Int?
-        if let screen = targetScreens?.first {
-            screenIndex = NSScreen.screens.firstIndex(of: screen)
-        } else {
-            screenIndex = nil
+        let screens = targetScreens?.isEmpty == false ? targetScreens! : NSScreen.screens
+        guard !screens.isEmpty else {
+            throw WallpaperEngineError.executionFailed("没有可用的 Web 壁纸目标显示器")
         }
 
-        // ✅ Web 壁纸改走旧 wallpaperengine-cli：daemon 自带 WKWebView 桥，能正确处理 web 类型项目。
-        //    原内置 WebRendererBridge 在新流程中已不参与启动，仅作为停止时的清场调用保留。
-        var args = ["set", path]
-        if let idx = screenIndex {
-            args.append(String(idx))
+        let targetIndexes = screens.compactMap(Self.legacyCLIScreenIndex(for:))
+        guard targetIndexes.count == screens.count else {
+            throw WallpaperEngineError.executionFailed("Web 壁纸目标显示器已变化，请重试")
         }
 
-        print("[WallpaperEngineXBridge] 使用旧 wallpaperengine-cli 设置 Web 壁纸: \(path) screenIdx=\(screenIndex.map(String.init) ?? "all")")
+        // wallpaperengine-cli 的 set 命令一次只处理一个屏幕索引。必须逐屏发送，
+        // 否则全局多屏轮换会让副屏被记录为已管理、实际却没有 WebView。
+        print("[WallpaperEngineXBridge] 使用旧 wallpaperengine-cli 设置 Web 壁纸: \(path) screenIdx=\(targetIndexes)")
         // 清理旧的 legacy 路径和 per-screen 路径（CLI daemon 写入 per-screen 路径）
         try? FileManager.default.removeItem(atPath: legacyCLIWebCapturePath)
         for i in 0..<NSScreen.screens.count {
             try? FileManager.default.removeItem(atPath: legacyCLICapturePath(for: i))
         }
-        let status = try await Self.runLegacyCLIClientCommand(args)
-        guard status == 0 else {
-            throw WallpaperEngineError.executionFailed("wallpaperengine-cli set 失败 (exit=\(status))")
+
+        for screenIndex in targetIndexes {
+            let status = try await Self.runLegacyCLIClientCommand(["set", path, String(screenIndex)])
+            guard status == 0 else {
+                throw WallpaperEngineError.executionFailed(
+                    "wallpaperengine-cli set 失败 (screen=\(screenIndex), exit=\(status))"
+                )
+            }
         }
 
         if let propertiesJSON = try? WebWallpaperDesignService.shared.effectivePropertiesJSON(for: path),
            !propertiesJSON.isEmpty {
-            try? await applyWebWallpaperProperties(propertiesJSON)
+            for screenIndex in targetIndexes {
+                let status = try await Self.runLegacyCLIClientCommand([
+                    "apply-properties",
+                    propertiesJSON,
+                    String(screenIndex)
+                ])
+                if status != 0 {
+                    print("[WallpaperEngineXBridge] ⚠️ Web 属性初始化失败 screen=\(screenIndex) exit=\(status)")
+                }
+            }
         }
 
         let captureURLs = await captureWebFallbackFramesForLockScreenIfNeeded(targetScreens: targetScreens)
@@ -1374,7 +1410,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         // 初始化 Web 壁纸的音频状态（同步当前 mute/volume）
         let isMuted = VideoWallpaperManager.shared.isMuted
         let volume = VideoWallpaperManager.shared.volume
-        sendAudioControlToWebDaemon(muted: isMuted, volume: isMuted ? nil : volume, screen: screenIndex)
+        for screenIndex in targetIndexes {
+            sendAudioControlToWebDaemon(
+                muted: isMuted,
+                volume: isMuted ? nil : volume,
+                screen: screenIndex
+            )
+        }
     }
 
     private func syncWebStaticFramesToLockScreenIfNeeded(imageURLs: [UInt32: URL], targetScreens: [NSScreen]?) async {
@@ -1441,7 +1483,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         return result
     }
 
-    /// 启动旧 `wallpaperengine-cli` 的客户端子命令（set/pause/resume/stop）。
+    /// 启动旧 `wallpaperengine-cli` 的客户端子命令（set/pause/resume/stop-screen）。
     /// 这些命令仅作为 IPC 客户端，向 daemon 发完消息就退出；真正的 web 渲染由 daemon 持有。
     @discardableResult
     private static func runLegacyCLIClientCommand(_ arguments: [String]) async throws -> Int32 {
@@ -1468,9 +1510,25 @@ final class WallpaperEngineXBridge: ObservableObject {
         guard isCurrentWallpaperWeb else {
             throw WallpaperEngineError.executionFailed("当前没有运行中的 Web 壁纸")
         }
-        let status = try await Self.runLegacyCLIClientCommand(["apply-properties", propertiesJSON])
-        guard status == 0 else {
-            throw WallpaperEngineError.executionFailed("Web 壁纸属性热更新失败 (exit=\(status))")
+
+        let targetIndexes = NSScreen.screens.enumerated().compactMap { index, screen -> Int? in
+            isWebWallpaperOn(screen: screen) ? index : nil
+        }
+        guard !targetIndexes.isEmpty else {
+            throw WallpaperEngineError.executionFailed("当前没有可更新属性的 Web 显示器")
+        }
+
+        for screenIndex in targetIndexes {
+            let status = try await Self.runLegacyCLIClientCommand([
+                "apply-properties",
+                propertiesJSON,
+                String(screenIndex)
+            ])
+            guard status == 0 else {
+                throw WallpaperEngineError.executionFailed(
+                    "Web 壁纸属性热更新失败 (screen=\(screenIndex), exit=\(status))"
+                )
+            }
         }
     }
 
@@ -1986,6 +2044,16 @@ final class WallpaperEngineXBridge: ObservableObject {
             .appendingPathComponent("waifux-wallpaper-wgpu-wallpaper-\(String(safeID))-\(UUID().uuidString).json")
     }
 
+    /// 热切换前删除上一张场景写出的 canvas 尺寸，避免被误用作新场景的裁切依据。
+    private func invalidateCanvasSizeFile(at url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            print("[WallpaperEngineXBridge] ⚠️ 清除旧 canvas_size 文件失败: \(error.localizedDescription)")
+        }
+    }
+
     /// 读取 wgpu 写出的 canvas 尺寸 JSON。读不到/解析失败返回 nil（调用方 fallback 屏尺寸）。
     private func readCanvasSize(url: URL?) -> CGSize? {
         guard let url = url else { return nil }
@@ -2120,12 +2188,17 @@ final class WallpaperEngineXBridge: ObservableObject {
     private func removeRenderState(for screen: NSScreen) {
         let screenID = screen.wallpaperScreenIdentifier
         let state = renderState(for: screen)
-        if state?.renderKind == .web {
-            screenRenderStates = screenRenderStates.filter { $0.value.renderKind != .web }
-        } else if let state {
+        if let state {
             screenRenderStates.removeValue(forKey: state.screenID)
         } else {
             screenRenderStates.removeValue(forKey: screenID)
+        }
+    }
+
+    private static func legacyCLIScreenIndex(for screen: NSScreen) -> Int? {
+        NSScreen.screens.firstIndex {
+            $0.wallpaperScreenIdentifier == screen.wallpaperScreenIdentifier
+                || $0.wallpaperScreenFingerprint == screen.wallpaperScreenFingerprint
         }
     }
 

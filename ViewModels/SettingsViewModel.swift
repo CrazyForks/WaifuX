@@ -9,6 +9,7 @@ class SettingsViewModel: ObservableObject {
     // 直接读 UserDefaults，如果 SettingsViewModel 在 AppDelegate 属性初始化阶段被创建，
     // 会触发 _CFXPreferences 递归栈溢出（EXC_BAD_ACCESS SIGSEGV）。
     // 改用 @Published + 手动 UserDefaults 同步 + restoreSavedSettings() 延迟恢复。
+    private var systemWallpaperSyncTransitionGeneration: UInt64 = 0
 
     @Published var saveToDownloads = true {
         didSet { UserDefaults.standard.set(saveToDownloads, forKey: DownloadPathManager.persistDownloadsToAppLibraryDefaultsKey) }
@@ -206,9 +207,101 @@ class SettingsViewModel: ObservableObject {
                     }
                 }
             }
-            // 重新开启系统壁纸同步时，关闭并清除静态图 overlay（下次设壁纸走系统壁纸路径）
-            if systemWallpaperSyncEnabled {
-                StaticImageWallpaperOverlayManager.shared.clearState()
+            systemWallpaperSyncTransitionGeneration &+= 1
+            let transitionGeneration = systemWallpaperSyncTransitionGeneration
+            let enabled = systemWallpaperSyncEnabled
+            Task { @MainActor [weak self] in
+                await self?.migrateStaticWallpaperPresentation(
+                    systemSyncEnabled: enabled,
+                    generation: transitionGeneration
+                )
+            }
+        }
+    }
+
+    /// Preserves each display's visible static image when the presentation
+    /// backend changes between the system desktop and the in-app overlay.
+    private func migrateStaticWallpaperPresentation(
+        systemSyncEnabled: Bool,
+        generation: UInt64
+    ) async {
+        guard systemWallpaperSyncTransitionGeneration == generation,
+              self.systemWallpaperSyncEnabled == systemSyncEnabled else {
+            return
+        }
+
+        let screens = NSScreen.screens
+        let overlay = StaticImageWallpaperOverlayManager.shared
+
+        if !systemSyncEnabled {
+            for screen in screens {
+                guard systemWallpaperSyncTransitionGeneration == generation,
+                      !VideoWallpaperManager.shared.hasActiveWallpaper(on: screen),
+                      !WallpaperEngineXBridge.shared.isManaging(screen: screen),
+                      overlay.imageURL(for: screen) == nil,
+                      let imageURL = DesktopWallpaperSyncManager.shared.imageURL(for: screen),
+                      FileManager.default.fileExists(atPath: imageURL.path) else {
+                    continue
+                }
+                await overlay.showPrepared(imageURL: imageURL, for: screen)
+                guard systemWallpaperSyncTransitionGeneration == generation,
+                      !self.systemWallpaperSyncEnabled else {
+                    if overlay.imageURL(for: screen)?.standardizedFileURL == imageURL.standardizedFileURL {
+                        overlay.clearState(for: screen)
+                    }
+                    return
+                }
+            }
+            return
+        }
+
+        let staticEntries = screens.compactMap { screen -> (NSScreen, URL)? in
+            guard let imageURL = overlay.imageURL(for: screen),
+                  FileManager.default.fileExists(atPath: imageURL.path) else {
+                return nil
+            }
+            return (screen, imageURL)
+        }
+        guard !staticEntries.isEmpty else { return }
+
+        let workspace = NSWorkspace.shared
+        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+            .allowClipping: true
+        ]
+
+        for (screen, imageURL) in staticEntries {
+            guard systemWallpaperSyncTransitionGeneration == generation,
+                  self.systemWallpaperSyncEnabled else {
+                return
+            }
+
+            let preparedURL = await overlay.preparedSystemWallpaperURL(for: imageURL)
+            guard systemWallpaperSyncTransitionGeneration == generation,
+                  self.systemWallpaperSyncEnabled else {
+                return
+            }
+            do {
+                try workspace.setDesktopImageURLForAllSpaces(
+                    preparedURL,
+                    for: screen,
+                    options: fillOptions
+                )
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(
+                    preparedURL,
+                    for: screen,
+                    options: fillOptions
+                )
+            } catch {
+                AppLogger.error(.wallpaper, "Failed to migrate static overlay into system wallpaper", metadata: [
+                    "screen": screen.localizedName,
+                    "error": error.localizedDescription
+                ])
+                continue
+            }
+
+            if overlay.imageURL(for: screen)?.standardizedFileURL == imageURL.standardizedFileURL {
+                overlay.clearState(for: screen)
             }
         }
     }

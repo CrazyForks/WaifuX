@@ -21,6 +21,13 @@ class WallpaperSchedulerService: ObservableObject {
     private var onEndSwitchCooldownUntilByScreen: [String: Date] = [:]
     /// Ignore another on-end trigger for the same screen within this window after apply returns.
     private let onEndSwitchCooldown: TimeInterval = 1.5
+    /// A timed multi-screen batch is one transaction. Later timer ticks must
+    /// not race it while renderer/player setup is still awaiting.
+    private var timedRotationTask: Task<Void, Never>?
+    private var timedRotationGeneration: UInt64 = 0
+    /// Shared-decoder playback has one logical end event even though every
+    /// attached display may observe the underlying AVPlayerItem.
+    private var globalOnEndSwitchCooldownUntil: Date?
 
     private var dispatchTimer: DispatchSourceTimer?
     private var pendingCleanupWorkItem: DispatchWorkItem?
@@ -301,10 +308,16 @@ class WallpaperSchedulerService: ObservableObject {
            !(displayConfig.isEnabled && displayConfig.isOnEndMode) {
             return
         }
+        if case .onEnd? = requiredMode,
+           let cooldownUntil = globalOnEndSwitchCooldownUntil,
+           Date() < cooldownUntil {
+            print("\(logTag) Skip global on-end rotation: within post-switch cooldown")
+            return
+        }
         let items = getSchedulableItems(for: displayConfig)
         guard !items.isEmpty else {
-            if case .onEnd? = requiredMode, let primary = screens.first {
-                VideoWallpaperManager.shared.resumeOnEndVideoAfterFailedSwitch(for: primary)
+            if case .onEnd? = requiredMode {
+                VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
             }
             return
         }
@@ -325,14 +338,17 @@ class WallpaperSchedulerService: ObservableObject {
 
             let success = await self.applyItemGlobally(item, to: screens)
             guard success else {
-                if case .onEnd? = requiredMode, let primary = screens.first {
-                    VideoWallpaperManager.shared.resumeOnEndVideoAfterFailedSwitch(for: primary)
+                if case .onEnd? = requiredMode {
+                    VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
                 }
                 return
             }
 
             self.lastChangeTimes[self.globalSchedulerStateKey] = Date()
             self.lastChangedItemIDs[self.globalSchedulerStateKey] = item.id
+            if case .onEnd? = requiredMode {
+                self.globalOnEndSwitchCooldownUntil = Date().addingTimeInterval(self.onEndSwitchCooldown)
+            }
             self.persistSchedulerState()
         }
         globalRotationTask = task
@@ -359,6 +375,7 @@ class WallpaperSchedulerService: ObservableObject {
             self.isScreenLocked = true
             self.dispatchTimer?.cancel()
             self.dispatchTimer = nil
+            self.cancelTimedRotation()
             print("\(self.logTag) Screen locked, pausing scheduler")
         }
     }
@@ -394,6 +411,7 @@ class WallpaperSchedulerService: ObservableObject {
                 self.relinkDisplayConfigsByFingerprint()
                 self.relinkSchedulerStateByFingerprint(using: previousFingerprints)
                 self.cleanupOrphanedScreenState()
+                self.cancelTimedRotation()
                 if self.isRunning {
                     self.scheduleNextChange()
                 }
@@ -627,6 +645,7 @@ class WallpaperSchedulerService: ObservableObject {
     func stop() {
         dispatchTimer?.cancel()
         dispatchTimer = nil
+        cancelTimedRotation()
         isRunning = false
         saveConfig()
         // 停止时保留持久化状态，以便重新启用时继续上轮随机进度
@@ -637,6 +656,7 @@ class WallpaperSchedulerService: ObservableObject {
     /// 手动设置壁纸后调用：重置该屏幕的调度计时器，避免刚设置完就被自动切换覆盖。
     /// - Parameter screenID: 被手动设置壁纸的屏幕标识符；nil 表示重置所有屏幕。
     func notifyManualWallpaperChange(screenID: String? = nil) {
+        cancelTimedRotation()
         let now = Date()
         if config.isGlobalDisplaySyncEnabled {
             lastChangeTimes[globalSchedulerStateKey] = now
@@ -723,11 +743,22 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateGlobalDisplayEnabled(_ enabled: Bool) {
+        let wasUsingOnEndPlayback = config.globalDisplayConfig.isEnabled
+            && config.globalDisplayConfig.isOnEndMode
         updateGlobalDisplayConfig { $0.isEnabled = enabled }
+        let isUsingOnEndPlayback = config.globalDisplayConfig.isEnabled
+            && config.globalDisplayConfig.isOnEndMode
+        if wasUsingOnEndPlayback != isUsingOnEndPlayback {
+            reconfigureCurrentGlobalVideoForScheduling()
+        }
     }
 
     func updateGlobalDisplayInterval(_ minutes: Int) {
+        let wasOnEndMode = config.globalDisplayConfig.isOnEndMode
         updateGlobalDisplayConfig { $0.intervalMinutes = minutes }
+        if wasOnEndMode != config.globalDisplayConfig.isOnEndMode {
+            reconfigureCurrentGlobalVideoForScheduling()
+        }
     }
 
     func updateGlobalDisplayOrder(_ order: ScheduleOrder) {
@@ -756,6 +787,37 @@ class WallpaperSchedulerService: ObservableObject {
         updateConfig(newConfig)
     }
 
+    /// An existing AVPlayerLooper cannot change into non-looping playback by
+    /// configuration alone. Rebuild the global player whenever the scheduling
+    /// mode crosses the play-to-end boundary.
+    private func reconfigureCurrentGlobalVideoForScheduling() {
+        guard config.isGlobalDisplaySyncEnabled,
+              let videoURL = VideoWallpaperManager.shared.currentVideoURL,
+              FileManager.default.fileExists(atPath: videoURL.path) else {
+            return
+        }
+
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        let posterURL = VideoWallpaperManager.shared.currentPosterURL
+        Task { @MainActor in
+            do {
+                try VideoWallpaperManager.shared.applyVideoWallpaper(
+                    from: videoURL,
+                    posterURL: posterURL,
+                    muted: VideoWallpaperManager.shared.isMuted,
+                    targetScreens: screens,
+                    animatedTransition: false,
+                    usesSharedVideoDecoder: screens.count > 1,
+                    forceRebuild: true
+                )
+                print("\(logTag) Reconfigured global video playback for scheduler mode")
+            } catch {
+                print("\(logTag) Failed to reconfigure global video playback: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
@@ -775,7 +837,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Auto-switch disabled for screen \(screenID) (was on-end mode), re-enabled looping")
                     }
@@ -811,7 +874,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Switched to on-end mode, reapplied wallpaper for screen \(screenID)")
                         return
@@ -836,7 +900,8 @@ class WallpaperSchedulerService: ObservableObject {
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
-                            targetScreen: screen
+                            targetScreen: screen,
+                            forceRebuild: true
                         )
                         print("\(logTag) Switched from on-end mode, reapplied wallpaper with looping for screen \(screenID)")
                     }
@@ -1084,10 +1149,25 @@ class WallpaperSchedulerService: ObservableObject {
         }
 
         guard !pending.isEmpty else { return }
+        guard timedRotationTask == nil else {
+            print("\(logTag) Timed rotation already in flight; coalescing tick")
+            return
+        }
 
-        Task { @MainActor in
+        let generation = timedRotationGeneration
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.timedRotationGeneration == generation {
+                    self.timedRotationTask = nil
+                }
+            }
+
             for (index, change) in pending.enumerated() {
-                await self.waitBeforeApplyingBatchedWallpaper(index: index)
+                guard self.timedRotationGeneration == generation,
+                      await self.waitBeforeApplyingBatchedWallpaper(index: index) else {
+                    return
+                }
                 let (screenID, item, _) = change
                 let bakeStatus: String
                 if item.bakedVideoPath != nil { bakeStatus = "mp4" }
@@ -1095,8 +1175,9 @@ class WallpaperSchedulerService: ObservableObject {
                 print("\(logTag) Applying '\(item.title)' to screen \(screenID) [bake=\(bakeStatus)]")
 
                 let success = await applyItem(item, toScreenID: screenID)
+                guard self.timedRotationGeneration == generation else { return }
                 if success {
-                    self.lastChangeTimes[screenID] = now
+                    self.lastChangeTimes[screenID] = Date()
                     self.lastChangedItemIDs[screenID] = item.id
                     self.persistSchedulerState()
                     print("\(logTag) Successfully applied '\(item.title)' to screen \(screenID)")
@@ -1105,6 +1186,7 @@ class WallpaperSchedulerService: ObservableObject {
                 }
             }
         }
+        timedRotationTask = task
     }
 
     private func changeUnlockWallpapersIfNeeded() {
@@ -1154,7 +1236,9 @@ class WallpaperSchedulerService: ObservableObject {
 
         Task { @MainActor in
             for (index, change) in pending.enumerated() {
-                await self.waitBeforeApplyingBatchedWallpaper(index: index)
+                guard await self.waitBeforeApplyingBatchedWallpaper(index: index) else {
+                    return
+                }
                 let (screenID, item) = change
                 print("\(logTag) Unlock applying '\(item.title)' to screen \(screenID)")
 
@@ -1173,10 +1257,22 @@ class WallpaperSchedulerService: ObservableObject {
 
     // MARK: - Item Application
 
-    private func waitBeforeApplyingBatchedWallpaper(index: Int) async {
-        guard index > 0 else { return }
+    private func waitBeforeApplyingBatchedWallpaper(index: Int) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard index > 0 else { return true }
         let delayNanoseconds = UInt64(index) * 1_200_000_000
-        try? await Task.sleep(nanoseconds: delayNanoseconds)
+        do {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+        } catch {
+            return false
+        }
+        return !Task.isCancelled
+    }
+
+    private func cancelTimedRotation() {
+        timedRotationGeneration &+= 1
+        timedRotationTask?.cancel()
+        timedRotationTask = nil
     }
 
     /// 调度只选片 + 触发；真正设壁纸与详情页共用 `LocalWallpaperApplyService`。

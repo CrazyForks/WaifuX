@@ -842,7 +842,8 @@ final class VideoWallpaperManager: ObservableObject {
         muted: Bool = true,
         targetScreens: [NSScreen]?,
         animatedTransition: Bool = false,
-        usesSharedVideoDecoder: Bool = false
+        usesSharedVideoDecoder: Bool = false,
+        forceRebuild: Bool = false
     ) throws {
         if usesSharedVideoDecoder {
             try applyVideoWallpaper(
@@ -851,7 +852,8 @@ final class VideoWallpaperManager: ObservableObject {
                 muted: muted,
                 targetScreen: nil,
                 animatedTransition: animatedTransition,
-                usesSharedVideoDecoder: true
+                usesSharedVideoDecoder: true,
+                forceRebuild: forceRebuild
             )
             return
         }
@@ -863,7 +865,8 @@ final class VideoWallpaperManager: ObservableObject {
                     muted: muted,
                     targetScreen: screen,
                     animatedTransition: animatedTransition,
-                    usesSharedVideoDecoder: false
+                    usesSharedVideoDecoder: false,
+                    forceRebuild: forceRebuild
                 )
             }
         } else {
@@ -873,7 +876,8 @@ final class VideoWallpaperManager: ObservableObject {
                 muted: muted,
                 targetScreen: nil,
                 animatedTransition: animatedTransition,
-                usesSharedVideoDecoder: false
+                usesSharedVideoDecoder: false,
+                forceRebuild: forceRebuild
             )
         }
     }
@@ -884,7 +888,8 @@ final class VideoWallpaperManager: ObservableObject {
         muted: Bool = true,
         targetScreen: NSScreen? = nil,
         animatedTransition: Bool = false,
-        usesSharedVideoDecoder: Bool = false
+        usesSharedVideoDecoder: Bool = false,
+        forceRebuild: Bool = false
     ) throws {
         AppLogger.error(.wallpaper, "applyVideoWallpaper 开始", metadata: [
             "video": localFileURL.lastPathComponent,
@@ -943,7 +948,8 @@ final class VideoWallpaperManager: ObservableObject {
         let targetScreenAlreadyActive = targetScreenID.map { windows[$0] != nil && videoTargetScreenIDs.contains($0) } ?? true
         let targetDisplayConfigurationChanged = hasEffectiveTargetDisplayChange()
 
-        if !isNewVideo,
+        if !forceRebuild,
+           !isNewVideo,
            currentVideoURL == localFileURL,
            !windows.isEmpty,
            (targetScreen == nil || (isSameVideoForTarget && targetScreenAlreadyActive)),
@@ -1158,6 +1164,37 @@ final class VideoWallpaperManager: ObservableObject {
 
                 player.play()
                 self.hidePosterImage(for: screenID)
+            }
+        }
+    }
+
+    /// Global sync can attach one player to several display windows. When a
+    /// rotation fails, restore every poster layer that observed that player.
+    func resumeOnEndVideosAfterFailedGlobalSwitch(for targetScreens: [NSScreen]) {
+        var playerGroups: [(player: AVQueuePlayer, screenIDs: [String])] = []
+
+        for screen in targetScreens {
+            let screenID = screen.wallpaperScreenIdentifier
+            guard let player = players[screenID] else { continue }
+
+            if let index = playerGroups.firstIndex(where: { $0.player === player }) {
+                playerGroups[index].screenIDs.append(screenID)
+            } else {
+                playerGroups.append((player: player, screenIDs: [screenID]))
+            }
+            showPosterImage(for: screenID)
+        }
+
+        for group in playerGroups {
+            group.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player = group.player] _ in
+                guard let player else { return }
+                DispatchQueue.main.async {
+                    guard let self, !self.isPaused else { return }
+                    player.play()
+                    for screenID in group.screenIDs where self.players[screenID] === player {
+                        self.hidePosterImage(for: screenID)
+                    }
+                }
             }
         }
     }
@@ -3650,7 +3687,13 @@ final class VideoWallpaperManager: ObservableObject {
         // 如果是"播完即换"模式，添加视频播放完成的观察者
         if isOnEndMode {
             onEndModeScreens.insert(screenID)
-            setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
+            let hasSharedPlaybackObserver = usesSharedVideoDecoder
+                && playbackEndObservers.keys.contains { existingScreenID in
+                    players[existingScreenID] === components.player
+                }
+            if !hasSharedPlaybackObserver {
+                setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
+            }
         } else {
             onEndModeScreens.remove(screenID)
             // 清理旧的播放结束观察者

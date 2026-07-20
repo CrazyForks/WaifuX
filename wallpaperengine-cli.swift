@@ -1962,7 +1962,7 @@ struct WallpaperEngineCLI {
         }
 
         switch command {
-        case "set", "pause", "resume", "stop", "exit", "apply-properties":
+        case "set", "pause", "resume", "stop", "stop-screen", "exit", "apply-properties":
             if command == "stop" || command == "exit" {
                 stopDaemonIfRunning()
                 exit(0)
@@ -1982,7 +1982,12 @@ struct WallpaperEngineCLI {
                         exit(1)
                     }
                 }
-            } else {
+            } else if !isDaemonRunning() {
+                // Per-screen stop is idempotent: the target daemon may already
+                // have exited while the App was completing a display switch.
+                if command == "stop-screen" {
+                    exit(0)
+                }
                 guard isDaemonRunning() else {
                     print("Daemon not responding")
                     exit(1)
@@ -2031,6 +2036,15 @@ struct WallpaperEngineCLI {
                     resumeScreen = screenIdx
                 }
                 msg = IPCMessage(command: .resume, path: nil, screen: resumeScreen)
+            case "stop-screen":
+                let stopArgs = Array(remainingArgs.dropFirst())
+                guard stopArgs.count == 1,
+                      let stopScreen = Int(stopArgs[0]),
+                      stopScreen >= 0 else {
+                    print("Usage: wallpaperengine-cli stop-screen <screen_index>")
+                    exit(1)
+                }
+                msg = IPCMessage(command: .stop, path: nil, screen: stopScreen)
             case "stop", "exit":
                 let stopArgs = Array(remainingArgs.dropFirst())
                 var stopScreen: Int? = nil
@@ -2145,6 +2159,7 @@ struct WallpaperEngineCLI {
           set <path> [screen_index]   Set wallpaper
           pause                       Pause wallpaper
           resume                      Resume wallpaper
+          stop-screen <screen_index>  Stop wallpaper on one display
           stop                        Stop wallpaper
           exit                        Alias for stop
         """)
