@@ -513,7 +513,8 @@ class SettingsViewModel: ObservableObject {
                 && (defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false)
             applyVideoOptimizationSettings()
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
-            sceneRealtimeRenderingEnabled = defaults.bool(forKey: "scene_realtime_rendering_enabled")
+            // 未写过 key 时默认 true（与属性初始值一致）；bool(forKey:) 会把缺失当成 false
+            sceneRealtimeRenderingEnabled = defaults.object(forKey: "scene_realtime_rendering_enabled") as? Bool ?? true
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true
             upscalingPercent = defaults.object(forKey: "upscaling_percent") as? Double ?? 70
             effectReductionEnabled = defaults.object(forKey: "effect_reduction_enabled") as? Bool ?? false

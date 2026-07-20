@@ -1190,8 +1190,18 @@ enum SceneOfflineBakeService {
         }
     }
 
+    /// Lightweight, main-thread-safe gate: file exists and is non-trivial.
+    /// Avoids AVAsset + semaphore on the main actor (that path deadlocked /
+    /// starved set-wallpaper when a bake product was present).
     static func isUsableBakedVideo(at url: URL) -> Bool {
-        inspectBakedVideoSync(at: url) != nil
+        guard url.isFileURL,
+              FileManager.default.fileExists(atPath: url.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? NSNumber,
+              size.int64Value > 10_000 else {
+            return false
+        }
+        return true
     }
 
     private static func mainDisplayPixelSize() -> (width: Int, height: Int) {
@@ -1205,13 +1215,7 @@ enum SceneOfflineBakeService {
     }
 
     private static func inspectBakedVideo(at url: URL, expectedWidth: Int? = nil, expectedHeight: Int? = nil) async -> BakedVideoInspection? {
-        guard url.isFileURL,
-              FileManager.default.fileExists(atPath: url.path),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? NSNumber,
-              size.int64Value > 10_000 else {
-            return nil
-        }
+        guard isUsableBakedVideo(at: url) else { return nil }
 
         let asset = AVURLAsset(url: url)
         let duration = try? await asset.load(.duration)
@@ -1228,19 +1232,5 @@ enum SceneOfflineBakeService {
             return nil
         }
         return BakedVideoInspection(duration: durationSec, width: width, height: height)
-    }
-
-    private static func inspectBakedVideoSync(at url: URL, expectedWidth: Int? = nil, expectedHeight: Int? = nil) -> BakedVideoInspection? {
-        final class Box: @unchecked Sendable { var value: BakedVideoInspection? }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = Box()
-        DispatchQueue.global().async {
-            Task {
-                box.value = await inspectBakedVideo(at: url, expectedWidth: expectedWidth, expectedHeight: expectedHeight)
-                semaphore.signal()
-            }
-        }
-        semaphore.wait()
-        return box.value
     }
 }

@@ -140,12 +140,16 @@ enum LocalWallpaperApplyService {
             return true
 
         case .web:
-            if let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
+            // Align with scene: realtime mode always prefers live WKWebView daemon.
+            // Baked MP4 is only for offline / non-realtime desktop playback (and posters).
+            // Previously bake always short-circuited here, so "Set wallpaper" never
+            // applied the live web wallpaper once a bake product existed.
+            if !isRealtime,
+               let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
                 try await applyVideo(bakedURL, to: screens, options: options)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }
-            // No baked artifact yet: keep the existing daemon renderer path.
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
             return true
 

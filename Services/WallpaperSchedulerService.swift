@@ -1612,8 +1612,14 @@ class WallpaperSchedulerService: ObservableObject {
                 var sceneBakeItemID: String? = nil
                 if isWorkshop,
                    let art = SceneOfflineBakeService.usableArtifact(from: record) {
+                    // Scene and web share the same rule: realtime mode keeps live
+                    // rendering; baked MP4 is only used when realtime is off (or
+                    // on-end without web/scene timer where live cannot participate).
                     let isWebBake = art.renderer == .wallpaperEngineWeb
-                    if isWebBake || !preferRealtimeForScene {
+                    let preferRealtime = isWebBake
+                        ? (isRealtimeRenderingEnabled && (!onEndMode || webSceneSwitchEnabled))
+                        : preferRealtimeForScene
+                    if !preferRealtime {
                         bakedVideoPath = art.videoPath
                         sceneBakeItemID = record.item.id
                     }
