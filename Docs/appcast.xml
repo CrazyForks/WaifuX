@@ -6,59 +6,18 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.135</title>
-      <sparkle:version>38.0.135</sparkle:version>
-      <sparkle:shortVersionString>38.0.135</sparkle:shortVersionString>
-      <pubDate>Mon, 20 Jul 2026 21:03:29 +0800</pubDate>
+      <title>Version 38.0.136</title>
+      <sparkle:version>38.0.136</sparkle:version>
+      <sparkle:shortVersionString>38.0.136</sparkle:shortVersionString>
+      <pubDate>Mon, 20 Jul 2026 21:56:05 +0800</pubDate>
       <description><![CDATA[
-        <h3>WaifuX 38.0.135</h3>
+        <h3>WaifuX 38.0.136</h3>
         <ul>
-          <li>【竖图模糊填充】竖版静态壁纸不再留黑边
-            <ul>
-              <li>自动为竖屏壁纸生成与显示器比例一致的模糊延伸版本</li>
-              <li>原图完好无损，派生图按需生成、自动清理</li>
-              <li>设置 &gt; 通用 中可关闭此功能</li>
-            </ul>
-          </li>
-          <li>【非活动屏幕暂停】多显示器动态壁纸
-            <ul>
-              <li>新增「仅播放活动屏幕」开关：动态壁纸仅在鼠标所在屏幕播放，其余自动暂停</li>
-              <li>外接屏合盖、热插拔时自动恢复预期状态</li>
-              <li>暂停/恢复状态按屏幕独立追踪</li>
-            </ul>
-          </li>
-          <li>【Web 壁纸离线烘焙】Web 类型 Workshop 壁纸也能烘焙了
-            <ul>
-              <li>支持将 Web 工程（如音频响应类壁纸）烘焙为独立 MP4</li>
-              <li>渲染在离屏 WKWebView 中完成，不影响当前桌面壁纸</li>
-              <li>新增 <code>WebOfflineBakeService</code>，与 Scene 烘焙共享并发门控</li>
-            </ul>
-          </li>
-          <li>【视频优化体验统一】循环分析 + 补帧合并为单一入口
-            <ul>
-              <li>库卡片 / 右键菜单中「生成循环过渡」和「补帧」合并为「优化视频」</li>
-              <li>用户可在设置中个性化需要启用的优化项</li>
-              <li>后台任务 Toast 不再分别展示，统合显示队列进度</li>
-            </ul>
-          </li>
-          <li>【Wallpaper Engine 多屏体验提升】
-            <ul>
-              <li>Web 壁纸按屏幕独立暂停/恢复</li>
-              <li>暂停时仅向有该壁纸的屏幕发送命令，避免错杀同屏渲染</li>
-              <li>CLI 支持离屏窗口、用户属性注入，烘焙更准确</li>
-              <li>修复部分场景壁纸渲染异常</li>
-            </ul>
-          </li>
-          <li>⚙️ 其他
-            <ul>
-              <li>新增多语言文案（简中/繁中/日文/英文）</li>
-              <li>wallpaper-wgpu、wallpaperengine-cli 同步更新</li>
-            </ul>
-          </li>
+          <li>feat :增强 WebOfflineBakeService 和 MediaDetailSheet 以改进视频处理 (c6696ca)</li>
         </ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.135/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.136/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
