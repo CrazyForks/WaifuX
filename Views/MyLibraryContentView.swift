@@ -648,6 +648,8 @@ struct MyLibraryContentView: View {
 
     private func handleLibraryScroll(_ offset: CGFloat) {
         libraryScrollRuntimeState.currentOffset = offset
+        // 滚动中抑制媒体卡 hover/GIF 叠加，避免滚过时反复挂载 KFAnimatedImage
+        LibraryScrollHoverGate.shared.noteScrollActivity()
 
         let hideThreshold = libraryHeaderHeight + 24
         let showThreshold = libraryHeaderHeight - 24

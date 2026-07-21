@@ -60,6 +60,39 @@ private struct WebDaemonMediaThumbnailMessage: Codable {
     let thumbnail: String
 }
 
+/// Host → daemon：整首歌词就绪 / 清空（Web 只收 JSON，无 token）。
+private struct WebDaemonMediaLyricsMessage: Codable {
+    let command: String
+    let hasLyrics: Bool
+    let title: String
+    let artist: String
+    let songId: String
+    let storefront: String
+    let source: String
+    let lineCount: Int
+    let lines: [WebDaemonLyricLine]
+}
+
+private struct WebDaemonLyricLine: Codable {
+    let start: Double
+    let end: Double?
+    let text: String
+}
+
+/// Host → daemon：当前歌词行（行变化 / 进度）。
+private struct WebDaemonMediaLyricsLineMessage: Codable {
+    let command: String
+    let index: Int
+    let text: String
+    let nextText: String
+    let previousText: String
+    let start: Double
+    let end: Double?
+    let progress: Double
+    let elapsedTime: Double
+    let hasLine: Bool
+}
+
 /// 进程终止事件（线程安全，通过 os_unfair_lock 传递到 @MainActor）
 private struct TerminationEvent: @unchecked Sendable {
     let pid: pid_t
@@ -1230,6 +1263,61 @@ final class WallpaperEngineXBridge: ObservableObject {
         sendFireAndForgetToWebDaemon(data)
     }
 
+    /// 推送整首歌词（或 hasLyrics=false 清空）。Web 无 token。
+    func sendMediaLyricsToWebDaemon(
+        hasLyrics: Bool,
+        title: String,
+        artist: String,
+        songId: String,
+        storefront: String,
+        source: String,
+        lines: [(start: Double, end: Double?, text: String)]
+    ) {
+        guard isCurrentWallpaperWeb || mediaRelayActiveForCurrentWallpaper else { return }
+        let msg = WebDaemonMediaLyricsMessage(
+            command: "mediaLyrics",
+            hasLyrics: hasLyrics,
+            title: title,
+            artist: artist,
+            songId: songId,
+            storefront: storefront,
+            source: source,
+            lineCount: lines.count,
+            lines: lines.map { WebDaemonLyricLine(start: $0.start, end: $0.end, text: $0.text) }
+        )
+        guard let data = try? JSONEncoder().encode(msg) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
+
+    /// 推送当前歌词行。
+    func sendMediaLyricsLineToWebDaemon(
+        index: Int,
+        text: String,
+        nextText: String,
+        previousText: String,
+        start: Double,
+        end: Double?,
+        progress: Double,
+        elapsedTime: Double,
+        hasLine: Bool
+    ) {
+        guard isCurrentWallpaperWeb || mediaRelayActiveForCurrentWallpaper else { return }
+        let msg = WebDaemonMediaLyricsLineMessage(
+            command: "mediaLyricsLine",
+            index: index,
+            text: text,
+            nextText: nextText,
+            previousText: previousText,
+            start: start,
+            end: end,
+            progress: progress,
+            elapsedTime: elapsedTime,
+            hasLine: hasLine
+        )
+        guard let data = try? JSONEncoder().encode(msg) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
+
     /// 通用 fire-and-forget Unix socket 发送（audio / media 共用）。
     private func sendFireAndForgetToWebDaemon(_ data: Data) {
         let socketPath = "/tmp/wallpaperengine-cli.sock"
@@ -1324,9 +1412,10 @@ final class WallpaperEngineXBridge: ObservableObject {
             audioRelayActiveForCurrentWallpaper = false
         }
 
+        // 先置标志再 start：start() 内会立刻 force 推一帧，需放行 sendMedia*
         if needsMedia && !mediaRelayActiveForCurrentWallpaper {
-            WallpaperWebMediaRelay.shared.start()
             mediaRelayActiveForCurrentWallpaper = true
+            WallpaperWebMediaRelay.shared.start()
         } else if !needsMedia && mediaRelayActiveForCurrentWallpaper {
             WallpaperWebMediaRelay.shared.stop()
             mediaRelayActiveForCurrentWallpaper = false
@@ -3600,8 +3689,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
-            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [] };
-            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "" };
+            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: [] };
+            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "", lyrics: null, lyricsLine: null };
             function __wxFire(list, payload) {
               for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) {} }
             }
@@ -3632,6 +3721,30 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
               __wxMedia.timeline.push(cb);
               try { cb({ position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 }); } catch (e) {}
             };
+            window.wallpaperRegisterMediaLyricsListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyrics.push(cb);
+              try { if (__wxMediaState.lyrics) cb(__wxMediaState.lyrics); } catch (e) {}
+            };
+            window.wallpaperRegisterMediaLyricsLineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyricsLine.push(cb);
+              try { if (__wxMediaState.lyricsLine) cb(__wxMediaState.lyricsLine); } catch (e) {}
+            };
+            window.__wxParseB64JSON = function(b64) {
+              if (!b64) return null;
+              try {
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+                var text = (typeof TextDecoder !== 'undefined')
+                  ? new TextDecoder('utf-8').decode(bytes)
+                  : decodeURIComponent(escape(bin));
+                return JSON.parse(text);
+              } catch (e) {
+                try { return JSON.parse(atob(b64)); } catch (e2) { return null; }
+              }
+            };
             window.__wxPushMediaUpdate = function(obj) {
               if (!obj || typeof obj !== 'object') return;
               if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
@@ -3651,6 +3764,16 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
               if (!obj || typeof obj !== 'object') return;
               __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
               __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
+            window.__wxPushMediaLyrics = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyrics = obj;
+              __wxFire(__wxMedia.lyrics, obj);
+            };
+            window.__wxPushMediaLyricsLine = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyricsLine = obj;
+              __wxFire(__wxMedia.lyricsLine, obj);
             };
           } catch (e) {}
         })();

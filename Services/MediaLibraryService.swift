@@ -914,16 +914,25 @@ final class MediaLibraryService: ObservableObject {
     /// 删除与下载记录关联的 Scene 烘焙产物
     private func deleteSceneBakeArtifacts(for record: MediaDownloadRecord) {
         let fm = FileManager.default
+        let existenceCache = FileExistenceCache.shared
 
         // 1. 删除烘焙视频文件（如果存在）
         if let artifact = record.sceneBakeArtifact,
-           !artifact.videoPath.isEmpty,
-           fm.fileExists(atPath: artifact.videoPath) {
-            do {
-                try fm.removeItem(atPath: artifact.videoPath)
-                print("[MediaLibraryService] ✅ Deleted scene bake video: \(artifact.videoPath)")
-            } catch {
-                print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(artifact.videoPath): \(error)")
+           !artifact.videoPath.isEmpty {
+            let videoPath = artifact.videoPath
+            if fm.fileExists(atPath: videoPath) {
+                do {
+                    try fm.removeItem(atPath: videoPath)
+                    print("[MediaLibraryService] ✅ Deleted scene bake video: \(videoPath)")
+                } catch {
+                    print("[MediaLibraryService] ⚠️ Failed to delete scene bake video \(videoPath): \(error)")
+                }
+            }
+            // 详情页 previewVideoURL 依赖存在性缓存；删后必须失效，否则仍当文件在
+            existenceCache.invalidate(atPath: videoPath)
+            let standardized = (videoPath as NSString).standardizingPath
+            if standardized != videoPath {
+                existenceCache.invalidate(atPath: standardized)
             }
         }
         // 2. 删除该 item 对应的烘焙目录（清理空目录或残留文件）
@@ -937,6 +946,7 @@ final class MediaLibraryService: ObservableObject {
             } catch {
                 print("[MediaLibraryService] ⚠️ Failed to delete scene bake directory \(bakeDir.path): \(error)")
             }
+            existenceCache.invalidate(atPath: bakeDir.path)
         }
     }
 

@@ -80,6 +80,8 @@ struct MediaDetailSheet: View {
     @State private var pendingDeleteFrameInterpolationURL: URL?
     @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
     @State private var isDeletingBake = false
+    /// 删除烘焙 / 本地预览源变化时递增，强制详情背景重建（避免仍挂已删 MP4 黑屏）
+    @State private var mediaBackgroundEpoch: Int = 0
     @State private var isDeletingFrameInterpolation = false
     @State private var isResettingVideoOptimization = false
     @State private var isTranscodingVideo = false
@@ -187,7 +189,7 @@ struct MediaDetailSheet: View {
 
                 if isVisible {
                     fixedMediaBackground(width: viewW, height: viewH)
-                        .id("media-bg-\(resolvedItem.id)-\(previewVideoURL?.path ?? heroImageURL.path)")
+                        .id("media-bg-\(resolvedItem.id)-\(mediaBackgroundEpoch)-\(previewVideoURL?.path ?? heroImageURL.path)")
                         .transition(
                             isAuthorPanelFade
                                 ? AnyTransition.opacity.animation(.easeInOut(duration: 0.28))
@@ -482,30 +484,68 @@ struct MediaDetailSheet: View {
         }
     }
 
+    /// 详情静态底图：与「未下载」进详情一致，优先 catalog/远程缩略图，不强制 bake 抽帧。
     private var heroImageURL: URL {
-        resolvedItem.coverImageURL
+        // 无可用烘焙循环视频时：严格走未下载预览链路（thumbnail → poster → initial）
+        if cachedSceneBakeVideoURL == nil {
+            return undownloadedStylePreviewImageURL
+        }
+        return resolvedItem.coverImageURL
+    }
+
+    /// 列表/探索未下载时常用的封面：thumbnail 优先，再 poster，最后 initialItem。
+    private var undownloadedStylePreviewImageURL: URL {
+        // 远程/原始 thumbnail 最接近「未下载」详情观感
+        let candidates: [URL?] = [
+            initialItem.thumbnailURL,
+            resolvedItem.thumbnailURL,
+            initialItem.posterURL,
+            resolvedItem.posterURL,
+            initialItem.coverImageURL,
+            resolvedItem.coverImageURL
+        ]
+
+        for case let url? in candidates {
+            if url.isFileURL {
+                if FileExistenceCache.shared.fileExists(atPath: url.path) {
+                    return url
+                }
+                continue
+            }
+            // 远程 URL 直接可用（Kingfisher 拉取）
+            return url
+        }
+        return resolvedItem.thumbnailURL
     }
 
     private var previewVideoURL: URL? {
-        // 优先使用已烘焙的 Scene MP4 作为背景视频
+        // 仅在有可用烘焙 MP4 时用循环视频作详情背景
         if let cachedSceneBakeVideoURL {
             return cachedSceneBakeVideoURL
         }
 
-        // 已下载：优先解析本地可播视频（Workshop 目录 / 直链 mp4 等）。
-        // 记录路径常是 content 根目录而非文件，不能只看 pathExtension。
+        // Scene / Web 可烘焙项：没有烘焙产物时不再播任何视频背景，
+        // 直接显示未下载风格静态预览（避免死路径 / 工程内误匹配小视频 / 远程预览视频黑屏）
+        if sceneOfflineBakeButtonVisible {
+            return nil
+        }
+
+        // 普通视频壁纸：本地可播文件
         if let localVideo = resolvedLocalPreviewVideoURL() {
             return localVideo
         }
 
-        // resolvedItem 可能已在下载完成后注入本地 previewVideoURL
-        if let preview = resolvedItem.previewVideoURL,
-           preview.isFileURL,
-           FileExistenceCache.shared.fileExists(atPath: preview.path),
-           Self.previewVideoExtensions.contains(preview.pathExtension.lowercased()) {
+        if let preview = resolvedItem.previewVideoURL {
+            if preview.isFileURL {
+                guard FileExistenceCache.shared.fileExists(atPath: preview.path),
+                      Self.previewVideoExtensions.contains(preview.pathExtension.lowercased()) else {
+                    return nil
+                }
+                return preview
+            }
             return preview
         }
-        return resolvedItem.previewVideoURL
+        return nil
     }
 
     private static let previewVideoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
@@ -1188,7 +1228,10 @@ struct MediaDetailSheet: View {
         // 3. 删除烘焙 MP4 + 重置 artifact（保留 poster；保留 eligibility）
         MediaLibraryService.shared.clearSceneBakeArtifactKeepingPoster(itemID: itemID)
 
-        // 4. 仅当确实有屏正在用这张烘焙视频，且 poster 可用时，立即用静态图替换
+        // 4. 立刻切详情页背景：停用已删 MP4 → 未下载风格静态预览（不改桌面/锁屏）
+        refreshDetailBackgroundAfterBakeDeleted(deletedBakePath: bakedVideoPath)
+
+        // 5. 仅当确实有屏正在用这张烘焙视频，且 poster 可用时，立即用静态图替换锁屏/桌面
         guard let posterURL = posterURL,
               FileManager.default.fileExists(atPath: posterURL.path),
               !affectedScreens.isEmpty else {
@@ -1223,6 +1266,40 @@ struct MediaDetailSheet: View {
                 }
             }
             print("[MediaDetailSheet] deleteBake: set desktop poster on \(affectedScreens.count) screen(s): \(posterURL.path)")
+        }
+    }
+
+    /// 删除烘焙产物后**仅**刷新详情页背景（不碰桌面/锁屏）：
+    /// 失效存在性缓存、清掉指向 bake 的 preview、强制重建背景层 → 未下载风格静态预览。
+    @MainActor
+    private func refreshDetailBackgroundAfterBakeDeleted(deletedBakePath: String) {
+        let cache = FileExistenceCache.shared
+        cache.invalidate(atPath: deletedBakePath)
+        let standardizedBakePath = (deletedBakePath as NSString).standardizingPath
+        if standardizedBakePath != deletedBakePath {
+            cache.invalidate(atPath: standardizedBakePath)
+        }
+
+        // Scene/Web 可烘焙项：删 bake 后详情不再保留任何视频预览 URL
+        if sceneOfflineBakeButtonVisible {
+            resolvedItem.previewVideoURL = nil
+        } else if let preview = resolvedItem.previewVideoURL, preview.isFileURL {
+            let previewPath = preview.standardizedFileURL.path
+            if previewPath == standardizedBakePath || preview.path == deletedBakePath {
+                resolvedItem.previewVideoURL = nil
+            }
+        }
+
+        isMediaLoaded = false
+        mediaBackgroundEpoch &+= 1
+
+        // 静态图 onFailure 也会 loadFinished；再兜一层防止卡在黑色 LoadingOverlay
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !isMediaLoaded else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                isMediaLoaded = true
+            }
         }
     }
 
@@ -4890,8 +4967,8 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
-            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [] };
-            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "" };
+            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: [] };
+            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "", lyrics: null, lyricsLine: null };
             function __wxFire(list, payload) {
               for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) {} }
             }
@@ -4922,6 +4999,30 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
               __wxMedia.timeline.push(cb);
               try { cb({ position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 }); } catch (e) {}
             };
+            window.wallpaperRegisterMediaLyricsListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyrics.push(cb);
+              try { if (__wxMediaState.lyrics) cb(__wxMediaState.lyrics); } catch (e) {}
+            };
+            window.wallpaperRegisterMediaLyricsLineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyricsLine.push(cb);
+              try { if (__wxMediaState.lyricsLine) cb(__wxMediaState.lyricsLine); } catch (e) {}
+            };
+            window.__wxParseB64JSON = function(b64) {
+              if (!b64) return null;
+              try {
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+                var text = (typeof TextDecoder !== 'undefined')
+                  ? new TextDecoder('utf-8').decode(bytes)
+                  : decodeURIComponent(escape(bin));
+                return JSON.parse(text);
+              } catch (e) {
+                try { return JSON.parse(atob(b64)); } catch (e2) { return null; }
+              }
+            };
             window.__wxPushMediaUpdate = function(obj) {
               if (!obj || typeof obj !== 'object') return;
               if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
@@ -4941,6 +5042,16 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
               if (!obj || typeof obj !== 'object') return;
               __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
               __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
+            window.__wxPushMediaLyrics = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyrics = obj;
+              __wxFire(__wxMedia.lyrics, obj);
+            };
+            window.__wxPushMediaLyricsLine = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyricsLine = obj;
+              __wxFire(__wxMedia.lyricsLine, obj);
             };
           } catch (e) {}
         })();

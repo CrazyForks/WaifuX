@@ -160,6 +160,14 @@ private enum IPCCommand: String, Codable {
     case set, pause, resume, stop, applyProperties, audioControl, audioData
     /// Host → daemon：系统 Now Playing 元数据（低频）
     case mediaUpdate, mediaThumbnail
+    /// Host → daemon：Apple Music 歌词（整首 / 当前行）；Web 只收 JSON
+    case mediaLyrics, mediaLyricsLine
+}
+
+private struct IPCLyricLine: Codable {
+    let start: Double
+    let end: Double?
+    let text: String
 }
 
 private struct IPCMessage: Codable {
@@ -183,6 +191,22 @@ private struct IPCMessage: Codable {
     let rate: Double?
     /// data URL 或空字符串
     let thumbnail: String?
+    // MARK: mediaLyrics / mediaLyricsLine
+    let hasLyrics: Bool?
+    let songId: String?
+    let storefront: String?
+    let source: String?
+    let lineCount: Int?
+    let lines: [IPCLyricLine]?
+    let index: Int?
+    let text: String?
+    let nextText: String?
+    let previousText: String?
+    let start: Double?
+    let end: Double?
+    let progress: Double?
+    let elapsedTime: Double?
+    let hasLine: Bool?
 
     init(
         command: IPCCommand,
@@ -200,7 +224,22 @@ private struct IPCMessage: Codable {
         position: Double? = nil,
         duration: Double? = nil,
         rate: Double? = nil,
-        thumbnail: String? = nil
+        thumbnail: String? = nil,
+        hasLyrics: Bool? = nil,
+        songId: String? = nil,
+        storefront: String? = nil,
+        source: String? = nil,
+        lineCount: Int? = nil,
+        lines: [IPCLyricLine]? = nil,
+        index: Int? = nil,
+        text: String? = nil,
+        nextText: String? = nil,
+        previousText: String? = nil,
+        start: Double? = nil,
+        end: Double? = nil,
+        progress: Double? = nil,
+        elapsedTime: Double? = nil,
+        hasLine: Bool? = nil
     ) {
         self.command = command
         self.path = path
@@ -218,6 +257,21 @@ private struct IPCMessage: Codable {
         self.duration = duration
         self.rate = rate
         self.thumbnail = thumbnail
+        self.hasLyrics = hasLyrics
+        self.songId = songId
+        self.storefront = storefront
+        self.source = source
+        self.lineCount = lineCount
+        self.lines = lines
+        self.index = index
+        self.text = text
+        self.nextText = nextText
+        self.previousText = previousText
+        self.start = start
+        self.end = end
+        self.progress = progress
+        self.elapsedTime = elapsedTime
+        self.hasLine = hasLine
     }
 }
 
@@ -556,7 +610,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
             // ---- Media Integration ----
             var __wxMedia = {
-              status: [], properties: [], thumbnail: [], playback: [], timeline: []
+              status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: []
             };
             var __wxMediaState = {
               enabled: false,
@@ -567,7 +621,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
               position: 0,
               duration: 0,
               rate: 1,
-              thumbnail: ""
+              thumbnail: "",
+              lyrics: null,
+              lyricsLine: null
             };
             function __wxFire(list, payload) {
               for (var i = 0; i < list.length; i++) {
@@ -611,6 +667,32 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 });
               } catch (e) {}
             };
+            window.wallpaperRegisterMediaLyricsListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyrics.push(cb);
+              try { if (__wxMediaState.lyrics) cb(__wxMediaState.lyrics); } catch (e) {}
+            };
+            window.wallpaperRegisterMediaLyricsLineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.lyricsLine.push(cb);
+              try { if (__wxMediaState.lyricsLine) cb(__wxMediaState.lyricsLine); } catch (e) {}
+            };
+            // UTF-8 安全：JSON.parse(atob(b64)) 会把多字节中文解成 Latin-1 乱码。
+            // 正确：atob → 字节数组 → TextDecoder('utf-8') → JSON.parse
+            window.__wxParseB64JSON = function(b64) {
+              if (!b64) return null;
+              try {
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
+                var text = (typeof TextDecoder !== 'undefined')
+                  ? new TextDecoder('utf-8').decode(bytes)
+                  : decodeURIComponent(escape(bin));
+                return JSON.parse(text);
+              } catch (e) {
+                try { return JSON.parse(atob(b64)); } catch (e2) { return null; }
+              }
+            };
             // Host 注入：整包媒体状态
             window.__wxPushMediaUpdate = function(obj) {
               if (!obj || typeof obj !== 'object') return;
@@ -640,6 +722,16 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
               __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
               __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
             };
+            window.__wxPushMediaLyrics = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyrics = obj;
+              __wxFire(__wxMedia.lyrics, obj);
+            };
+            window.__wxPushMediaLyricsLine = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.lyricsLine = obj;
+              __wxFire(__wxMedia.lyricsLine, obj);
+            };
           } catch (e) {}
         })();
         """,
@@ -649,12 +741,35 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     /// `file://` 壁纸常见兼容问题：
     /// 1) Spine 等库对 `HTMLImageElement` 设置 `crossOrigin = "anonymous"`，WebKit 在本地文件场景下会拒绝加载同目录纹理 → 画面空白。
-    /// 2) 部分 Workshop 脚本用 `fetch()` 读相对路径 JSON，在 `file` 协议下可能失败；XHR 更稳。
+    /// 2) 部分 Workshop 脚本用 `fetch()` 读相对路径 JSON / `.splat` 等二进制资源；
+    ///    原生 `fetch(file://...)` 常返回 status=0 或直接失败。
+    ///    尤其是 `fetch(new URL("test.splat", location.href))` 传入的是 URL 对象：
+    ///    旧兼容层只识别 string / Request.url，漏掉了 URL.href，导致仍走原生 fetch。
+    ///    改走 XHR，并把 file:// 的 status 0 规范成 200，保证 body.getReader() 可用。
     private static let localFileCompatScript = WKUserScript(
         source: """
         (function() {
           try {
             if (location.protocol !== "file:") return;
+
+            function resolveFetchURL(input) {
+              if (typeof input === "string") return input;
+              if (!input) return "";
+              // URL 用 .href；Request 用 .url
+              if (typeof input.href === "string" && input.href) return input.href;
+              if (typeof input.url === "string" && input.url) return input.url;
+              try { return String(input); } catch (e) { return ""; }
+            }
+
+            function isLocalNonHTTPURL(url) {
+              if (!url) return false;
+              var lower = String(url).toLowerCase();
+              if (lower.indexOf("http:") === 0 || lower.indexOf("https:") === 0) return false;
+              if (lower.indexOf("data:") === 0 || lower.indexOf("blob:") === 0) return false;
+              // 相对路径 / file:// / 其他本地 scheme
+              return true;
+            }
+
             var proto = HTMLImageElement.prototype;
             var srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
             if (srcDesc && srcDesc.set) {
@@ -662,7 +777,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 set: function(value) {
                   try {
                     var s = String(value || "");
-                    if (s.indexOf("http:") !== 0 && s.indexOf("https:") !== 0 && s.indexOf("data:") !== 0 && s.indexOf("blob:") !== 0) {
+                    if (isLocalNonHTTPURL(s)) {
                       this.removeAttribute("crossorigin");
                     }
                   } catch (e) {}
@@ -672,33 +787,55 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 configurable: true
               });
             }
+
             var origFetch = window.fetch;
             if (typeof origFetch === "function") {
               window.fetch = function(input, init) {
-                var url = typeof input === "string" ? input : (input && input.url) ? input.url : "";
-                if (url && url.indexOf("http:") !== 0 && url.indexOf("https:") !== 0 && url.indexOf("data:") !== 0 && url.indexOf("blob:") !== 0) {
+                var url = resolveFetchURL(input);
+                if (isLocalNonHTTPURL(url)) {
                   return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", url, true);
-                    xhr.responseType = "arraybuffer";
-                    xhr.onload = function() {
-                      if (xhr.status === 200 || xhr.status === 0) {
-                        var headers = new Headers();
-                        try {
-                          var contentType = xhr.getResponseHeader("Content-Type");
-                          if (contentType) headers.set("Content-Type", contentType);
-                        } catch (e) {}
-                        resolve(new Response(xhr.response, {
-                          status: xhr.status === 0 ? 200 : xhr.status,
-                          statusText: xhr.statusText || "OK",
-                          headers: headers
-                        }));
-                      } else {
-                        reject(new Error("HTTP " + xhr.status));
-                      }
-                    };
-                    xhr.onerror = function() { reject(new Error("network error")); };
-                    xhr.send();
+                    try {
+                      var xhr = new XMLHttpRequest();
+                      // 显式串化，避免某些 WebKit 对 URL 对象 open 行为不一致
+                      xhr.open("GET", String(url), true);
+                      xhr.responseType = "arraybuffer";
+                      xhr.onload = function() {
+                        // file:// 成功时常为 status 0；部分环境也可能给 200
+                        if (xhr.status === 200 || xhr.status === 0) {
+                          var headers = new Headers();
+                          try {
+                            var contentType = xhr.getResponseHeader("Content-Type");
+                            if (contentType) headers.set("Content-Type", contentType);
+                            var contentLength = xhr.getResponseHeader("Content-Length");
+                            if (contentLength) headers.set("Content-Length", contentLength);
+                          } catch (e) {}
+                          // 无 Content-Type 时给二进制默认值，避免部分库误判
+                          if (!headers.has("Content-Type")) {
+                            headers.set("Content-Type", "application/octet-stream");
+                          }
+                          var body = xhr.response || new ArrayBuffer(0);
+                          if (!headers.has("Content-Length") && body && typeof body.byteLength === "number") {
+                            headers.set("Content-Length", String(body.byteLength));
+                          }
+                          resolve(new Response(body, {
+                            status: 200,
+                            statusText: "OK",
+                            headers: headers
+                          }));
+                        } else {
+                          reject(new Error("HTTP " + xhr.status + " Unable to load " + url));
+                        }
+                      };
+                      xhr.onerror = function() {
+                        reject(new Error("0 Unable to load " + url));
+                      };
+                      xhr.onabort = function() {
+                        reject(new Error("Aborted loading " + url));
+                      };
+                      xhr.send();
+                    } catch (e) {
+                      reject(e);
+                    }
                   });
                 }
                 return origFetch.call(this, input, init);
@@ -1423,9 +1560,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             "duration": duration,
             "rate": rate
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let b64 = data.base64EncodedString() as String? else { return }
-        let js = "(function(){try{var o=JSON.parse(atob('\(b64)'));if(window.__wxPushMediaUpdate)window.__wxPushMediaUpdate(o);}catch(e){}})();"
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        // 必须走 __wxParseB64JSON：裸 atob+JSON.parse 会把中文 title 解成 Latin-1 乱码
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaUpdate)window.__wxPushMediaUpdate(o);}catch(e){}})();"
         for (_, st) in screenStates where st.isLoaded {
             guard let webView = st.webView else { continue }
             DispatchQueue.main.async { [weak webView] in
@@ -1436,9 +1574,80 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     func pushMediaThumbnail(_ thumbnail: String) {
         let payload: [String: Any] = ["thumbnail": thumbnail]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let b64 = data.base64EncodedString() as String? else { return }
-        let js = "(function(){try{var o=JSON.parse(atob('\(b64)'));if(window.__wxPushMediaThumbnail)window.__wxPushMediaThumbnail(o);}catch(e){}})();"
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaThumbnail)window.__wxPushMediaThumbnail(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+
+    func pushMediaLyrics(
+        hasLyrics: Bool,
+        title: String,
+        artist: String,
+        songId: String,
+        storefront: String,
+        source: String,
+        lines: [IPCLyricLine]
+    ) {
+        var lineArr: [[String: Any]] = []
+        lineArr.reserveCapacity(lines.count)
+        for ln in lines {
+            var d: [String: Any] = ["start": ln.start, "text": ln.text]
+            if let end = ln.end { d["end"] = end }
+            lineArr.append(d)
+        }
+        let payload: [String: Any] = [
+            "hasLyrics": hasLyrics,
+            "title": title,
+            "artist": artist,
+            "songId": songId,
+            "storefront": storefront,
+            "source": source,
+            "lineCount": lines.count,
+            "lines": lineArr
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaLyrics)window.__wxPushMediaLyrics(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+    func pushMediaLyricsLine(
+        index: Int,
+        text: String,
+        nextText: String,
+        previousText: String,
+        start: Double,
+        end: Double?,
+        progress: Double,
+        elapsedTime: Double,
+        hasLine: Bool
+    ) {
+        var payload: [String: Any] = [
+            "index": index,
+            "text": text,
+            "nextText": nextText,
+            "previousText": previousText,
+            "start": start,
+            "progress": progress,
+            "elapsedTime": elapsedTime,
+            "hasLine": hasLine
+        ]
+        if let end { payload["end"] = end }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              case let b64 = data.base64EncodedString() else { return }
+        let js = "(function(){try{var o=(window.__wxParseB64JSON?window.__wxParseB64JSON('\(b64)'):JSON.parse(atob('\(b64)')));if(o&&window.__wxPushMediaLyricsLine)window.__wxPushMediaLyricsLine(o);}catch(e){}})();"
         for (_, st) in screenStates where st.isLoaded {
             guard let webView = st.webView else { continue }
             DispatchQueue.main.async { [weak webView] in
@@ -2326,6 +2535,51 @@ private final class DesktopWallpaperManager {
         WebRendererBridge.shared.pushMediaThumbnail(thumbnail)
     }
 
+
+    func pushWebMediaLyrics(
+        hasLyrics: Bool,
+        title: String,
+        artist: String,
+        songId: String,
+        storefront: String,
+        source: String,
+        lines: [IPCLyricLine]
+    ) {
+        WebRendererBridge.shared.pushMediaLyrics(
+            hasLyrics: hasLyrics,
+            title: title,
+            artist: artist,
+            songId: songId,
+            storefront: storefront,
+            source: source,
+            lines: lines
+        )
+    }
+
+    func pushWebMediaLyricsLine(
+        index: Int,
+        text: String,
+        nextText: String,
+        previousText: String,
+        start: Double,
+        end: Double?,
+        progress: Double,
+        elapsedTime: Double,
+        hasLine: Bool
+    ) {
+        WebRendererBridge.shared.pushMediaLyricsLine(
+            index: index,
+            text: text,
+            nextText: nextText,
+            previousText: previousText,
+            start: start,
+            end: end,
+            progress: progress,
+            elapsedTime: elapsedTime,
+            hasLine: hasLine
+        )
+    }
+
     func stopWallpaper(screen: Int = 0) {
         guard screenStates[screen] != nil else { return }
         WebRendererBridge.shared.stop(screen: screen)
@@ -2871,6 +3125,32 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                     let thumbLen = (msg.thumbnail ?? "").count
                     dlog("[Daemon] mediaThumbnail len=\(thumbLen)")
                     DesktopWallpaperManager.shared.pushWebMediaThumbnail(msg.thumbnail ?? "")
+                    close(fd)
+                case .mediaLyrics:
+                    let n = msg.lines?.count ?? 0
+                    dlog("[Daemon] mediaLyrics has=\(msg.hasLyrics ?? false) lines=\(n) songId=\(msg.songId ?? "")")
+                    DesktopWallpaperManager.shared.pushWebMediaLyrics(
+                        hasLyrics: msg.hasLyrics ?? false,
+                        title: msg.title ?? "",
+                        artist: msg.artist ?? "",
+                        songId: msg.songId ?? "",
+                        storefront: msg.storefront ?? "",
+                        source: msg.source ?? "",
+                        lines: msg.lines ?? []
+                    )
+                    close(fd)
+                case .mediaLyricsLine:
+                    DesktopWallpaperManager.shared.pushWebMediaLyricsLine(
+                        index: msg.index ?? -1,
+                        text: msg.text ?? "",
+                        nextText: msg.nextText ?? "",
+                        previousText: msg.previousText ?? "",
+                        start: msg.start ?? 0,
+                        end: msg.end,
+                        progress: msg.progress ?? 0,
+                        elapsedTime: msg.elapsedTime ?? 0,
+                        hasLine: msg.hasLine ?? false
+                    )
                     close(fd)
                 }
             }

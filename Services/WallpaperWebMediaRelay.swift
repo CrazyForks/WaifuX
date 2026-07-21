@@ -6,6 +6,7 @@ import Combine
 // 订阅 NowPlayingService，把系统正在播放推给 wallpaperengine-cli daemon：
 //   mediaUpdate   → status / properties / playback / timeline
 //   mediaThumbnail → 封面 data URL（换歌才发，payload 大）
+//   mediaLyrics / mediaLyricsLine → Apple Music 歌词（Host 鉴权，Web 只收推送）
 //
 // 与 WallpaperWebAudioRelay 并列：音频走 spectrum；媒体元数据走本类。
 // Web 页只收推送，不碰 token。
@@ -17,6 +18,8 @@ public final class WallpaperWebMediaRelay {
 
     private var referenceCount = 0
     private var cancellable: AnyCancellable?
+    private var lyricsDocCancellable: AnyCancellable?
+    private var lyricsLineCancellable: AnyCancellable?
     private var timelineTimer: Timer?
 
     private var lastTitle = ""
@@ -26,6 +29,8 @@ public final class WallpaperWebMediaRelay {
     private var lastEnabled: Bool?
     private var lastArtworkHash = 0
     private var lastTimelinePushAt: Date = .distantPast
+    private var lastLyricsSongId = ""
+    private var lastLyricsLineIndex: Int = Int.min
 
     /// timeline 推送最小间隔（秒）
     private let timelineMinInterval: TimeInterval = 0.9
@@ -39,15 +44,30 @@ public final class WallpaperWebMediaRelay {
         guard referenceCount == 1 else { return }
 
         NowPlayingService.shared.start()
+        AppleMusicLyricsService.shared.start()
+
         cancellable = NowPlayingService.shared.$snapshot
             .receive(on: DispatchQueue.main)
             .sink { [weak self] snap in
                 self?.handle(snap)
             }
-        // 进度本地外推：即使 snapshot 未变也低频刷 timeline
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.pushTimelineIfNeeded()
+
+        lyricsDocCancellable = AppleMusicLyricsService.shared.$currentDoc
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] doc in
+                self?.pushLyricsDoc(doc)
+            }
+
+        lyricsLineCancellable = AppleMusicLyricsService.shared.$currentLine
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] line in
+                self?.pushLyricsLine(line)
+            }
+
+        // 进度本地外推：即使 snapshot 未变也低频刷 timeline + 歌词行
+        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.onTimerTick()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -65,12 +85,18 @@ public final class WallpaperWebMediaRelay {
 
         cancellable?.cancel()
         cancellable = nil
+        lyricsDocCancellable?.cancel()
+        lyricsDocCancellable = nil
+        lyricsLineCancellable?.cancel()
+        lyricsLineCancellable = nil
         timelineTimer?.invalidate()
         timelineTimer = nil
+        AppleMusicLyricsService.shared.stop()
         NowPlayingService.shared.stop()
 
         // 清空媒体，让壁纸 mediaPlaying 回落
         pushEmpty()
+        pushLyricsDoc(nil)
         resetDedupe()
         print("[WallpaperWebMediaRelay] stopped")
     }
@@ -80,6 +106,8 @@ public final class WallpaperWebMediaRelay {
         resetDedupe()
         NowPlayingService.shared.refresh()
         handle(NowPlayingService.shared.snapshot)
+        pushLyricsDoc(AppleMusicLyricsService.shared.currentDoc)
+        pushLyricsLine(AppleMusicLyricsService.shared.currentLine, force: true)
     }
 
     // MARK: - Push
@@ -106,6 +134,7 @@ public final class WallpaperWebMediaRelay {
             }
 
             let elapsed = NowPlayingService.shared.estimatedElapsed
+            print("[WallpaperWebMediaRelay] push mediaUpdate enabled=\(enabled) title=\(enabled ? title : "") state=\(state)")
             WallpaperEngineXBridge.shared.sendMediaUpdateToWebDaemon(
                 enabled: enabled,
                 title: enabled ? title : "",
@@ -135,15 +164,38 @@ public final class WallpaperWebMediaRelay {
             WallpaperEngineXBridge.shared.sendMediaThumbnailToWebDaemon(dataURL: "")
             lastArtworkHash = 0
         } else if enabled, snap.artworkData == nil, lastArtworkHash != 0 {
-            // 有媒体但无封面：清一次，避免旧封面残留
             WallpaperEngineXBridge.shared.sendMediaThumbnailToWebDaemon(dataURL: "")
             lastArtworkHash = 0
+        }
+
+        // 歌词：换歌触发拉；进度由 timer tick
+        if enabled {
+            if propsChanged || enabledChanged {
+                AppleMusicLyricsService.shared.onTrackChanged(title: title, artist: artist)
+            }
+            AppleMusicLyricsService.shared.tick(
+                elapsed: NowPlayingService.shared.estimatedElapsed,
+                isPlaying: playing
+            )
+        } else if enabledChanged {
+            AppleMusicLyricsService.shared.onTrackChanged(title: "", artist: "")
         }
 
         // 仅进度变化时走 timeline 路径
         if enabled, !propsChanged, !playChanged {
             pushTimelineIfNeeded()
         }
+    }
+
+    private func onTimerTick() {
+        guard lastEnabled == true else { return }
+        let snap = NowPlayingService.shared.snapshot
+        guard snap.hasMedia else { return }
+        AppleMusicLyricsService.shared.tick(
+            elapsed: NowPlayingService.shared.estimatedElapsed,
+            isPlaying: snap.isPlaying
+        )
+        pushTimelineIfNeeded()
     }
 
     private func pushTimelineIfNeeded() {
@@ -182,6 +234,59 @@ public final class WallpaperWebMediaRelay {
         WallpaperEngineXBridge.shared.sendMediaThumbnailToWebDaemon(dataURL: "")
     }
 
+    private func pushLyricsDoc(_ doc: LyricsDoc?) {
+        if let doc, doc.hasLyrics {
+            if doc.songId == lastLyricsSongId, !lastLyricsSongId.isEmpty { return }
+            lastLyricsSongId = doc.songId
+            lastLyricsLineIndex = Int.min
+            print("[WallpaperWebMediaRelay] push mediaLyrics songId=\(doc.songId) lines=\(doc.lines.count)")
+            WallpaperEngineXBridge.shared.sendMediaLyricsToWebDaemon(
+                hasLyrics: true,
+                title: doc.title,
+                artist: doc.artist,
+                songId: doc.songId,
+                storefront: doc.storefront,
+                source: doc.source,
+                lines: doc.lines.map { (start: $0.start, end: $0.end, text: $0.text) }
+            )
+        } else {
+            if lastLyricsSongId.isEmpty && AppleMusicLyricsService.shared.currentDoc == nil {
+                // 已空：仍推一次清空（force 场景）
+            }
+            lastLyricsSongId = ""
+            lastLyricsLineIndex = Int.min
+            WallpaperEngineXBridge.shared.sendMediaLyricsToWebDaemon(
+                hasLyrics: false,
+                title: "",
+                artist: "",
+                songId: "",
+                storefront: "",
+                source: "",
+                lines: []
+            )
+        }
+    }
+
+    private func pushLyricsLine(_ line: LyricsLineState, force: Bool = false) {
+        if !force, line.index == lastLyricsLineIndex { return }
+        // 无歌词文档时不刷空行（避免噪声）；force 或 hasLine/index 变化才推
+        if AppleMusicLyricsService.shared.currentDoc == nil, !line.hasLine, line.index < 0, !force {
+            return
+        }
+        lastLyricsLineIndex = line.index
+        WallpaperEngineXBridge.shared.sendMediaLyricsLineToWebDaemon(
+            index: line.index,
+            text: line.text,
+            nextText: line.nextText,
+            previousText: line.previousText,
+            start: line.start,
+            end: line.end,
+            progress: line.progress,
+            elapsedTime: line.elapsedTime,
+            hasLine: line.hasLine
+        )
+    }
+
     private func resetDedupe() {
         lastTitle = ""
         lastArtist = ""
@@ -190,5 +295,7 @@ public final class WallpaperWebMediaRelay {
         lastEnabled = nil
         lastArtworkHash = 0
         lastTimelinePushAt = .distantPast
+        lastLyricsSongId = ""
+        lastLyricsLineIndex = Int.min
     }
 }

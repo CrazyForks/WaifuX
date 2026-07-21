@@ -339,6 +339,37 @@ public enum LibraryCardMetrics {
     public static let thumbnailHeight: CGFloat = 180
 }
 
+// MARK: - Scroll Hover Gate
+
+/// 我的库滚动期间抑制 hover（尤其 GIF 叠加层挂载）。
+/// 仅在 suppress 边沿发一次通知，避免滚动帧驱动整树重绘。
+@MainActor
+final class LibraryScrollHoverGate {
+    static let shared = LibraryScrollHoverGate()
+
+    private(set) var suppressesAnimatedHover = false
+    private var idleWorkItem: DispatchWorkItem?
+    /// 滚停后稍等再恢复，避免惯性滚动尾段反复开关
+    private let idleDelay: TimeInterval = 0.18
+
+    func noteScrollActivity() {
+        idleWorkItem?.cancel()
+        if !suppressesAnimatedHover {
+            suppressesAnimatedHover = true
+            NotificationCenter.default.post(name: .libraryScrollDidSuppressHover, object: nil)
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.suppressesAnimatedHover = false
+        }
+        idleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleDelay, execute: work)
+    }
+}
+
+extension Notification.Name {
+    static let libraryScrollDidSuppressHover = Notification.Name("libraryScrollDidSuppressHover")
+}
+
 // MARK: - Media Video Card
 
 public struct MediaVideoCard: View, @preconcurrency Equatable {
@@ -417,7 +448,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
     }
 
     private var shouldAnimateGIF: Bool {
-        isHovered && isVisible
+        // 滚动中一律不挂 KFAnimatedImage，避免滚过 GIF 时反复切显示层
+        isHovered && isVisible && !LibraryScrollHoverGate.shared.suppressesAnimatedHover
     }
 
     // 降采样目标尺寸（固定 512x512，避免窗口大小变化导致缓存失效）
@@ -447,8 +479,17 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         .buttonStyle(.plain)
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .throttledHover(interval: 0.05) { hovering in
-            if !isEditing {
-                isHovered = hovering
+            guard !isEditing else { return }
+            if hovering, LibraryScrollHoverGate.shared.suppressesAnimatedHover {
+                // 滚动中忽略 enter，保持静态封面
+                return
+            }
+            isHovered = hovering
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .libraryScrollDidSuppressHover)) { _ in
+            // 滚过时立刻收起 hover / GIF，避免已 hover 的卡片在滚动中继续切层
+            if isHovered {
+                isHovered = false
             }
         }
         .task(id: "\(animatedGIFSourceURL.absoluteString)|\(shouldProbeAnimatedThumbnail)") {
