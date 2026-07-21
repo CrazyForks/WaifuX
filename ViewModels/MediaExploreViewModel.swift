@@ -1085,7 +1085,7 @@ final class MediaExploreViewModel: ObservableObject {
     /// - Returns: 下载后的本地文件 URL
     /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
     ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
-    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption, folderID: String? = nil) async throws -> URL {
+    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption?, folderID: String? = nil) async throws -> URL {
         let task = downloadTaskService.addTask(mediaItem: item)
         // 作者批量下载需要库记录才能归夹：即使设置关闭“写入媒体库”，有 folderID 时也强制入库
         let saveToLibrary = persistDownloadedMediaToAppLibrary

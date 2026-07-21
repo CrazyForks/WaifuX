@@ -80,6 +80,7 @@ struct LibraryFolderCard: View {
     let onToggleLock: (() -> Void)?
     let onRelock: (() -> Void)?
     let onOptimizeVideos: (() -> Void)?
+    let onRedownloadAll: (() -> Void)?
 
     @State private var isHovered = false
     @State private var isDropTarget = false
@@ -206,6 +207,11 @@ struct LibraryFolderCard: View {
                 Divider()
                 Button(action: onOptimizeVideos) {
                     Label(t("videoOptimizationBatchOptimizeVideos"), systemImage: "sparkles")
+                }
+            }
+            if let onRedownloadAll {
+                Button(action: onRedownloadAll) {
+                    Label(t("folder.redownload.all.media"), systemImage: "arrow.clockwise.circle")
                 }
             }
             Button(role: .destructive, action: onDisband) {
