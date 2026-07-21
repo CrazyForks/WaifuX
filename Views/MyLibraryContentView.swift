@@ -2886,10 +2886,13 @@ struct MyLibraryContentView: View {
         guard !records.isEmpty else { return }
 
         // 先持久化整个 FIFO 队列并展示任务；实际传输在旧记录清理完成后启动。
-        PersistentMediaDownloadQueueService.shared.stage(
+        guard PersistentDownloadQueueService.shared.stage(
             records.map(\.item),
             folderID: folder.id
-        )
+        ) else {
+            mediaViewModel.errorMessage = "无法保存下载队列，已取消删除旧文件"
+            return
+        }
 
         // 新文件需要重新建立自己的优化判断，不能继承已删除文件的 sidecar 终态。
         for videoURL in records.compactMap(\.resolvedVideoFileURL) {
@@ -2901,7 +2904,7 @@ struct MyLibraryContentView: View {
         mediaViewModel.removeDownloads(withIDs: itemIDs)
         updateMediaItems()
 
-        PersistentMediaDownloadQueueService.shared.start(using: mediaViewModel)
+        PersistentDownloadQueueService.shared.start(using: mediaViewModel)
     }
 
     private func matchesLibrarySearch(for folder: LibraryFolder, query: String) -> Bool {

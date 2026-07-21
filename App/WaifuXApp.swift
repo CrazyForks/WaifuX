@@ -557,8 +557,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                             PlaybackProgressCache.shared.restoreSavedData()
                             DownloadTaskService.shared.restoreSavedTasks()
                             if let self {
-                                PersistentMediaDownloadQueueService.shared.restoreAndResume(
-                                    using: self.mediaViewModel
+                                PersistentDownloadQueueService.shared.configure(
+                                    wallpaperViewModel: self.wallpaperViewModel,
+                                    mediaViewModel: self.mediaViewModel
                                 )
                             }
                             WallpaperSchedulerService.shared.restoreSavedConfig()

@@ -1564,67 +1564,56 @@ class WallpaperViewModel: ObservableObject {
     /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
     ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
     func downloadWallpaper(_ wallpaper: Wallpaper, folderID: String? = nil) async throws {
-        let task = downloadTaskService.addTask(wallpaper: wallpaper)
+        try await PersistentDownloadQueueService.shared.enqueueWallpaperAndWait(
+            wallpaper,
+            folderID: folderID,
+            using: self
+        )
+    }
 
-        // 将实际下载逻辑包装为可取消的 Task，并注册到 DownloadTaskService
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
+    /// 只执行落盘逻辑；队列统一负责状态、取消、重试与并发槽位。
+    func executeQueuedWallpaperDownload(
+        _ wallpaper: Wallpaper,
+        folderID: String?,
+        taskID: String
+    ) async throws {
+        guard await downloadPathManager.ensureDirectoryStructure() else {
+            throw DownloadError.permissionDenied
+        }
 
-            // 确保下载权限
-            guard await downloadPathManager.ensureDirectoryStructure() else {
-                throw DownloadError.permissionDenied
-            }
+        let imageData = try await downloadWallpaperData(wallpaper, taskID: taskID)
+        try Task.checkCancellation()
 
-            let imageData = try await downloadWallpaperData(wallpaper, taskID: task.id)
+        guard let originalURL = wallpaper.fullImageURL else {
+            throw NetworkError.invalidResponse
+        }
 
-            guard let originalURL = wallpaper.fullImageURL else {
-                throw NetworkError.invalidResponse
-            }
+        updateDownloadProgress(taskID: taskID, progress: 0.92)
+        try await cacheService.cacheImage(imageData, for: originalURL)
 
-            updateDownloadProgress(taskID: task.id, progress: 0.92)
-            try await cacheService.cacheImage(imageData, for: originalURL)
+        let fileURL = downloadPathManager.wallpaperFileURL(
+            id: wallpaper.id,
+            fileExtension: wallpaper.fileExtension
+        )
+        let directory = fileURL.deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
 
-            // 使用 DownloadPathManager 获取正确的保存路径
-            let fileURL = downloadPathManager.wallpaperFileURL(
-                id: wallpaper.id,
-                fileExtension: wallpaper.fileExtension
+        try await imageData.writeAsync(to: fileURL)
+        try Task.checkCancellation()
+
+        guard await fileURL.fileExistsAsync() else {
+            throw DownloadError.writeFailed(
+                NSError(
+                    domain: "WaifuX",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "File not found after write"]
+                )
             )
-
-            // 确保目标目录存在
-            let directory = fileURL.deletingLastPathComponent()
-            if !FileManager.default.fileExists(atPath: directory.path) {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            }
-
-            // 写入文件（使用后台 I/O，避免阻塞 MainActor）
-            try await imageData.writeAsync(to: fileURL)
-
-            // 验证文件是否成功写入（后台 I/O）
-            let fileExists = await fileURL.fileExistsAsync()
-            if fileExists {
-                // 作者批量下载把 folderID 和落盘登记绑在同一步，避免
-                // “文件已写盘但后续 moveToFolder 因并发/失败中断未执行”落在根目录
-                wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL, folderID: folderID)
-                downloadTaskService.markCompleted(id: task.id)
-            } else {
-                throw DownloadError.writeFailed(NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "File not found after write"]))
-            }
         }
 
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            // 取消时不重复标记 failed（已在 cancelTask 中标记 cancelled）
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
-            }
-            throw error
-        }
+        wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL, folderID: folderID)
     }
 
     func downloadWallpaperData(_ wallpaper: Wallpaper, taskID: String? = nil) async throws -> Data {
@@ -1697,12 +1686,10 @@ class WallpaperViewModel: ObservableObject {
     }
 
     func retryDownload(task: DownloadTask) async throws {
-        guard let wallpaper = task.wallpaper else {
+        guard task.wallpaper != nil else {
             throw NetworkError.invalidResponse
         }
-
-        downloadTaskService.removeTask(id: task.id)
-        try await downloadWallpaper(wallpaper)
+        try await PersistentDownloadQueueService.shared.retryAndWait(task)
     }
 
     // MARK: - 设置壁纸
