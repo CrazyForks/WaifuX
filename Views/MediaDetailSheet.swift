@@ -1957,10 +1957,7 @@ struct MediaDetailSheet: View {
     }
 
     private func videoOptimizationStatusTitle(videoURL: URL) -> String? {
-        switch VideoOptimizationRecordStore.shared.optimizationState(
-            for: videoURL,
-            targetFPS: currentFrameInterpolationTargetFPS
-        ) {
+        switch currentVideoOptimizationState(videoURL: videoURL) {
         case .completed:
             return t("videoOptimizationCompleted")
         case .notNeeded:
@@ -1971,10 +1968,29 @@ struct MediaDetailSheet: View {
     }
 
     private func shouldShowVideoOptimizationMenuItem(videoURL: URL) -> Bool {
-        frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL)
+        // 持久化终态优先于同步粗判。否则 Scene 烘焙视频虽然已经记录为
+        // `notNeeded`，下面的 loopState 仍可能是 idle，导致“无需优化”和
+        // “优化视频”同时出现。
+        switch currentVideoOptimizationState(videoURL: videoURL) {
+        case .completed, .notNeeded:
+            return false
+        case .idle, .failed, .blacklisted:
+            break
+        }
+
+        return frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL)
             || shouldResetVideoOptimization(videoURL: videoURL)
             || isFrameInterpolationBlacklisted(videoURL: videoURL)
             || !videoOptimizationOperations(for: videoURL).isEmpty
+    }
+
+    private func currentVideoOptimizationState(
+        videoURL: URL
+    ) -> VideoOptimizationRecordStore.OptimizationState {
+        VideoOptimizationRecordStore.shared.optimizationState(
+            for: videoURL,
+            targetFPS: currentFrameInterpolationTargetFPS
+        )
     }
 
     private func videoOptimizationMenuItem(videoURL: URL) -> some View {
