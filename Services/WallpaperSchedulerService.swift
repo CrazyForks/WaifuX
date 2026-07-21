@@ -28,6 +28,10 @@ class WallpaperSchedulerService: ObservableObject {
     /// Shared-decoder playback has one logical end event even though every
     /// attached display may observe the underlying AVPlayerItem.
     private var globalOnEndSwitchCooldownUntil: Date?
+    /// 使关闭全局同步之前启动的全局任务失效，禁止其晚到结果覆盖各屏状态。
+    private var globalRotationGeneration: UInt64 = 0
+    private var displayModeTransitionGeneration: UInt64 = 0
+    private var displayModeTransitionTask: Task<Void, Never>?
 
     /// One-shot deadline timer: fire at the earliest due switch, then recompute.
     private var dispatchTimer: DispatchSourceTimer?
@@ -106,6 +110,11 @@ class WallpaperSchedulerService: ObservableObject {
         }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            if self.displayModeTransitionTask != nil,
+               !self.config.isGlobalDisplaySyncEnabled {
+                print("\(self.logTag) Ignoring playback-end event during global-to-independent transition")
+                return
+            }
             if self.config.isGlobalDisplaySyncEnabled {
                 self.applyNextGlobalWallpaper(requiredMode: .onEnd)
             } else {
@@ -346,18 +355,27 @@ class WallpaperSchedulerService: ObservableObject {
             return
         }
 
+        let generation = globalRotationGeneration
         let task = Task { [weak self] in
             guard let self else { return }
             defer {
-                self.globalRotationTask = nil
-                // Re-arm one-shot timer after any global batch (timed or on-end
-                // with web/scene fallback). Event-only modes get nextFire=nil.
-                if self.isRunning {
-                    self.scheduleNextChange()
+                if self.globalRotationGeneration == generation {
+                    self.globalRotationTask = nil
+                    // Re-arm one-shot timer after any global batch (timed or on-end
+                    // with web/scene fallback). Event-only modes get nextFire=nil.
+                    if self.isRunning {
+                        self.scheduleNextChange()
+                    }
                 }
             }
 
             let success = await self.applyItemGlobally(item, to: screens)
+            guard !Task.isCancelled,
+                  self.globalRotationGeneration == generation,
+                  self.config.isGlobalDisplaySyncEnabled else {
+                print("\(self.logTag) Ignoring superseded global rotation result")
+                return
+            }
             guard success else {
                 if case .onEnd? = requiredMode {
                     VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
@@ -968,12 +986,116 @@ class WallpaperSchedulerService: ObservableObject {
 
     func updateGlobalDisplaySyncEnabled(_ enabled: Bool) {
         guard config.isGlobalDisplaySyncEnabled != enabled else { return }
-        var newConfig = config
-        newConfig.isGlobalDisplaySyncEnabled = enabled
-        updateConfig(newConfig)
+
+        displayModeTransitionGeneration &+= 1
+        let transitionGeneration = displayModeTransitionGeneration
+        displayModeTransitionTask?.cancel()
+        displayModeTransitionTask = nil
+
         if enabled {
+            var newConfig = config
+            newConfig.isGlobalDisplaySyncEnabled = true
+            updateConfig(newConfig)
             GlobalWallpaperSyncCoordinator.shared.synchronizeCurrentWallpaperAfterEnabling()
+            return
         }
+
+        // 先让旧全局选片任务失效；其底层全局事务会在异步切换阶段完整收尾。
+        globalRotationGeneration &+= 1
+        let supersededGlobalTask = globalRotationTask
+        supersededGlobalTask?.cancel()
+        globalRotationTask = nil
+        globalOnEndSwitchCooldownUntil = nil
+        failedApplyRetryAfter.removeValue(forKey: globalSchedulerStateKey)
+
+        var newConfig = config
+        newConfig.isGlobalDisplaySyncEnabled = false
+        updateConfig(newConfig)
+
+        // updateConfig 会按独立配置启动计时器；模式切换完成前先阻止它抢跑。
+        cancelDispatchTimer()
+        endSchedulerActivity()
+        cancelTimedRotation()
+
+        displayModeTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled,
+                  self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+
+            // 等待已开始的全局事务结束，避免它在各屏重选后又覆盖全部屏幕。
+            await GlobalWallpaperSyncCoordinator.shared.drainBeforeLeavingGlobalMode()
+            if let supersededGlobalTask {
+                await supersededGlobalTask.value
+            }
+
+            guard !Task.isCancelled,
+                  self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+
+            // 先把当前共享 AVPlayer 拆成各屏独立播放器；未启用调度的屏幕保留当前画面。
+            if let primary = NSScreen.screensOrderedForDisplay.first,
+               VideoWallpaperManager.shared.isVideoWallpaperActive {
+                VideoWallpaperManager.shared.setSharedDecoderPlaybackEnabled(
+                    false,
+                    sourceScreen: primary
+                )
+            }
+
+            await self.applyIndependentSelectionsAfterGlobalDisable(
+                transitionGeneration: transitionGeneration
+            )
+
+            guard self.displayModeTransitionGeneration == transitionGeneration,
+                  !self.config.isGlobalDisplaySyncEnabled else { return }
+            self.displayModeTransitionTask = nil
+            if self.isRunning {
+                self.scheduleNextChange()
+            }
+        }
+    }
+
+    /// 按每块显示器已保存的启用状态、内容范围、文件夹过滤和顺序立即重选一次。
+    private func applyIndependentSelectionsAfterGlobalDisable(
+        transitionGeneration: UInt64
+    ) async {
+        for screen in NSScreen.screensOrderedForDisplay {
+            guard !Task.isCancelled,
+                  displayModeTransitionGeneration == transitionGeneration,
+                  !config.isGlobalDisplaySyncEnabled else { return }
+
+            let screenID = screen.wallpaperScreenIdentifier
+            let displayConfig = resolvedDisplayConfig(for: screen)
+            guard displayConfig.isEnabled else {
+                print("\(logTag) Global sync disabled: scheduler remains off for \(screen.localizedName)")
+                continue
+            }
+
+            let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+            guard let item = selectNextItem(
+                from: items,
+                lastID: lastChangedItemIDs[screenID],
+                screenID: screenID,
+                order: displayConfig.order
+            ) else {
+                print("\(logTag) Global sync disabled: no candidate for \(screen.localizedName)")
+                continue
+            }
+
+            let success = await applyItem(item, toScreenID: screenID)
+            guard displayModeTransitionGeneration == transitionGeneration,
+                  !config.isGlobalDisplaySyncEnabled else { return }
+            if success {
+                lastChangeTimes[screenID] = Date()
+                lastChangedItemIDs[screenID] = item.id
+                failedApplyRetryAfter.removeValue(forKey: screenID)
+                print("\(logTag) Activated independent scheduler for \(screen.localizedName): \(item.title)")
+            } else {
+                failedApplyRetryAfter[screenID] = Date().addingTimeInterval(failedApplyRetryDelay)
+                print("\(logTag) Failed initial independent selection for \(screen.localizedName)")
+            }
+        }
+        persistSchedulerState()
     }
 
     func updateGlobalDisplayEnabled(_ enabled: Bool) {
