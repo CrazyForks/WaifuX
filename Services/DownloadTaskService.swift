@@ -429,3 +429,137 @@ class DownloadTaskService: ObservableObject {
         tasks.max(by: { $0.lastUpdatedAt < $1.lastUpdatedAt })
     }
 }
+
+// MARK: - 可恢复的媒体下载执行队列
+
+/// `DownloadTaskService` 保存的是展示状态；这里额外保存真正可重新执行的媒体任务。
+/// 当前用于文件夹“重新下载所有壁纸”，保证退出应用后仍能恢复原 folderID 和 FIFO 顺序。
+@MainActor
+final class PersistentMediaDownloadQueueService {
+    static let shared = PersistentMediaDownloadQueueService()
+
+    private struct Job: Codable, Identifiable {
+        let id: String
+        let item: MediaItem
+        let folderID: String
+        let addedAt: Date
+    }
+
+    private let defaultsKey = "persistent_media_download_queue_v1"
+    private var jobs: [Job] = []
+    private var runnerTask: Task<Void, Never>?
+    private var didRestore = false
+
+    private init() {}
+
+    /// 先持久化并展示全部任务，但暂不执行；调用方可安全地在返回后删除旧文件。
+    func stage(_ items: [MediaItem], folderID: String) {
+        guard !folderID.isEmpty else { return }
+
+        for item in items {
+            let taskID = Self.taskID(for: item)
+            if let index = jobs.firstIndex(where: { $0.id == taskID }) {
+                jobs[index] = Job(
+                    id: taskID,
+                    item: item,
+                    folderID: folderID,
+                    addedAt: jobs[index].addedAt
+                )
+            } else {
+                jobs.append(Job(id: taskID, item: item, folderID: folderID, addedAt: .now))
+            }
+            addPresentationTask(for: item)
+        }
+        jobs.sort { $0.addedAt < $1.addedAt }
+        persist()
+    }
+
+    /// 应用启动、媒体库和下载任务快照恢复完成后调用。
+    func restoreAndResume(using viewModel: MediaExploreViewModel) {
+        guard !didRestore else {
+            start(using: viewModel)
+            return
+        }
+        didRestore = true
+
+        if let data = UserDefaults.standard.data(forKey: defaultsKey),
+           let restored = try? JSONDecoder().decode([Job].self, from: data) {
+            var seen = Set<String>()
+            jobs = restored
+                .sorted { $0.addedAt < $1.addedAt }
+                .filter {
+                    seen.insert($0.id).inserted
+                        && !MediaLibraryService.shared.isDownloaded($0.item)
+                }
+            for job in jobs {
+                addPresentationTask(for: job.item)
+            }
+            // 清除“文件已落盘但应用在移除队列记录前退出”的任务。
+            persist()
+        }
+        start(using: viewModel)
+    }
+
+    /// 在旧文件删除完成后启动。每批最多两个任务，避免所有任务同时抢 SteamCMD 槽位。
+    func start(using viewModel: MediaExploreViewModel) {
+        guard runnerTask == nil, !jobs.isEmpty else { return }
+        runnerTask = Task { @MainActor [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+            defer { runnerTask = nil }
+
+            while !Task.isCancelled, !jobs.isEmpty {
+                let batch = Array(jobs.prefix(2))
+                let workers = batch.map { job in
+                    Task { @MainActor in
+                        await self.execute(job, using: viewModel)
+                    }
+                }
+                var finishedIDs: [String] = []
+                for worker in workers {
+                    finishedIDs.append(await worker.value)
+                }
+
+                jobs.removeAll { finishedIDs.contains($0.id) }
+                persist()
+            }
+        }
+    }
+
+    private func addPresentationTask(for item: MediaItem) {
+        if item.id.hasPrefix("workshop_") {
+            _ = DownloadTaskService.shared.addTask(workshopWallpaper: item)
+        } else {
+            _ = DownloadTaskService.shared.addTask(mediaItem: item)
+        }
+    }
+
+    private func execute(_ job: Job, using viewModel: MediaExploreViewModel) async -> String {
+        if DownloadTaskService.shared.task(for: job.id)?.status == .cancelled {
+            return job.id
+        }
+        do {
+            try await viewModel.executePersistedMediaDownload(job.item, folderID: job.folderID)
+        } catch {
+            AppLogger.error(.download, "持久化媒体下载失败", metadata: [
+                "itemID": job.item.id,
+                "folderID": job.folderID,
+                "error": error.localizedDescription
+            ])
+        }
+        return job.id
+    }
+
+    private func persist() {
+        guard !jobs.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+            return
+        }
+        if let data = try? JSONEncoder().encode(jobs) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    private static func taskID(for item: MediaItem) -> String {
+        item.id.hasPrefix("workshop_") ? "workshop.\(item.id)" : "media.\(item.id)"
+    }
+}

@@ -2885,14 +2885,11 @@ struct MyLibraryContentView: View {
         let records = MediaLibraryService.shared.downloadedItems(inFolder: folder.id)
         guard !records.isEmpty else { return }
 
-        // 用户要求先进入下载队列，再删除旧文件。实际传输会在旧记录清理完成后启动。
-        for record in records {
-            if record.item.id.hasPrefix("workshop_") {
-                _ = DownloadTaskService.shared.addTask(workshopWallpaper: record.item)
-            } else {
-                _ = DownloadTaskService.shared.addTask(mediaItem: record.item)
-            }
-        }
+        // 先持久化整个 FIFO 队列并展示任务；实际传输在旧记录清理完成后启动。
+        PersistentMediaDownloadQueueService.shared.stage(
+            records.map(\.item),
+            folderID: folder.id
+        )
 
         // 新文件需要重新建立自己的优化判断，不能继承已删除文件的 sidecar 终态。
         for videoURL in records.compactMap(\.resolvedVideoFileURL) {
@@ -2904,38 +2901,7 @@ struct MyLibraryContentView: View {
         mediaViewModel.removeDownloads(withIDs: itemIDs)
         updateMediaItems()
 
-        let folderID = folder.id
-        Task { @MainActor in
-            await withTaskGroup(of: Void.self) { group in
-                for record in records {
-                    group.addTask {
-                        do {
-                            if record.item.id.hasPrefix("workshop_") {
-                                try await mediaViewModel.downloadWorkshopWallpaper(
-                                    record.item,
-                                    folderID: folderID
-                                )
-                            } else {
-                                _ = try await mediaViewModel.downloadMedia(
-                                    record.item,
-                                    option: nil,
-                                    folderID: folderID
-                                )
-                            }
-                        } catch {
-                            AppLogger.error(.download, "文件夹壁纸重新下载失败", metadata: [
-                                "folderID": folderID,
-                                "itemID": record.item.id,
-                                "error": error.localizedDescription
-                            ])
-                        }
-                    }
-                }
-                await group.waitForAll()
-            }
-            mediaViewModel.refreshLibraryContent()
-            updateMediaItems()
-        }
+        PersistentMediaDownloadQueueService.shared.start(using: mediaViewModel)
     }
 
     private func matchesLibrarySearch(for folder: LibraryFolder, query: String) -> Bool {

@@ -1125,6 +1125,67 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
+    /// 执行已经由持久化队列登记过的任务；这里不再 `addTask`，避免覆盖任务顺序和进度。
+    func executePersistedMediaDownload(_ item: MediaItem, folderID: String) async throws {
+        if item.id.hasPrefix("workshop_") {
+            let workshopID = String(item.id.dropFirst("workshop_".count))
+            let taskID = "workshop.\(item.id)"
+            downloadTaskService.markDownloading(id: taskID)
+
+            let operation = Task<Void, Error> { [weak self] in
+                guard let self else { throw CancellationError() }
+                let localURL = try await workshopService.downloadWorkshopItem(
+                    workshopID: workshopID,
+                    progressHandler: { progress in
+                        Task { @MainActor in
+                            DownloadTaskService.shared.updateProgress(id: taskID, progress: progress)
+                        }
+                    }
+                )
+                let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
+                mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
+                downloadTaskService.markCompleted(id: taskID)
+            }
+            downloadTaskService.registerDownloadTask(id: taskID, task: operation)
+            defer { downloadTaskService.unregisterDownloadTask(id: taskID) }
+
+            do {
+                try await operation.value
+            } catch {
+                if !(error is CancellationError) {
+                    downloadTaskService.markFailed(id: taskID)
+                }
+                throw error
+            }
+            return
+        }
+
+        let taskID = "media.\(item.id)"
+        downloadTaskService.markDownloading(id: taskID)
+        let operation = Task<Void, Error> { [weak self] in
+            guard let self else { throw CancellationError() }
+            _ = try await ensureLocalVideoFile(
+                for: item,
+                preferredOption: nil,
+                saveToDownloads: true,
+                taskID: taskID,
+                folderID: folderID
+            )
+            downloadTaskService.markCompleted(id: taskID)
+        }
+        downloadTaskService.registerDownloadTask(id: taskID, task: operation)
+        defer { downloadTaskService.unregisterDownloadTask(id: taskID) }
+
+        do {
+            try await operation.value
+        } catch {
+            if !(error is CancellationError) {
+                downloadTaskService.markFailed(id: taskID)
+            }
+            throw error
+        }
+    }
+
     func applyDynamicWallpaper(
         _ item: MediaItem,
         muted: Bool,
