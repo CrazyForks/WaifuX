@@ -205,11 +205,11 @@ class WallpaperSchedulerService: ObservableObject {
                 return
             }
         }
-        guard NSScreen.screens.contains(where: { $0.wallpaperScreenIdentifier == screenID }) else {
+        guard let liveScreen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             print("\(logTag) Skip next wallpaper: screen \(screenID) not found")
             return
         }
-        let displayConfig = config.resolvedDisplayConfig(for: screenID)
+        let displayConfig = resolvedDisplayConfig(for: liveScreen)
         switch requiredMode {
         case .onEnd:
             guard displayConfig.isEnabled && displayConfig.isOnEndMode else {
@@ -486,33 +486,83 @@ class WallpaperSchedulerService: ObservableObject {
     /// Re-maps display configs whose screen ID changed (e.g. after sleep/wake when
     /// CGDirectDisplayID may change on external monitors) using the stable fingerprint.
     private func relinkDisplayConfigsByFingerprint() {
-        let currentScreens = NSScreen.screens
-        let currentScreenIDs = Set(currentScreens.map { $0.wallpaperScreenIdentifier })
+        let currentScreens = NSScreen.screensOrderedForDisplay
+        let currentScreenIDs = Set(currentScreens.map(\.wallpaperScreenIdentifier))
 
         // Find orphaned config keys — screen IDs that were in displayConfigs but are no longer present
-        let orphanedIDs = Set(config.displayConfigs.keys).subtracting(currentScreenIDs)
+        var orphanedIDs = Set(config.displayConfigs.keys).subtracting(currentScreenIDs)
         guard !orphanedIDs.isEmpty else { return }
 
-        // Build fingerprint → current screenID map
-        var fingerprintToScreenID: [String: String] = [:]
-        for screen in currentScreens {
-            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
-            fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
+        var claimedTargets = Set(config.displayConfigs.keys).intersection(currentScreenIDs)
+        var migratedCount = 0
+
+        // 第一轮：唯一精确/松散匹配（含 position 的新指纹通常走这里）
+        for orphanedID in orphanedIDs.sorted() {
+            guard let orphanedConfig = config.displayConfigs[orphanedID],
+                  let fingerprint = displayFingerprints[orphanedID],
+                  let newScreenID = resolveScreenID(
+                    forFingerprint: fingerprint,
+                    among: currentScreens,
+                    excluding: claimedTargets
+                  ) else {
+                continue
+            }
+
+            applyDisplayConfigMigration(
+                orphanedID: orphanedID,
+                orphanedConfig: orphanedConfig,
+                fingerprint: fingerprint,
+                newScreenID: newScreenID,
+                currentScreens: currentScreens
+            )
+            claimedTargets.insert(newScreenID)
+            orphanedIDs.remove(orphanedID)
+            migratedCount += 1
         }
 
-        var migratedCount = 0
-        for orphanedID in orphanedIDs {
-            guard let fingerprint = displayFingerprints[orphanedID],
-                  let newScreenID = fingerprintToScreenID[fingerprint],
-                  !config.displayConfigs.keys.contains(newScreenID) else { continue }
-
-            if let orphanedConfig = config.displayConfigs[orphanedID] {
-                config.displayConfigs[newScreenID] = orphanedConfig
-                displayFingerprints[newScreenID] = fingerprint
-                migratedCount += 1
+        // 第二轮：旧版无序列号短指纹会同时命中多块同型号屏。
+        // 按「硬件身份」分组后，将 orphan 与空闲屏各自按稳定顺序 1:1 zip，
+        // 避免随机 .first 把显示器 2/3 配置互换。
+        if !orphanedIDs.isEmpty {
+            let freeScreens = currentScreens.filter {
+                !claimedTargets.contains($0.wallpaperScreenIdentifier)
             }
-            displayFingerprints.removeValue(forKey: orphanedID)
-            config.displayConfigs.removeValue(forKey: orphanedID)
+            var freeByHardware: [String: [NSScreen]] = [:]
+            for screen in freeScreens {
+                freeByHardware[hardwareIdentityKey(for: screen), default: []].append(screen)
+            }
+
+            var orphansByHardware: [String: [String]] = [:]
+            for orphanedID in orphanedIDs {
+                guard let fingerprint = displayFingerprints[orphanedID] else { continue }
+                orphansByHardware[hardwareIdentityKey(forFingerprint: fingerprint), default: []].append(orphanedID)
+            }
+
+            for hardwareKey in orphansByHardware.keys.sorted() {
+                guard var orphanGroup = orphansByHardware[hardwareKey],
+                      let freeGroup = freeByHardware[hardwareKey],
+                      !freeGroup.isEmpty else { continue }
+                orphanGroup.sort()
+                // freeGroup 已来自 screensOrderedForDisplay 的稳定顺序
+                let pairCount = min(orphanGroup.count, freeGroup.count)
+                for i in 0..<pairCount {
+                    let orphanedID = orphanGroup[i]
+                    let target = freeGroup[i]
+                    let newScreenID = target.wallpaperScreenIdentifier
+                    guard let orphanedConfig = config.displayConfigs[orphanedID] else { continue }
+                    let fingerprint = displayFingerprints[orphanedID] ?? target.schedulerConfigFingerprint
+                    applyDisplayConfigMigration(
+                        orphanedID: orphanedID,
+                        orphanedConfig: orphanedConfig,
+                        fingerprint: fingerprint,
+                        newScreenID: newScreenID,
+                        currentScreens: currentScreens
+                    )
+                    claimedTargets.insert(newScreenID)
+                    orphanedIDs.remove(orphanedID)
+                    migratedCount += 1
+                }
+            }
         }
 
         if migratedCount > 0 {
@@ -522,19 +572,65 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    private func applyDisplayConfigMigration(
+        orphanedID: String,
+        orphanedConfig: DisplaySchedulerConfig,
+        fingerprint: String,
+        newScreenID: String,
+        currentScreens: [NSScreen]
+    ) {
+        config.displayConfigs[newScreenID] = orphanedConfig
+        config.displayConfigs.removeValue(forKey: orphanedID)
+        displayFingerprints.removeValue(forKey: orphanedID)
+        if let screen = currentScreens.first(where: { $0.wallpaperScreenIdentifier == newScreenID }) {
+            displayFingerprints[newScreenID] = screen.schedulerConfigFingerprint
+        } else {
+            displayFingerprints[newScreenID] = fingerprint
+        }
+    }
+
+    /// 用于同型号双屏分组：去掉 position 后缀，并尽量归一化到 vendor/model/name 粒度。
+    private func hardwareIdentityKey(for screen: NSScreen) -> String {
+        hardwareIdentityKey(forFingerprint: screen.externalConnectionFingerprint)
+    }
+
+    private func hardwareIdentityKey(forFingerprint fingerprint: String) -> String {
+        var key = fingerprint
+        if let range = key.range(of: ":position:") {
+            key = String(key[..<range.lowerBound])
+        }
+        // 去掉分辨率段（旧 wallpaper 指纹：…:WxH:builtin）
+        // cg:v:m:noserial:name:2560x1440:external → cg:v:m:noserial:name:external
+        if let regex = try? NSRegularExpression(pattern: #":\d+x\d+(?=:)"#),
+           regex.firstMatch(in: key, range: NSRange(key.startIndex..., in: key)) != nil {
+            key = regex.stringByReplacingMatches(
+                in: key,
+                range: NSRange(key.startIndex..., in: key),
+                withTemplate: ""
+            )
+        }
+        return key
+    }
+
     private func existingConfigScreenID(for screen: NSScreen) -> String? {
         let currentID = screen.wallpaperScreenIdentifier
         if config.displayConfigs[currentID] != nil {
             return currentID
         }
 
-        let fingerprints = Set([
-            screen.schedulerConfigFingerprint,
-            screen.wallpaperScreenFingerprint,
-        ])
-        return displayFingerprints.first { _, fingerprint in
-            fingerprints.contains(fingerprint)
-        }?.key
+        let candidates = screen.schedulerFingerprintCandidates
+        let matches = displayFingerprints.filter { key, fingerprint in
+            config.displayConfigs[key] != nil && candidates.contains(fingerprint)
+        }
+
+        // 精确指纹优先（含位置）；同型号无序列号时旧短指纹可能命中多条，绝不能 .first 随机挑。
+        if let exact = matches.first(where: { $0.value == screen.wallpaperScreenFingerprint })?.key {
+            return exact
+        }
+        if matches.count == 1, let only = matches.keys.first {
+            return only
+        }
+        return nil
     }
 
     private func migrateDisplayConfig(from oldScreenID: String, to screen: NSScreen) {
@@ -556,25 +652,31 @@ class WallpaperSchedulerService: ObservableObject {
 
     /// Re-maps per-screen scheduler state using the saved display fingerprint.
     private func relinkSchedulerStateByFingerprint(using previousFingerprints: [String: String]) {
-        let currentScreens = NSScreen.screens
-        let currentScreenIDs = Set(currentScreens.map { $0.wallpaperScreenIdentifier })
-
-        var fingerprintToScreenID: [String: String] = [:]
-        for screen in currentScreens {
-            fingerprintToScreenID[screen.schedulerConfigFingerprint] = screen.wallpaperScreenIdentifier
-            fingerprintToScreenID[screen.wallpaperScreenFingerprint] = screen.wallpaperScreenIdentifier
-        }
+        let currentScreens = NSScreen.screensOrderedForDisplay
+        let currentScreenIDs = Set(currentScreens.map(\.wallpaperScreenIdentifier))
 
         let orphanedIDs = Set(lastChangedItemIDs.keys)
             .union(lastChangeTimes.keys)
             .union(usedItemIDs.keys)
             .subtracting(currentScreenIDs)
+            .subtracting([globalSchedulerStateKey])
         guard !orphanedIDs.isEmpty else { return }
 
+        // 已有运行时状态的屏先占位，避免两块同型号屏的 orphan 状态互换。
+        var claimedTargets = Set(
+            currentScreenIDs.filter {
+                lastChangedItemIDs[$0] != nil || lastChangeTimes[$0] != nil || usedItemIDs[$0] != nil
+            }
+        )
         var migratedCount = 0
-        for orphanedID in orphanedIDs {
+
+        for orphanedID in orphanedIDs.sorted() {
             guard let fingerprint = previousFingerprints[orphanedID],
-                  let newScreenID = fingerprintToScreenID[fingerprint],
+                  let newScreenID = resolveScreenID(
+                    forFingerprint: fingerprint,
+                    among: currentScreens,
+                    excluding: claimedTargets
+                  ),
                   newScreenID != orphanedID else {
                 continue
             }
@@ -602,12 +704,74 @@ class WallpaperSchedulerService: ObservableObject {
                 }
                 migratedCount += 1
             }
+
+            claimedTargets.insert(newScreenID)
         }
 
         if migratedCount > 0 {
             persistSchedulerState()
             print("\(logTag) Relinked scheduler state by fingerprint (\(migratedCount) migrated value(s))")
         }
+    }
+
+    /// 在当前屏幕列表中按指纹找回目标屏。优先精确匹配；旧版无 position 的短指纹
+    /// 若命中多块同型号屏，只在「唯一未占用」时才绑定，避免 2/3 配置互换。
+    private func resolveScreenID(
+        forFingerprint fingerprint: String,
+        among screens: [NSScreen],
+        excluding claimedTargets: Set<String>
+    ) -> String? {
+        let exactMatches = screens.filter { screen in
+            let id = screen.wallpaperScreenIdentifier
+            guard !claimedTargets.contains(id) else { return false }
+            return screen.schedulerFingerprintCandidates.contains(fingerprint)
+                || screen.wallpaperScreenFingerprint == fingerprint
+                || screen.schedulerConfigFingerprint == fingerprint
+                || screen.legacyWallpaperScreenFingerprint == fingerprint
+                || screen.externalConnectionFingerprint == fingerprint
+        }
+
+        if exactMatches.count == 1 {
+            return exactMatches[0].wallpaperScreenIdentifier
+        }
+
+        // 短指纹（无 position）可能同时命中两块同型号屏：只接受唯一未占用目标。
+        let available = exactMatches.map(\.wallpaperScreenIdentifier)
+        if available.count == 1 {
+            return available[0]
+        }
+
+        // 模糊匹配：历史 fingerprint 与当前候选有公共前缀（旧 noserial 无 position）。
+        if exactMatches.isEmpty {
+            let fuzzy = screens.filter { screen in
+                let id = screen.wallpaperScreenIdentifier
+                guard !claimedTargets.contains(id) else { return false }
+                return screen.schedulerFingerprintCandidates.contains { candidate in
+                    fingerprintsLooselyMatch(fingerprint, candidate)
+                }
+            }
+            if fuzzy.count == 1 {
+                return fuzzy[0].wallpaperScreenIdentifier
+            }
+        }
+
+        return nil
+    }
+
+    private func fingerprintsLooselyMatch(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+        // 新指纹 = 旧指纹 + ":position:..."
+        if lhs.hasPrefix(rhs + ":position:") || rhs.hasPrefix(lhs + ":position:") {
+            return true
+        }
+        // 去掉 position 后缀后比较
+        let strip: (String) -> String = { value in
+            if let range = value.range(of: ":position:") {
+                return String(value[..<range.lowerBound])
+            }
+            return value
+        }
+        return strip(lhs) == strip(rhs)
     }
 
     /// Persists fingerprint mapping whenever display configs are saved.
@@ -695,7 +859,7 @@ class WallpaperSchedulerService: ObservableObject {
         } else {
             for screen in NSScreen.screens {
                 let screenID = screen.wallpaperScreenIdentifier
-                let displayConfig = config.resolvedDisplayConfig(for: screenID)
+                let displayConfig = resolvedDisplayConfig(for: screen)
                 guard timedIntervalSeconds(for: displayConfig) != nil else { continue }
                 guard lastChangeTimes[screenID] == nil else { continue }
                 lastChangeTimes[screenID] = now
@@ -796,7 +960,7 @@ class WallpaperSchedulerService: ObservableObject {
                 && !NSScreen.screens.isEmpty
         }
         return NSScreen.screens.contains { screen in
-            config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier).isEnabled
+            resolvedDisplayConfig(for: screen).isEnabled
         }
     }
 
@@ -888,7 +1052,28 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
+    /// 写入前把「当前 screenID」规范到真实配置 key。
+    /// sleep/wake 后 UI 传来的是新 NSScreenNumber，但配置可能仍在旧 id 下；
+    /// 若不迁移就直接写，会留下双份配置并在设置页看起来像 2/3 对调。
+    private func canonicalDisplayConfigScreenID(_ screenID: String) -> String {
+        if config.displayConfigs[screenID] != nil {
+            if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
+                displayFingerprints[screenID] = screen.schedulerConfigFingerprint
+            }
+            return screenID
+        }
+        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+              let existing = existingConfigScreenID(for: screen),
+              existing != screenID,
+              config.displayConfigs[existing] != nil else {
+            return screenID
+        }
+        migrateDisplayConfig(from: existing, to: screen)
+        return screen.wallpaperScreenIdentifier
+    }
+
     func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         let wasOnEndMode = displayConfig.isOnEndMode
@@ -921,6 +1106,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayInterval(_ minutes: Int, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         let wasOnEndMode = displayConfig.isOnEndMode
@@ -981,6 +1167,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayOrder(_ order: ScheduleOrder, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.order = order
@@ -989,6 +1176,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayIncludeWallpapers(_ include: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.includeWallpapers = include
@@ -997,6 +1185,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayIncludeMedia(_ include: Bool, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.includeMedia = include
@@ -1005,6 +1194,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayFolderIDs(_ folderIDs: [String]?, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.folderIDs = folderIDs
@@ -1013,6 +1203,7 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func updateDisplayWebSceneSwitchSeconds(_ seconds: Int?, for screenID: String) {
+        let screenID = canonicalDisplayConfigScreenID(screenID)
         var newConfig = config
         var displayConfig = newConfig.storedDisplayConfig(for: screenID)
         displayConfig.webSceneSwitchSeconds = seconds
@@ -1144,7 +1335,7 @@ class WallpaperSchedulerService: ObservableObject {
         var hasTimedDisplay = false
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            let displayConfig = resolvedDisplayConfig(for: screen)
             guard let interval = timedIntervalSeconds(for: displayConfig) else { continue }
             hasTimedDisplay = true
             if displayConfig.isOnEndMode,
@@ -1246,7 +1437,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in screens {
             let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            let displayConfig = resolvedDisplayConfig(for: screen)
             guard displayConfig.isEnabled else { continue }
             guard !displayConfig.isOnUnlockMode else { continue }
             guard let interval = timedIntervalSeconds(for: displayConfig) else { continue }
@@ -1355,7 +1546,7 @@ class WallpaperSchedulerService: ObservableObject {
 
         for screen in NSScreen.screens {
             let screenID = screen.wallpaperScreenIdentifier
-            let displayConfig = config.resolvedDisplayConfig(for: screenID)
+            let displayConfig = resolvedDisplayConfig(for: screen)
             guard displayConfig.isEnabled && displayConfig.isOnUnlockMode else { continue }
 
             let items = getSchedulableItems(for: displayConfig, screenID: screenID)
@@ -1422,10 +1613,18 @@ class WallpaperSchedulerService: ObservableObject {
             return false
         }
 
-        let displayConfig = config.resolvedDisplayConfig(for: screenID)
+        let displayConfig = resolvedDisplayConfig(for: screen)
         // 播完即换且未开 web/scene 定时：只能切可接播放完成通知的视频类
         let requirePlaybackEndSupport = displayConfig.isOnEndMode
             && displayConfig.webSceneSwitchSeconds == nil
+
+        // 自动切换常在 App 未激活时发生；短暂拉起 userInitiated activity，
+        // 避免 App Nap 挂起桌面层 CA / AVPlayer 首帧提交（表现为要点一下才更新）。
+        let applyActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Wallpaper auto-switch apply"
+        )
+        defer { ProcessInfo.processInfo.endActivity(applyActivity) }
 
         do {
             print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName)")
@@ -1480,6 +1679,12 @@ class WallpaperSchedulerService: ObservableObject {
         let displayConfig = config.globalDisplayConfig
         let requirePlaybackEndSupport = displayConfig.isOnEndMode
             && displayConfig.webSceneSwitchSeconds == nil
+
+        let applyActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Wallpaper global auto-switch apply"
+        )
+        defer { ProcessInfo.processInfo.endActivity(applyActivity) }
 
         do {
             return try await LocalWallpaperApplyService.apply(

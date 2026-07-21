@@ -973,7 +973,9 @@ private struct SchedulerSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
 
     private var screens: [NSScreen] {
-        NSScreen.screens
+        // 勿直接用 NSScreen.screens：系统枚举顺序会在睡眠/唤醒后打乱，
+        // 导致「显示器 2/3」标签对调，看起来像自动切换配置串台。
+        NSScreen.screensOrderedForDisplay
     }
 
     private var isGlobalDisplaySyncEnabled: Bool {
@@ -1035,6 +1037,9 @@ private struct SchedulerSettingsTab: View {
                 // 每屏配置（独立模式）
                 MacSettingsSection(header: t("scheduleConfig")) {
                     ForEach(Array(screens.enumerated()), id: \.element.wallpaperScreenIdentifier) { (index: Int, screen: NSScreen) in
+                        // 勿在 body 内调用会写 UserDefaults / 改 @Published 的 migrate；
+                        // 读路径 resolvedDisplayConfig 会按 fingerprint 找回旧配置，
+                        // 写路径 update* 使用当前 wallpaperScreenIdentifier。
                         let screenID = screen.wallpaperScreenIdentifier
                         let displayConfig = viewModel.schedulerViewModel.displayConfig(for: screen)
 

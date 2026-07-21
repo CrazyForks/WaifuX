@@ -216,9 +216,13 @@ enum LocalWallpaperApplyService {
             && screens.count == NSScreen.screens.count
             && Set(screens.map(\.wallpaperScreenIdentifier))
                 == Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+        // 多屏播同一文件时默认共享一路 AVQueuePlayer，避免每屏各起 VTDecoderXPCService。
+        // 仅「覆盖全部当前屏幕」或全局同步时走共享标志路径；子集多选仍按屏循环，
+        // 由 VideoWallpaperManager 按 URL 机会式复用已有 player。
         let useShared = options.usesSharedVideoDecoder
             || ((options.isGlobalTransaction || WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled)
                 && screens.count > 1)
+            || (coversAllScreens && screens.count > 1)
         if useShared {
             try VideoWallpaperManager.shared.applyVideoWallpaper(
                 from: videoURL,

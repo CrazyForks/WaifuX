@@ -18,6 +18,32 @@ extension NSScreen {
         }
         return localizedName + ":\(frame.origin.x):\(frame.origin.y)"
     }
+
+    /// 与主 App `WallpaperScreenIdentity.orderedScreens` 保持一致：
+    /// 主屏优先、从左到右、从上到下。CLI 索引必须与 App 侧一致，
+    /// 否则 sleep/wake 后 `NSScreen.screens` 打乱会导致 Web 壁纸落到错误显示器。
+    static var screensOrderedForDisplay: [NSScreen] {
+        let screens = NSScreen.screens
+        let mainID = NSScreen.main?.wallpaperScreenIdentifier
+        return screens.sorted { lhs, rhs in
+            let lhsIsMain = lhs.wallpaperScreenIdentifier == mainID
+            let rhsIsMain = rhs.wallpaperScreenIdentifier == mainID
+            if lhsIsMain != rhsIsMain {
+                return lhsIsMain
+            }
+            let lx = lhs.frame.origin.x
+            let rx = rhs.frame.origin.x
+            if abs(lx - rx) > 0.5 {
+                return lx < rx
+            }
+            let ly = lhs.frame.origin.y
+            let ry = rhs.frame.origin.y
+            if abs(ly - ry) > 0.5 {
+                return lhs.frame.maxY > rhs.frame.maxY
+            }
+            return lhs.wallpaperScreenIdentifier < rhs.wallpaperScreenIdentifier
+        }
+    }
 }
 
 // MARK: - Constants
@@ -954,14 +980,17 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         userPropertiesJSON: String? = nil,
         completion: ((Bool) -> Void)? = nil
     ) {
-        // 解析目标屏幕索引
-        let screens = NSScreen.screens
+        // 解析目标屏幕索引（与 App 共用稳定顺序，禁止依赖系统枚举）
+        let screens = NSScreen.screensOrderedForDisplay
         let screenIdx: Int
         if offscreen {
             screenIdx = Self.offlineBakeScreen
         } else if let s = screen, s >= 0, s < screens.count {
             screenIdx = s
-        } else if let main = NSScreen.main, let mainIdx = screens.firstIndex(of: main) {
+        } else if let main = NSScreen.main,
+                  let mainIdx = screens.firstIndex(where: {
+                      $0.wallpaperScreenIdentifier == main.wallpaperScreenIdentifier
+                  }) {
             screenIdx = mainIdx
         } else {
             screenIdx = 0
@@ -1951,7 +1980,7 @@ private final class DesktopWallpaperManager {
 
     /// 停掉已不对应任何 NSScreen 的 web 槽位（断线后 index 越界，或窗口落在虚空）。
     private func cleanupOrphanedScreensAfterDisplayChange() {
-        let screens = NSScreen.screens
+        let screens = NSScreen.screensOrderedForDisplay
         let screenCount = screens.count
         let orphanIndices = screenStates.keys.filter { idx in
             if idx < 0 { return true }
@@ -2139,7 +2168,7 @@ private final class DesktopWallpaperManager {
         }
 
         let workspace = NSWorkspace.shared
-        let screens = NSScreen.screens
+        let screens = NSScreen.screensOrderedForDisplay
         guard screen >= 0, screen < screens.count else { return }
         let targetScreen = screens[screen]
 
@@ -2542,7 +2571,7 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                 case .set:
                     if let path = msg.path {
                         let targetSize: (Int, Int)
-                        let screens = NSScreen.screens
+                        let screens = NSScreen.screensOrderedForDisplay
                         if let s = msg.screen, s >= 0, s < screens.count {
                             let frame = screens[s].frame
                             targetSize = (Int(frame.width), Int(frame.height))

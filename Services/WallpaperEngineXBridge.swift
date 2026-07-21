@@ -1552,7 +1552,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         for screen in screens {
             guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
             let displayID = screenNumber.uint32Value
-            let screenIdx = NSScreen.screens.firstIndex(of: screen) ?? 0
+            let screenIdx = WallpaperScreenIdentity.stableIndex(of: screen) ?? 0
             let capturePath = legacyCLICapturePath(for: screenIdx)
 
             if FileManager.default.fileExists(atPath: capturePath) {
@@ -1610,7 +1610,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             throw WallpaperEngineError.executionFailed("当前没有运行中的 Web 壁纸")
         }
 
-        let targetIndexes = NSScreen.screens.enumerated().compactMap { index, screen -> Int? in
+        let targetIndexes = NSScreen.screensOrderedForDisplay.enumerated().compactMap { index, screen -> Int? in
             isWebWallpaperOn(screen: screen) ? index : nil
         }
         guard !targetIndexes.isEmpty else {
@@ -2296,10 +2296,9 @@ final class WallpaperEngineXBridge: ObservableObject {
     }
 
     private static func legacyCLIScreenIndex(for screen: NSScreen) -> Int? {
-        NSScreen.screens.firstIndex {
-            $0.wallpaperScreenIdentifier == screen.wallpaperScreenIdentifier
-                || $0.wallpaperScreenFingerprint == screen.wallpaperScreenFingerprint
-        }
+        // 与 wallpaperengine-cli daemon 使用同一套稳定顺序，避免系统枚举打乱后
+        // App 与 daemon 的 screen 索引指向不同物理显示器。
+        WallpaperScreenIdentity.stableIndex(of: screen)
     }
 
     private func removeScreenProcess(_ screenID: String) {
@@ -4232,11 +4231,12 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         try? FileManager.default.removeItem(at: dst)
         guard (try? FileManager.default.copyItem(at: src, to: dst)) != nil else { return }
 
+        let orderedScreens = NSScreen.screensOrderedForDisplay
         let screens: [NSScreen]
-        if let idx = currentScreenIndex, NSScreen.screens.indices.contains(idx) {
-            screens = [NSScreen.screens[idx]]
+        if let idx = currentScreenIndex, orderedScreens.indices.contains(idx) {
+            screens = [orderedScreens[idx]]
         } else {
-            screens = NSScreen.screens
+            screens = orderedScreens
         }
         for screen in screens {
             try? NSWorkspace.shared.setDesktopImageURLForAllSpaces(dst, for: screen, options: [

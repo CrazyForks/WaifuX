@@ -526,9 +526,10 @@ final class StatusBarController: NSObject {
         // 全局同步开启时合并为单一入口，避免同一份全局配置重复出现。
         let displayScreens: [NSScreen]
         if isGlobalDisplaySyncEnabled {
-            displayScreens = NSScreen.screens.first.map { [$0] } ?? []
+            // 全局同步入口用主屏（稳定序第 0 项），避免系统枚举顺序跳动
+            displayScreens = NSScreen.screensOrderedForDisplay.first.map { [$0] } ?? []
         } else {
-            displayScreens = NSScreen.screens
+            displayScreens = NSScreen.screensOrderedForDisplay
         }
 
         // 每屏一个顶层子菜单（多屏直接平铺，无外层「显示器」包裹）
@@ -584,7 +585,7 @@ final class StatusBarController: NSObject {
             screenMenuItem.submenu = screenSubMenu
             let schedulerConfig = isGlobalDisplaySyncEnabled
                 ? WallpaperSchedulerService.shared.globalDisplayConfig
-                : WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screen.wallpaperScreenIdentifier)
+                : WallpaperSchedulerService.shared.resolvedDisplayConfig(for: screen)
             let screenHasManagedWallpaper: Bool
             if isGlobalDisplaySyncEnabled {
                 screenHasManagedWallpaper = screenHasWallpaper

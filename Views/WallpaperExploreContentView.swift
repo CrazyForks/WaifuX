@@ -490,7 +490,7 @@ struct WallpaperExploreContentView: View {
                 onDismiss: { showWallpaperURLSheet = false },
                 title: "通过链接打开壁纸",
                 placeholder: "粘贴壁纸链接...",
-                supportedFormatsHint: "支持格式：wallhaven.cc/w/{id}、4kwallpapers.com/…/{name}-{id}.html、konachan.net/post/show/{id}、pixiv.net/artworks/{id}"
+                supportedFormatsHint: "支持格式：whvn.cc/{id}、wallhaven.cc/w/{id}、4kwallpapers.com/…/{name}-{id}.html、konachan.net/post/show/{id}、pixiv.net/artworks/{id}"
             )
         }
     }

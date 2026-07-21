@@ -108,6 +108,11 @@ class WallpaperSchedulerViewModel: ObservableObject {
         schedulerService.resolvedDisplayConfig(for: screen)
     }
 
+    /// 返回写入配置时使用的 screenID；必要时先把旧 NSScreenNumber 下的配置迁移过来。
+    func displayConfigScreenID(for screen: NSScreen) -> String {
+        schedulerService.displayConfigScreenID(for: screen)
+    }
+
     func updateDisplayEnabled(_ enabled: Bool, for screenID: String) {
         schedulerService.updateDisplayEnabled(enabled, for: screenID)
     }

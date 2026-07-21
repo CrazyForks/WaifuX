@@ -590,17 +590,51 @@ class WallpaperViewModel: ObservableObject {
 
     // MARK: - 通过 URL 解析壁纸
 
-    /// 提取 Wallhaven 壁纸 ID（支持 wallhaven.cc/w/{id} 和 wallhaven.cc/wallpaper/{id}）
+    /// 提取 Wallhaven 壁纸 ID。
+    /// 支持：
+    /// - `https://wallhaven.cc/w/{id}` / `.../wallpaper/{id}`
+    /// - 短链 `https://whvn.cc/{id}`（详情页「复制链接」常见格式，会 301 到 wallhaven.cc/w/{id}）
+    /// - 裸 ID（如 `po71m9`）
     static func extractWallhavenID(from urlString: String) -> String? {
-        guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)),
-              url.host?.contains("wallhaven") == true else { return nil }
-        let pathComponents = url.pathComponents
-        // 格式: /w/{id} 或 /wallpaper/{id}
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // 裸 ID：Wallhaven 壁纸 ID 为 5–7 位字母数字（常见 6 位）
+        if Self.isWallhavenWallpaperID(trimmed) {
+            return trimmed
+        }
+
+        guard let url = URL(string: trimmed), let host = url.host?.lowercased() else { return nil }
+        let pathComponents = url.pathComponents.filter { $0 != "/" }
+
+        // 短链：whvn.cc/{id}（也可能是 whvn.cc/w/{id}）
+        if host == "whvn.cc" || host.hasSuffix(".whvn.cc") {
+            if pathComponents.count == 1, Self.isWallhavenWallpaperID(pathComponents[0]) {
+                return pathComponents[0]
+            }
+            if let idIndex = pathComponents.firstIndex(where: { $0 == "w" || $0 == "wallpaper" }),
+               idIndex + 1 < pathComponents.count,
+               Self.isWallhavenWallpaperID(pathComponents[idIndex + 1]) {
+                return pathComponents[idIndex + 1]
+            }
+            return nil
+        }
+
+        // 正式站：wallhaven.cc/w/{id} 或 /wallpaper/{id}
+        guard host.contains("wallhaven") else { return nil }
         if let idIndex = pathComponents.firstIndex(where: { $0 == "w" || $0 == "wallpaper" }),
-           idIndex + 1 < pathComponents.count {
+           idIndex + 1 < pathComponents.count,
+           Self.isWallhavenWallpaperID(pathComponents[idIndex + 1]) {
             return pathComponents[idIndex + 1]
         }
         return nil
+    }
+
+    /// Wallhaven 壁纸 ID：仅字母数字，长度 5–7（官方短链 /w/ 与 whvn.cc 一致）。
+    private static func isWallhavenWallpaperID(_ value: String) -> Bool {
+        let id = value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard (5...7).contains(id.count) else { return false }
+        return id.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) }
     }
 
     /// 提取 4KWallpapers 详情页 URL（4kwallpapers.com/.../{name}-{id}.html）
