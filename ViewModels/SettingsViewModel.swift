@@ -85,7 +85,7 @@ class SettingsViewModel: ObservableObject {
             applyVideoOptimizationSettings()
         }
     }
-    /// 视频下载、设壁纸或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
+    /// 视频下载或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
     /// 与详情页 / 我的库手动「优化视频」同一流水线；手动入口不依赖此开关。
     @Published var autoOptimizeVideosAfterDownload = false {
         didSet {

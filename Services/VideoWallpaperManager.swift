@@ -1683,21 +1683,6 @@ final class VideoWallpaperManager: ObservableObject {
         frameInterpolationDebugPrint("播放器已刷新：优化源视频=\(sourceURL.lastPathComponent)，播放文件=\(outputURL.lastPathComponent)")
     }
 
-    func restoreOriginalVideoAfterDeletingFrameInterpolation(videoURL: URL, targetFPSs: Set<Int>) {
-        for screen in NSScreen.screens {
-            let screenID = screen.wallpaperScreenIdentifier
-            let currentSourceURL = videoURLByScreen[screenID]
-                ?? videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
-                ?? currentVideoURL
-            guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL,
-                  targetFPSs.contains(frameInterpolationTargetFPS(for: screen)),
-                  frameInterpolatedPlaybackURLByScreen[screenID] != nil else {
-                continue
-            }
-            replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
-        }
-    }
-
     func reloadPlaybackAfterInPlaceInterpolation(videoURL: URL) {
         reloadPlaybackAfterInPlaceReplacement(videoURL: videoURL, markAsInterpolated: true)
     }
@@ -1724,48 +1709,6 @@ final class VideoWallpaperManager: ObservableObject {
                 markAsInterpolated: markAsInterpolated
             )
         }
-    }
-
-    private func replacePlayerWithOriginalVideoIfNeeded(screenID: String, sourceURL: URL) {
-        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
-              let window = windows[screenID],
-              let containerView = window.contentView as? WallpaperVideoContainerView else {
-            return
-        }
-
-        let oldPlayer = players[screenID]
-        let oldLooper = loopers[screenID]
-        let schedulerConfig = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screenID)
-        let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
-        players.removeValue(forKey: screenID)
-        if oldLooper != nil {
-            loopers.removeValue(forKey: screenID)
-        }
-        let components = resolvePlayerComponents(
-            for: screen,
-            videoURL: sourceURL,
-            muted: isMuted,
-            enableLooping: !isOnEndMode
-        )
-        assignPlayerComponents(components, to: screenID)
-        frameInterpolatedPlaybackURLByScreen.removeValue(forKey: screenID)
-        containerView.playerLayer.player = components.player
-        containerView.playerLayer.videoGravity = .resizeAspectFill
-        applyCropToScreen(screen)
-        applyPlayerAudioPolicy(components.player, muted: isMuted, volume: volumeByScreen[screenID] ?? volume)
-        if !isPaused {
-            components.player.play()
-        }
-
-        if isOnEndMode {
-            onEndModeScreens.insert(screenID)
-            setupPlaybackEndObserver(for: screenID, player: components.player, item: components.item)
-        }
-
-        if let oldPlayer, oldPlayer !== components.player {
-            releasePlayerIfUnreferenced(oldPlayer, looper: oldLooper)
-        }
-        frameInterpolationDebugPrint("删除补帧后已切回原视频：屏幕=\(screen.localizedName)，视频=\(sourceURL.lastPathComponent)")
     }
 
     private func resetFrameInterpolation(for screenID: String, player: AVQueuePlayer, item: AVPlayerItem) {

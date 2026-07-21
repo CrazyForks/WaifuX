@@ -348,7 +348,7 @@ struct FrameInterpolationRecordItem: Identifiable, Equatable, Codable {
 
 
 struct VideoOptimizationAutomaticPolicy: Equatable {
-    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」。
+    /// 下载 / 烘焙完成后是否自动「优化视频」。
     /// 与手动入口一致：先循环分析，再补帧（Scene bake 产物跳过循环分析）。
     var automaticallyOptimizeVideos: Bool
     var targetFPS: Int
@@ -371,7 +371,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     @Published private(set) var completedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var blacklistedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var history: [VideoOptimizationHistoryRecord] = []
-    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」（循环 → 补帧）。
+    /// 下载/烘焙完成后是否自动进入优化流水线。
     @Published private(set) var automaticPolicy = VideoOptimizationAutomaticPolicy.disabled
 
     /// 兼容旧属性名：映射到统一自动优化开关。
@@ -473,9 +473,9 @@ final class VideoOptimizationQueueService: ObservableObject {
             needsLoop = false
         } else if preferDurableLoopState {
             switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
-            case .applied, .notNeeded:
+            case .applied, .notNeeded, .noReliablePoint:
                 needsLoop = false
-            case .idle, .failed, .noReliablePoint:
+            case .idle, .failed:
                 needsLoop = true
             }
         } else {
@@ -531,7 +531,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         planningVideoPaths.remove(videoURL.standardizedFileURL.path)
     }
 
-    /// 下载 / 设壁纸 / 烘焙完成后的统一自动入口。
+    /// 下载或烘焙完成后的统一自动入口。
     @discardableResult
     func enqueueAutomaticOptimizationIfNeeded(
         videoURL: URL,
@@ -736,21 +736,6 @@ final class VideoOptimizationQueueService: ObservableObject {
             title: title,
             targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             operations: ops
-        )
-        persistQueueCheckpointImmediately()
-    }
-
-    /// Blacklist after a fresh source restore instead of stamping the old file.
-    func requestBlacklistAfterSourceRestore(
-        videoURL: URL,
-        title: String? = nil,
-        operation: FrameInterpolationQueueItem.Operation
-    ) {
-        sourceRestoreRequests[videoURL.standardizedFileURL.path] = .blacklist(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            operation: operation
         )
         persistQueueCheckpointImmediately()
     }

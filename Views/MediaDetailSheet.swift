@@ -75,14 +75,11 @@ struct MediaDetailSheet: View {
     @State private var copyToastMessage = "链接已复制"
     @State private var showMoreOptionsPopover = false
     @State private var showDeleteBakeConfirm = false
-    @State private var showDeleteFrameInterpolationConfirm = false
     @State private var showRemoveFrameInterpolationBlacklistConfirm = false
-    @State private var pendingDeleteFrameInterpolationURL: URL?
     @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
     @State private var isDeletingBake = false
     /// 删除烘焙 / 本地预览源变化时递增，强制详情背景重建（避免仍挂已删 MP4 黑屏）
     @State private var mediaBackgroundEpoch: Int = 0
-    @State private var isDeletingFrameInterpolation = false
     @State private var isResettingVideoOptimization = false
     @State private var isTranscodingVideo = false
     @State private var transcodeVideoProgress: Double = 0
@@ -391,17 +388,6 @@ struct MediaDetailSheet: View {
             Button(t("cancel"), role: .cancel) {}
         } message: {
             Text("将删除该壁纸的离线烘焙视频，静态预览图保留。删除后会立即用静态图替换正在显示的锁屏/桌面壁纸。")
-        }
-        .alert(t("frameInterpolationDeleteConfirmTitle"), isPresented: $showDeleteFrameInterpolationConfirm) {
-            Button(t("frameInterpolationDeleteButton"), role: .destructive) {
-                guard let url = pendingDeleteFrameInterpolationURL else { return }
-                Task { await deleteFrameInterpolationFileAndRedownload(videoURL: url) }
-            }
-            Button(t("cancel"), role: .cancel) {
-                pendingDeleteFrameInterpolationURL = nil
-            }
-        } message: {
-            Text(t("frameInterpolationDeleteConfirmMessage"))
         }
         .alert(t("frameInterpolationBlacklistRemoveConfirmTitle"), isPresented: $showRemoveFrameInterpolationBlacklistConfirm) {
             Button(t("frameInterpolationBlacklistRemoveButton"), role: .destructive) {
@@ -1837,28 +1823,20 @@ struct MediaDetailSheet: View {
             }
 
             if let optimizationVideoURL = currentOptimizationVideoURL,
-               shouldShowVideoOptimizationMenuItem(videoURL: optimizationVideoURL) {
-                videoOptimizationMenuItem(videoURL: optimizationVideoURL)
+               let statusTitle = videoOptimizationStatusTitle(videoURL: optimizationVideoURL) {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                    Text(statusTitle)
+                    Spacer()
+                }
+                .foregroundStyle(Color(hex: "30D158"))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             }
 
-            if let interpolationVideoURL = currentOptimizationVideoURL,
-               case .applied = VideoOptimizationRecordStore.shared.frameState(for: interpolationVideoURL) {
-                Button {
-                    showMoreOptionsPopover = false
-                    pendingDeleteFrameInterpolationURL = interpolationVideoURL
-                    showDeleteFrameInterpolationConfirm = true
-                } label: {
-                    HStack {
-                        Image(systemName: "trash")
-                        Text(t("frameInterpolationDeleteFile"))
-                        Spacer()
-                    }
-                    .foregroundStyle(Color(hex: "FF453A"))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.plain)
-                .disabled(isDeletingFrameInterpolation)
+            if let optimizationVideoURL = currentOptimizationVideoURL,
+               shouldShowVideoOptimizationMenuItem(videoURL: optimizationVideoURL) {
+                videoOptimizationMenuItem(videoURL: optimizationVideoURL)
             }
 
             // 复制静态图片
@@ -1975,7 +1953,21 @@ struct MediaDetailSheet: View {
 
     private func shouldShowVideoOptimizationSection(videoURL: URL) -> Bool {
         shouldShowVideoOptimizationMenuItem(videoURL: videoURL)
-            || isFrameInterpolationApplied(videoURL: videoURL)
+            || videoOptimizationStatusTitle(videoURL: videoURL) != nil
+    }
+
+    private func videoOptimizationStatusTitle(videoURL: URL) -> String? {
+        switch VideoOptimizationRecordStore.shared.optimizationState(
+            for: videoURL,
+            targetFPS: currentFrameInterpolationTargetFPS
+        ) {
+        case .completed:
+            return t("videoOptimizationCompleted")
+        case .notNeeded:
+            return t("videoOptimizationNotNeeded")
+        case .idle, .failed, .blacklisted:
+            return nil
+        }
     }
 
     private func shouldShowVideoOptimizationMenuItem(videoURL: URL) -> Bool {
@@ -2075,9 +2067,9 @@ struct MediaDetailSheet: View {
     ) -> [FrameInterpolationQueueItem.Operation] {
         var operations: [FrameInterpolationQueueItem.Operation] = []
         switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
-        case .idle, .failed, .noReliablePoint:
+        case .idle, .failed:
             operations.append(.loopTransition)
-        case .applied, .notNeeded:
+        case .applied, .notNeeded, .noReliablePoint:
             break
         }
 
@@ -2115,16 +2107,8 @@ struct MediaDetailSheet: View {
         return false
     }
 
-    private func isFrameInterpolationApplied(videoURL: URL) -> Bool {
-        if case .applied = VideoOptimizationRecordStore.shared.frameState(for: videoURL) {
-            return true
-        }
-        return false
-    }
-
     /// Clears durable optimization state, removes library files, then re-downloads source.
-    /// 对齐本地 `deleteFrameInterpolationFileAndRedownload`：先清队列/sidecar，
-    /// 再 `removeDownloads`（含物理文件 + 烘焙产物），最后重下。
+    /// 先清队列/sidecar，再 `removeDownloads`（含物理文件 + 烘焙产物），最后重下。
     private func deleteAndRedownloadCurrentItem() {
         guard !isResettingVideoOptimization, !isLocalFile else { return }
 
@@ -2890,60 +2874,6 @@ struct MediaDetailSheet: View {
                     ["id": itemID, "error": error.localizedDescription,
                      "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
             }
-        }
-    }
-
-    private func deleteFrameInterpolationFileAndRedownload(videoURL: URL) async {
-        guard !isDeletingFrameInterpolation else { return }
-        let downloadingItem = resolvedItem
-        let itemID = downloadingItem.id
-        isDeletingFrameInterpolation = true
-        downloadActivity.start(itemID: itemID)
-        errorMessage = ""
-        defer {
-            isDeletingFrameInterpolation = false
-            downloadActivity.finish(itemID: itemID)
-            pendingDeleteFrameInterpolationURL = nil
-        }
-
-        let targetFPS = currentFrameInterpolationTargetFPS
-        // Clear in-memory/queue state now; blacklist the *restored* source after download.
-        frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
-        frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
-        frameInterpolationQueue.requestBlacklistAfterSourceRestore(
-            videoURL: videoURL,
-            title: downloadingItem.title,
-            operation: .frameInterpolation
-        )
-
-        do {
-            if FileManager.default.fileExists(atPath: videoURL.path) {
-                try FileManager.default.removeItem(at: videoURL)
-            }
-
-            if itemID.hasPrefix("workshop_") {
-                try await viewModel.downloadWorkshopWallpaper(downloadingItem)
-            } else {
-                try await viewModel.download(downloadingItem)
-            }
-            refreshResolvedItemAfterLocalDownload()
-
-            // registerDownloadedSource runs on download completion and clears old state;
-            // then enqueueAfterDownloadIfNeeded consumes the blacklist restore request.
-            VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
-            sceneBakeStatusFlash = "已重新下载原文件"
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                sceneBakeStatusFlash = nil
-            }
-        } catch {
-            errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-            showError = true
-            AppLogger.error(.download, "删除补帧文件后重新下载失败", metadata: [
-                "id": itemID,
-                "video": videoURL.path,
-                "error": error.localizedDescription
-            ])
         }
     }
 

@@ -84,7 +84,6 @@ enum LocalWallpaperApplyService {
         // 1) 直接视频文件
         if !isDirectory.boolValue, videoExts.contains(ext) {
             try await applyVideo(localURL, to: screens, options: options)
-            VideoOptimizationAutomationService.considerAppliedVideo(localURL)
             return true
         }
 

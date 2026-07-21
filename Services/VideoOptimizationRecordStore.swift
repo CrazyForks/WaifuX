@@ -131,6 +131,14 @@ final class VideoOptimizationRecordStore {
         case blacklisted
     }
 
+    enum OptimizationState: Equatable {
+        case idle
+        case completed
+        case notNeeded
+        case failed
+        case blacklisted
+    }
+
     private let videoExtensions: Set<String> = [
         "mp4", "mov", "m4v", "mkv", "webm", "avi", "flv", "wmv"
     ]
@@ -321,6 +329,55 @@ final class VideoOptimizationRecordStore {
              .frameQueued, .frameStarted, .frameCancelled:
             return .idle
         }
+    }
+
+    /// Derives the whole-pipeline result from the durable sidecar events.
+    /// Scene bake provenance satisfies the loop stage by design; ordinary videos
+    /// require a terminal loop judgment before the overall result is complete.
+    func optimizationState(for videoURL: URL, targetFPS: Int) -> OptimizationState {
+        let record = record(for: videoURL)
+        let isSceneBake = record?.source?.kind == .sceneBake
+        let loop = loopState(for: videoURL)
+        let frame = frameState(for: videoURL)
+
+        if frame == .blacklisted { return .blacklisted }
+        if loop == .failed || frame == .failed { return .failed }
+
+        let loopResolved: Bool
+        let loopChangedFile: Bool
+        if isSceneBake {
+            loopResolved = true
+            loopChangedFile = false
+        } else {
+            switch loop {
+            case .applied:
+                loopResolved = true
+                loopChangedFile = true
+            case .notNeeded, .noReliablePoint:
+                loopResolved = true
+                loopChangedFile = false
+            case .idle, .failed:
+                loopResolved = false
+                loopChangedFile = false
+            }
+        }
+
+        let frameResolved: Bool
+        let frameChangedFile: Bool
+        switch frame {
+        case .applied(let appliedTarget):
+            frameResolved = (appliedTarget ?? 0) >= targetFPS
+            frameChangedFile = frameResolved
+        case .notNeeded(let checkedTarget):
+            frameResolved = (checkedTarget ?? 0) >= targetFPS
+            frameChangedFile = false
+        case .idle, .failed, .blacklisted:
+            frameResolved = false
+            frameChangedFile = false
+        }
+
+        guard loopResolved, frameResolved else { return .idle }
+        return loopChangedFile || frameChangedFile ? .completed : .notNeeded
     }
 
     @discardableResult
