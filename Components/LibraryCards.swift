@@ -526,13 +526,16 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
             guard let updatedItemID = notification.object as? String,
                   updatedItemID == item.id else { return }
+            // 强制 KFImage 换 id，避免同 path 的 list_*.jpg / scene_bake_*.jpg 仍吃旧内存图
             thumbnailRefreshID &+= 1
             resolvedThumbnailURL = nil
             cachedListThumbnailURL = nil
-            if let posterURL = notification.userInfo?["thumbnailURL"] as? URL {
-                resolvedThumbnailURL = posterURL
-                cachedListThumbnailURL = posterURL
+            if let thumbURL = notification.userInfo?["thumbnailURL"] as? URL {
+                resolvedThumbnailURL = thumbURL
+                cachedListThumbnailURL = thumbURL
             } else {
+                // 清除产物 / 无新帧：重新解析（可能回退站点封面）
+                resolveThumbnailURL()
                 triggerThumbnailIfNeeded()
             }
         }
@@ -715,14 +718,21 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         if let bakedPath = MediaLibraryService.shared.downloadRecord(for: item.id)?.sceneBakeArtifact?.videoPath,
            !bakedPath.isEmpty {
             let bakedVideo = URL(fileURLWithPath: bakedPath)
-            if let listThumb = VideoThumbnailCache.shared.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedVideo) {
+            // 通知刚写入的新帧已进 cachedListThumbnailURL 时不要用旧磁盘 list 覆盖
+            if cachedListThumbnailURL == nil,
+               let listThumb = VideoThumbnailCache.shared.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedVideo) {
                 resolvedThumbnailURL = listThumb
                 cachedListThumbnailURL = listThumb
                 return
             }
-            if let hd = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
+            if cachedListThumbnailURL == nil,
+               let hd = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
                 resolvedThumbnailURL = hd
                 cachedListThumbnailURL = hd
+            }
+            // 已有有效列表帧则不必再生成；缺则后台补
+            if VideoThumbnailCache.shared.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedVideo) != nil {
+                return
             }
             Task { @MainActor in
                 // 不在主线程 isUsableBakedVideo（外置卡 stat 很慢）；生成侧会自己检查文件

@@ -51,26 +51,41 @@ extension Notification.Name {
 @MainActor
 func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> URL? {
     guard SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) else { return nil }
-    guard let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+
+    // 重新烘焙时 MP4 路径通常不变（analysisId+分辨率+fps+时长）；必须先清列表帧，
+    // 否则 library 优先 list_*.jpg 会一直显示旧画面。
+    VideoThumbnailCache.shared.removeListThumbnail(forLocalVideo: videoURL)
+
+    // 并行重生：高清 poster（锁屏/桌面/详情）+ 列表完整画幅小图（我的库网格）
+    async let posterTask = VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
         forLocalVideo: videoURL,
         itemID: itemID,
         forceRegenerate: true
-    ) else {
-        return nil
-    }
-    // 清除 Kingfisher 对该 poster URL 的缓存，确保下次 KFImage 加载时读取磁盘上的新文件
-    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey)
-    // KFImage 使用了 DownsamplingImageProcessor(size: 512x512)，处理器会生成不同的缓存 key
-    // （格式：originalKey@processorIdentifier），必须一并清除，否则旧的降采样版本仍被命中
+    )
+    async let listTask = VideoThumbnailCache.shared.regenerateListThumbnailJPEGFileURL(forLocalVideo: videoURL)
+    let posterURL = await posterTask
+    let listURL = await listTask
+
+    // 库列表优先完整画幅 list 帧；无则退 poster
+    let displayURL = listURL ?? posterURL
+    guard let displayURL else { return nil }
+
     let processor = DownsamplingImageProcessor(size: CGSize(width: 512, height: 512))
-    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey, processorIdentifier: processor.identifier)
-    print("[BakeService] ✅ 已清除 Kingfisher 缓存: \(posterURL.cacheKey)")
+    for url in [displayURL, posterURL, listURL].compactMap({ $0 }) {
+        try? await ImageCache.default.removeImage(forKey: url.cacheKey)
+        try? await ImageCache.default.removeImage(
+            forKey: url.cacheKey,
+            processorIdentifier: processor.identifier
+        )
+    }
+    print("[BakeService] ✅ 已刷新烘焙封面 item=\(itemID) list=\(listURL?.lastPathComponent ?? "nil") poster=\(posterURL?.lastPathComponent ?? "nil")")
+
     NotificationCenter.default.post(
         name: .sceneOfflineBakeThumbnailDidUpdate,
         object: itemID,
-        userInfo: ["thumbnailURL": posterURL]
+        userInfo: ["thumbnailURL": displayURL]
     )
-    return posterURL
+    return displayURL
 }
 
 /// 所有离线烘焙共用的串行 FIFO 队列。
