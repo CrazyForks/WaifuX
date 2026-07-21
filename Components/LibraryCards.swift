@@ -64,6 +64,9 @@ extension MediaItem {
     }
 
     /// 若 `url` 是目录（壁纸引擎 Workshop 项），递归查找其中的视频文件并返回；若是视频文件则直接返回。
+    ///
+    /// 注意：根目录有 `.pkg` 时仍可能带 `video.mp4`（混合工程），不能一票否决；
+    /// 只跳过纯 scene（有 pkg 且无视频文件）的抽帧。
     nonisolated static func resolveLocalVideoFile(from url: URL) -> URL? {
         WorkshopLibraryPreviewCache.shared.videoFile(for: url) {
             let fm = FileManager.default
@@ -74,17 +77,26 @@ extension MediaItem {
                 return videoFileExtensions.contains(url.pathExtension.lowercased()) ? url : nil
             }
 
-            // 目录：使用 WorkshopService 的根解析逻辑
             let resolved = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: url)
-            let rootContents = (try? fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: nil)) ?? []
 
-            // scene 类型（有 .pkg 文件）不生成视频抽帧
-            if rootContents.contains(where: { $0.pathExtension.lowercased() == "pkg" }) {
-                return nil
+            // 先浅扫工程根（常见 video.mp4 / 同级媒体）
+            let rootContents = (try? fm.contentsOfDirectory(
+                at: resolved,
+                includingPropertiesForKeys: nil,
+                options: .skipsHiddenFiles
+            )) ?? []
+            if let rootVideo = rootContents.first(where: {
+                videoFileExtensions.contains($0.pathExtension.lowercased())
+            }) {
+                return rootVideo
             }
 
-            // 递归查找视频文件
-            if let enumerator = fm.enumerator(at: resolved, includingPropertiesForKeys: nil) {
+            // 再递归（部分工程把视频放 materials/ 等子目录）
+            if let enumerator = fm.enumerator(
+                at: resolved,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
                 for case let fileURL as URL in enumerator {
                     if videoFileExtensions.contains(fileURL.pathExtension.lowercased()) {
                         return fileURL
@@ -100,14 +112,16 @@ extension MediaItem {
     @MainActor
     func libraryGridThumbnailURL(localFileURL: URL?) -> URL {
         let fileCache = FileExistenceCache.shared
-        // Scene 烘焙视频是此项目的最终可播放产物，必须压过原始 GIF/preview。
-        // 该优先级不依赖原工程目录仍存在，旧路径失效时也可以继续显示已烘焙的封面。
+        // Scene 烘焙：列表优先完整画幅列表帧；高清 poster 可能已 letterbox 裁切，作次选兜底。
         if let record = MediaLibraryService.shared.downloadRecord(for: id),
-           let bakedPath = record.sceneBakeArtifact?.videoPath,
-           let extracted = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: id) {
-            // 已有 scene bake poster 时不再 stat 烘焙视频（外置卡上 isUsableBakedVideo 很贵）
-            _ = bakedPath
-            return extracted
+           let bakedPath = record.sceneBakeArtifact?.videoPath {
+            let bakedURL = URL(fileURLWithPath: bakedPath)
+            if let listThumb = VideoThumbnailCache.shared.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedURL) {
+                return listThumb
+            }
+            if let extracted = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: id) {
+                return extracted
+            }
         }
 
         if let local = localFileURL,
@@ -115,8 +129,14 @@ extension MediaItem {
            fileCache.fileExists(atPath: local.path) {
             let ext = local.pathExtension.lowercased()
 
+            // GIF：必须返回原文件（或站点封面），禁止压成 LocalImageThumbnails JPEG，否则 hover 无法播放
+            if ext == "gif" {
+                return local
+            }
+
             // 静图：优先 SSD 列表缩略图，缺失时异步生成，列表先用站点封面
-            if Self.libraryLocalRasterExtensions.contains(ext) {
+            if Self.libraryLocalRasterExtensions.contains(ext),
+               LocalImageThumbnailCache.isRasterImageFile(local) {
                 if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
                     return cached
                 }
@@ -126,20 +146,30 @@ extension MediaItem {
                 )
             }
 
-            // 直出视频文件：只读已有抽帧缓存，不在列表重建时扫目录/生成
+            // 直出视频文件：只读已有抽帧缓存（优先列表小图），不在列表重建时扫目录/生成
             if Self.videoFileExtensions.contains(ext),
                let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) {
                 return extracted
             }
 
-            // Workshop 目录：仅在已有缓存时解析 type/preview，避免冷路径递归枚举
+            // Workshop 目录：
+            // - 有可抽帧视频时：**优先**已有列表抽帧 / 高清 poster，preview 只作临时占位
+            //   （Steam preview 往往极小，scaledToFill 后像马赛克，用户会以为「没抽帧」）
+            // - 无视频（纯 scene/web）才长期用 preview / 远程封面
             if fileCache.isDirectory(atPath: local.path) {
+                if let resolved = Self.resolveLocalVideoFile(from: local),
+                   let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) {
+                    return extracted
+                }
                 if let localPreview = Self.resolveLocalWorkshopPreviewImage(from: local) {
+                    // preview.gif 必须原路径，供 hover 播放
+                    if LocalImageThumbnailCache.isGIFFile(localPreview) {
+                        return localPreview
+                    }
                     if LocalImageThumbnailCache.isRasterImageFile(localPreview),
                        let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: localPreview) {
                         return cached
                     }
-                    // preview 若在外置卡上仍可能大；能走静图缓存则走，否则直接返回 preview（通常远小于原片）
                     if LocalImageThumbnailCache.isRasterImageFile(localPreview) {
                         return LocalImageThumbnailCache.shared.listThumbnailURL(
                             forLocalFile: localPreview,
@@ -147,10 +177,6 @@ extension MediaItem {
                         )
                     }
                     return localPreview
-                }
-                if let resolved = Self.resolveLocalVideoFile(from: local),
-                   let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) {
-                    return extracted
                 }
             }
         }
@@ -160,36 +186,149 @@ extension MediaItem {
         return coverImageURL
     }
 
-    /// 文件夹卡片只读取已存在的封面，不扫描 Workshop 目录或触发视频抽帧。
-    /// 打开文件夹后，由可见的媒体卡片按需生成缺失的海报。
+    /// 文件夹卡片封面：与夹内列表同一套「清晰源」优先级，但**只读已有 SSD 缓存**，
+/// 不在此函数里同步扫外置卡/抽帧（生成由 `refreshMediaFolderDisplay` 后台预热）。
+///
+/// 优先级：
+/// 1. scene bake 列表帧 / 高清 poster
+/// 2. 本地视频列表抽帧（含 Workshop 目录内已解析视频）
+/// 3. 本地静图 SSD 列表小图
+/// 4. 本地 GIF / 已落盘 poster
+/// 5. 站点 cover（可能偏糊，仅作占位）
     @MainActor
     func libraryFolderThumbnailURL(localFileURL: URL?) -> URL {
         let fileCache = FileExistenceCache.shared
-        if let extracted = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: id) {
+        let videoCache = VideoThumbnailCache.shared
+
+        // Scene 烘焙：优先完整画幅列表帧，再高清 poster
+        if let record = MediaLibraryService.shared.downloadRecord(for: id),
+           let bakedPath = record.sceneBakeArtifact?.videoPath,
+           !bakedPath.isEmpty {
+            let bakedURL = URL(fileURLWithPath: bakedPath)
+            if let listThumb = videoCache.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedURL) {
+                return listThumb
+            }
+            if let extracted = videoCache.cachedSceneBakePosterFileURLIfExists(itemID: id) {
+                return extracted
+            }
+        } else if let extracted = videoCache.cachedSceneBakePosterFileURLIfExists(itemID: id) {
             return extracted
         }
 
-        if let local = localFileURL,
-           local.isFileURL,
-           fileCache.fileExists(atPath: local.path) {
+        if let local = localFileURL, local.isFileURL {
             let ext = local.pathExtension.lowercased()
-            if Self.libraryLocalRasterExtensions.contains(ext) {
-                if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
-                    return cached
-                }
-                // 文件夹预览也不读外置原图，缺缓存时回退站点封面
-                return coverImageURL
-            }
+
+            // 直出视频：只认已有列表/poster 缓存
             if Self.videoFileExtensions.contains(ext),
-               let extracted = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) {
+               let extracted = videoCache.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) {
                 return extracted
+            }
+
+            // 静图：SSD 列表小图
+            if LocalImageThumbnailCache.isRasterImageFile(local),
+               let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
+                return cached
+            }
+
+            // GIF 原文件（动图本身通常已是封面尺寸）
+            if LocalImageThumbnailCache.isGIFFile(local) {
+                return local
+            }
+
+            // Workshop 目录：优先内部视频的已有抽帧，其次 preview 的 SSD 小图/原 preview
+            // 注意：不在此处 fileExists 负缓存短路；缓存查找本身只打 SSD
+            if fileCache.isDirectory(atPath: local.path)
+                || ext.isEmpty
+                || (!Self.videoFileExtensions.contains(ext) && !Self.libraryLocalRasterExtensions.contains(ext)) {
+                if let resolved = Self.resolveLocalVideoFile(from: local),
+                   let extracted = videoCache.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) {
+                    return extracted
+                }
+                if let preview = Self.resolveLocalWorkshopPreviewImage(from: local) {
+                    if LocalImageThumbnailCache.isGIFFile(preview) {
+                        return preview
+                    }
+                    if LocalImageThumbnailCache.isRasterImageFile(preview),
+                       let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: preview) {
+                        return cached
+                    }
+                    // preview 本身往往偏小，仅在无抽帧时作占位
+                    return preview
+                }
             }
         }
 
         if let poster = posterURL, poster.isFileURL, fileCache.fileExists(atPath: poster.path) {
+            // 本地 poster 也可能是抽帧产物
             return poster
         }
         return coverImageURL
+    }
+
+    /// 为文件夹叠图预热：把「前 N 项」缺的列表抽帧/静图小图生成到 SSD（限流由调用方控制）。
+    /// - Returns: 是否新生成了至少一个清晰源（用于决定是否刷新文件夹 display）
+    @MainActor
+    @discardableResult
+    func ensureFolderPreviewCache(localFileURL: URL?) async -> Bool {
+        var generated = false
+        let videoCache = VideoThumbnailCache.shared
+
+        if let record = MediaLibraryService.shared.downloadRecord(for: id),
+           let bakedPath = record.sceneBakeArtifact?.videoPath,
+           !bakedPath.isEmpty {
+            let bakedURL = URL(fileURLWithPath: bakedPath)
+            if videoCache.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedURL) == nil {
+                if await videoCache.listThumbnailJPEGFileURL(forLocalVideo: bakedURL) != nil {
+                    generated = true
+                }
+            }
+            return generated
+        }
+
+        guard let local = localFileURL, local.isFileURL else { return false }
+        let ext = local.pathExtension.lowercased()
+
+        if Self.videoFileExtensions.contains(ext) {
+            if videoCache.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) == nil {
+                if await videoCache.listThumbnailJPEGFileURL(forLocalVideo: local) != nil {
+                    generated = true
+                }
+            }
+            return generated
+        }
+
+        if LocalImageThumbnailCache.isRasterImageFile(local) {
+            if LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) == nil {
+                if await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: local) != nil {
+                    generated = true
+                }
+            }
+            return generated
+        }
+
+        if LocalImageThumbnailCache.isGIFFile(local) {
+            return false
+        }
+
+        // Workshop 目录
+        if let resolved = MediaItem.resolveLocalVideoFile(from: local),
+           Self.videoFileExtensions.contains(resolved.pathExtension.lowercased()) {
+            if videoCache.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) == nil {
+                if await videoCache.listThumbnailJPEGFileURL(forLocalVideo: resolved) != nil {
+                    generated = true
+                }
+            }
+            return generated
+        }
+
+        if let preview = MediaItem.resolveLocalWorkshopPreviewImage(from: local),
+           LocalImageThumbnailCache.isRasterImageFile(preview),
+           LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: preview) == nil {
+            if await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: preview) != nil {
+                generated = true
+            }
+        }
+        return generated
     }
 }
 
@@ -256,6 +395,27 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         cachedListThumbnailURL ?? thumbnailURL ?? item.coverImageURL
     }
 
+    /// hover 播放源：必须是真实 GIF 文件，不能是 LocalImageThumbnails / VideoThumbnails 里的静态 JPEG。
+    private var animatedGIFSourceURL: URL {
+        if let local = localMediaFileURL, LocalImageThumbnailCache.isGIFFile(local) {
+            return local
+        }
+        if let local = localMediaFileURL,
+           local.isFileURL,
+           FileExistenceCache.shared.isDirectory(atPath: local.path),
+           let preview = MediaItem.resolveLocalWorkshopPreviewImage(from: local),
+           LocalImageThumbnailCache.isGIFFile(preview) {
+            return preview
+        }
+        if LocalImageThumbnailCache.isGIFFile(listThumbnailURL) {
+            return listThumbnailURL
+        }
+        if let thumbnailURL, LocalImageThumbnailCache.isGIFFile(thumbnailURL) {
+            return thumbnailURL
+        }
+        return listThumbnailURL
+    }
+
     private var shouldAnimateGIF: Bool {
         isHovered && isVisible
     }
@@ -291,8 +451,13 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 isHovered = hovering
             }
         }
-        .task(id: listThumbnailURL.absoluteString) {
+        .task(id: "\(animatedGIFSourceURL.absoluteString)|\(shouldProbeAnimatedThumbnail)") {
             gifProbeTask?.cancel()
+            // 路径已是 .gif 时直接认定，避免外置卡上再读文件头探测
+            if LocalImageThumbnailCache.isGIFFile(animatedGIFSourceURL) {
+                detectedGIF = true
+                return
+            }
             guard shouldProbeAnimatedThumbnail else {
                 detectedGIF = false
                 return
@@ -301,7 +466,14 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             gifProbeTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
-                let probeURL = listThumbnailURL
+                let probeURL = animatedGIFSourceURL
+                // 静态列表缓存路径不可能是动图
+                let path = probeURL.standardizedFileURL.path
+                if probeURL.isFileURL,
+                   path.contains("/WaifuX/VideoThumbnails/") || path.contains("/WaifuX/LocalImageThumbnails/") {
+                    detectedGIF = false
+                    return
+                }
                 let result = await AnimatedImageProbeCache.shared.isAnimatedGIF(
                     probeURL,
                     maxByteCount: maxAnimatedGIFBytes
@@ -408,9 +580,9 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 .clipped()
                 .id(thumbnailRefreshID)
 
-            // 顶层：仅 GIF 已确认 + 当前应播放时叠加（库列表 shouldAnimateGIF 通常包含 isHovered 条件）
+            // 顶层：仅 GIF 已确认 + 当前应播放时叠加；动画源用原始 GIF，勿用静态列表 JPEG
             if detectedGIF, shouldAnimateGIF {
-                KFAnimatedImage.url(listThumbnailURL)
+                KFAnimatedImage.url(animatedGIFSourceURL)
                     .memoryCacheExpiration(.expired)
                     .diskCacheExpiration(.days(3))
                     .cancelOnDisappear(true)
@@ -419,7 +591,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                     }
                     .placeholder { _ in Color.clear }
                     .onFailure { _ in /* 静默：底层 KFImage 兜底 */ }
-                    .id("\(listThumbnailURL.absoluteString)|play:1|r:\(thumbnailRefreshID)")
+                    .id("\(animatedGIFSourceURL.absoluteString)|play:1|r:\(thumbnailRefreshID)")
                     .aspectRatio(contentMode: .fill)
                     .frame(width: cardWidth, height: thumbnailHeight)
                     .clipped()
@@ -498,19 +670,29 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
 
     @MainActor
     private func triggerThumbnailIfNeeded() {
-        // 已有 scene bake poster：直接用，不 stat 外置烘焙文件
-        if let cached = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
-            resolvedThumbnailURL = cached
-            cachedListThumbnailURL = cached
-            return
-        }
-
-        if let bakedVideo = usableBakedSceneVideoURL() {
+        // Scene 烘焙：优先列表小图；有 poster 先占位再后台补完整画幅帧
+        if let bakedPath = MediaLibraryService.shared.downloadRecord(for: item.id)?.sceneBakeArtifact?.videoPath,
+           !bakedPath.isEmpty {
+            let bakedVideo = URL(fileURLWithPath: bakedPath)
+            if let listThumb = VideoThumbnailCache.shared.cachedListThumbnailFileURLIfExists(forLocalVideo: bakedVideo) {
+                resolvedThumbnailURL = listThumb
+                cachedListThumbnailURL = listThumb
+                return
+            }
+            if let hd = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
+                resolvedThumbnailURL = hd
+                cachedListThumbnailURL = hd
+            }
             Task { @MainActor in
-                if let poster = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
-                    forLocalVideo: bakedVideo,
-                    itemID: item.id
-                ) {
+                // 不在主线程 isUsableBakedVideo（外置卡 stat 很慢）；生成侧会自己检查文件
+                if let listThumb = await VideoThumbnailCache.shared.listThumbnailJPEGFileURL(forLocalVideo: bakedVideo) {
+                    resolvedThumbnailURL = listThumb
+                    cachedListThumbnailURL = listThumb
+                } else if cachedListThumbnailURL == nil,
+                          let poster = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                            forLocalVideo: bakedVideo,
+                            itemID: item.id
+                          ) {
                     resolvedThumbnailURL = poster
                     cachedListThumbnailURL = poster
                 }
@@ -518,14 +700,37 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             return
         }
 
-        guard resolvedThumbnailURL == nil,
-              let local = localMediaFileURL,
-              local.isFileURL,
-              FileExistenceCache.shared.fileExists(atPath: local.path) else { return }
+        if let cached = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: item.id) {
+            resolvedThumbnailURL = cached
+            cachedListThumbnailURL = cached
+            return
+        }
+
+        // 已有解析结果则不再重入
+        guard resolvedThumbnailURL == nil else { return }
+
+        // 注意：不要因 FileExistenceCache 负缓存直接 return。
+        // 外置卡上偶发 stat 失败会被缓存成 false，导致永远不抽帧。
+        guard let local = localMediaFileURL, local.isFileURL else {
+            // 无本地路径：用传入/站点封面即可
+            if cachedListThumbnailURL == nil {
+                cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
+            }
+            return
+        }
 
         let ext = local.pathExtension.lowercased()
+        let fileCache = FileExistenceCache.shared
 
-        // 静图：生成 SSD 列表缩略图，勿把外置原图塞给 KFImage
+        // GIF：直接用原文件
+        if ext == "gif" {
+            resolvedThumbnailURL = local
+            cachedListThumbnailURL = local
+            fileCache.markExisting(atPath: local.path)
+            return
+        }
+
+        // 静图
         if LocalImageThumbnailCache.isRasterImageFile(local) {
             if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
                 resolvedThumbnailURL = cached
@@ -536,36 +741,75 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: local) {
                     resolvedThumbnailURL = thumb
                     cachedListThumbnailURL = thumb
+                    fileCache.markExisting(atPath: local.path)
+                } else if cachedListThumbnailURL == nil {
+                    cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
                 }
             }
             return
         }
 
-        // 直出视频：优先已有抽帧；缺失再异步生成
+        // 直出视频文件
         if Self.videoExtensions.contains(ext) {
-            if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: local) {
-                resolvedThumbnailURL = cached
-                cachedListThumbnailURL = cached
+            applyVideoListThumbnail(for: local, fallbackCover: true)
+            return
+        }
+
+        // 父视图已解析出内部视频（轻量路径）
+        if let resolved = resolvedVideoFileURL,
+           Self.videoExtensions.contains(resolved.pathExtension.lowercased()) {
+            applyVideoListThumbnail(for: resolved, fallbackCover: true)
+            return
+        }
+
+        // Workshop 目录：有内部视频则必须抽帧；preview 仅占位，不能「有 preview 就永久 return」
+        Task { @MainActor in
+            let exists = await local.fileExistsAsync()
+            if exists {
+                fileCache.markExisting(atPath: local.path)
+            } else {
+                fileCache.invalidate(atPath: local.path)
+                if cachedListThumbnailURL == nil {
+                    cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
+                }
                 return
             }
-            Task { @MainActor in
-                if let poster = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: local) {
-                    resolvedThumbnailURL = poster
-                    cachedListThumbnailURL = poster
-                }
-            }
-            return
-        }
 
-        // Workshop：优先 preview；再解析内部视频（结果已缓存）
-        if let localPreview = MediaItem.resolveLocalWorkshopPreviewImage(from: local) {
-            if LocalImageThumbnailCache.isRasterImageFile(localPreview) {
-                if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: localPreview) {
+            // 1) 先找可抽帧视频（结果有 WorkshopLibraryPreviewCache）
+            if let resolved = MediaItem.resolveLocalVideoFile(from: local),
+               Self.videoExtensions.contains(resolved.pathExtension.lowercased()) {
+                // 有缓存帧 → 直接用；没有则先 preview/远程占位，再异步抽帧替换
+                if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) {
                     resolvedThumbnailURL = cached
                     cachedListThumbnailURL = cached
                     return
                 }
-                Task { @MainActor in
+                // 临时占位：preview 或站点图（用户会先看到模糊小图，抽完变清晰）
+                if cachedListThumbnailURL == nil {
+                    if let preview = MediaItem.resolveLocalWorkshopPreviewImage(from: local),
+                       !LocalImageThumbnailCache.isGIFFile(preview) {
+                        cachedListThumbnailURL = preview
+                    } else {
+                        cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
+                    }
+                }
+                applyVideoListThumbnail(for: resolved, fallbackCover: false)
+                return
+            }
+
+            // 2) 无视频（web/scene 等）：用 preview / GIF
+            if let localPreview = MediaItem.resolveLocalWorkshopPreviewImage(from: local) {
+                if LocalImageThumbnailCache.isGIFFile(localPreview) {
+                    resolvedThumbnailURL = localPreview
+                    cachedListThumbnailURL = localPreview
+                    return
+                }
+                if LocalImageThumbnailCache.isRasterImageFile(localPreview) {
+                    if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: localPreview) {
+                        resolvedThumbnailURL = cached
+                        cachedListThumbnailURL = cached
+                        return
+                    }
                     if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: localPreview) {
                         resolvedThumbnailURL = thumb
                         cachedListThumbnailURL = thumb
@@ -573,51 +817,45 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                         resolvedThumbnailURL = localPreview
                         cachedListThumbnailURL = localPreview
                     }
+                    return
                 }
-                // 先用站点封面/已有 thumbnail，避免同步读 preview 大图
-                if cachedListThumbnailURL == nil {
-                    cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
-                }
+                resolvedThumbnailURL = localPreview
+                cachedListThumbnailURL = localPreview
                 return
             }
-            resolvedThumbnailURL = localPreview
-            cachedListThumbnailURL = localPreview
-            return
-        }
 
-        if let resolved = resolvedVideoFileURL ?? MediaItem.resolveLocalVideoFile(from: local) {
-            if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: resolved) {
-                resolvedThumbnailURL = cached
-                cachedListThumbnailURL = cached
-                return
+            if cachedListThumbnailURL == nil {
+                cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
             }
-            if Self.videoExtensions.contains(resolved.pathExtension.lowercased()) {
-                Task { @MainActor in
-                    if let poster = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: resolved) {
-                        resolvedThumbnailURL = poster
-                        cachedListThumbnailURL = poster
-                    }
-                }
-            }
-            return
-        }
-
-        if let thumbnailURL,
-           thumbnailURL.isFileURL,
-           !Self.videoExtensions.contains(thumbnailURL.pathExtension.lowercased()) {
-            return
         }
     }
 
+    /// 列表视频封面：已有缓存直接用；否则后台生成列表帧，失败回退站点封面/高清 poster。
     @MainActor
-    private func usableBakedSceneVideoURL() -> URL? {
-        guard let record = MediaLibraryService.shared.downloadRecord(for: item.id),
-              let artifact = record.sceneBakeArtifact else {
-            return nil
+    private func applyVideoListThumbnail(for videoURL: URL, fallbackCover: Bool) {
+        if let cached = VideoThumbnailCache.shared.cachedStaticThumbnailFileURLIfExists(forLocalFile: videoURL) {
+            resolvedThumbnailURL = cached
+            cachedListThumbnailURL = cached
+            FileExistenceCache.shared.markExisting(atPath: videoURL.path)
+            return
         }
-        let videoURL = URL(fileURLWithPath: artifact.videoPath)
-        // 已有 poster 时上层已 return；此处仅在需要生成时 stat 一次
-        return SceneOfflineBakeService.isUsableBakedVideo(at: videoURL) ? videoURL : nil
+        if fallbackCover, cachedListThumbnailURL == nil {
+            cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
+        }
+        Task { @MainActor in
+            if let listThumb = await VideoThumbnailCache.shared.listThumbnailJPEGFileURL(forLocalVideo: videoURL) {
+                resolvedThumbnailURL = listThumb
+                cachedListThumbnailURL = listThumb
+                FileExistenceCache.shared.markExisting(atPath: videoURL.path)
+                return
+            }
+            // 列表帧失败：尝试高清 poster 兜底（总比空白好）
+            if let poster = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoURL) {
+                resolvedThumbnailURL = poster
+                cachedListThumbnailURL = poster
+                FileExistenceCache.shared.markExisting(atPath: videoURL.path)
+            }
+        }
     }
 
     @MainActor

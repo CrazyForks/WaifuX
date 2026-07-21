@@ -30,6 +30,8 @@
 		115463CB6ED578D5E0CCCEFB /* CropLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EF268EC8CBE8BF9D9FFCDF0 /* CropLayoutEngine.swift */; };
 		125C55DCCB210DEEC2C877E3 /* ScrollBottomSentinel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D49A7B305CF1CA62E5D9540 /* ScrollBottomSentinel.swift */; };
 		12A2B369F54393CDC3D14962 /* WallpaperWebAudioRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDA9D99F4333649D5B21FAA3 /* WallpaperWebAudioRelay.swift */; };
+		55E5E43D4178E37DF249F471 /* NowPlayingService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC03C4D2D8E9A14A61A27A45 /* NowPlayingService.swift */; };
+		7C484A88FFB2EA4E15567F67 /* WallpaperWebMediaRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 658E79AFF18AC628CB4A045F /* WallpaperWebMediaRelay.swift */; };
 		1690A3149D7BB0D38115C959 /* RuleRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A2B9FA650F7E9301E7CF0C7 /* RuleRepository.swift */; };
 		1750A0E5F95C9ECD90EAD7F2 /* SceneConfigOverridePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EB8D69CAADE135414C7A5CA /* SceneConfigOverridePanel.swift */; };
 		176A9DA0A7C0133A4700CE1D /* AnimeCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F37BDF9740FAC2EF2BE6BEB8 /* AnimeCardView.swift */; };
@@ -580,6 +582,8 @@
 		FB3C0713026606E42DCCE8F9 /* UnixSocketClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixSocketClient.swift; sourceTree = "<group>"; };
 		FC5EF18290E78CAC93FAF3FA /* HTMLParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLParser.swift; sourceTree = "<group>"; };
 		FDA9D99F4333649D5B21FAA3 /* WallpaperWebAudioRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperWebAudioRelay.swift; sourceTree = "<group>"; };
+		CC03C4D2D8E9A14A61A27A45 /* NowPlayingService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowPlayingService.swift; sourceTree = "<group>"; };
+		658E79AFF18AC628CB4A045F /* WallpaperWebMediaRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperWebMediaRelay.swift; sourceTree = "<group>"; };
 		FE1F79382529DE877D6E372A /* CachePersistenceService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CachePersistenceService.swift; sourceTree = "<group>"; };
 		FEEBA93D7CC0380CF9E1693B /* MediaDetailSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaDetailSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -826,6 +830,8 @@
 				14D73C39F92D4787695466A1 /* WallpaperSchedulerService.swift */,
 				1105A3D2BD988D514CE5D6F1 /* WallpaperSourceManager.swift */,
 				FDA9D99F4333649D5B21FAA3 /* WallpaperWebAudioRelay.swift */,
+				CC03C4D2D8E9A14A61A27A45 /* NowPlayingService.swift */,
+				658E79AFF18AC628CB4A045F /* WallpaperWebMediaRelay.swift */,
 				6DA2FF2BF95D650BD6997B2A /* WallsflowService.swift */,
 				A84F5A5EB05B301C9FC8E859 /* WebOfflineBakeService.swift */,
 				41B90FB7E5E929B342AD6FB7 /* WebWallpaperDesignService.swift */,
@@ -1402,6 +1408,8 @@
 				940C5C019DEA74617741A6E7 /* WallpaperSourceManager.swift in Sources */,
 				3C167FEA842C4C6D02F8CE64 /* WallpaperViewModel.swift in Sources */,
 				12A2B369F54393CDC3D14962 /* WallpaperWebAudioRelay.swift in Sources */,
+				55E5E43D4178E37DF249F471 /* NowPlayingService.swift in Sources */,
+				7C484A88FFB2EA4E15567F67 /* WallpaperWebMediaRelay.swift in Sources */,
 				4BF7B91D2CB501146BAA71DD /* WallsflowService.swift in Sources */,
 				1E04CE586233F48EA937AD2A /* WaterfallChunkLayout.swift in Sources */,
 				F9C6D151FC8B8C21B9CF08BD /* WebOfflineBakeService.swift in Sources */,

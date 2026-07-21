@@ -348,17 +348,13 @@ struct FrameInterpolationRecordItem: Identifiable, Equatable, Codable {
 
 
 struct VideoOptimizationAutomaticPolicy: Equatable {
-    var loopAnalysisEnabled: Bool
-    var automaticallyAnalyzeLoopPoints: Bool
-    var frameInterpolationEnabled: Bool
-    var automaticallyInterpolateFrames: Bool
+    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」。
+    /// 与手动入口一致：先循环分析，再补帧（Scene bake 产物跳过循环分析）。
+    var automaticallyOptimizeVideos: Bool
     var targetFPS: Int
 
     static let disabled = VideoOptimizationAutomaticPolicy(
-        loopAnalysisEnabled: false,
-        automaticallyAnalyzeLoopPoints: false,
-        frameInterpolationEnabled: false,
-        automaticallyInterpolateFrames: false,
+        automaticallyOptimizeVideos: false,
         targetFPS: 60
     )
 }
@@ -375,16 +371,17 @@ final class VideoOptimizationQueueService: ObservableObject {
     @Published private(set) var completedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var blacklistedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var history: [VideoOptimizationHistoryRecord] = []
-    /// 下载完成时是否自动入队补帧（调度/设壁纸路径禁止使用）。
+    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」（循环 → 补帧）。
     @Published private(set) var automaticPolicy = VideoOptimizationAutomaticPolicy.disabled
 
+    /// 兼容旧属性名：映射到统一自动优化开关。
     @Published var autoInterpolateOnDownload: Bool {
         didSet {
             UserDefaults.standard.set(autoInterpolateOnDownload, forKey: Self.autoOnDownloadKey)
         }
     }
 
-    /// 兼容旧设置页绑定名；映射到「下载时自动补帧」。
+    /// 兼容旧设置页绑定名；映射到「下载后自动优化视频」。
     @Published var autoEnqueueEnabled: Bool {
         didSet {
             if autoEnqueueEnabled != autoInterpolateOnDownload {
@@ -396,6 +393,8 @@ final class VideoOptimizationQueueService: ObservableObject {
     private var runningTasks: [UUID: Task<Void, Never>] = [:]
     private var heartbeatTasks: [UUID: Task<Void, Never>] = [:]
     private var taskStartDates: [UUID: Date] = [:]
+    /// 异步规划（读源 FPS）进行中的视频路径，防止连点重复入队。
+    private var planningVideoPaths = Set<String>()
     private var interpolationRecordsLoaded = false
     private var historyLoaded = false
     private var didRestoreQueueCheckpoint = false
@@ -406,6 +405,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     private static let blacklistedInterpolationRecordsKey = "frame_interpolation_blacklist_records_v1"
     private static let autoOnDownloadKey = "frame_interpolation_auto_on_download"
     private static let legacyAutoEnqueueKey = "frame_interpolation_auto_enqueue"
+    private static let legacyAutoAnalyzeLoopKey = "auto_analyze_loop_point"
     private static let historyKey = "video_optimization_history_v1"
 
     private init() {
@@ -419,24 +419,116 @@ final class VideoOptimizationQueueService: ObservableObject {
     func applySettings(autoOnDownload: Bool) {
         applySettings(
             automaticPolicy: VideoOptimizationAutomaticPolicy(
-                loopAnalysisEnabled: true,
-                automaticallyAnalyzeLoopPoints: false,
-                frameInterpolationEnabled: UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false,
-                automaticallyInterpolateFrames: autoOnDownload,
+                automaticallyOptimizeVideos: autoOnDownload,
                 targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
             )
         )
     }
 
-    /// 统一自动优化策略：循环分析与补帧均由设置页写入。
+    /// 统一自动优化策略：开关打开后按「循环分析 → 补帧」入队（与手动优化一致）。
     func applySettings(automaticPolicy: VideoOptimizationAutomaticPolicy) {
         self.automaticPolicy = automaticPolicy
-        autoInterpolateOnDownload = automaticPolicy.automaticallyInterpolateFrames
-        autoEnqueueEnabled = automaticPolicy.automaticallyInterpolateFrames
-        UserDefaults.standard.set(automaticPolicy.automaticallyInterpolateFrames, forKey: Self.autoOnDownloadKey)
+        autoInterpolateOnDownload = automaticPolicy.automaticallyOptimizeVideos
+        autoEnqueueEnabled = automaticPolicy.automaticallyOptimizeVideos
+        UserDefaults.standard.set(automaticPolicy.automaticallyOptimizeVideos, forKey: Self.autoOnDownloadKey)
+        // 旧双开关一并同步，避免其它路径读到分叉状态。
+        UserDefaults.standard.set(automaticPolicy.automaticallyOptimizeVideos, forKey: Self.legacyAutoAnalyzeLoopKey)
         // 清理旧的「切换壁纸时自动补帧」开关，避免再被读回。
         UserDefaults.standard.set(false, forKey: Self.legacyAutoEnqueueKey)
         restoreQueueCheckpointIfNeeded()
+    }
+
+    private struct OptimizationPlan: Sendable {
+        let operations: [FrameInterpolationQueueItem.Operation]
+        /// 仅当明确读到源 FPS 且 ≥ 目标时非 nil，用于写入 frameNotNeeded。
+        let frameNotNeededReason: String?
+    }
+
+    /// 规划优化步骤：先循环再补帧。
+    /// - 循环：Scene bake 已可循环或已有终态时跳过。
+    /// - 补帧：源 FPS 已达到/高于目标、或已有覆盖目标的补帧终态时跳过。
+    func plannedOptimizationOperations(
+        for videoURL: URL,
+        targetFPS: Int,
+        preferDurableLoopState: Bool = true
+    ) async -> [FrameInterpolationQueueItem.Operation] {
+        await makeOptimizationPlan(
+            for: videoURL,
+            targetFPS: targetFPS,
+            preferDurableLoopState: preferDurableLoopState
+        ).operations
+    }
+
+    private func makeOptimizationPlan(
+        for videoURL: URL,
+        targetFPS: Int,
+        preferDurableLoopState: Bool = true
+    ) async -> OptimizationPlan {
+        let fps = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(targetFPS)
+        var operations: [FrameInterpolationQueueItem.Operation] = []
+        var frameNotNeededReason: String?
+
+        let needsLoop: Bool
+        if hasSceneBakeProvidedLoop(for: videoURL) {
+            needsLoop = false
+        } else if preferDurableLoopState {
+            switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
+            case .applied, .notNeeded:
+                needsLoop = false
+            case .idle, .failed, .noReliablePoint:
+                needsLoop = true
+            }
+        } else {
+            needsLoop = true
+        }
+        if needsLoop {
+            operations.append(.loopTransition)
+        }
+
+        if fps > 0,
+           !isBlacklisted(videoURL: videoURL),
+           completedRecord(videoURL: videoURL, satisfying: fps) == nil {
+            let decision = await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: fps)
+            if decision.shouldInterpolate {
+                operations.append(.frameInterpolation)
+            } else if decision.sourceFPS != nil {
+                frameNotNeededReason = decision.reason
+            }
+        }
+
+        return OptimizationPlan(
+            operations: normalizedOperations(operations),
+            frameNotNeededReason: frameNotNeededReason
+        )
+    }
+
+    private func applyFrameNotNeededIfNeeded(
+        plan: OptimizationPlan,
+        videoURL: URL,
+        title: String,
+        targetFPS: Int
+    ) {
+        guard let reason = plan.frameNotNeededReason else { return }
+        markInterpolationNotNeeded(
+            videoURL: videoURL,
+            title: title,
+            targetFPS: targetFPS,
+            reason: reason
+        )
+    }
+
+    private func beginPlanning(for videoURL: URL) -> Bool {
+        let path = videoURL.standardizedFileURL.path
+        if planningVideoPaths.contains(path) { return false }
+        if hasActiveInterpolation(videoURL: videoURL) { return false }
+        objectWillChange.send()
+        planningVideoPaths.insert(path)
+        return true
+    }
+
+    private func endPlanning(for videoURL: URL) {
+        objectWillChange.send()
+        planningVideoPaths.remove(videoURL.standardizedFileURL.path)
     }
 
     /// 下载 / 设壁纸 / 烘焙完成后的统一自动入口。
@@ -446,6 +538,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         title: String? = nil
     ) -> UUID? {
         let policy = automaticPolicy
+        guard policy.automaticallyOptimizeVideos else { return nil }
         guard videoURL.isFileURL,
               FileManager.default.fileExists(atPath: videoURL.path) else {
             return nil
@@ -456,30 +549,44 @@ final class VideoOptimizationQueueService: ObservableObject {
         let targetFPS = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(policy.targetFPS)
         guard targetFPS > 0 else { return nil }
         guard !isBlacklisted(videoURL: videoURL) else { return nil }
+        guard beginPlanning(for: videoURL) else { return nil }
 
-        var operations: [FrameInterpolationQueueItem.Operation] = []
-        if policy.loopAnalysisEnabled,
-           policy.automaticallyAnalyzeLoopPoints,
-           !hasSceneBakeProvidedLoop(for: videoURL) {
-            operations.append(.loopTransition)
-        }
-        if policy.frameInterpolationEnabled, policy.automaticallyInterpolateFrames {
-            if completedRecord(videoURL: videoURL, satisfying: targetFPS) == nil {
-                operations.append(.frameInterpolation)
+        let resolvedTitle = title?.isEmpty == false
+            ? title!
+            : videoURL.deletingPathExtension().lastPathComponent
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.endPlanning(for: videoURL) }
+            let plan = await self.makeOptimizationPlan(
+                for: videoURL,
+                targetFPS: targetFPS,
+                preferDurableLoopState: true
+            )
+            self.applyFrameNotNeededIfNeeded(
+                plan: plan,
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: targetFPS
+            )
+            guard !plan.operations.isEmpty else {
+                frameInterpolationDebugPrint(
+                    "自动入口：源 FPS 已达标且无需循环，跳过。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
+                )
+                return
             }
+            frameInterpolationDebugPrint(
+                "自动入口：加入优化队列。操作=\(plan.operations.map(\.rawValue).joined(separator: "+"))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
+            )
+            _ = self.enqueue(
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: targetFPS,
+                source: .automatic,
+                operations: plan.operations
+            )
         }
-        guard !operations.isEmpty else { return nil }
-
-        frameInterpolationDebugPrint(
-            "自动入口：加入优化队列。操作=\(operations.map(\.rawValue).joined(separator: "+"))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
-        )
-        return enqueue(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: targetFPS,
-            source: .automatic,
-            operations: operations
-        )
+        // 异步规划 FPS；调用方只需触发即可，具体入队在 Task 内完成。
+        return nil
     }
 
 
@@ -500,9 +607,9 @@ final class VideoOptimizationQueueService: ObservableObject {
     /// 烘焙产物登记后的自动优化入口。
     ///
     /// Scene bake already produces a loopable clip (period detection / fixed
-    /// duration). Automatic loop analysis is therefore skipped here to avoid
-    /// redundant work and accidental rewrites. Manual loop actions remain
-    /// available. Optional automatic frame interpolation still follows settings.
+    /// duration). Automatic loop analysis is therefore skipped; with auto
+    /// optimize on, only frame interpolation is enqueued. Manual loop actions
+    /// remain available.
     @discardableResult
     func enqueueAfterBakeIfNeeded(videoURL: URL, title: String? = nil) -> UUID? {
         let policy = automaticPolicy
@@ -523,10 +630,9 @@ final class VideoOptimizationQueueService: ObservableObject {
             )
         }
 
-        guard policy.frameInterpolationEnabled,
-              policy.automaticallyInterpolateFrames else {
+        guard policy.automaticallyOptimizeVideos else {
             frameInterpolationDebugPrint(
-                "烘焙完成：已跳过自动循环分析；自动补帧关闭，不入队。视频=\(videoURL.lastPathComponent)"
+                "烘焙完成：自动优化关闭，不入队。视频=\(videoURL.lastPathComponent)"
             )
             return nil
         }
@@ -534,23 +640,43 @@ final class VideoOptimizationQueueService: ObservableObject {
         let targetFPS = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(policy.targetFPS)
         guard targetFPS > 0 else { return nil }
         guard !isBlacklisted(videoURL: videoURL) else { return nil }
-        if completedRecord(videoURL: videoURL, satisfying: targetFPS) != nil {
-            frameInterpolationDebugPrint(
-                "烘焙完成：已有补帧终态，跳过自动补帧。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
-            )
-            return nil
-        }
+        guard beginPlanning(for: videoURL) else { return nil }
 
-        frameInterpolationDebugPrint(
-            "烘焙完成：跳过自动循环分析，按设置自动补帧。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
-        )
-        return enqueue(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: targetFPS,
-            source: .automatic,
-            operations: [.frameInterpolation]
-        )
+        let resolvedTitle = title?.isEmpty == false
+            ? title!
+            : videoURL.deletingPathExtension().lastPathComponent
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.endPlanning(for: videoURL) }
+            let plan = await self.makeOptimizationPlan(
+                for: videoURL,
+                targetFPS: targetFPS,
+                preferDurableLoopState: true
+            )
+            self.applyFrameNotNeededIfNeeded(
+                plan: plan,
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: targetFPS
+            )
+            guard !plan.operations.isEmpty else {
+                frameInterpolationDebugPrint(
+                    "烘焙完成：源 FPS 已达标且无需循环，跳过。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
+                )
+                return
+            }
+            frameInterpolationDebugPrint(
+                "烘焙完成：自动优化入队。操作=\(plan.operations.map(\.rawValue).joined(separator: "+"))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)"
+            )
+            _ = self.enqueue(
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: targetFPS,
+                source: .automatic,
+                operations: plan.operations
+            )
+        }
+        return nil
     }
 
     /// Registers a completed download as a new optimization origin. A re-download
@@ -635,24 +761,73 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
 
-    var isLoopAnalysisEnabled: Bool {
-        automaticPolicy.loopAnalysisEnabled
-    }
+    /// 手动循环分析始终可用；不再受设置页总开关门控。
+    var isLoopAnalysisEnabled: Bool { true }
 
-    var isFrameInterpolationEnabled: Bool {
-        automaticPolicy.frameInterpolationEnabled
-            || (UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false)
-    }
+    /// 手动补帧始终可用；不再受设置页总开关门控。
+    /// 实际是否入队补帧仍以源 FPS 与目标 FPS 比较为准。
+    var isFrameInterpolationEnabled: Bool { true }
 
+    /// 菜单展示用：始终提供「优化视频」入口；具体步骤在入队时按 FPS/终态规划。
     var enabledManualOptimizationOperations: [FrameInterpolationQueueItem.Operation] {
-        var operations: [FrameInterpolationQueueItem.Operation] = []
-        if isLoopAnalysisEnabled {
-            operations.append(.loopTransition)
+        [.loopTransition, .frameInterpolation]
+    }
+
+    /// 手动「优化视频」：读取源 FPS 后规划步骤。
+    /// 源 FPS ≥ 目标时只做循环；都无需做则不入队。
+    @discardableResult
+    func enqueueOptimizeVideo(
+        videoURL: URL,
+        title: String? = nil,
+        targetFPS: Int? = nil,
+        source: FrameInterpolationQueueItem.Source = .manual
+    ) -> UUID? {
+        let fps = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(
+            targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
+        )
+        guard fps > 0,
+              videoURL.isFileURL,
+              FileManager.default.fileExists(atPath: videoURL.path) else {
+            return nil
         }
-        if isFrameInterpolationEnabled {
-            operations.append(.frameInterpolation)
+        guard beginPlanning(for: videoURL) else { return nil }
+
+        let resolvedTitle = title?.isEmpty == false
+            ? title!
+            : videoURL.deletingPathExtension().lastPathComponent
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.endPlanning(for: videoURL) }
+            let plan = await self.makeOptimizationPlan(
+                for: videoURL,
+                targetFPS: fps,
+                preferDurableLoopState: true
+            )
+            // 源 FPS 已达标时记下 notNeeded，避免详情菜单仍显示可补帧却入队后空跑。
+            self.applyFrameNotNeededIfNeeded(
+                plan: plan,
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: fps
+            )
+            guard !plan.operations.isEmpty else {
+                frameInterpolationDebugPrint(
+                    "手动优化：源 FPS 已达标且无需循环，跳过。视频=\(videoURL.lastPathComponent)，目标 FPS=\(fps)"
+                )
+                return
+            }
+            frameInterpolationDebugPrint(
+                "手动优化：加入队列。操作=\(plan.operations.map(\.rawValue).joined(separator: "+"))，视频=\(videoURL.lastPathComponent)，目标 FPS=\(fps)"
+            )
+            _ = self.enqueue(
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: fps,
+                source: source,
+                operations: plan.operations
+            )
         }
-        return operations
+        return nil
     }
 
     @discardableResult
@@ -681,6 +856,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     /// Explicit frame interpolation without a preceding loop step.
+    /// 源 FPS 已达标时不入队。
     @discardableResult
     func enqueueFrameInterpolation(
         videoURL: URL,
@@ -688,16 +864,50 @@ final class VideoOptimizationQueueService: ObservableObject {
         targetFPS: Int? = nil,
         source: FrameInterpolationQueueItem.Source = .manual
     ) -> UUID? {
-        enqueue(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            source: source,
-            operations: [.frameInterpolation]
+        let fps = FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(
+            targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
         )
+        guard fps > 0,
+              videoURL.isFileURL,
+              FileManager.default.fileExists(atPath: videoURL.path) else {
+            return nil
+        }
+        guard beginPlanning(for: videoURL) else { return nil }
+
+        let resolvedTitle = title?.isEmpty == false
+            ? title!
+            : videoURL.deletingPathExtension().lastPathComponent
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.endPlanning(for: videoURL) }
+            let decision = await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: fps)
+            guard decision.shouldInterpolate else {
+                if decision.sourceFPS != nil {
+                    self.markInterpolationNotNeeded(
+                        videoURL: videoURL,
+                        title: resolvedTitle,
+                        targetFPS: fps,
+                        reason: decision.reason
+                    )
+                }
+                frameInterpolationDebugPrint(
+                    "手动补帧：源 FPS 已达标或无法读取，跳过。视频=\(videoURL.lastPathComponent)，目标 FPS=\(fps)，原因=\(decision.reason)"
+                )
+                return
+            }
+            _ = self.enqueue(
+                videoURL: videoURL,
+                title: resolvedTitle,
+                targetFPS: fps,
+                source: source,
+                operations: [.frameInterpolation]
+            )
+        }
+        return nil
     }
 
     /// 将同一个文件按“生成循环过渡 -> 补帧”的顺序加入统一队列。
+    /// 源 FPS 已达标时只入队循环分析。
     @discardableResult
     func enqueueLoopTransitionThenInterpolation(
         videoURL: URL,
@@ -705,12 +915,11 @@ final class VideoOptimizationQueueService: ObservableObject {
         targetFPS: Int? = nil,
         source: FrameInterpolationQueueItem.Source = .manual
     ) -> UUID? {
-        enqueue(
+        enqueueOptimizeVideo(
             videoURL: videoURL,
             title: title,
-            targetFPS: targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            source: source,
-            operations: [.loopTransition, .frameInterpolation]
+            targetFPS: targetFPS,
+            source: source
         )
     }
 
@@ -785,24 +994,28 @@ final class VideoOptimizationQueueService: ObservableObject {
         return enqueue(videoURLs: urls, operation: operation, targetFPS: targetFPS, source: source)
     }
 
-    /// 从“我的库”的逻辑文件夹解析本地视频并批量入队；视图只传递文件夹与操作，不枚举或替换文件。
+    /// 从“我的库”的逻辑文件夹解析本地视频并批量入队；视图只传递文件夹，不枚举或替换文件。
+    /// 每个视频单独规划步骤：源 FPS 已达标时只做循环。
+    /// `operations` 保留兼容旧调用方，实际步骤由 `enqueueOptimizeVideo` 按 FPS/终态规划。
     @discardableResult
     func enqueueLibraryFolder(
         _ folder: LibraryFolder,
-        operations: [FrameInterpolationQueueItem.Operation],
+        operations _: [FrameInterpolationQueueItem.Operation] = [.loopTransition, .frameInterpolation],
         targetFPS: Int? = nil,
         source: FrameInterpolationQueueItem.Source = .manual
     ) -> [UUID] {
         let effectiveTargetFPS = targetFPS ?? FrameInterpolationTargetFPSResolver.targetFPSForManualAction()
-        return libraryOptimizationTargets(in: folder).compactMap { target in
-            enqueue(
+        let targets = libraryOptimizationTargets(in: folder)
+        for target in targets {
+            _ = enqueueOptimizeVideo(
                 videoURL: target.videoURL,
                 title: target.title,
                 targetFPS: effectiveTargetFPS,
-                source: source,
-                operations: operations
+                source: source
             )
         }
+        // 异步规划后入队，无法同步返回真实 UUID。
+        return []
     }
 
     /// 统一判断库条目是否能作为视频优化输入，避免各个视图各自猜测文件类型。
@@ -901,6 +1114,12 @@ final class VideoOptimizationQueueService: ObservableObject {
             item.videoURL.standardizedFileURL == videoURL.standardizedFileURL
                 && !item.isTerminalForCleanup
         }
+    }
+
+    /// 队列中或异步规划（读 FPS）中，用于 UI 禁用连点。
+    func isPlanningOrQueued(videoURL: URL) -> Bool {
+        let path = videoURL.standardizedFileURL.path
+        return planningVideoPaths.contains(path) || hasActiveInterpolation(videoURL: videoURL)
     }
 
     func activeInterpolationTargetFPS(videoURL: URL) -> Int? {

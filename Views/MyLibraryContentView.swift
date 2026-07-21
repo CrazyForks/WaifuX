@@ -250,6 +250,9 @@ struct MyLibraryContentView: View {
         let itemCount: Int
     }
 
+    /// 文件夹叠图后台预热任务（按 content+subTab 合并，避免快速切换时堆积）
+    @State private var folderPreviewWarmupTask: Task<Void, Never>?
+
     private enum LastLibraryPageStore {
         private static let contentTypeKey = "my_library_last_content_type_v1"
         private static let subTabKey = "my_library_last_sub_tab_v1"
@@ -818,7 +821,6 @@ struct MyLibraryContentView: View {
     private func wallpaperFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = wallpaperFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
-        let optimizationOperations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
@@ -844,11 +846,8 @@ struct MyLibraryContentView: View {
             onRelock: {
                 folderLockService.lockFolder(folder.id)
             },
-            onOptimizeVideos: optimizationOperations.isEmpty ? nil : {
-                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
-                    folder,
-                    operations: optimizationOperations
-                )
+            onOptimizeVideos: {
+                _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
             }
         )
     }
@@ -1179,20 +1178,16 @@ struct MyLibraryContentView: View {
                 }
             }
             if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
-                let operations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
-                if !operations.isEmpty {
-                    Divider()
-                    Button {
-                        VideoOptimizationQueueService.shared.enqueue(
-                            videoURL: videoURL,
-                            title: item.wallpaper.title,
-                            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-                            source: .manual,
-                            operations: operations
-                        )
-                    } label: {
-                        Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
-                    }
+                Divider()
+                Button {
+                    _ = VideoOptimizationQueueService.shared.enqueueOptimizeVideo(
+                        videoURL: videoURL,
+                        title: item.wallpaper.title,
+                        targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                        source: .manual
+                    )
+                } label: {
+                    Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
             }
         }
@@ -1252,7 +1247,6 @@ struct MyLibraryContentView: View {
     private func mediaFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = mediaFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
-        let optimizationOperations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
         return LibraryFolderCard(
             folder: folder,
             previewURLs: display.previewURLs,
@@ -1278,11 +1272,8 @@ struct MyLibraryContentView: View {
             onRelock: {
                 folderLockService.lockFolder(folder.id)
             },
-            onOptimizeVideos: optimizationOperations.isEmpty ? nil : {
-                VideoOptimizationQueueService.shared.enqueueLibraryFolder(
-                    folder,
-                    operations: optimizationOperations
-                )
+            onOptimizeVideos: {
+                _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
             }
         )
     }
@@ -1372,20 +1363,16 @@ struct MyLibraryContentView: View {
                 }
             }
             if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
-                let operations = VideoOptimizationQueueService.shared.enabledManualOptimizationOperations
-                if !operations.isEmpty {
-                    Divider()
-                    Button {
-                        VideoOptimizationQueueService.shared.enqueue(
-                            videoURL: videoURL,
-                            title: item.mediaItem.title,
-                            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-                            source: .manual,
-                            operations: operations
-                        )
-                    } label: {
-                        Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
-                    }
+                Divider()
+                Button {
+                    _ = VideoOptimizationQueueService.shared.enqueueOptimizeVideo(
+                        videoURL: videoURL,
+                        title: item.mediaItem.title,
+                        targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
+                        source: .manual
+                    )
+                } label: {
+                    Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
             }
         }
@@ -1581,6 +1568,8 @@ struct MyLibraryContentView: View {
         // ⚡ O(N) 预分组：按 folderID 建索引，避免对每个文件夹线性扫描全部记录。
         // 收藏/下载集合各自只读对应记录，避免跨集合污染封面与计数。
         var next: [String: FolderDisplayInfo] = [:]
+        var warmupTargets: [(local: URL?, remote: URL?)] = []
+
         if selectedSubTab == .favorites {
             var favoriteByFolder: [String: [WallpaperFavoriteRecord]] = [:]
             for r in WallpaperLibraryService.shared.favoriteRecords where r.isActive {
@@ -1589,10 +1578,12 @@ struct MyLibraryContentView: View {
             }
             for folder in folders {
                 let wallpapers = favoriteByFolder[folder.id, default: []].map(\.wallpaper)
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: [:])
                 next[folder.id] = FolderDisplayInfo(
-                    previewURLs: Array(wallpapers.prefix(3).compactMap(\.thumbURL)),
+                    previewURLs: preview.urls,
                     itemCount: wallpapers.count
                 )
+                warmupTargets.append(contentsOf: preview.warmup)
             }
         } else {
             var downloadedByFolder: [String: [WallpaperDownloadRecord]] = [:]
@@ -1601,11 +1592,112 @@ struct MyLibraryContentView: View {
                 downloadedByFolder[fid, default: []].append(r)
             }
             for folder in folders {
-                let wallpapers = downloadedByFolder[folder.id, default: []].map(\.wallpaper)
+                let records = downloadedByFolder[folder.id, default: []]
+                let wallpapers = records.map(\.wallpaper)
+                var localPathByID: [String: URL] = [:]
+                for r in records {
+                    localPathByID[r.wallpaper.id] = r.localFileURL
+                }
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: localPathByID)
                 next[folder.id] = FolderDisplayInfo(
-                    previewURLs: Array(wallpapers.prefix(3).compactMap(\.thumbURL)),
+                    previewURLs: preview.urls,
                     itemCount: wallpapers.count
                 )
+                warmupTargets.append(contentsOf: preview.warmup)
+            }
+        }
+        wallpaperFolderDisplay = next
+        scheduleWallpaperFolderPreviewWarmup(targets: warmupTargets)
+    }
+
+    /// 壁纸夹叠图：优先本机 SSD 列表小图 / 本地文件，再远程 thumb（避免夹外永远糊远程图）。
+    private static func wallpaperFolderPreviewURLs(
+        from wallpapers: [Wallpaper],
+        localPathByID: [String: URL]
+    ) -> (urls: [URL], warmup: [(local: URL?, remote: URL?)]) {
+        var urls: [URL] = []
+        var warmup: [(local: URL?, remote: URL?)] = []
+        urls.reserveCapacity(3)
+        for wallpaper in wallpapers.prefix(3) {
+            let local = localPathByID[wallpaper.id]
+                ?? WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper)
+            let remote = wallpaper.thumbURL ?? wallpaper.smallThumbURL
+            if let local, local.isFileURL {
+                if LocalImageThumbnailCache.isRasterImageFile(local),
+                   let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
+                    urls.append(cached)
+                    continue
+                }
+                // 无 SSD 小图：先远程占位，后台预热
+                if let remote {
+                    urls.append(remote)
+                } else {
+                    urls.append(local)
+                }
+                warmup.append((local, remote))
+            } else if let remote {
+                urls.append(remote)
+            }
+        }
+        return (urls, warmup)
+    }
+
+    private func scheduleWallpaperFolderPreviewWarmup(targets: [(local: URL?, remote: URL?)]) {
+        let needWarmup = targets.compactMap(\.local).filter { local in
+            LocalImageThumbnailCache.isRasterImageFile(local)
+                && LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) == nil
+        }
+        guard !needWarmup.isEmpty else { return }
+
+        folderPreviewWarmupTask?.cancel()
+        folderPreviewWarmupTask = Task { @MainActor in
+            var any = false
+            for url in needWarmup.prefix(12) {
+                guard !Task.isCancelled else { return }
+                if await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: url) != nil {
+                    any = true
+                }
+            }
+            guard any, !Task.isCancelled else { return }
+            // 小图落盘后重算夹外预览，替换远程糊图
+            refreshWallpaperFolderDisplayWithoutWarmup()
+        }
+    }
+
+    /// 预热完成后刷新，避免递归再 schedule 同一批任务。
+    private func refreshWallpaperFolderDisplayWithoutWarmup() {
+        let folders = currentWallpaperFolders
+        guard !folders.isEmpty else {
+            wallpaperFolderDisplay = [:]
+            return
+        }
+        var next: [String: FolderDisplayInfo] = [:]
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [WallpaperFavoriteRecord]] = [:]
+            for r in WallpaperLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let wallpapers = favoriteByFolder[folder.id, default: []].map(\.wallpaper)
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: [:])
+                next[folder.id] = FolderDisplayInfo(previewURLs: preview.urls, itemCount: wallpapers.count)
+            }
+        } else {
+            var downloadedByFolder: [String: [WallpaperDownloadRecord]] = [:]
+            for r in WallpaperLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = WallpaperLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                let wallpapers = records.map(\.wallpaper)
+                var localPathByID: [String: URL] = [:]
+                for r in records {
+                    localPathByID[r.wallpaper.id] = r.localFileURL
+                }
+                let preview = Self.wallpaperFolderPreviewURLs(from: wallpapers, localPathByID: localPathByID)
+                next[folder.id] = FolderDisplayInfo(previewURLs: preview.urls, itemCount: wallpapers.count)
             }
         }
         wallpaperFolderDisplay = next
@@ -1620,6 +1712,8 @@ struct MyLibraryContentView: View {
 
         // ⚡ O(N) 预分组；收藏/下载各自只读对应记录
         var next: [String: FolderDisplayInfo] = [:]
+        var warmupItems: [(item: MediaItem, local: URL?)] = []
+
         if selectedSubTab == .favorites {
             var favoriteByFolder: [String: [MediaFavoriteRecord]] = [:]
             for r in MediaLibraryService.shared.favoriteRecords where r.isActive {
@@ -1628,8 +1722,11 @@ struct MyLibraryContentView: View {
             }
             for folder in folders {
                 let items = favoriteByFolder[folder.id, default: []].map(\.item)
-                let previewURLs = items.prefix(3).map { item in
-                    item.libraryFolderThumbnailURL(localFileURL: nil)
+                // 收藏也可能已下载：尽量解析本地路径，夹外才能用抽帧
+                let previewURLs: [URL] = items.prefix(3).map { item in
+                    let local = MediaLibraryService.shared.localFileURLIfAvailable(for: item)
+                    if let local { warmupItems.append((item, local)) }
+                    return item.libraryFolderThumbnailURL(localFileURL: local)
                 }
                 next[folder.id] = FolderDisplayInfo(
                     previewURLs: previewURLs,
@@ -1652,13 +1749,84 @@ struct MyLibraryContentView: View {
                     items.append(r.item)
                     localPaths[r.item.id] = URL(fileURLWithPath: r.localFilePath)
                 }
-                let previewURLs = items.prefix(3).map { item in
-                    item.libraryFolderThumbnailURL(localFileURL: localPaths[item.id])
+                let previewURLs = items.prefix(3).map { item -> URL in
+                    let local = localPaths[item.id]
+                    warmupItems.append((item, local))
+                    return item.libraryFolderThumbnailURL(localFileURL: local)
                 }
                 next[folder.id] = FolderDisplayInfo(
                     previewURLs: previewURLs,
                     itemCount: items.count
                 )
+            }
+        }
+        mediaFolderDisplay = next
+        scheduleMediaFolderPreviewWarmup(targets: warmupItems)
+    }
+
+    /// 夹外叠图：后台为前若干项生成列表抽帧/静图小图，完成后刷新 display。
+    private func scheduleMediaFolderPreviewWarmup(targets: [(item: MediaItem, local: URL?)]) {
+        guard !targets.isEmpty else { return }
+        // 去重，限制总量，避免一次对整库外置卡抽帧
+        var seen = Set<String>()
+        let unique = targets.filter { seen.insert($0.item.id).inserted }.prefix(18)
+
+        folderPreviewWarmupTask?.cancel()
+        folderPreviewWarmupTask = Task { @MainActor in
+            var any = false
+            for entry in unique {
+                guard !Task.isCancelled else { return }
+                if await entry.item.ensureFolderPreviewCache(localFileURL: entry.local) {
+                    any = true
+                }
+            }
+            guard any, !Task.isCancelled else { return }
+            refreshMediaFolderDisplayWithoutWarmup()
+        }
+    }
+
+    private func refreshMediaFolderDisplayWithoutWarmup() {
+        let folders = currentMediaFolders
+        guard !folders.isEmpty else {
+            mediaFolderDisplay = [:]
+            return
+        }
+        var next: [String: FolderDisplayInfo] = [:]
+        if selectedSubTab == .favorites {
+            var favoriteByFolder: [String: [MediaFavoriteRecord]] = [:]
+            for r in MediaLibraryService.shared.favoriteRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                favoriteByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let items = favoriteByFolder[folder.id, default: []].map(\.item)
+                let previewURLs = items.prefix(3).map { item in
+                    item.libraryFolderThumbnailURL(
+                        localFileURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item)
+                    )
+                }
+                next[folder.id] = FolderDisplayInfo(previewURLs: previewURLs, itemCount: items.count)
+            }
+        } else {
+            var downloadedByFolder: [String: [MediaDownloadRecord]] = [:]
+            for r in MediaLibraryService.shared.downloadRecords where r.isActive {
+                guard let fid = MediaLibraryService.normalizedFolderID(r.folderID) else { continue }
+                downloadedByFolder[fid, default: []].append(r)
+            }
+            for folder in folders {
+                let records = downloadedByFolder[folder.id, default: []]
+                var items: [MediaItem] = []
+                var localPaths: [String: URL] = [:]
+                var seen = Set<String>()
+                for r in records {
+                    guard seen.insert(r.item.id).inserted else { continue }
+                    items.append(r.item)
+                    localPaths[r.item.id] = URL(fileURLWithPath: r.localFilePath)
+                }
+                let previewURLs = items.prefix(3).map {
+                    $0.libraryFolderThumbnailURL(localFileURL: localPaths[$0.id])
+                }
+                next[folder.id] = FolderDisplayInfo(previewURLs: previewURLs, itemCount: items.count)
             }
         }
         mediaFolderDisplay = next
@@ -3419,26 +3587,34 @@ private struct AnyMediaItem: Identifiable {
     }
 
     private static func shouldProbeAnimatedThumbnail(url: URL, mediaItem: MediaItem) -> Bool {
+        // 明确动图元数据 / 路径后缀：必须探测并允许 hover 播放
+        if mediaItem.isAnimatedImage == true {
+            return true
+        }
+        if url.pathExtension.lowercased() == "gif" {
+            return true
+        }
+        // 本地路径文件名含 preview.gif 等（query 少见，仍看 pathExtension 即可）
+        if let local = mediaItem.posterURL, local.pathExtension.lowercased() == "gif" {
+            return true
+        }
+
         if url.isFileURL {
             let path = url.standardizedFileURL.path
+            // 已生成的静态列表缓存绝不是可播放 GIF
             if path.contains("/WaifuX/VideoThumbnails/")
                 || path.contains("/WaifuX/LocalImageThumbnails/") {
                 return false
             }
 
             let ext = url.pathExtension.lowercased()
-            if ["mp4", "mov", "webm", "m4v", "mkv", "jpg", "jpeg", "png", "webp", "heic"].contains(ext) {
-                // 静图/视频封面无需 GIF probe；尤其外置卡上 probe 会再读文件头
-                if ext != "gif" {
-                    return false
-                }
+            // 静图/视频封面无需 GIF probe；尤其外置卡上 probe 会再读文件头
+            if ["mp4", "mov", "webm", "m4v", "mkv", "jpg", "jpeg", "png", "webp", "heic", "heif", "avif", "bmp", "tiff", "tif"].contains(ext) {
+                return false
             }
         }
 
-        if mediaItem.isAnimatedImage == true {
-            return true
-        }
-
+        // 远程封面等：保持探测（站点可能返回 GIF 但后缀不是 .gif）
         return true
     }
 }

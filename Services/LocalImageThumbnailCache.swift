@@ -72,8 +72,9 @@ final class LocalImageThumbnailCache {
     private let jpegQuality: CGFloat = 0.82
     private let minUsableBytes = 400
 
+    /// 可生成静态列表 JPEG 的扩展（**不含 gif**：动图必须保留原文件给 hover 播放）。
     nonisolated private static let rasterExtensions: Set<String> = [
-        "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "bmp", "tiff", "tif"
+        "jpg", "jpeg", "png", "webp", "heic", "heif", "avif", "bmp", "tiff", "tif"
     ]
 
     private init() {
@@ -85,10 +86,15 @@ final class LocalImageThumbnailCache {
 
     // MARK: - Public
 
-    /// 是否适合走本缓存（本地静图文件）。
+    /// 是否适合走本缓存（本地**静图**文件；GIF 返回 false，避免压成 JPEG 后无法 hover 播放）。
     nonisolated static func isRasterImageFile(_ url: URL) -> Bool {
         guard url.isFileURL else { return false }
         return rasterExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// 本地 GIF（含 Workshop preview.gif）应直接用于列表动画源，不要经本缓存。
+    nonisolated static func isGIFFile(_ url: URL) -> Bool {
+        url.isFileURL && url.pathExtension.lowercased() == "gif"
     }
 
     /// 仅返回已存在的列表缩略图（不触发磁盘生成、不访问源文件）。

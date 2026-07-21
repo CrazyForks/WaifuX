@@ -72,17 +72,6 @@ class SettingsViewModel: ObservableObject {
             UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
         }
     }
-    @Published var frameInterpolationEnabled = false {
-        didSet {
-            guard !isBatchUpdating else { return }
-            if !frameInterpolationEnabled, frameInterpolationAutoEnqueue {
-                frameInterpolationAutoEnqueue = false
-            }
-            UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
-            VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
-            applyVideoOptimizationSettings()
-        }
-    }
     @Published var frameInterpolationTargetFPS: Double = 60 {
         didSet {
             guard !isBatchUpdating else { return }
@@ -96,31 +85,19 @@ class SettingsViewModel: ObservableObject {
             applyVideoOptimizationSettings()
         }
     }
-    /// 视频下载、烘焙或设为壁纸后，按公共策略自动补帧。
-    @Published var frameInterpolationAutoEnqueue = false {
+    /// 视频下载、设壁纸或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
+    /// 与详情页 / 我的库手动「优化视频」同一流水线；手动入口不依赖此开关。
+    @Published var autoOptimizeVideosAfterDownload = false {
         didSet {
             guard !isBatchUpdating else { return }
-            UserDefaults.standard.set(frameInterpolationAutoEnqueue, forKey: "frame_interpolation_auto_on_download")
+            UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
+            // 旧双开关一并同步，避免分叉。
+            UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
             // 旧 key 清理，防止被当成「切换时自动补帧」读回。
             UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
-            applyVideoOptimizationSettings()
-        }
-    }
-    @Published var loopPointAnalysisEnabled = true {
-        didSet {
-            guard !isBatchUpdating else { return }
-            if !loopPointAnalysisEnabled, autoAnalyzeLoopPoint {
-                autoAnalyzeLoopPoint = false
-            }
-            UserDefaults.standard.set(loopPointAnalysisEnabled, forKey: "loop_point_analysis_enabled")
-            applyVideoOptimizationSettings()
-        }
-    }
-    /// 新视频下载完成或成功设定后，优先进行循环点分析；若自动补帧也已开启，统一任务会在分析结束后再补帧。
-    @Published var autoAnalyzeLoopPoint = false {
-        didSet {
-            guard !isBatchUpdating else { return }
-            UserDefaults.standard.set(autoAnalyzeLoopPoint, forKey: "auto_analyze_loop_point")
+            // 清理已废弃的总开关，避免其它路径误读。
+            UserDefaults.standard.set(true, forKey: "frame_interpolation_enabled")
+            UserDefaults.standard.set(true, forKey: "loop_point_analysis_enabled")
             applyVideoOptimizationSettings()
         }
     }
@@ -382,16 +359,13 @@ class SettingsViewModel: ObservableObject {
         UserDefaults.standard.set(hideNotch, forKey: "hide_notch")
         UserDefaults.standard.set(autoRemoveVideoLetterbox, forKey: "auto_remove_video_letterbox")
         UserDefaults.standard.set(portraitBlurFillEnabled, forKey: "portrait_blur_fill_enabled")
-        UserDefaults.standard.set(frameInterpolationEnabled, forKey: "frame_interpolation_enabled")
         UserDefaults.standard.set(frameInterpolationTargetFPS, forKey: "frame_interpolation_target_fps")
-        let effectiveAutoOnDownload = frameInterpolationEnabled && frameInterpolationAutoEnqueue
-        frameInterpolationAutoEnqueue = effectiveAutoOnDownload
-        let effectiveAutoAnalyzeLoopPoint = loopPointAnalysisEnabled && autoAnalyzeLoopPoint
-        autoAnalyzeLoopPoint = effectiveAutoAnalyzeLoopPoint
-        UserDefaults.standard.set(loopPointAnalysisEnabled, forKey: "loop_point_analysis_enabled")
-        UserDefaults.standard.set(autoAnalyzeLoopPoint, forKey: "auto_analyze_loop_point")
+        // 手动优化始终可用；总开关已废弃，写 true 以免旧代码路径误判为关闭。
+        UserDefaults.standard.set(true, forKey: "frame_interpolation_enabled")
+        UserDefaults.standard.set(true, forKey: "loop_point_analysis_enabled")
+        UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
         applyVideoOptimizationSettings()
-        UserDefaults.standard.set(effectiveAutoOnDownload, forKey: "frame_interpolation_auto_on_download")
+        UserDefaults.standard.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
         UserDefaults.standard.set(false, forKey: "frame_interpolation_auto_enqueue")
         UserDefaults.standard.set(sceneRealtimeRenderingEnabled, forKey: "scene_realtime_rendering_enabled")
         UserDefaults.standard.set(proxyEnabled, forKey: "proxy_enabled")
@@ -405,7 +379,7 @@ class SettingsViewModel: ObservableObject {
         VideoWallpaperManager.shared.refreshAutoRemoveVideoLetterbox()
         StaticImageWallpaperOverlayManager.shared.refreshAutoRemoveImageLetterbox()
         VideoWallpaperManager.shared.refreshFrameInterpolationSettings()
-        VideoOptimizationQueueService.shared.applySettings(autoOnDownload: effectiveAutoOnDownload)
+        VideoOptimizationQueueService.shared.applySettings(autoOnDownload: autoOptimizeVideosAfterDownload)
         NotchOverlayManager.shared.setEnabled(hideNotch)
         if sceneRealtimeRenderingEnabled {
             LiquidGlassClockSettings.shared.update { $0.enabled = false }
@@ -502,15 +476,17 @@ class SettingsViewModel: ObservableObject {
             hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
             autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
             portraitBlurFillEnabled = defaults.object(forKey: "portrait_blur_fill_enabled") as? Bool ?? false
-            frameInterpolationEnabled = defaults.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
             frameInterpolationTargetFPS = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int((defaults.object(forKey: "frame_interpolation_target_fps") as? Double ?? 60.0).rounded())))
-            // 新语义：下载时自动补帧。旧 key「切换时自动」不再迁移为开启。
-            frameInterpolationAutoEnqueue = frameInterpolationEnabled
-                && (defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false)
+            // 统一为「下载后自动优化视频」。任一旧自动开关为 true 即迁移为开启。
+            // 旧 key「切换时自动」不再迁移为开启。
+            let legacyAutoInterpolate = defaults.object(forKey: "frame_interpolation_auto_on_download") as? Bool ?? false
+            let legacyAutoLoop = defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false
+            autoOptimizeVideosAfterDownload = legacyAutoInterpolate || legacyAutoLoop
+            defaults.set(true, forKey: "frame_interpolation_enabled")
+            defaults.set(true, forKey: "loop_point_analysis_enabled")
             defaults.set(false, forKey: "frame_interpolation_auto_enqueue")
-            loopPointAnalysisEnabled = defaults.object(forKey: "loop_point_analysis_enabled") as? Bool ?? true
-            autoAnalyzeLoopPoint = loopPointAnalysisEnabled
-                && (defaults.object(forKey: "auto_analyze_loop_point") as? Bool ?? false)
+            defaults.set(autoOptimizeVideosAfterDownload, forKey: "frame_interpolation_auto_on_download")
+            defaults.set(autoOptimizeVideosAfterDownload, forKey: "auto_analyze_loop_point")
             applyVideoOptimizationSettings()
             showAllWorkshopContent = defaults.bool(forKey: "show_all_workshop_content")
             // 未写过 key 时默认 true（与属性初始值一致）；bool(forKey:) 会把缺失当成 false
@@ -560,10 +536,7 @@ class SettingsViewModel: ObservableObject {
     private func applyVideoOptimizationSettings() {
         VideoOptimizationQueueService.shared.applySettings(
             automaticPolicy: VideoOptimizationAutomaticPolicy(
-                loopAnalysisEnabled: loopPointAnalysisEnabled,
-                automaticallyAnalyzeLoopPoints: autoAnalyzeLoopPoint,
-                frameInterpolationEnabled: frameInterpolationEnabled,
-                automaticallyInterpolateFrames: frameInterpolationAutoEnqueue,
+                automaticallyOptimizeVideos: autoOptimizeVideosAfterDownload,
                 targetFPS: FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int(frameInterpolationTargetFPS.rounded()))
             )
         )

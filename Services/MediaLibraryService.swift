@@ -260,7 +260,7 @@ final class MediaLibraryService: ObservableObject {
 
         // 视频文件下载完成后异步生成**高清** poster（锁屏/桌面用，最大 3840×2160）；
         // 列表 800×600 小图由 UI 侧按需 generateThumbnail，二者隔离。
-        // 若开启「下载时自动补帧」，再入队离线补帧（不走调度/设壁纸路径）。
+        // 若开启「下载后自动优化视频」，按循环分析 → 补帧入队（不走调度切换路径）。
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
         let videoFileURL: URL? = if videoExts.contains(localFileURL.pathExtension.lowercased()) {
             localFileURL

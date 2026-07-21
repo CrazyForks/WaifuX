@@ -579,56 +579,29 @@ private struct GeneralSettingsTab: View {
             }
 
             // 动态壁纸优化设置组。自动任务均由公共优化队列串行处理。
+            // 手动「优化视频」始终可走循环分析 + 补帧；此处只控制下载后自动优化与目标帧率。
             MacSettingsSection(header: t("videoOptimizationSection")) {
                 MacSettingsRow(
-                    title: t("frameInterpolation"),
-                    subtitle: t("frameInterpolationDesc"),
+                    title: t("videoOptimizationAutoAfterDownload"),
+                    subtitle: t("videoOptimizationAutoAfterDownloadDesc"),
                     showDivider: true
                 ) {
-                    MacToggle(isOn: $viewModel.frameInterpolationEnabled)
-                }
-
-                if viewModel.frameInterpolationEnabled {
-                    MacSettingsRow(
-                        title: t("frameInterpolationAutoEnqueue"),
-                        subtitle: t("frameInterpolationAutoEnqueueDesc"),
-                        showDivider: true
-                    ) {
-                        MacToggle(isOn: $viewModel.frameInterpolationAutoEnqueue)
-                    }
-
-                    MacSettingsRow(
-                        title: t("frameInterpolationTargetFPS"),
-                        subtitle: nil,
-                        showDivider: true
-                    ) {
-                        Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
-                            ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
-                                Text("\(fps)")
-                                    .tag(Double(fps))
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 180)
-                    }
+                    MacToggle(isOn: $viewModel.autoOptimizeVideosAfterDownload)
                 }
 
                 MacSettingsRow(
-                    title: t("loopPointAnalysis"),
-                    subtitle: t("loopPointAnalysisDesc"),
-                    showDivider: viewModel.loopPointAnalysisEnabled
+                    title: t("frameInterpolationTargetFPS"),
+                    subtitle: nil,
+                    showDivider: false
                 ) {
-                    MacToggle(isOn: $viewModel.loopPointAnalysisEnabled)
-                }
-
-                if viewModel.loopPointAnalysisEnabled {
-                    MacSettingsRow(
-                        title: t("loopPointAnalysisAutoEnqueue"),
-                        subtitle: t("loopPointAnalysisAutoEnqueueDesc"),
-                        showDivider: false
-                    ) {
-                        MacToggle(isOn: $viewModel.autoAnalyzeLoopPoint)
+                    Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
+                        ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
+                            Text("\(fps)")
+                                .tag(Double(fps))
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
                 }
             }
 

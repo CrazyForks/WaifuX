@@ -41,6 +41,25 @@ private struct WebDaemonAudioDataMessage: Codable {
     let spectrum: [Float]
 }
 
+/// Host → daemon：系统 Now Playing 元数据（低频，fire-and-forget）。
+private struct WebDaemonMediaUpdateMessage: Codable {
+    let command: String
+    let enabled: Bool
+    let title: String
+    let artist: String
+    let albumTitle: String
+    let state: Int
+    let position: Double
+    let duration: Double
+    let rate: Double
+}
+
+/// Host → daemon：封面 data URL。
+private struct WebDaemonMediaThumbnailMessage: Codable {
+    let command: String
+    let thumbnail: String
+}
+
 /// 进程终止事件（线程安全，通过 os_unfair_lock 传递到 @MainActor）
 private struct TerminationEvent: @unchecked Sendable {
     let pid: pid_t
@@ -228,6 +247,10 @@ final class WallpaperEngineXBridge: ObservableObject {
     private var audioRelayActiveForCurrentWallpaper = false
     /// 暂停前的 relay 状态，恢复时还原
     private var wasAudioRelayActiveBeforePause = false
+    /// WE Web 壁纸 Media Integration 中继是否活跃（任意 web 壁纸）
+    private var mediaRelayActiveForCurrentWallpaper = false
+    /// 暂停前 media relay 是否活跃
+    private var wasMediaRelayActiveBeforePause = false
 
     private let lastWallpaperPathKey = "we_last_wallpaper_path_v1"
     private let controllingExternalKey = "we_controlling_external_v1"
@@ -911,10 +934,14 @@ final class WallpaperEngineXBridge: ObservableObject {
         isExternalPaused = true
         perScreenPausedScreenIDs.formUnion(managedRenderScreenIDs)
         updateRendererAudioControls(paused: true)
-        // 暂停时释放 SCK；恢复时由 resumeWallpaper 根据当前壁纸重启
+        // 暂停时释放 SCK / MediaRemote；恢复时由 resumeWallpaper 根据当前壁纸重启
         if audioRelayActiveForCurrentWallpaper {
             wasAudioRelayActiveBeforePause = true
             stopAudioRelayIfActive()
+        }
+        if mediaRelayActiveForCurrentWallpaper {
+            wasMediaRelayActiveBeforePause = true
+            stopMediaRelayIfActive()
         }
         let generation = launchGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -941,10 +968,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         isExternalPaused = false
         updateRendererAudioControls(paused: false)
         // 恢复前是否启用过 relay → 根据当前壁纸的 project.json 重新检测启动
-        if wasAudioRelayActiveBeforePause, let path = lastWallpaperPath {
+        if wasAudioRelayActiveBeforePause || wasMediaRelayActiveBeforePause, let path = lastWallpaperPath {
             ensureAudioRelayMatchesActiveWallpaper(projectRoot: path)
+        } else if wasAudioRelayActiveBeforePause || wasMediaRelayActiveBeforePause {
+            ensureAudioRelayMatchesActiveWallpaper()
         }
         wasAudioRelayActiveBeforePause = false
+        wasMediaRelayActiveBeforePause = false
     }
 
     /// 按屏幕暂停追踪：通过 per-screen API 暂停的屏幕 ID
@@ -1015,9 +1045,14 @@ final class WallpaperEngineXBridge: ObservableObject {
                 wasAudioRelayActiveBeforePause = true
                 stopAudioRelayIfActive()
             }
-        } else if wasAudioRelayActiveBeforePause, let path = lastWallpaperPath {
+            if mediaRelayActiveForCurrentWallpaper {
+                wasMediaRelayActiveBeforePause = true
+                stopMediaRelayIfActive()
+            }
+        } else if wasAudioRelayActiveBeforePause || wasMediaRelayActiveBeforePause, let path = lastWallpaperPath {
             ensureAudioRelayMatchesActiveWallpaper(projectRoot: path)
             wasAudioRelayActiveBeforePause = false
+            wasMediaRelayActiveBeforePause = false
         }
     }
 
@@ -1155,10 +1190,49 @@ final class WallpaperEngineXBridge: ObservableObject {
     func sendAudioDataToWebDaemon(_ spectrum128: [Float]) {
         guard isCurrentWallpaperWeb else { return }
         guard spectrum128.count == 128 else { return }
-        let socketPath = "/tmp/wallpaperengine-cli.sock"
         let msg = WebDaemonAudioDataMessage(command: "audioData", spectrum: spectrum128)
         guard let data = try? JSONEncoder().encode(msg) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
 
+    /// 推送系统 Now Playing 到 daemon Web Media Integration。
+    func sendMediaUpdateToWebDaemon(
+        enabled: Bool,
+        title: String,
+        artist: String,
+        albumTitle: String,
+        state: Int,
+        position: Double,
+        duration: Double,
+        rate: Double
+    ) {
+        guard isCurrentWallpaperWeb || mediaRelayActiveForCurrentWallpaper else { return }
+        let msg = WebDaemonMediaUpdateMessage(
+            command: "mediaUpdate",
+            enabled: enabled,
+            title: title,
+            artist: artist,
+            albumTitle: albumTitle,
+            state: state,
+            position: position,
+            duration: duration,
+            rate: rate
+        )
+        guard let data = try? JSONEncoder().encode(msg) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
+
+    /// 推送封面 data URL（或空字符串清空）。
+    func sendMediaThumbnailToWebDaemon(dataURL: String) {
+        guard isCurrentWallpaperWeb || mediaRelayActiveForCurrentWallpaper else { return }
+        let msg = WebDaemonMediaThumbnailMessage(command: "mediaThumbnail", thumbnail: dataURL)
+        guard let data = try? JSONEncoder().encode(msg) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
+
+    /// 通用 fire-and-forget Unix socket 发送（audio / media 共用）。
+    private func sendFireAndForgetToWebDaemon(_ data: Data) {
+        let socketPath = "/tmp/wallpaperengine-cli.sock"
         DispatchQueue.global(qos: .userInitiated).async {
             var addr = sockaddr_un()
             addr.sun_family = sa_family_t(AF_UNIX)
@@ -1179,8 +1253,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             var length = UInt32(data.count)
             let payload = Data(bytes: &length, count: MemoryLayout<UInt32>.size) + data
             _ = payload.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, payload.count, 0) }
-            // 不 recv：daemon 不发响应；shutdown(SHUT_WR) 让对端读到 EOF 后干净关闭，
-            // 避免半开连接堆积。daemon 已 SIGPIPE IGN，残留写不会 KILL 进程。
+            // 不 recv：daemon 对 audio/media 不发响应；shutdown 让对端 EOF。
             shutdown(fd, SHUT_WR)
         }
     }
@@ -1202,29 +1275,44 @@ final class WallpaperEngineXBridge: ObservableObject {
         return false
     }
 
+    /// project.json `type` 是否为 Web（大小写不敏感）
+    static func wallpaperIsWebType(projectJSONURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: projectJSONURL) else { return false }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        guard let type = obj["type"] as? String else { return false }
+        return type.lowercased() == "web"
+    }
+
     /// 单点真相：扫描所有屏幕当前 web 壁纸的 project.json，
-    /// 只要有任意一块屏正在跑需要音频的 web 壁纸，就启 relay；否则停。
+    /// 只要有任意一块屏正在跑需要音频的 web 壁纸，就启 audio relay；
+    /// 只要有任意一块在线 web 壁纸，就启 media relay（Media Integration）。
     /// 任何会改变 `screenRenderStates` 或新增/停止 web 渲染的路径都应该在尾部调用一次。
     func ensureAudioRelayMatchesActiveWallpaper(projectRoot: String? = nil) {
         var needsAudio = false
-        // 只扫描当前在线屏上的 web 壁纸；断线保留的 orphan state 不得继续占用 SCK 音频中继
+        var needsMedia = false
+        // 只扫描当前在线屏上的 web 壁纸；断线保留的 orphan state 不得继续占用中继
         let onlineIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
         let onlineFingerprints = Set(NSScreen.screens.map(\.wallpaperScreenFingerprint))
         for state in screenRenderStates.values where state.renderKind == .web {
             let stillOnline = onlineIDs.contains(state.screenID)
                 || onlineFingerprints.contains(state.screenFingerprint)
             guard stillOnline else { continue }
+            needsMedia = true
             let projectJSON = URL(fileURLWithPath: state.path).appendingPathComponent("project.json")
             if Self.wallpaperRequiresAudio(projectJSONURL: projectJSON) {
                 needsAudio = true
-                break
             }
+            if needsAudio && needsMedia { break }
         }
         // 兜底：调用方明确传入的 projectRoot（刚 setWebWallpaper 完，可能 recordRenderState 还未到）
-        if !needsAudio, let projectRoot {
+        // 仅当 project.json type=Web 时才计入，避免 scene 路径误启 media relay
+        if let projectRoot {
             let projectJSON = URL(fileURLWithPath: projectRoot).appendingPathComponent("project.json")
-            if Self.wallpaperRequiresAudio(projectJSONURL: projectJSON) {
-                needsAudio = true
+            if Self.wallpaperIsWebType(projectJSONURL: projectJSON) {
+                needsMedia = true
+                if !needsAudio, Self.wallpaperRequiresAudio(projectJSONURL: projectJSON) {
+                    needsAudio = true
+                }
             }
         }
 
@@ -1235,6 +1323,17 @@ final class WallpaperEngineXBridge: ObservableObject {
             WallpaperWebAudioRelay.shared.stop()
             audioRelayActiveForCurrentWallpaper = false
         }
+
+        if needsMedia && !mediaRelayActiveForCurrentWallpaper {
+            WallpaperWebMediaRelay.shared.start()
+            mediaRelayActiveForCurrentWallpaper = true
+        } else if !needsMedia && mediaRelayActiveForCurrentWallpaper {
+            WallpaperWebMediaRelay.shared.stop()
+            mediaRelayActiveForCurrentWallpaper = false
+        } else if needsMedia && mediaRelayActiveForCurrentWallpaper {
+            // 换了一张 web 壁纸：强制重推，避免新页错过首帧
+            WallpaperWebMediaRelay.shared.forcePush()
+        }
     }
 
     /// 任何"完全停止外部引擎/暂停"的路径必须调用，确保 relay 不残留 SCK。
@@ -1242,6 +1341,12 @@ final class WallpaperEngineXBridge: ObservableObject {
         guard audioRelayActiveForCurrentWallpaper else { return }
         WallpaperWebAudioRelay.shared.stop()
         audioRelayActiveForCurrentWallpaper = false
+    }
+
+    func stopMediaRelayIfActive() {
+        guard mediaRelayActiveForCurrentWallpaper else { return }
+        WallpaperWebMediaRelay.shared.stop()
+        mediaRelayActiveForCurrentWallpaper = false
     }
 
     /// 切换暂停/恢复
@@ -1275,6 +1380,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         webRenderer.stop()
         Task { try? await Self.runLegacyCLIClientCommand(["stop"]) }
         stopAudioRelayIfActive()
+        stopMediaRelayIfActive()
         isControllingExternalEngine = false
         isExternalPaused = false
         perScreenPausedScreenIDs.removeAll()
@@ -1303,6 +1409,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         webRenderer.stop()
         activeRenderKind = nil
         stopAudioRelayIfActive()
+        stopMediaRelayIfActive()
         isControllingExternalEngine = false
         isExternalPaused = false
         perScreenPausedScreenIDs.removeAll()
@@ -1403,6 +1510,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         screenWatchdogs.removeAll()
         webRenderer.stop()
         stopAudioRelayIfActive()
+        stopMediaRelayIfActive()
         isControllingExternalEngine = false
         isExternalPaused = false
         targetScreenIDs.removeAll()
@@ -1481,10 +1589,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         for screenIndex in targetIndexes {
-            let status = try await Self.runLegacyCLIClientCommand(["set", path, String(screenIndex)])
-            guard status == 0 else {
+            let result = try await Self.runLegacyCLIClientCommandDetailed([
+                "set", path, String(screenIndex)
+            ])
+            guard result.status == 0 else {
+                let detail = result.output.isEmpty ? "" : ": \(result.output)"
                 throw WallpaperEngineError.executionFailed(
-                    "wallpaperengine-cli set 失败 (screen=\(screenIndex), exit=\(status))"
+                    "wallpaperengine-cli set 失败 (screen=\(screenIndex), exit=\(result.status))\(detail)"
                 )
             }
         }
@@ -1586,23 +1697,34 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 这些命令仅作为 IPC 客户端，向 daemon 发完消息就退出；真正的 web 渲染由 daemon 持有。
     @discardableResult
     private static func runLegacyCLIClientCommand(_ arguments: [String]) async throws -> Int32 {
+        let result = try await runLegacyCLIClientCommandDetailed(arguments)
+        return result.status
+    }
+
+    /// 同 `runLegacyCLIClientCommand`，额外捕获 stdout/stderr，便于把 daemon ERROR 文案回传给 UI。
+    private static func runLegacyCLIClientCommandDetailed(
+        _ arguments: [String]
+    ) async throws -> (status: Int32, output: String) {
         guard let cli = Self.resolvedLegacyCLIExecutableURL() else {
             print("[WallpaperEngineXBridge] ❌ wallpaperengine-cli 二进制未找到，已搜索所有路径")
             throw WallpaperEngineError.legacyCliNotFound
         }
         let env = legacyCLILaunchEnvironment(for: cli)
-        let processTask = Task.detached(priority: .userInitiated) { () throws -> Int32 in
+        return try await Task.detached(priority: .userInitiated) { () throws -> (Int32, String) in
             let process = Process()
             process.executableURL = cli
             process.arguments = arguments
             process.environment = env
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
             try process.run()
             process.waitUntilExit()
-            return process.terminationStatus
-        }
-        return try await processTask.value
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return (process.terminationStatus, output)
+        }.value
     }
 
     func applyWebWallpaperProperties(_ propertiesJSON: String) async throws {
@@ -3478,19 +3600,58 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
+            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [] };
+            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "" };
+            function __wxFire(list, payload) {
+              for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) {} }
+            }
             window.wallpaperRegisterMediaStatusListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ enabled: false }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.status.push(cb);
+              try { cb({ enabled: !!__wxMediaState.enabled }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaPropertiesListener = function(cb) {};
-            window.wallpaperRegisterMediaThumbnailListener = function(cb) {};
+            window.wallpaperRegisterMediaPropertiesListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.properties.push(cb);
+              try {
+                cb({ title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
+              } catch (e) {}
+            };
+            window.wallpaperRegisterMediaThumbnailListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.thumbnail.push(cb);
+              try { cb({ thumbnail: __wxMediaState.thumbnail||"" }); } catch (e) {}
+            };
             window.wallpaperRegisterMediaPlaybackListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ state: window.wallpaperMediaIntegration.playback.STOPPED }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.playback.push(cb);
+              try { cb({ state: __wxMediaState.state|0 }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaTimelineListener = function(cb) {};
+            window.wallpaperRegisterMediaTimelineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.timeline.push(cb);
+              try { cb({ position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 }); } catch (e) {}
+            };
+            window.__wxPushMediaUpdate = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
+              if (typeof obj.title === 'string') __wxMediaState.title = obj.title;
+              if (typeof obj.artist === 'string') __wxMediaState.artist = obj.artist;
+              if (typeof obj.albumTitle === 'string') __wxMediaState.albumTitle = obj.albumTitle;
+              if (typeof obj.state === 'number') __wxMediaState.state = obj.state;
+              if (typeof obj.position === 'number') __wxMediaState.position = obj.position;
+              if (typeof obj.duration === 'number') __wxMediaState.duration = obj.duration;
+              if (typeof obj.rate === 'number') __wxMediaState.rate = obj.rate;
+              __wxFire(__wxMedia.status, { enabled: !!__wxMediaState.enabled });
+              __wxFire(__wxMedia.properties, { title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
+              __wxFire(__wxMedia.playback, { state: __wxMediaState.state|0 });
+              __wxFire(__wxMedia.timeline, { position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 });
+            };
+            window.__wxPushMediaThumbnail = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
+              __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
           } catch (e) {}
         })();
         """,

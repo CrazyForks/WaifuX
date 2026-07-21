@@ -212,10 +212,6 @@ final class VideoWallpaperManager: ObservableObject {
         UserDefaults.standard.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
     }
 
-    private var frameInterpolationEnabled: Bool {
-        UserDefaults.standard.object(forKey: "frame_interpolation_enabled") as? Bool ?? false
-    }
-
     private func frameInterpolationTargetFPS(for screen: NSScreen?) -> Int {
         FrameInterpolationTargetFPSResolver.targetFPS(for: screen)
     }
@@ -1462,16 +1458,7 @@ final class VideoWallpaperManager: ObservableObject {
         containerView: WallpaperVideoContainerView
     ) {
         let targetFPS = frameInterpolationTargetFPS(for: screen)
-        guard frameInterpolationEnabled else {
-            if frameInterpolatedPlaybackURLByScreen[screenID] != nil {
-                frameInterpolationDebugPrint("设置已关闭：当前视频补帧状态已重置。视频：\(videoURL.path)")
-                replacePlayerWithOriginalVideoIfNeeded(screenID: screenID, sourceURL: videoURL)
-            } else {
-                resetFrameInterpolation(for: screenID, player: player, item: item)
-            }
-            frameInterpolationDebugPrint("设置未开启：跳过补帧。视频：\(videoURL.path)")
-            return
-        }
+        // 手动补帧始终可用；设壁纸路径只做 FPS 探测与记录修复，不会自动入队。
         guard targetFPS > 0 else {
             resetFrameInterpolation(for: screenID, player: player, item: item)
             frameInterpolationDebugPrint("目标 FPS 无效：跳过补帧。目标 FPS：\(targetFPS)，视频：\(videoURL.path)")
@@ -1570,8 +1557,8 @@ final class VideoWallpaperManager: ObservableObject {
         forceReload: Bool = false,
         markAsInterpolated: Bool = true
     ) {
-        guard frameInterpolationEnabled || forceReload,
-              let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+        // 原地补帧完成后的播放切换不再依赖已废弃的「启用视频补帧」总开关。
+        guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
               windows[screenID] != nil,
               let window = windows[screenID],
               let containerView = window.contentView as? WallpaperVideoContainerView else {

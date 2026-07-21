@@ -1902,7 +1902,7 @@ struct MediaDetailSheet: View {
     }
 
     private func shouldShowVideoOptimizationMenuItem(videoURL: URL) -> Bool {
-        frameInterpolationQueue.item(for: videoURL) != nil
+        frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL)
             || shouldResetVideoOptimization(videoURL: videoURL)
             || isFrameInterpolationBlacklisted(videoURL: videoURL)
             || !videoOptimizationOperations(for: videoURL).isEmpty
@@ -1927,7 +1927,7 @@ struct MediaDetailSheet: View {
     }
 
     private func videoOptimizationActionTitle(videoURL: URL) -> String {
-        if frameInterpolationQueue.item(for: videoURL) != nil {
+        if frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL) {
             return t("videoOptimizationOptimizingVideo")
         }
         if shouldResetVideoOptimization(videoURL: videoURL) {
@@ -1940,7 +1940,7 @@ struct MediaDetailSheet: View {
     }
 
     private func videoOptimizationActionIcon(videoURL: URL) -> String {
-        if frameInterpolationQueue.item(for: videoURL) != nil {
+        if frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL) {
             return "hourglass"
         }
         if shouldResetVideoOptimization(videoURL: videoURL) {
@@ -1963,13 +1963,13 @@ struct MediaDetailSheet: View {
     }
 
     private func videoOptimizationActionDisabled(videoURL: URL) -> Bool {
-        guard frameInterpolationQueue.item(for: videoURL) == nil else { return true }
+        guard !frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL) else { return true }
         guard shouldResetVideoOptimization(videoURL: videoURL) else { return false }
         return isResettingVideoOptimization || isLocalFile
     }
 
     private func handleVideoOptimizationTap(videoURL: URL) {
-        guard frameInterpolationQueue.item(for: videoURL) == nil else { return }
+        guard !frameInterpolationQueue.isPlanningOrQueued(videoURL: videoURL) else { return }
 
         if shouldResetVideoOptimization(videoURL: videoURL) {
             deleteAndRedownloadCurrentItem()
@@ -1982,41 +1982,37 @@ struct MediaDetailSheet: View {
             return
         }
 
-        let operations = videoOptimizationOperations(for: videoURL)
-        guard !operations.isEmpty else { return }
-        frameInterpolationQueue.enqueue(
+        // 入队前读源 FPS：已达目标则只做循环，源 FPS 不足才带补帧。
+        _ = frameInterpolationQueue.enqueueOptimizeVideo(
             videoURL: videoURL,
             title: resolvedItem.title,
             targetFPS: currentFrameInterpolationTargetFPS,
-            source: .manual,
-            operations: operations
+            source: .manual
         )
     }
 
+    /// 菜单/禁用态用的同步粗判（不读磁盘 FPS）。
+    /// 真实步骤在 `enqueueOptimizeVideo` 内按源 FPS 再规划。
     private func videoOptimizationOperations(
         for videoURL: URL
     ) -> [FrameInterpolationQueueItem.Operation] {
         var operations: [FrameInterpolationQueueItem.Operation] = []
         switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
         case .idle, .failed, .noReliablePoint:
-            if frameInterpolationQueue.isLoopAnalysisEnabled {
-                operations.append(.loopTransition)
-            }
+            operations.append(.loopTransition)
         case .applied, .notNeeded:
             break
         }
 
-        if frameInterpolationQueue.isFrameInterpolationEnabled {
-            switch VideoOptimizationRecordStore.shared.frameState(for: videoURL) {
-            case .idle, .failed:
+        switch VideoOptimizationRecordStore.shared.frameState(for: videoURL) {
+        case .idle, .failed:
+            operations.append(.frameInterpolation)
+        case .notNeeded(let targetFPS):
+            if (targetFPS ?? 0) < currentFrameInterpolationTargetFPS {
                 operations.append(.frameInterpolation)
-            case .notNeeded(let targetFPS):
-                if (targetFPS ?? 0) < currentFrameInterpolationTargetFPS {
-                    operations.append(.frameInterpolation)
-                }
-            case .applied, .blacklisted:
-                break
             }
+        case .applied, .blacklisted:
+            break
         }
         return operations
     }
@@ -4894,19 +4890,58 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
+            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [] };
+            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "" };
+            function __wxFire(list, payload) {
+              for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) {} }
+            }
             window.wallpaperRegisterMediaStatusListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ enabled: false }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.status.push(cb);
+              try { cb({ enabled: !!__wxMediaState.enabled }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaPropertiesListener = function(cb) {};
-            window.wallpaperRegisterMediaThumbnailListener = function(cb) {};
+            window.wallpaperRegisterMediaPropertiesListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.properties.push(cb);
+              try {
+                cb({ title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
+              } catch (e) {}
+            };
+            window.wallpaperRegisterMediaThumbnailListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.thumbnail.push(cb);
+              try { cb({ thumbnail: __wxMediaState.thumbnail||"" }); } catch (e) {}
+            };
             window.wallpaperRegisterMediaPlaybackListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ state: window.wallpaperMediaIntegration.playback.STOPPED }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.playback.push(cb);
+              try { cb({ state: __wxMediaState.state|0 }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaTimelineListener = function(cb) {};
+            window.wallpaperRegisterMediaTimelineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.timeline.push(cb);
+              try { cb({ position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 }); } catch (e) {}
+            };
+            window.__wxPushMediaUpdate = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
+              if (typeof obj.title === 'string') __wxMediaState.title = obj.title;
+              if (typeof obj.artist === 'string') __wxMediaState.artist = obj.artist;
+              if (typeof obj.albumTitle === 'string') __wxMediaState.albumTitle = obj.albumTitle;
+              if (typeof obj.state === 'number') __wxMediaState.state = obj.state;
+              if (typeof obj.position === 'number') __wxMediaState.position = obj.position;
+              if (typeof obj.duration === 'number') __wxMediaState.duration = obj.duration;
+              if (typeof obj.rate === 'number') __wxMediaState.rate = obj.rate;
+              __wxFire(__wxMedia.status, { enabled: !!__wxMediaState.enabled });
+              __wxFire(__wxMedia.properties, { title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
+              __wxFire(__wxMedia.playback, { state: __wxMediaState.state|0 });
+              __wxFire(__wxMedia.timeline, { position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 });
+            };
+            window.__wxPushMediaThumbnail = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
+              __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
           } catch (e) {}
         })();
         """,

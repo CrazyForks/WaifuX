@@ -8,6 +8,9 @@ import Foundation
 final class WorkshopLibraryPreviewCache: @unchecked Sendable {
     static let shared = WorkshopLibraryPreviewCache()
 
+    /// 解析策略变更时递增，避免旧版「有 pkg 就不找视频」等负结果永久卡住。
+    private static let videoLookupGeneration = 2
+
     private let lock = NSLock()
     private var projectTypeByPath: [String: String?] = [:]
     private var previewImageByPath: [String: URL?] = [:]
@@ -30,7 +33,7 @@ final class WorkshopLibraryPreviewCache: @unchecked Sendable {
         defer { lock.unlock() }
         projectTypeByPath.removeValue(forKey: key)
         previewImageByPath.removeValue(forKey: key)
-        videoFileByPath.removeValue(forKey: key)
+        videoFileByPath.removeValue(forKey: videoCacheKey(for: key))
     }
 
     func projectType(for url: URL, compute: () -> String?) -> String? {
@@ -68,7 +71,8 @@ final class WorkshopLibraryPreviewCache: @unchecked Sendable {
     }
 
     func videoFile(for url: URL, compute: () -> URL?) -> URL? {
-        let key = url.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        let key = videoCacheKey(for: path)
         lock.lock()
         if let cached = videoFileByPath[key] {
             lock.unlock()
@@ -82,6 +86,10 @@ final class WorkshopLibraryPreviewCache: @unchecked Sendable {
         videoFileByPath[key] = value
         lock.unlock()
         return value
+    }
+
+    private func videoCacheKey(for path: String) -> String {
+        "v\(Self.videoLookupGeneration):\(path)"
     }
 
     private func trimIfNeededLocked() {

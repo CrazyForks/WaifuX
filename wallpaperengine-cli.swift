@@ -158,6 +158,8 @@ private func waifuXGrayscaleThumb(from cgImage: CGImage, dimension: Int) -> [UIn
 // MARK: - IPC
 private enum IPCCommand: String, Codable {
     case set, pause, resume, stop, applyProperties, audioControl, audioData
+    /// Host → daemon：系统 Now Playing 元数据（低频）
+    case mediaUpdate, mediaThumbnail
 }
 
 private struct IPCMessage: Codable {
@@ -169,8 +171,37 @@ private struct IPCMessage: Codable {
     let volume: Double?
     /// WE 音频频谱（128 floats; 0..63 = L, 64..127 = R）；仅 `.audioData` 命令使用。
     let spectrum: [Float]?
+    // MARK: mediaUpdate / mediaThumbnail（可选字段，其它命令忽略）
+    let enabled: Bool?
+    let title: String?
+    let artist: String?
+    let albumTitle: String?
+    /// WE playback state: 0=STOPPED, 1=PLAYING, 2=PAUSED
+    let state: Int?
+    let position: Double?
+    let duration: Double?
+    let rate: Double?
+    /// data URL 或空字符串
+    let thumbnail: String?
 
-    init(command: IPCCommand, path: String?, screen: Int?, propertiesJSON: String? = nil, muted: Bool? = nil, volume: Double? = nil, spectrum: [Float]? = nil) {
+    init(
+        command: IPCCommand,
+        path: String?,
+        screen: Int?,
+        propertiesJSON: String? = nil,
+        muted: Bool? = nil,
+        volume: Double? = nil,
+        spectrum: [Float]? = nil,
+        enabled: Bool? = nil,
+        title: String? = nil,
+        artist: String? = nil,
+        albumTitle: String? = nil,
+        state: Int? = nil,
+        position: Double? = nil,
+        duration: Double? = nil,
+        rate: Double? = nil,
+        thumbnail: String? = nil
+    ) {
         self.command = command
         self.path = path
         self.screen = screen
@@ -178,6 +209,15 @@ private struct IPCMessage: Codable {
         self.muted = muted
         self.volume = volume
         self.spectrum = spectrum
+        self.enabled = enabled
+        self.title = title
+        self.artist = artist
+        self.albumTitle = albumTitle
+        self.state = state
+        self.position = position
+        self.duration = duration
+        self.rate = rate
+        self.thumbnail = thumbnail
     }
 }
 
@@ -475,9 +515,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     static let shared = WebRendererBridge()
     static let offlineBakeScreen = -1
 
-    /// 对齐 [Wallpaper Engine Web 文档](https://docs.wallpaperengine.io/en/web/api/propertylistener.html) 等：提供 `wallpaperRegisterAudioListener`、
-    /// 媒体集成注册函数与 `wallpaperMediaIntegration` 命名空间。无系统音频捕获时音频为全零；媒体集成默认 `enabled: false`。
-    /// 避免壁纸脚本因 `undefined is not a function` 整页中断。
+    /// 对齐 Wallpaper Engine Web 文档：`wallpaperRegisterAudioListener`、Media Integration
+    /// 注册函数与 `wallpaperMediaIntegration` 命名空间。
+    /// 音频由 Host `__wxUpdateAudioBuf` 注入；媒体元数据由 `__wxPushMediaUpdate` / `__wxPushMediaThumbnail` 注入。
+    /// 注册 listener 时回放最近一次状态，避免壁纸晚于推送注册而丢首帧。
     private static let wallpaperEngineWebAPIShim = WKUserScript(
         source: """
         (function() {
@@ -492,7 +533,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             window.wallpaperRegisterAudioListener = function(cb) {
               if (typeof cb === 'function') __wxAudioCbs.push(cb);
             };
-            // 暴露给 Swift 侧注入真实音频 FFT 数据
             window.__wxUpdateAudioBuf = function(arr) {
               if (arr && arr.length) {
                 __wxAudioEnabled = true;
@@ -505,7 +545,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 }
               }
             };
-            // Fallback：无真实音频时维持旧行为（全零），或做 idle 动画
             setInterval(function() {
               if (!__wxAudioEnabled || Date.now() - __wxLastAudioAt > 500) {
                 for (var i = 0; i < __wxAudioBuf.length; i++) __wxAudioBuf[i] = 0;
@@ -514,19 +553,93 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
               }
             }, 33);
+
+            // ---- Media Integration ----
+            var __wxMedia = {
+              status: [], properties: [], thumbnail: [], playback: [], timeline: []
+            };
+            var __wxMediaState = {
+              enabled: false,
+              title: "",
+              artist: "",
+              albumTitle: "",
+              state: 0,
+              position: 0,
+              duration: 0,
+              rate: 1,
+              thumbnail: ""
+            };
+            function __wxFire(list, payload) {
+              for (var i = 0; i < list.length; i++) {
+                try { list[i](payload); } catch (e) {}
+              }
+            }
             window.wallpaperRegisterMediaStatusListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ enabled: false }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.status.push(cb);
+              try { cb({ enabled: !!__wxMediaState.enabled }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaPropertiesListener = function(cb) {};
-            window.wallpaperRegisterMediaThumbnailListener = function(cb) {};
+            window.wallpaperRegisterMediaPropertiesListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.properties.push(cb);
+              try {
+                cb({
+                  title: __wxMediaState.title || "",
+                  artist: __wxMediaState.artist || "",
+                  albumTitle: __wxMediaState.albumTitle || "",
+                  subTitle: __wxMediaState.artist || ""
+                });
+              } catch (e) {}
+            };
+            window.wallpaperRegisterMediaThumbnailListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.thumbnail.push(cb);
+              try { cb({ thumbnail: __wxMediaState.thumbnail || "" }); } catch (e) {}
+            };
             window.wallpaperRegisterMediaPlaybackListener = function(cb) {
-              if (typeof cb === 'function') {
-                try { cb({ state: window.wallpaperMediaIntegration.playback.STOPPED }); } catch (e) {}
-              }
+              if (typeof cb !== 'function') return;
+              __wxMedia.playback.push(cb);
+              try { cb({ state: __wxMediaState.state|0 }); } catch (e) {}
             };
-            window.wallpaperRegisterMediaTimelineListener = function(cb) {};
+            window.wallpaperRegisterMediaTimelineListener = function(cb) {
+              if (typeof cb !== 'function') return;
+              __wxMedia.timeline.push(cb);
+              try {
+                cb({
+                  position: __wxMediaState.position||0,
+                  duration: __wxMediaState.duration||0
+                });
+              } catch (e) {}
+            };
+            // Host 注入：整包媒体状态
+            window.__wxPushMediaUpdate = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
+              if (typeof obj.title === 'string') __wxMediaState.title = obj.title;
+              if (typeof obj.artist === 'string') __wxMediaState.artist = obj.artist;
+              if (typeof obj.albumTitle === 'string') __wxMediaState.albumTitle = obj.albumTitle;
+              if (typeof obj.state === 'number') __wxMediaState.state = obj.state;
+              if (typeof obj.position === 'number') __wxMediaState.position = obj.position;
+              if (typeof obj.duration === 'number') __wxMediaState.duration = obj.duration;
+              if (typeof obj.rate === 'number') __wxMediaState.rate = obj.rate;
+              __wxFire(__wxMedia.status, { enabled: !!__wxMediaState.enabled });
+              __wxFire(__wxMedia.properties, {
+                title: __wxMediaState.title || "",
+                artist: __wxMediaState.artist || "",
+                albumTitle: __wxMediaState.albumTitle || "",
+                subTitle: __wxMediaState.artist || ""
+              });
+              __wxFire(__wxMedia.playback, { state: __wxMediaState.state|0 });
+              __wxFire(__wxMedia.timeline, {
+                position: __wxMediaState.position||0,
+                duration: __wxMediaState.duration||0
+              });
+            };
+            window.__wxPushMediaThumbnail = function(obj) {
+              if (!obj || typeof obj !== 'object') return;
+              __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
+              __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
+            };
           } catch (e) {}
         })();
         """,
@@ -948,6 +1061,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         var extractedPKGDir: URL?
         var mergedDependencyDir: URL?
         var injectedPropertiesJSON: String?
+        /// 每次 load/stop 递增。首帧 settle 与 30s 超时回调必须比对 generation，
+        /// 否则旧 load 的 asyncAfter 会误杀后续 set 的 pendingCompletion（exit=1 竞态）。
         var firstFrameSettleGeneration: UInt64 = 0
         var isLoaded: Bool = false
         var isOffscreen: Bool = false
@@ -996,23 +1111,36 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             screenIdx = 0
         }
 
+        // 先保留旧 generation 再 stop：stop 会 fail 旧 pendingCompletion 并 +1 generation
+        let previousGeneration = screenStates[screenIdx]?.firstFrameSettleGeneration ?? 0
         stop(screen: screenIdx) // 只清理目标屏幕的旧状态
+        // stop 后可能仍留下空 state；统一重建，并分配本代 loadGeneration
+        let loadGeneration = max(previousGeneration, screenStates[screenIdx]?.firstFrameSettleGeneration ?? 0) &+ 1
         screenStates[screenIdx] = ScreenState()
+        screenStates[screenIdx]?.firstFrameSettleGeneration = loadGeneration
         screenStates[screenIdx]?.pendingCompletion = completion
         screenStates[screenIdx]?.isOffscreen = offscreen
 
-        // 超时安全网：30 秒后如果 pendingCompletion 仍在，强制回调防止 IPC 响应永远不发回
-        // （与 App 侧 WallpaperEngineXBridge 的 30s 超时对齐）
+        // 超时安全网：30 秒后如果本代 load 的 pendingCompletion 仍在，强制回调防止 IPC 卡死。
+        // 必须比对 firstFrameSettleGeneration：否则前一次 set 的 30s 定时器会误杀下一次 set。
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self, let state = self.screenStates[screenIdx],
-                  state.pendingCompletion != nil else { return }
-            dlog("[WebRendererBridge] ⚠️ loadWallpaper 30s timeout, forcing completion for screen \(screenIdx)")
-            state.pendingCompletion?(false)
+            guard let self else { return }
+            guard let state = self.screenStates[screenIdx],
+                  state.firstFrameSettleGeneration == loadGeneration,
+                  let pending = state.pendingCompletion else { return }
+            let alreadyLoaded = state.isLoaded
+            dlog("[WebRendererBridge] ⚠️ loadWallpaper 30s timeout screen=\(screenIdx) gen=\(loadGeneration) isLoaded=\(alreadyLoaded)")
+            // 页面已 didFinish 但首帧 settle 过慢：仍视为成功，避免大体积 Web 壁纸误报 exit=1
+            pending(alreadyLoaded)
             self.screenStates[screenIdx]?.pendingCompletion = nil
+            if !alreadyLoaded {
+                self.screenStates[screenIdx]?.firstFrameSettleGeneration &+= 1
+            }
         }
 
         guard let (baseURL, indexFile) = resolveWebWallpaperEntry(path: path) else {
             dlog("[WebRendererBridge] Failed to resolve web wallpaper entry for \(path)")
+            screenStates[screenIdx]?.pendingCompletion = nil
             completion?(false)
             return
         }
@@ -1036,6 +1164,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         } else if let main = NSScreen.main {
             targetScreen = main
         } else {
+            screenStates[screenIdx]?.pendingCompletion = nil
             completion?(false)
             return
         }
@@ -1272,6 +1401,52 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
     }
 
+    /// 推送 Now Playing 元数据到所有已加载的 Web 壁纸。
+    /// 参数与 WE Media Integration 对齐；JSON 经 base64 注入避免转义问题。
+    func pushMediaUpdate(
+        enabled: Bool,
+        title: String,
+        artist: String,
+        albumTitle: String,
+        state: Int,
+        position: Double,
+        duration: Double,
+        rate: Double
+    ) {
+        let payload: [String: Any] = [
+            "enabled": enabled,
+            "title": title,
+            "artist": artist,
+            "albumTitle": albumTitle,
+            "state": state,
+            "position": position,
+            "duration": duration,
+            "rate": rate
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let b64 = data.base64EncodedString() as String? else { return }
+        let js = "(function(){try{var o=JSON.parse(atob('\(b64)'));if(window.__wxPushMediaUpdate)window.__wxPushMediaUpdate(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
+    func pushMediaThumbnail(_ thumbnail: String) {
+        let payload: [String: Any] = ["thumbnail": thumbnail]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let b64 = data.base64EncodedString() as String? else { return }
+        let js = "(function(){try{var o=JSON.parse(atob('\(b64)'));if(window.__wxPushMediaThumbnail)window.__wxPushMediaThumbnail(o);}catch(e){}})();"
+        for (_, st) in screenStates where st.isLoaded {
+            guard let webView = st.webView else { continue }
+            DispatchQueue.main.async { [weak webView] in
+                webView?.evaluateJavaScript(js, completionHandler: nil)
+            }
+        }
+    }
+
     @discardableResult
     func applyUserProperties(jsonString: String, screen: Int = 0) -> Bool {
         screenStates[screen]?.injectedPropertiesJSON = jsonString
@@ -1404,14 +1579,22 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     private func beginSettlingFirstFrame(screen: Int) {
-        screenStates[screen]?.firstFrameSettleGeneration &+= 1
+        // 不递增 generation：loadWallpaper 已为本次 set 分配 loadGeneration；
+        // settle 复用同一 gen，便于 30s 超时与 stop 统一取消。
         let gen = screenStates[screen]?.firstFrameSettleGeneration ?? 0
         let t0 = Date()
         final class SettleState { var lastThumb: [UInt8]?; var stablePasses = 0; var lastImage: NSImage? }
         let ss = SettleState()
         func finish(_ image: NSImage?, reason: String) {
             guard self.screenStates[screen]?.firstFrameSettleGeneration == gen else { return }
-            let ok = image.map { self.saveImage($0, screen: screen) } ?? false
+            var ok = image.map { self.saveImage($0, screen: screen) } ?? false
+            // 页面已加载但截图失败/始终空白：仍返回成功，动态窗口已在渲染
+            if !ok, self.screenStates[screen]?.isLoaded == true {
+                dlog("[WebRendererBridge] first-frame capture weak path screen=\(screen) reason=\(reason); treating as success")
+                ok = true
+            } else {
+                dlog("[WebRendererBridge] first-frame settle screen=\(screen) reason=\(reason) ok=\(ok)")
+            }
             self.screenStates[screen]?.pendingCompletion?(ok)
             self.screenStates[screen]?.pendingCompletion = nil
         }
@@ -2116,6 +2299,33 @@ private final class DesktopWallpaperManager {
         WebRendererBridge.shared.pushAudioFrame(spectrum)
     }
 
+    /// 透传系统 Now Playing 元数据到 Web Media Integration。
+    func pushWebMediaUpdate(
+        enabled: Bool,
+        title: String,
+        artist: String,
+        albumTitle: String,
+        state: Int,
+        position: Double,
+        duration: Double,
+        rate: Double
+    ) {
+        WebRendererBridge.shared.pushMediaUpdate(
+            enabled: enabled,
+            title: title,
+            artist: artist,
+            albumTitle: albumTitle,
+            state: state,
+            position: position,
+            duration: duration,
+            rate: rate
+        )
+    }
+
+    func pushWebMediaThumbnail(_ thumbnail: String) {
+        WebRendererBridge.shared.pushMediaThumbnail(thumbnail)
+    }
+
     func stopWallpaper(screen: Int = 0) {
         guard screenStates[screen] != nil else { return }
         WebRendererBridge.shared.stop(screen: screen)
@@ -2543,7 +2753,12 @@ private final class Daemon: NSObject, NSApplicationDelegate {
             guard lenRead == MemoryLayout<UInt32>.size else { close(fd); return }
 
             let length = lengthBuf.withUnsafeBytes { $0.load(as: UInt32.self) }
-            guard length > 0, length < 1024 * 1024 else { close(fd); return }
+            // mediaThumbnail 可能带 data URL，放宽到 8MB
+            guard length > 0, length < 8 * 1024 * 1024 else {
+                dlog("[Daemon] IPC length rejected: \(length)")
+                close(fd)
+                return
+            }
 
             var data = Data()
             while data.count < Int(length) {
@@ -2554,7 +2769,12 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                 data.append(chunk.prefix(n))
             }
 
-            guard let msg = try? JSONDecoder().decode(IPCMessage.self, from: data) else {
+            let msg: IPCMessage
+            do {
+                msg = try JSONDecoder().decode(IPCMessage.self, from: data)
+            } catch {
+                let preview = String(data: data.prefix(200), encoding: .utf8) ?? "<bin>"
+                dlog("[Daemon] IPC decode failed: \(error) body=\(preview)")
                 _ = "INVALID".data(using: .utf8)?.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
                 close(fd)
                 return
@@ -2632,6 +2852,25 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                     }
                     // 不发响应：30fps 高频命令，sendResponse 会塞爆缓冲且让 App 侧每帧都要 recv。
                     // 必须显式关闭 fd，否则每帧泄漏一个文件描述符，~8s 后耗尽（256/30fps）导致 daemon 完全停止接收 IPC。
+                    close(fd)
+                case .mediaUpdate:
+                    dlog("[Daemon] mediaUpdate enabled=\(msg.enabled ?? false) title=\(msg.title ?? "") state=\(msg.state ?? 0)")
+                    DesktopWallpaperManager.shared.pushWebMediaUpdate(
+                        enabled: msg.enabled ?? false,
+                        title: msg.title ?? "",
+                        artist: msg.artist ?? "",
+                        albumTitle: msg.albumTitle ?? "",
+                        state: msg.state ?? 0,
+                        position: msg.position ?? 0,
+                        duration: msg.duration ?? 0,
+                        rate: msg.rate ?? 1
+                    )
+                    // 低频；仍 fire-and-forget，避免阻塞 Host 主线程
+                    close(fd)
+                case .mediaThumbnail:
+                    let thumbLen = (msg.thumbnail ?? "").count
+                    dlog("[Daemon] mediaThumbnail len=\(thumbLen)")
+                    DesktopWallpaperManager.shared.pushWebMediaThumbnail(msg.thumbnail ?? "")
                     close(fd)
                 }
             }
