@@ -116,6 +116,10 @@ final class VideoWallpaperManager: ObservableObject {
     private var sharedVideoPlayer: AVQueuePlayer?
     private var sharedVideoLooper: AVPlayerLooper?
     private var sharedVideoItem: AVPlayerItem?
+    /// 解码管线的不可变文件锚点。不能用 `currentVideoURL` 判断 player 归属：
+    /// 单屏切换会在新 player 创建前更新全局 URL，从而把旧共享管线误认成新文件。
+    /// 一个 player 从创建到释放始终锚定同一个物理文件；屏幕引用由 `players` 映射管理。
+    private var anchoredVideoPathByPlayerID: [ObjectIdentifier: String] = [:]
     /// 全局同源视频切换采用双代管线：旧共享 player 保持可见，新共享 player
     /// 在每屏隐藏 layer 中预热；所有 layer 都有首帧后再统一黑场交接。
     private var globalTransitionGeneration: UInt64 = 0
@@ -1244,11 +1248,15 @@ final class VideoWallpaperManager: ObservableObject {
 
     func pauseWallpaper(for targetScreen: NSScreen? = nil) {
         if let targetScreen = targetScreen {
-            // 暂停特定屏幕的壁纸
             let screenID = targetScreen.wallpaperScreenIdentifier
-            players[screenID]?.pause()
-            // 将 rate 设为 0 确保完全停止渲染，但保持 player 连接
-            players[screenID]?.rate = 0
+            if let player = players[screenID] {
+                // 同文件多屏共用一条解码管线时，单屏暂停只能遮住该屏画面，
+                // 不能暂停共享 player，否则仍引用它的其它屏也会一起停止。
+                if screenIDsReferencingPlayer(player).count == 1 {
+                    player.pause()
+                    player.rate = 0
+                }
+            }
             showPosterImage(for: screenID)
         } else {
             // 暂停所有屏幕的壁纸
@@ -1679,6 +1687,7 @@ final class VideoWallpaperManager: ObservableObject {
 
         if let oldPlayer, oldPlayer !== components.player {
             releasePlayerIfUnreferenced(oldPlayer, looper: oldLooper)
+            rehomePlaybackEndObserverIfNeeded(for: oldPlayer, preferredScreenID: nil)
         }
         frameInterpolationDebugPrint("播放器已刷新：优化源视频=\(sourceURL.lastPathComponent)，播放文件=\(outputURL.lastPathComponent)")
     }
@@ -1973,6 +1982,7 @@ final class VideoWallpaperManager: ObservableObject {
         windows.removeAll()
         players.removeAll()
         loopers.removeAll()
+        anchoredVideoPathByPlayerID.removeAll()
         sharedVideoLooper?.disableLooping()
         sharedVideoLooper = nil
         sharedVideoItem = nil
@@ -2164,6 +2174,7 @@ final class VideoWallpaperManager: ObservableObject {
         // looper 可能还往 queue 里插 item：先 disable 再清队列。
         player.removeAllItems()
         player.replaceCurrentItem(with: nil)
+        anchoredVideoPathByPlayerID.removeValue(forKey: ObjectIdentifier(player))
         retainPlayersTemporarily([player])
     }
 
@@ -3371,6 +3382,11 @@ final class VideoWallpaperManager: ObservableObject {
                             self.playbackEndObservers.removeValue(forKey: targetScreenID)
                         }
                     }
+                    // 如果目标屏原先持有旧共享管线唯一的 end observer，切走后把
+                    // observer 迁给仍引用旧文件的屏幕，不能让旧管线失去播完事件。
+                    if let oldPlayer, oldPlayer !== components.player {
+                        self.rehomePlaybackEndObserverIfNeeded(for: oldPlayer, preferredScreenID: nil)
+                    }
                 }
 
                 if shouldAnimateReplacement {
@@ -3721,6 +3737,7 @@ final class VideoWallpaperManager: ObservableObject {
             player.pause()
             player.removeAllItems()
             player.replaceCurrentItem(with: nil)
+            anchoredVideoPathByPlayerID.removeValue(forKey: ObjectIdentifier(player))
             retainPlayersTemporarily([player])
             NSLog("[VideoWallpaperManager] Cancelled pending global transition: \(reason)")
         }
@@ -3879,10 +3896,10 @@ final class VideoWallpaperManager: ObservableObject {
     private func coalesceDuplicateDecodersForSameVideos() -> Bool {
         // Group active screens by (video path, on-end mode). Different loop modes cannot share.
         var groups: [String: [String]] = [:]
-        for (screenID, _) in players {
-            let path = frameInterpolatedPlaybackURLByScreen[screenID]?.standardizedFileURL.path
-                ?? videoURLByScreen[screenID]?.standardizedFileURL.path
-                ?? (players[screenID].flatMap { ($0.currentItem?.asset as? AVURLAsset)?.url.standardizedFileURL.path })
+        for (screenID, player) in players {
+            // 合并依据必须是 player 自身锚定的文件，不能读可能已被下一次
+            // 单屏 apply 提前改写的 screen/global URL 映射。
+            let path = anchoredVideoPath(for: player)
             guard let path, !path.isEmpty else { continue }
             let onEnd = onEndModeScreens.contains(screenID)
             let key = "\(path)|onEnd=\(onEnd)"
@@ -4006,15 +4023,17 @@ final class VideoWallpaperManager: ObservableObject {
         if usesSharedVideoDecoder,
            let sharedVideoPlayer,
            let sharedVideoItem,
-           playerMatchesVideoURL(sharedVideoPlayer, screenID: excludingScreenID ?? "", targetPath: targetPath)
-            || (currentVideoURL?.standardizedFileURL.path == targetPath) {
+           playerMatchesVideoURL(
+               sharedVideoPlayer,
+               targetPath: targetPath
+           ) {
             expandPreferredMaximumResolutionIfNeeded(for: sharedVideoItem, screen: attachingScreen)
             return (sharedVideoPlayer, sharedVideoLooper, sharedVideoItem)
         }
 
         for (existingScreenID, player) in players {
             if let excludingScreenID, existingScreenID == excludingScreenID { continue }
-            guard playerMatchesVideoURL(player, screenID: existingScreenID, targetPath: targetPath) else {
+            guard playerMatchesVideoURL(player, targetPath: targetPath) else {
                 continue
             }
             let existingIsOnEnd = onEndModeScreens.contains(existingScreenID)
@@ -4036,24 +4055,32 @@ final class VideoWallpaperManager: ObservableObject {
         return nil
     }
 
-    private func playerMatchesVideoURL(_ player: AVQueuePlayer, screenID: String, targetPath: String) -> Bool {
-        if player === sharedVideoPlayer,
-           let sharedURL = currentVideoURL?.standardizedFileURL.path,
-           sharedURL == targetPath {
-            return true
+    private func anchoredVideoPath(for player: AVQueuePlayer) -> String? {
+        let playerID = ObjectIdentifier(player)
+        if let anchoredPath = anchoredVideoPathByPlayerID[playerID] {
+            return anchoredPath
         }
-        if let playbackURL = frameInterpolatedPlaybackURLByScreen[screenID]?.standardizedFileURL.path,
-           playbackURL == targetPath {
-            return true
+
+        // 兼容锚点机制引入前已存在的 player：优先从活跃 item 反查并补建锚点。
+        if let assetURL = (player.currentItem?.asset as? AVURLAsset)?.url
+            ?? (player.items().first?.asset as? AVURLAsset)?.url {
+            let assetPath = assetURL.standardizedFileURL.path
+            anchoredVideoPathByPlayerID[playerID] = assetPath
+            return assetPath
         }
-        if let mapped = videoURLByScreen[screenID]?.standardizedFileURL.path, mapped == targetPath {
-            return true
+        return nil
+    }
+
+    private func playerMatchesVideoURL(_ player: AVQueuePlayer, targetPath: String) -> Bool {
+        // 锚点一旦存在就是该解码管线的唯一事实源。
+        // 不允许已被单屏切换改写的全局/每屏 URL 覆盖它。
+        anchoredVideoPath(for: player) == targetPath
+    }
+
+    private func screenIDsReferencingPlayer(_ player: AVQueuePlayer) -> [String] {
+        players.compactMap { screenID, candidate in
+            candidate === player ? screenID : nil
         }
-        // Fallback: compare asset URL on the live item (covers rekeyed / fingerprint-only maps).
-        if let assetURL = (player.currentItem?.asset as? AVURLAsset)?.url.standardizedFileURL.path {
-            return assetURL == targetPath
-        }
-        return false
     }
 
     /// When a larger display attaches to a shared decode pipeline, raise the item's
@@ -4094,9 +4121,7 @@ final class VideoWallpaperManager: ObservableObject {
         // It may already be absent from `players` while one or more screens still
         // show it as the outgoing frame during their independent black transitions.
         guard transitionRetainedPlayers[ObjectIdentifier(player)] == nil else { return }
-        let remainingOwners = players.compactMap { id, p -> String? in
-            p === player ? id : nil
-        }
+        let remainingOwners = screenIDsReferencingPlayer(player)
         if !remainingOwners.isEmpty {
             // Opportunistic share: first owner may have held the looper entry.
             // Rehome it under a remaining screen so ARC doesn't kill seamless looping.
@@ -4123,10 +4148,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
         guard !alreadyObserved else { return }
 
-        let candidates = players.compactMap { id, p -> String? in
-            guard p === player, onEndModeScreens.contains(id) else { return nil }
-            return id
-        }
+        let candidates = screenIDsReferencingPlayer(player).filter(onEndModeScreens.contains)
         guard let newOwner = preferredScreenID.flatMap({ candidates.contains($0) ? $0 : nil })
                 ?? candidates.first,
               let item = player.currentItem ?? player.items().first else {
@@ -4236,6 +4258,8 @@ final class VideoWallpaperManager: ObservableObject {
         } else {
             queuePlayer.insert(playerItem, after: nil)
         }
+
+        anchoredVideoPathByPlayerID[ObjectIdentifier(queuePlayer)] = videoURL.standardizedFileURL.path
 
         return (queuePlayer, looper, playerItem)
     }
@@ -4437,22 +4461,38 @@ final class VideoWallpaperManager: ObservableObject {
             Task { @MainActor [weak self, weak player] in
                 guard let self, let player, self.players[screenID] === player else { return }
 
+                let attachedOnEndScreenIDs = self.screenIDsReferencingPlayer(player)
+                    .filter(self.onEndModeScreens.contains)
+                guard !attachedOnEndScreenIDs.isEmpty else { return }
+
                 // 结束帧的 AVPlayerLayer 可能清空为黑色。先盖上 poster，再等待 seek
                 // 真正完成后派发切换事件；不能在异步 seek 发起后立即暂停。
-                self.showPosterImage(for: screenID)
+                // 同一文件共享播放时，所有引用屏会同时到达结尾；先给每屏盖图，
+                // 独立调度模式再分别派发切换，不能只处理 observer 的持有屏。
+                for attachedScreenID in attachedOnEndScreenIDs {
+                    self.showPosterImage(for: attachedScreenID)
+                }
                 player.pause()
                 player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] _ in
                     guard let player else { return }
                     DispatchQueue.main.async {
-                        guard let self, self.players[screenID] === player else { return }
+                        guard let self else { return }
+                        let liveScreenIDs = self.screenIDsReferencingPlayer(player)
+                            .filter(self.onEndModeScreens.contains)
+                        guard !liveScreenIDs.isEmpty else { return }
                         player.pause()
-                        // 发送视频播放完成通知
-                        DistributedNotificationCenter.default().postNotificationName(
-                            notificationName,
-                            object: nil,
-                            userInfo: ["screenID": screenID],
-                            deliverImmediately: true
-                        )
+                        // 全局同步只需要一个逻辑事件；独立调度则每个引用屏都要收到事件。
+                        let notificationScreenIDs = WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
+                            ? Array(liveScreenIDs.prefix(1))
+                            : liveScreenIDs
+                        for liveScreenID in notificationScreenIDs {
+                            DistributedNotificationCenter.default().postNotificationName(
+                                notificationName,
+                                object: nil,
+                                userInfo: ["screenID": liveScreenID],
+                                deliverImmediately: true
+                            )
+                        }
                     }
                 }
             }
@@ -4526,6 +4566,7 @@ final class VideoWallpaperManager: ObservableObject {
         players.removeAll()
         transitionRetainedPlayers.removeAll()
         transitionRetainedPlayerOwners.removeAll()
+        anchoredVideoPathByPlayerID.removeAll()
         screenTransitionSourceRollbacks.removeAll()
         sharedVideoLooper?.disableLooping()
         sharedVideoLooper = nil
