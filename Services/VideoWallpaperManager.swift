@@ -116,6 +116,35 @@ final class VideoWallpaperManager: ObservableObject {
     private var sharedVideoPlayer: AVQueuePlayer?
     private var sharedVideoLooper: AVPlayerLooper?
     private var sharedVideoItem: AVPlayerItem?
+    /// 全局同源视频切换采用双代管线：旧共享 player 保持可见，新共享 player
+    /// 在每屏隐藏 layer 中预热；所有 layer 都有首帧后再统一黑场交接。
+    private var globalTransitionGeneration: UInt64 = 0
+    private var globalTransitionObservers: [NSKeyValueObservation] = []
+    private var globalTransitionTimeout: DispatchWorkItem?
+    private var globalTransitionReadyScreenIDs = Set<String>()
+    private var globalTransitionDidBeginCommit = false
+    private var globalTransitionPendingCompletionScreenIDs = Set<String>()
+    private var pendingGlobalTransitionPlayer: AVQueuePlayer?
+    private var pendingGlobalTransitionLooper: AVPlayerLooper?
+    /// 单屏异步交接期间，旧 player 已从 `players` 映射摘除但仍是主层可见画面。
+    /// 显式保活，防止 rebuild 末尾的 orphan 清扫提前把旧画面断开。
+    private var transitionRetainedPlayers: [ObjectIdentifier: AVQueuePlayer] = [:]
+    private var transitionRetainedPlayerOwners: [ObjectIdentifier: Set<String>] = [:]
+    private struct ScreenTransitionSourceRollback {
+        let videoURL: URL
+        let posterURL: URL?
+        let fingerprint: String
+    }
+    private var screenTransitionSourceRollbacks: [String: ScreenTransitionSourceRollback] = [:]
+    private struct GlobalTransitionSourceRollback {
+        let currentVideoURL: URL?
+        let currentPosterURL: URL?
+        let videoURLByScreen: [String: URL]
+        let videoURLByScreenFingerprint: [String: URL]
+        let posterURLByScreen: [String: URL]
+        let posterURLByScreenFingerprint: [String: URL]
+    }
+    private var globalTransitionSourceRollback: GlobalTransitionSourceRollback?
     /// 每屏视频真实尺寸缓存（naturalSize），供 crop 计算用。设置壁纸时填充。
     private var videoSizes: [String: CGSize] = [:]
     /// 每屏视频源文件自带黑边的内容裁切框。只在全屏自动铺满模式下叠加。
@@ -950,6 +979,13 @@ final class VideoWallpaperManager: ObservableObject {
             return
         }
 
+        // A newer apply supersedes a still-warming global generation. Roll its
+        // logical source mapping back before capturing the next transition state.
+        if pendingGlobalTransitionPlayer != nil {
+            restoreGlobalTransitionSourceState()
+            cancelPendingGlobalVideoTransition(reason: "supersededByNewApply")
+        }
+
         // 设视频壁纸时关闭并清除静态图 overlay（视频窗口本身覆盖桌面，静态 overlay 无意义且浪费窗口）
         // 单屏切换只清目标屏，避免副屏自动轮换时误拆掉其它屏的静态 overlay。
         if let targetScreen {
@@ -1050,6 +1086,29 @@ final class VideoWallpaperManager: ObservableObject {
                 scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: coalesced ? "reuseExistingCoalesced" : "reuseExisting")
             }
             return
+        }
+
+        if let targetScreen,
+           animatedTransition,
+           windows[targetScreen.wallpaperScreenIdentifier] != nil,
+           let previousVideoURL = videoURL(for: targetScreen) {
+            screenTransitionSourceRollbacks[targetScreen.wallpaperScreenIdentifier] = ScreenTransitionSourceRollback(
+                videoURL: previousVideoURL,
+                posterURL: self.posterURL(for: targetScreen),
+                fingerprint: targetScreen.wallpaperScreenFingerprint
+            )
+        } else if targetScreen == nil,
+                  animatedTransition,
+                  usesSharedVideoDecoder,
+                  !windows.isEmpty {
+            globalTransitionSourceRollback = GlobalTransitionSourceRollback(
+                currentVideoURL: currentVideoURL,
+                currentPosterURL: currentPosterURL,
+                videoURLByScreen: videoURLByScreen,
+                videoURLByScreenFingerprint: videoURLByScreenFingerprint,
+                posterURLByScreen: posterURLByScreen,
+                posterURLByScreenFingerprint: posterURLByScreenFingerprint
+            )
         }
 
         self.usesSharedVideoDecoder = usesSharedVideoDecoder
@@ -2175,6 +2234,10 @@ final class VideoWallpaperManager: ObservableObject {
         if let sharedVideoPlayer {
             live.insert(ObjectIdentifier(sharedVideoPlayer))
         }
+        if let pendingGlobalTransitionPlayer {
+            live.insert(ObjectIdentifier(pendingGlobalTransitionPlayer))
+        }
+        live.formUnion(transitionRetainedPlayers.keys)
 
         // 过渡层若仍挂着已不在 map 里的 player，强制摘掉。
         for window in windows.values {
@@ -2221,6 +2284,7 @@ final class VideoWallpaperManager: ObservableObject {
         playerItemObserverTokens.removeValue(forKey: screenID)
         fadeInTimeouts[screenID]?.cancel()
         fadeInTimeouts.removeValue(forKey: screenID)
+        screenTransitionSourceRollbacks.removeValue(forKey: screenID)
 
         let playerBeforeRemoval = players[screenID]
         let ownedPlaybackEndObserver = playbackEndObservers[screenID]
@@ -3251,15 +3315,27 @@ final class VideoWallpaperManager: ObservableObject {
 
         NSLog("[VideoWallpaperManager] Rebuilding windows for \(screensToRebuild.count) screen(s)")
 
-        // 如果只更新特定屏幕，不要 teardown 所有窗口——优先复用现有窗口，只替换 player，实现无感切换
+        // 全局同源视频切换不能 teardown：旧共享解码必须一直播放到新共享解码首帧就绪。
         if targetScreen == nil {
-            teardownAllWindows()
-            for screen in screensToRebuild {
-                do {
-                    guard let videoURL = self.videoURL(for: screen) else { continue }
-                    try createWindow(for: screen, videoURL: videoURL, muted: isMuted)
-                } catch {
-                    NSLog("[VideoWallpaperManager] Failed to create window: \(error.localizedDescription)")
+            let canStageGlobalTransition = animatedTransition
+                && usesSharedVideoDecoder
+                && !windows.isEmpty
+                && screensToRebuild.allSatisfy { windows[$0.wallpaperScreenIdentifier]?.contentView is WallpaperVideoContainerView }
+
+            if canStageGlobalTransition,
+               stageGlobalSharedVideoTransition(for: screensToRebuild) {
+                NSLog("[VideoWallpaperManager] Staged global shared-player transition for \(screensToRebuild.count) screen(s)")
+            } else {
+                globalTransitionSourceRollback = nil
+                cancelPendingGlobalVideoTransition(reason: "globalImmediateRebuild")
+                teardownAllWindows()
+                for screen in screensToRebuild {
+                    do {
+                        guard let videoURL = self.videoURL(for: screen) else { continue }
+                        try createWindow(for: screen, videoURL: videoURL, muted: isMuted)
+                    } catch {
+                        NSLog("[VideoWallpaperManager] Failed to create window: \(error.localizedDescription)")
+                    }
                 }
             }
         } else {
@@ -3311,18 +3387,16 @@ final class VideoWallpaperManager: ObservableObject {
                     containerView.hideGrainOverlay()
                 }
 
-                // 动画切换：旧 poster 继续盖住结束帧直到新视频淡入完成。
-                // 非动画切换：先失效旧异步加载，避免旧 poster 回盖新播放器。
+                // 异步切换期间让旧 player 继续可见；不能提前盖 poster 或停旧解码。
                 let shouldAnimateReplacement = animatedTransition && oldPlayer != nil && oldPlayer !== components.player
-                if shouldAnimateReplacement {
-                    // 确保结束瞬间有封面（播完即换路径通常已显示；定时切换也补一层）。
-                    showPosterImage(for: targetScreenID)
-                } else {
-                    invalidatePosterDisplay(for: targetScreenID)
+                invalidatePosterDisplay(for: targetScreenID)
+                if shouldAnimateReplacement, let oldPlayer {
+                    retainPlayerDuringTransition(oldPlayer, for: targetScreenID)
                 }
 
                 let finalizeReplacement: @MainActor @Sendable () -> Void = { [weak self, weak containerView] in
                     guard let self, let containerView else { return }
+                    self.screenTransitionSourceRollbacks.removeValue(forKey: targetScreenID)
                     // crossfade 完成时已把 player 写进主层；这里再写一次保持非动画路径一致。
                     containerView.playerLayer.player = components.player
                     containerView.playerLayer.videoGravity = .resizeAspectFill
@@ -3340,6 +3414,7 @@ final class VideoWallpaperManager: ObservableObject {
 
                     // 仅当旧 player 不再被任何屏引用时才停解/清队列（共享解码时另一屏可能仍在用）。
                     if let oldPlayer, oldPlayer !== components.player {
+                        self.endPlayerTransitionRetention(oldPlayer, for: targetScreenID)
                         self.releasePlayerIfUnreferenced(oldPlayer, looper: oldLooper)
                     }
 
@@ -3364,6 +3439,15 @@ final class VideoWallpaperManager: ObservableObject {
 
                     let readinessToken = UUID()
                     playerItemObserverTokens[targetScreenID] = readinessToken
+                    let incomingLayer = containerView.preparePlayerForBlackTransition(components.player)
+
+                    // Hidden warm-up layer must be attached before playback. Wait for
+                    // an actual displayable frame, not merely AVPlayerItem.status.
+                    let screenVolume = volumeByScreen[targetScreenID] ?? volume
+                    applyPlayerAudioPolicy(components.player, muted: isMuted, volume: screenVolume)
+                    if !isPaused {
+                        components.player.play()
+                    }
 
                     let beginAnimatedSwap: @MainActor @Sendable (String) -> Void = { [weak self, weak containerView] reason in
                         guard let self, let containerView else { return }
@@ -3374,33 +3458,14 @@ final class VideoWallpaperManager: ObservableObject {
                         self.fadeInTimeouts[targetScreenID]?.cancel()
                         self.fadeInTimeouts.removeValue(forKey: targetScreenID)
 
-                        // AVPlayerLooper 可能在 ready 前后插入新的循环 item，播放前重新应用音频策略。
+                        // AVPlayerLooper 可能在预热期间插入新的循环 item，交接前再应用一次音频策略。
                         let screenVolume = self.volumeByScreen[targetScreenID] ?? self.volume
                         self.applyPlayerAudioPolicy(components.player, muted: self.isMuted, volume: screenVolume)
                         if !self.isPaused {
                             components.player.play()
                         }
 
-                        // 后台自动切换：CA 交叉淡入 completion 可能一直不跑，
-                        // 画面卡在旧 poster / 旧帧，直到用户点一下才“醒”。直接瞬时换层。
-                        if !Self.shouldAnimateDesktopPresentation {
-                            CATransaction.begin()
-                            CATransaction.setDisableActions(true)
-                            containerView.cancelPlayerTransitionIfNeeded()
-                            containerView.playerLayer.player = components.player
-                            containerView.playerLayer.videoGravity = .resizeAspectFill
-                            CATransaction.commit()
-                            finalizeReplacement()
-                            if let window = self.windows[targetScreenID] {
-                                Self.revealDesktopWallpaperWindow(window)
-                            }
-                            self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "\(reason)ImmediateBackground")
-                            return
-                        }
-
-                        // 封面保留到 crossfade 完成；finalizeReplacement 里再 hide，
-                        // 防止旧 player 结束帧清空时露出桌面。
-                        containerView.crossfadeToPlayer(
+                        containerView.blackFadeToPreparedPlayer(
                             components.player,
                             duration: self.automaticSwitchTransitionDuration
                         ) {
@@ -3412,20 +3477,45 @@ final class VideoWallpaperManager: ObservableObject {
                         }
                     }
 
-                    let observer = components.item.observe(\.status, options: [.initial]) { item, _ in
-                        guard item.status == .readyToPlay else { return }
+                    let observer = incomingLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { _, change in
+                        guard change.newValue == true else { return }
                         DispatchQueue.main.async {
                             beginAnimatedSwap("replacementReady")
                         }
                     }
                     playerItemObservers[targetScreenID] = observer
 
-                    let timeout = DispatchWorkItem {
-                        beginAnimatedSwap("replacementTimeout")
+                    let timeout = DispatchWorkItem { [weak self, weak containerView] in
+                        guard let self, let containerView,
+                              self.playerItemObserverTokens[targetScreenID] == readinessToken else { return }
+                        self.playerItemObservers[targetScreenID]?.invalidate()
+                        self.playerItemObservers.removeValue(forKey: targetScreenID)
+                        self.playerItemObserverTokens.removeValue(forKey: targetScreenID)
+                        self.fadeInTimeouts.removeValue(forKey: targetScreenID)
+                        containerView.discardPreparedPlayerTransition()
+                        if let oldPlayer {
+                            self.players[targetScreenID] = oldPlayer
+                            if let oldLooper {
+                                self.loopers[targetScreenID] = oldLooper
+                            }
+                            self.endPlayerTransitionRetention(oldPlayer, for: targetScreenID)
+                        }
+                        if let rollback = self.screenTransitionSourceRollbacks.removeValue(forKey: targetScreenID) {
+                            self.videoURLByScreen[targetScreenID] = rollback.videoURL
+                            self.videoURLByScreenFingerprint[rollback.fingerprint] = rollback.videoURL
+                            self.posterURLByScreen[targetScreenID] = rollback.posterURL
+                            self.posterURLByScreenFingerprint[rollback.fingerprint] = rollback.posterURL
+                            self.syncCurrentVideoURL()
+                            self.persistState()
+                        }
+                        self.releasePlayerIfUnreferenced(components.player, looper: components.looper)
+                        NSLog("[VideoWallpaperManager] Replacement first-frame timeout on \(targetScreenID); old video kept playing")
+                        self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementFirstFrameTimeout")
                     }
                     fadeInTimeouts[targetScreenID] = timeout
-                    DispatchQueue.main.asyncAfter(deadline: .now() + automaticSwitchReadyTimeout, execute: timeout)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: timeout)
                 } else {
+                    screenTransitionSourceRollbacks.removeValue(forKey: targetScreenID)
                     containerView.cancelPlayerTransitionIfNeeded()
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
@@ -3461,6 +3551,250 @@ final class VideoWallpaperManager: ObservableObject {
 
         lastAppliedScreenConfigurations = currentTargetScreenConfigurations()
         NSLog("[VideoWallpaperManager] Windows rebuilt successfully")
+    }
+
+    /// Build exactly one incoming AVQueuePlayer for a global same-video apply.
+    /// Existing windows/layers and their old player remain untouched until every
+    /// hidden incoming layer reports a decoded frame ready for display.
+    @discardableResult
+    private func stageGlobalSharedVideoTransition(for screens: [NSScreen]) -> Bool {
+        guard let firstScreen = screens.first,
+              let videoURL = videoURL(for: firstScreen) else { return false }
+        let expectedPath = videoURL.standardizedFileURL.path
+        guard screens.allSatisfy({ self.videoURL(for: $0)?.standardizedFileURL.path == expectedPath }) else {
+            return false
+        }
+
+        let oldPlayersByScreen = players
+        guard !oldPlayersByScreen.isEmpty else { return false }
+        let oldLoopersByScreen = loopers
+
+        cancelPendingGlobalVideoTransition(reason: "superseded")
+        globalTransitionGeneration &+= 1
+        let generation = globalTransitionGeneration
+
+        let schedulerConfig = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(
+            for: firstScreen.wallpaperScreenIdentifier
+        )
+        let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
+        let components = makePlayerComponents(
+            for: firstScreen,
+            videoURL: videoURL,
+            muted: isMuted,
+            enableLooping: !isOnEndMode
+        )
+        pendingGlobalTransitionPlayer = components.player
+        pendingGlobalTransitionLooper = components.looper
+        applyPlayerAudioPolicy(components.player, muted: isMuted, volume: volume)
+
+        var incomingLayers: [String: AVPlayerLayer] = [:]
+        for screen in screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            guard let window = windows[screenID],
+                  let container = window.contentView as? WallpaperVideoContainerView else {
+                cancelPendingGlobalVideoTransition(reason: "missingWindow")
+                return false
+            }
+            synchronizeWindow(window, to: screen)
+            incomingLayers[screenID] = container.preparePlayerForBlackTransition(components.player)
+        }
+
+        globalTransitionReadyScreenIDs.removeAll()
+        globalTransitionDidBeginCommit = false
+        let beginCommitIfReady: @MainActor @Sendable () -> Void = { [weak self] in
+            guard let self,
+                  self.globalTransitionGeneration == generation,
+                  !self.globalTransitionDidBeginCommit,
+                  self.globalTransitionReadyScreenIDs.count == incomingLayers.count else { return }
+            self.globalTransitionDidBeginCommit = true
+            self.commitGlobalSharedVideoTransition(
+                generation: generation,
+                screens: screens,
+                videoURL: videoURL,
+                components: components,
+                oldPlayersByScreen: oldPlayersByScreen,
+                oldLoopersByScreen: oldLoopersByScreen,
+                isOnEndMode: isOnEndMode
+            )
+        }
+
+        for (screenID, layer) in incomingLayers {
+            let observer = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { _, change in
+                guard change.newValue == true else { return }
+                DispatchQueue.main.async {
+                    guard self.globalTransitionGeneration == generation else { return }
+                    self.globalTransitionReadyScreenIDs.insert(screenID)
+                    beginCommitIfReady()
+                }
+            }
+            globalTransitionObservers.append(observer)
+        }
+
+        // The hidden layers must be attached before playback starts; otherwise
+        // AVFoundation may report item-ready without decoding a presentable frame.
+        if !isPaused {
+            components.player.play()
+        }
+
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.globalTransitionGeneration == generation,
+                  !self.globalTransitionDidBeginCommit else { return }
+            NSLog("[VideoWallpaperManager] Global transition timed out before all screens had a first frame; keeping old video")
+            self.restoreGlobalTransitionSourceState()
+            self.cancelPendingGlobalVideoTransition(reason: "firstFrameTimeout")
+        }
+        globalTransitionTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: timeout)
+        return true
+    }
+
+    private func commitGlobalSharedVideoTransition(
+        generation: UInt64,
+        screens: [NSScreen],
+        videoURL: URL,
+        components: (player: AVQueuePlayer, looper: AVPlayerLooper?, item: AVPlayerItem),
+        oldPlayersByScreen: [String: AVQueuePlayer],
+        oldLoopersByScreen: [String: AVPlayerLooper],
+        isOnEndMode: Bool
+    ) {
+        guard globalTransitionGeneration == generation,
+              pendingGlobalTransitionPlayer === components.player else { return }
+
+        globalTransitionObservers.forEach { $0.invalidate() }
+        globalTransitionObservers.removeAll()
+        globalTransitionTimeout?.cancel()
+        globalTransitionTimeout = nil
+        globalTransitionReadyScreenIDs.removeAll()
+
+        // Promote the new generation only after first-frame readiness. Every
+        // screen points at the exact same player/item/looper tuple.
+        for observer in playbackEndObservers.values {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        playbackEndObservers.removeAll()
+        loopers.removeAll()
+        for screen in screens {
+            players[screen.wallpaperScreenIdentifier] = components.player
+        }
+        sharedVideoPlayer = components.player
+        sharedVideoLooper = components.looper
+        sharedVideoItem = components.item
+        pendingGlobalTransitionPlayer = nil
+        pendingGlobalTransitionLooper = nil
+        globalTransitionSourceRollback = nil
+
+        if isOnEndMode {
+            onEndModeScreens = Set(screens.map(\.wallpaperScreenIdentifier))
+            if let first = screens.first {
+                setupPlaybackEndObserver(
+                    for: first.wallpaperScreenIdentifier,
+                    player: components.player,
+                    item: components.item
+                )
+            }
+        } else {
+            onEndModeScreens.subtract(screens.map(\.wallpaperScreenIdentifier))
+        }
+
+        globalTransitionPendingCompletionScreenIDs = Set(screens.map(\.wallpaperScreenIdentifier))
+        let finishOne: @MainActor @Sendable (NSScreen) -> Void = { [weak self] screen in
+            guard let self, self.globalTransitionGeneration == generation else { return }
+            let screenID = screen.wallpaperScreenIdentifier
+            guard self.globalTransitionPendingCompletionScreenIDs.remove(screenID) != nil else { return }
+            self.hidePosterImage(for: screenID)
+            self.applyCropToScreen(screen)
+            self.scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: videoURL)
+            if let window = self.windows[screenID],
+               let container = window.contentView as? WallpaperVideoContainerView {
+                self.prepareFrameInterpolation(
+                    screenID: screenID,
+                    screen: screen,
+                    videoURL: videoURL,
+                    player: components.player,
+                    item: components.item,
+                    containerView: container
+                )
+                Self.revealDesktopWallpaperWindow(window)
+            }
+            guard self.globalTransitionPendingCompletionScreenIDs.isEmpty else { return }
+
+            var released = Set<ObjectIdentifier>()
+            for (oldScreenID, oldPlayer) in oldPlayersByScreen where oldPlayer !== components.player {
+                let id = ObjectIdentifier(oldPlayer)
+                guard released.insert(id).inserted else { continue }
+                self.releasePlayerIfUnreferenced(oldPlayer, looper: oldLoopersByScreen[oldScreenID])
+            }
+            self.purgeOrphanedVideoPlayers(reason: "globalBlackTransitionComplete")
+            self.persistState()
+            NSLog("[VideoWallpaperManager] Global shared-player black transition completed")
+        }
+
+        for screen in screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            guard let window = windows[screenID],
+                  let container = window.contentView as? WallpaperVideoContainerView else {
+                finishOne(screen)
+                continue
+            }
+            container.blackFadeToPreparedPlayer(
+                components.player,
+                duration: automaticSwitchTransitionDuration
+            ) {
+                finishOne(screen)
+            }
+        }
+
+        // Refresh natural size once and apply it to every screen sharing this asset.
+        Task { [weak self] in
+            let asset = AVURLAsset(url: videoURL)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let size = try? await track.load(.naturalSize),
+                  size.width > 0, size.height > 0 else { return }
+            await MainActor.run {
+                guard let self, self.globalTransitionGeneration == generation else { return }
+                for screen in screens {
+                    self.videoSizes[screen.wallpaperScreenIdentifier] = size
+                    self.applyCropToScreen(screen)
+                }
+            }
+        }
+    }
+
+    private func cancelPendingGlobalVideoTransition(reason: String) {
+        globalTransitionGeneration &+= 1
+        globalTransitionObservers.forEach { $0.invalidate() }
+        globalTransitionObservers.removeAll()
+        globalTransitionTimeout?.cancel()
+        globalTransitionTimeout = nil
+        globalTransitionReadyScreenIDs.removeAll()
+        globalTransitionDidBeginCommit = false
+        globalTransitionPendingCompletionScreenIDs.removeAll()
+        for window in windows.values {
+            (window.contentView as? WallpaperVideoContainerView)?.discardPreparedPlayerTransition()
+        }
+        if let player = pendingGlobalTransitionPlayer {
+            pendingGlobalTransitionLooper?.disableLooping()
+            player.pause()
+            player.removeAllItems()
+            player.replaceCurrentItem(with: nil)
+            retainPlayersTemporarily([player])
+            NSLog("[VideoWallpaperManager] Cancelled pending global transition: \(reason)")
+        }
+        pendingGlobalTransitionPlayer = nil
+        pendingGlobalTransitionLooper = nil
+    }
+
+    private func restoreGlobalTransitionSourceState() {
+        guard let rollback = globalTransitionSourceRollback else { return }
+        currentVideoURL = rollback.currentVideoURL
+        currentPosterURL = rollback.currentPosterURL
+        videoURLByScreen = rollback.videoURLByScreen
+        videoURLByScreenFingerprint = rollback.videoURLByScreenFingerprint
+        posterURLByScreen = rollback.posterURLByScreen
+        posterURLByScreenFingerprint = rollback.posterURLByScreenFingerprint
+        globalTransitionSourceRollback = nil
+        persistState()
     }
 
     /// 全局重建时只返回应显示 MP4 的 `NSScreen`（与 `videoTargetScreenIDs` 对齐）
@@ -3793,12 +4127,30 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
+    private func retainPlayerDuringTransition(_ player: AVQueuePlayer, for screenID: String) {
+        let id = ObjectIdentifier(player)
+        transitionRetainedPlayers[id] = player
+        transitionRetainedPlayerOwners[id, default: []].insert(screenID)
+    }
+
+    private func endPlayerTransitionRetention(_ player: AVQueuePlayer, for screenID: String) {
+        let id = ObjectIdentifier(player)
+        transitionRetainedPlayerOwners[id]?.remove(screenID)
+        if transitionRetainedPlayerOwners[id]?.isEmpty != false {
+            transitionRetainedPlayerOwners.removeValue(forKey: id)
+            transitionRetainedPlayers.removeValue(forKey: id)
+        }
+    }
+
     /// Pause/clear a player only when no window still references it (shared multi-display case).
     /// When other screens still share the player, rehome any looper ownership so looping stays alive.
     private func releasePlayerIfUnreferenced(
         _ player: AVQueuePlayer,
         looper: AVPlayerLooper? = nil
     ) {
+        // It may already be absent from `players` while one or more screens still
+        // show it as the outgoing frame during their independent black transitions.
+        guard transitionRetainedPlayers[ObjectIdentifier(player)] == nil else { return }
         let remainingOwners = players.compactMap { id, p -> String? in
             p === player ? id : nil
         }
@@ -4166,6 +4518,7 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     private func teardownAllWindows() {
+        cancelPendingGlobalVideoTransition(reason: "teardownAllWindows")
         // 0. 取消上一次未执行的延迟释放，避免快速切换时多组 AVPlayer 并发驻留
         pendingPlayerCleanups.forEach { $0.cancel() }
         pendingPlayerCleanups.removeAll()
@@ -4215,6 +4568,11 @@ final class VideoWallpaperManager: ObservableObject {
             guard seenPlayerIDs.insert(id).inserted else { continue }
             uniquePlayers.append(player)
         }
+        for player in transitionRetainedPlayers.values {
+            let id = ObjectIdentifier(player)
+            guard seenPlayerIDs.insert(id).inserted else { continue }
+            uniquePlayers.append(player)
+        }
         for player in uniquePlayers {
             // layer 已在上方断开；这里再清 looper 队列与 currentItem。
             player.pause()
@@ -4223,6 +4581,9 @@ final class VideoWallpaperManager: ObservableObject {
             player.replaceCurrentItem(with: nil)
         }
         players.removeAll()
+        transitionRetainedPlayers.removeAll()
+        transitionRetainedPlayerOwners.removeAll()
+        screenTransitionSourceRollbacks.removeAll()
         sharedVideoLooper?.disableLooping()
         sharedVideoLooper = nil
         sharedVideoItem = nil
@@ -4785,6 +5146,125 @@ private final class WallpaperVideoContainerView: NSView {
         blackTransitionLayer?.removeAllAnimations()
         blackTransitionLayer?.removeFromSuperlayer()
         blackTransitionLayer = nil
+    }
+
+    /// Attach an incoming shared player to an almost-transparent layer so AVFoundation
+    /// actually decodes a presentable frame while the old main layer remains visible.
+    @discardableResult
+    func preparePlayerForBlackTransition(_ player: AVQueuePlayer) -> AVPlayerLayer {
+        cancelPlayerTransitionIfNeeded()
+        let incoming = AVPlayerLayer(player: player)
+        incoming.videoGravity = avPlayerLayer.videoGravity
+        incoming.needsDisplayOnBoundsChange = true
+        incoming.frame = avPlayerLayer.frame
+        // A literal zero opacity layer can be culled and never become readyForDisplay.
+        incoming.opacity = 0.001
+        layer?.addSublayer(incoming)
+        transitionPlayerLayer = incoming
+        return incoming
+    }
+
+    func discardPreparedPlayerTransition() {
+        transitionPlayerLayer?.player = nil
+        transitionPlayerLayer?.removeFromSuperlayer()
+        transitionPlayerLayer = nil
+        blackTransitionLayer?.removeAllAnimations()
+        blackTransitionLayer?.removeFromSuperlayer()
+        blackTransitionLayer = nil
+    }
+
+    /// Fade to black, swap the already-warm incoming player while fully covered,
+    /// then fade black out. The old player is never detached before black is opaque.
+    func blackFadeToPreparedPlayer(
+        _ newPlayer: AVQueuePlayer,
+        duration: TimeInterval,
+        completion: @escaping () -> Void
+    ) {
+        guard let incoming = transitionPlayerLayer, incoming.player === newPlayer else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            avPlayerLayer.player = newPlayer
+            CATransaction.commit()
+            completion()
+            return
+        }
+
+        let black = CALayer()
+        black.backgroundColor = NSColor.black.cgColor
+        black.frame = bounds
+        black.opacity = 0
+        layer?.addSublayer(black)
+        blackTransitionLayer = black
+
+        var didComplete = false
+        let finish: () -> Void = { [weak self, weak black] in
+            guard !didComplete else { return }
+            didComplete = true
+            black?.removeAllAnimations()
+            black?.removeFromSuperlayer()
+            if self?.blackTransitionLayer === black {
+                self?.blackTransitionLayer = nil
+            }
+            completion()
+        }
+
+        let installIncoming: () -> Void = { [weak self, weak incoming] in
+            guard let self, let incoming else {
+                finish()
+                return
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.avPlayerLayer.player = newPlayer
+            self.avPlayerLayer.videoGravity = incoming.videoGravity
+            incoming.player = nil
+            incoming.removeFromSuperlayer()
+            if self.transitionPlayerLayer === incoming {
+                self.transitionPlayerLayer = nil
+            }
+            CATransaction.commit()
+        }
+
+        let totalDuration = max(0.16, duration)
+        let halfDuration = totalDuration / 2
+        let appActive = NSApp.isActive && NSApp.isRunning
+        if !appActive {
+            // Background CA completions are unreliable. Commit an explicit black
+            // frame, swap on the next run-loop slice, then reveal the warm player.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            black.opacity = 1
+            CATransaction.commit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                installIncoming()
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                black.opacity = 0
+                CATransaction.commit()
+                finish()
+            }
+            return
+        }
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(halfDuration)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+        CATransaction.setCompletionBlock {
+            installIncoming()
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(halfDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+            CATransaction.setCompletionBlock { finish() }
+            black.opacity = 0
+            CATransaction.commit()
+        }
+        black.opacity = 1
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + totalDuration + 0.5) {
+            installIncoming()
+            finish()
+        }
     }
 
     /// 若主层或过渡层仍引用指定 player，则断开（旧解码管线释放前必须调用）。
