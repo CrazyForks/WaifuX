@@ -89,7 +89,8 @@ final class VideoThumbnailCache {
     func cachedStaticThumbnailFileURLIfExists(forLocalFile mediaURL: URL) -> URL? {
         guard mediaURL.isFileURL else { return nil }
         let path = mediaURL.standardizedFileURL.path
-        guard fileManager.fileExists(atPath: path) else { return nil }
+        // 列表热路径：只查本机 SSD 上的抽帧缓存，不要 fileExists 外置原片
+        // （源文件是否存在由下载记录 / FileExistenceCache 保证）
 
         // 优先高清 poster，避免列表长期卡在 800×600 小图
         let poster = posterCacheURL(forPathKey: path)

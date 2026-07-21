@@ -225,6 +225,8 @@ struct WaifuXApp {
             ImageCache.default.clearMemoryCache()
             Task { @MainActor in
                 VideoThumbnailCache.shared.clearMemoryCache()
+                LocalImageThumbnailCache.shared.clearMemoryHints()
+                WorkshopLibraryPreviewCache.shared.clearAll()
                 NotificationCenter.default.post(name: .appDidReceiveMemoryPressure, object: nil)
             }
         }
@@ -788,6 +790,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             KingfisherManager.shared.downloader.cancelAll()
             ImageCache.default.clearMemoryCache()
             VideoThumbnailCache.shared.clearMemoryCache()
+            LocalImageThumbnailCache.shared.clearMemoryHints()
+            WorkshopLibraryPreviewCache.shared.clearAll()
             VideoPreloader.shared.clearCache()
             URLCache.shared.removeAllCachedResponses()
             clearWebKitForegroundCaches()
@@ -836,6 +840,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         PreviewWindowManager.shared.closePreview()
         ImageCache.default.clearMemoryCache()
         VideoThumbnailCache.shared.clearMemoryCache()
+        LocalImageThumbnailCache.shared.clearMemoryHints()
+        WorkshopLibraryPreviewCache.shared.clearAll()
         VideoPreloader.shared.clearCache()
         LocalWallpaperScanner.shared.clearInMemoryCache()
         WorkshopService.shared.clearForegroundState()

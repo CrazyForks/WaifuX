@@ -1490,9 +1490,18 @@ struct MyLibraryContentView: View {
 
         let targetSize = CGSize(width: 512, height: 512)
         let range = prefetchRange(around: index, totalCount: wallpaperItems.count)
+        // 优先本机 SSD 列表缩略图 / 站点 thumb，绝不 prefetch 外置原图路径
         let urls = range
             .filter { $0 != index }
-            .compactMap { wallpaperItems[$0].wallpaper.thumbURL }
+            .compactMap { idx -> URL? in
+                let entry = wallpaperItems[idx]
+                if let local = entry.localFileURL,
+                   LocalImageThumbnailCache.isRasterImageFile(local),
+                   let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
+                    return cached
+                }
+                return entry.wallpaper.thumbURL ?? entry.wallpaper.smallThumbURL
+            }
 
         ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
         ForegroundPrefetchManager.shared.start(
@@ -1500,6 +1509,17 @@ struct MyLibraryContentView: View {
             options: [.processor(DownsamplingImageProcessor(size: targetSize))],
             namespace: wallpaperPrefetchNamespace
         )
+
+        // 后台为附近静图生成 SSD 缩略图，后续滚动直接命中
+        let nearbyLocals = range.compactMap { wallpaperItems[$0].localFileURL }
+            .filter { LocalImageThumbnailCache.isRasterImageFile($0) }
+        if !nearbyLocals.isEmpty {
+            Task { @MainActor in
+                for url in nearbyLocals.prefix(12) {
+                    _ = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: url)
+                }
+            }
+        }
     }
 
     private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
@@ -3336,7 +3356,11 @@ private struct AnyMediaItem: Identifiable {
 
     @MainActor
     init(mediaItem: MediaItem, localFileURL: URL? = nil) {
-        let resolvedVideoFileURL = Self.resolveVideoFileURL(localFileURL: localFileURL, downloadRecord: nil)
+        // 列表重建不做 Workshop 递归/外置 stat；视频路径由卡片 onAppear 按需解析。
+        let resolvedVideoFileURL = Self.resolveVideoFileURLLightweight(
+            localFileURL: localFileURL,
+            downloadRecord: nil
+        )
         let thumbnailURL = mediaItem.libraryGridThumbnailURL(localFileURL: localFileURL)
 
         self.id = mediaItem.id
@@ -3353,7 +3377,7 @@ private struct AnyMediaItem: Identifiable {
 
     @MainActor
     init(unified: UnifiedLocalMedia) {
-        let resolvedVideoFileURL = Self.resolveVideoFileURL(
+        let resolvedVideoFileURL = Self.resolveVideoFileURLLightweight(
             localFileURL: unified.fileURL,
             downloadRecord: unified.downloadRecord
         )
@@ -3376,29 +3400,38 @@ private struct AnyMediaItem: Identifiable {
         unifiedLocalMedia?.isPortrait ?? mediaItem.isPortrait
     }
 
-    private static func resolveVideoFileURL(localFileURL: URL?, downloadRecord: MediaDownloadRecord?) -> URL? {
+    /// 轻量解析：只认 bake 记录路径与「本身就是视频文件」的扩展名，不扫目录、不 fileExists 外置卷。
+    private static func resolveVideoFileURLLightweight(
+        localFileURL: URL?,
+        downloadRecord: MediaDownloadRecord?
+    ) -> URL? {
         if let artifactPath = downloadRecord?.sceneBakeArtifact?.videoPath,
-           SceneOfflineBakeService.isUsableBakedVideo(at: URL(fileURLWithPath: artifactPath)) {
+           !artifactPath.isEmpty {
+            // 可用性检查延后到卡片/设壁纸路径；此处只给列表一个候选 URL
             return URL(fileURLWithPath: artifactPath)
         }
-        guard let localFileURL,
-              localFileURL.isFileURL,
-              FileManager.default.fileExists(atPath: localFileURL.path) else {
-            return nil
+        guard let localFileURL, localFileURL.isFileURL else { return nil }
+        let ext = localFileURL.pathExtension.lowercased()
+        if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+            return localFileURL
         }
-        return MediaItem.resolveLocalVideoFile(from: localFileURL) ?? localFileURL
+        return nil
     }
 
     private static func shouldProbeAnimatedThumbnail(url: URL, mediaItem: MediaItem) -> Bool {
         if url.isFileURL {
             let path = url.standardizedFileURL.path
-            if path.contains("/WaifuX/VideoThumbnails/") {
+            if path.contains("/WaifuX/VideoThumbnails/")
+                || path.contains("/WaifuX/LocalImageThumbnails/") {
                 return false
             }
 
             let ext = url.pathExtension.lowercased()
-            if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
-                return false
+            if ["mp4", "mov", "webm", "m4v", "mkv", "jpg", "jpeg", "png", "webp", "heic"].contains(ext) {
+                // 静图/视频封面无需 GIF probe；尤其外置卡上 probe 会再读文件头
+                if ext != "gif" {
+                    return false
+                }
             }
         }
 

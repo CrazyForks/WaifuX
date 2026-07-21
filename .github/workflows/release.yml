@@ -457,21 +457,18 @@ jobs:
       - name: Generate Changelog
         id: changelog
         run: |
-          # subject + body → markdown（GitHub Release body）
-          # 与本地 bump / pre-commit 共用 scripts/generate-appcast-changelog.py
+          # 获取上一个 tag（用于生成变更日志）
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
           if [ -n "$PREV_TAG" ]; then
-            CHANGELOG=$(python3 scripts/generate-appcast-changelog.py \
-              --format markdown --since "$PREV_TAG")
+            # 从上一个 tag 到当前提交的 commit messages 生成日志
+            CHANGELOG=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges | head -30)
+            echo "Generated changelog from $PREV_TAG to $GITHUB_REF_NAME:"
+            echo "$CHANGELOG"
           else
-            CHANGELOG=$(python3 scripts/generate-appcast-changelog.py \
-              --format markdown)
-          fi
-          if [ -z "$CHANGELOG" ]; then
             CHANGELOG="- Initial release"
+            echo "No previous tag found, using default changelog"
           fi
-          echo "Generated changelog from ${PREV_TAG:-初始版本} to $GITHUB_REF_NAME:"
-          echo "$CHANGELOG"
 
           # 写入 GITHUB_OUTPUT 供后续 step 使用
           {
@@ -485,8 +482,7 @@ jobs:
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          export APPCAST_VERSION="${{ steps.version.outputs.version }}"
-          VERSION="$APPCAST_VERSION"
+          VERSION="${{ steps.version.outputs.version }}"
           DMG_PATH="build/WaifuX.dmg"
 
           # 签名 DMG 获取 Ed25519 签名
@@ -496,64 +492,52 @@ jobs:
             exit 1
           fi
           echo "✅ DMG signed: $ED_SIG"
-          export APPCAST_SIG="$ED_SIG"
 
           # 获取文件大小
-          export APPCAST_SIZE=$(stat -f%z "$DMG_PATH")
-          export APPCAST_PUB_DATE=$(date -R)
-          PUB_DATE="$APPCAST_PUB_DATE"
+          DMG_SIZE=$(stat -f%z "$DMG_PATH")
+          PUB_DATE=$(date -R)
 
-          # subject + body → HTML description（body 行作为嵌套 <li>）
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV_TAG" ]; then
-            export APPCAST_DESC=$(python3 scripts/generate-appcast-changelog.py \
-              --format html --version "$VERSION" --since "$PREV_TAG")
-          else
-            export APPCAST_DESC=$(python3 scripts/generate-appcast-changelog.py \
-              --format html --version "$VERSION")
-          fi
-
-          # 用 Python 生成 appcast.xml
-          # - description 走环境变量，避免超长 changelog / 引号转义问题
-          # - 占位符用 @@KEY@@，避免 commit 正文中的 {} 触发 str.format 异常
+          # 用 Python 生成 appcast.xml（避免 sed 正则元字符问题：base64 签名含 + / 等）
+          CHANGELOG="${{ steps.changelog.outputs.changelog }}"
           python3 -c "
-          import os
-          version, pub_date, size, sig = os.environ['APPCAST_VERSION'], os.environ['APPCAST_PUB_DATE'], os.environ['APPCAST_SIZE'], os.environ['APPCAST_SIG']
-          desc = os.environ.get('APPCAST_DESC', '')
-          xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
-  <channel>
-    <title>WaifuX</title>
-    <link>https://jipika.github.io/WaifuX/appcast.xml</link>
-    <description>WaifuX Updates</description>
-    <language>zh</language>
-    <item>
-      <title>Version @@VERSION@@</title>
-      <sparkle:version>@@VERSION@@</sparkle:version>
-      <sparkle:shortVersionString>@@VERSION@@</sparkle:shortVersionString>
-      <pubDate>@@PUB_DATE@@</pubDate>
-      <description><![CDATA[
-@@DESC@@
-      ]]></description>
-      <enclosure
-        url=\"https://github.com/jipika/WaifuX/releases/download/v@@VERSION@@/WaifuX.dmg\"
-        type=\"application/octet-stream\"
-        length=\"@@SIZE@@\"
-        sparkle:edSignature=\"@@SIG@@\"
-      />
-    </item>
-  </channel>
-</rss>
-'''
-          xml = (xml
-            .replace('@@VERSION@@', version)
-            .replace('@@PUB_DATE@@', pub_date)
-            .replace('@@SIZE@@', size)
-            .replace('@@SIG@@', sig)
-            .replace('@@DESC@@', desc))
+          import sys
+          changelog = sys.argv[5].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          lines = changelog.split('\n')
+          items = ''.join('<li>{}</li>'.format(l.lstrip('- ')) for l in lines if l.strip().startswith('- '))
+          description = '<h3>WaifuX {}</h3><ul>{}</ul>'.format(sys.argv[1], items) if items else '<p>WaifuX {}</p>'.format(sys.argv[1])
+
+          template = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
+          <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
+            <channel>
+              <title>WaifuX</title>
+              <link>https://jipika.github.io/WaifuX/appcast.xml</link>
+              <description>WaifuX Updates</description>
+              <language>zh</language>
+              <item>
+                <title>Version {version}</title>
+                <sparkle:version>{version}</sparkle:version>
+                <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+                <pubDate>{pub_date}</pubDate>
+                <description><![CDATA[{desc}]]></description>
+                <enclosure
+                  url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
+                  type=\"application/octet-stream\"
+                  length=\"{size}\"
+                  sparkle:edSignature=\"{sig}\"
+                />
+              </item>
+            </channel>
+          </rss>'''
+          xml = template.format(
+            version=sys.argv[1],
+            pub_date=sys.argv[2],
+            size=sys.argv[3],
+            sig=sys.argv[4],
+            desc=description
+          )
           with open('Docs/appcast.xml', 'w') as f:
             f.write(xml)
-          "
+          " "$VERSION" "$PUB_DATE" "$DMG_SIZE" "$ED_SIG" "$CHANGELOG"
 
           echo "✅ Generated Docs/appcast.xml:"
           cat Docs/appcast.xml
