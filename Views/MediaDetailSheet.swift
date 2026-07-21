@@ -1873,7 +1873,8 @@ struct MediaDetailSheet: View {
                 .buttonStyle(.plain)
             }
         }
-        .frame(width: 192)
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(minWidth: 192)
     }
 
     private var copySourceLinkButton: some View {

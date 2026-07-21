@@ -308,8 +308,32 @@ final class VideoThumbnailCache {
         if let videoPath, !videoPath.isEmpty {
             let videoURL = URL(fileURLWithPath: videoPath)
             try? fileManager.removeItem(at: posterCacheURL(forPathKey: videoURL.standardizedFileURL.path))
-            try? fileManager.removeItem(at: cacheURL(for: videoURL))
+            removeListThumbnail(forLocalVideo: videoURL)
         }
+    }
+
+    /// 删除视频对应的列表小图磁盘缓存 + 内存缓存（重新烘焙后必须调用，否则 path 不变会继续命中旧帧）。
+    func removeListThumbnail(forLocalVideo videoURL: URL) {
+        guard videoURL.isFileURL else { return }
+        let pathKey = Self.stablePathKey(for: videoURL)
+        let listURL = cacheURL(forPathKey: pathKey)
+        try? fileManager.removeItem(at: listURL)
+        // 兼容旧 absoluteString / 无 list_ 前缀键
+        try? fileManager.removeItem(at: cacheDirectory.appendingPathComponent("\(videoURL.absoluteString.md5).jpg"))
+        try? fileManager.removeItem(at: cacheDirectory.appendingPathComponent("\(pathKey.md5).jpg"))
+        try? fileManager.removeItem(
+            at: cacheDirectory.appendingPathComponent("\(URL(fileURLWithPath: pathKey).absoluteString.md5).jpg")
+        )
+        memoryCache.removeObject(forKey: pathKey as NSString)
+        memoryCache.removeObject(forKey: videoURL.absoluteString as NSString)
+    }
+
+    /// 强制从当前视频重新抽列表小图（完整画幅），覆盖旧 `list_*.jpg`。
+    @discardableResult
+    func regenerateListThumbnailJPEGFileURL(forLocalVideo videoURL: URL) async -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        removeListThumbnail(forLocalVideo: videoURL)
+        return await listThumbnailJPEGFileURL(forLocalVideo: videoURL)
     }
 
     /// 动态壁纸的锁屏/静态桌面底图：对 mp4/mov/webm/m4v **强制**从片源抽高清帧。
