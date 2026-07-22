@@ -70,7 +70,8 @@ final class GlobalWallpaperSyncCoordinator {
                 requirePlaybackEndSupport: requirePlaybackEndSupport,
                 muted: muted,
                 fallbackPosterURL: fallbackPosterPath.map(URL.init(fileURLWithPath:)),
-                generatePosterFromVideoIfNeeded: false,
+                // 与调度器/手动设壁纸一致：无 HD poster 时后台抽帧补系统静帧
+                generatePosterFromVideoIfNeeded: true,
                 sceneBakeItemID: sceneBakeItemID,
                 bakedVideoPath: bakedVideoPath,
                 isGlobalTransaction: isGlobalTransaction,

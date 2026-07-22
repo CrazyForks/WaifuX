@@ -1086,6 +1086,24 @@ final class VideoWallpaperManager: ObservableObject {
                 LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
                 syncAllDisplayVideosToExtension()
             }
+            // 复用路径也要补齐静帧 map：上次 apply 时可能还没有 HD poster（调度器
+            // 先起播再后台抽帧），后台生成完成后 cache 已有，再点一次/再调度到
+            // 同一视频时需要把 poster 写进 map 并推系统桌面底图。
+            if let posterURL {
+                if let targetScreen {
+                    let existing = self.posterURL(for: targetScreen)
+                    if existing?.standardizedFileURL != posterURL.standardizedFileURL {
+                        updatePosterURL(posterURL, for: targetScreen, expectedVideoURL: localFileURL)
+                    }
+                } else {
+                    for screen in NSScreen.screens {
+                        let existing = self.posterURL(for: screen)
+                        if existing?.standardizedFileURL != posterURL.standardizedFileURL {
+                            updatePosterURL(posterURL, for: screen, expectedVideoURL: localFileURL)
+                        }
+                    }
+                }
+            }
             if let targetScreenID {
                 scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: coalesced ? "reuseExistingCoalesced" : "reuseExisting")
             }

@@ -1758,7 +1758,8 @@ class WallpaperSchedulerService: ObservableObject {
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,
-                    generatePosterFromVideoIfNeeded: false,
+                    // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
+                    generatePosterFromVideoIfNeeded: true,
                     sceneBakeItemID: item.sceneBakeItemID,
                     bakedVideoPath: item.bakedVideoPath,
                     reason: "scheduler"
@@ -1817,7 +1818,8 @@ class WallpaperSchedulerService: ObservableObject {
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,
-                    generatePosterFromVideoIfNeeded: false,
+                    // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
+                    generatePosterFromVideoIfNeeded: true,
                     sceneBakeItemID: item.sceneBakeItemID,
                     bakedVideoPath: item.bakedVideoPath,
                     usesSharedVideoDecoder: screens.count > 1,

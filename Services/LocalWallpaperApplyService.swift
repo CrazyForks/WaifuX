@@ -29,9 +29,10 @@ enum LocalWallpaperApplyService {
         /// 注意：这里只接受可直接当桌面/锁屏底图的图，不能塞列表 800×600 小图。
         var fallbackPosterURL: URL? = nil
         /// true 时若无**高清** poster 缓存，允许从视频抽高清帧（最大 3840×2160）。
-        /// 手动设壁纸应 true；调度器默认 false（避免切换卡顿，依赖下载时预生成的 poster）。
+        /// 抽帧始终在后台 Task 中执行，不阻塞起播热路径。
+        /// 调度器也应 true：否则无预生成 poster 的视频会永远写不上系统静帧。
         /// **绝不**回退到 `generateThumbnail` 列表小图。
-        var generatePosterFromVideoIfNeeded: Bool = false
+        var generatePosterFromVideoIfNeeded: Bool = true
         var sceneBakeItemID: String? = nil
         var bakedVideoPath: String? = nil
         /// Prevents re-entry after the global coordinator has acquired its
@@ -200,14 +201,19 @@ enum LocalWallpaperApplyService {
         //
         // 性能关键：只同步读取已有高清缓存；缺失时先起播视频，再后台抽帧补静帧，
         // 避免 4K copyCGImage 阻塞「设为壁纸 / 调度切换」热路径（静态图很快、动态却很慢的主因）。
-        let cachedPosterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
+        // 只查真正的 HD poster（scene_bake / poster_wallpaper），不把 fallback 预览算作已缓存，
+        // 否则有站点预览图时永远不会后台抽帧补系统静帧。
+        let hdPosterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
             forLocalVideo: videoURL,
             sceneBakeItemID: options.sceneBakeItemID,
-            fallbackPosterURL: options.fallbackPosterURL
+            fallbackPosterURL: nil
         )
-        let needsBackgroundPoster = (cachedPosterURL == nil && options.generatePosterFromVideoIfNeeded)
-        // 没有缓存时先用调用方 fallback（站点/工程预览，不能是列表小图）；仍无则 nil，视频先起播
-        let immediatePosterURL = cachedPosterURL ?? options.fallbackPosterURL
+        // 没有 HD 缓存时先用调用方 fallback（站点/工程预览，不能是列表小图）；仍无则 nil，视频先起播
+        let immediatePosterURL = hdPosterURL ?? options.fallbackPosterURL
+        // 无 HD 缓存时后台补静帧（异步、不阻塞切换）。
+        // 即使 immediate 用了 fallback，也尽量补一张真正的 HD poster 写回系统桌面/锁屏底图。
+        // 调度器必须允许补帧，否则无预生成 poster 的视频会「偶尔设置不到静态帧」。
+        let needsBackgroundPoster = (hdPosterURL == nil && options.generatePosterFromVideoIfNeeded)
 
         // Full current-screen-set applies use the nil-target path so window rebuild
         // and URL maps stay atomic across displays. Subsets still loop per screen.
