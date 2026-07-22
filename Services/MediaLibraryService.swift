@@ -549,8 +549,7 @@ final class MediaLibraryService: ObservableObject {
         }
 
         let isWeb = WebOfflineBakeService.isWebProject(at: record.localFileURL)
-        // Prefer scene-style names (`…_wallpaperEngineWeb_…` / `…_wallpaperWgpu_…`),
-        // then fall back to any usable mp4 (including legacy `web_v*` filenames).
+        // 优先标准 bake 命名（新格式无 wallpaperWgpu 段；旧格式仍含 renderer 段；再退 web_v* / 任意 mp4）。
         let ranked = candidates
             .filter {
                 $0.pathExtension.lowercased() == "mp4"
@@ -577,7 +576,11 @@ final class MediaLibraryService: ObservableObject {
                 || name.hasPrefix("web_v") {
                 return .wallpaperEngineWeb
             }
+            // 历史 Scene：`_wallpaperWgpu_`；新 Scene：UUID + 分辨率段且不含 web renderer 标记
             if name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_") {
+                return .wallpaperWgpu
+            }
+            if !isWeb, SceneOfflineBakeService.looksLikeBakeProductFilename(name) {
                 return .wallpaperWgpu
             }
             return isWeb ? .wallpaperEngineWeb : .wallpaperWgpu
@@ -589,10 +592,8 @@ final class MediaLibraryService: ObservableObject {
             if isWeb {
                 return WebOfflineBakeService.stableAnalysisId(for: record.localFileURL)
             }
-            // Parse leading UUID from scene-style filename when present.
-            let prefix = name.split(separator: "_", maxSplits: 1, omittingEmptySubsequences: true).first
-                .map(String.init) ?? ""
-            return UUID(uuidString: prefix) ?? UUID()
+            // 新旧文件名均以前缀 UUID 为准
+            return SceneOfflineBakeService.parseLeadingAnalysisId(from: name) ?? UUID()
         }()
         let artifact = SceneBakeArtifact(
             analysisId: analysisId,
@@ -607,12 +608,13 @@ final class MediaLibraryService: ObservableObject {
         attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: false)
     }
 
-    /// Scene-style cache names rank above legacy `web_v*` / orphan files.
+    /// 标准 bake 命名优先于杂散 mp4。Web 认 wallpaperEngineWeb / web_v*；Scene 认新格式与历史 wallpaperWgpu。
     private func isPreferredBakeFileName(_ name: String, isWeb: Bool) -> Bool {
         if isWeb {
             return name.contains("_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_")
+                || name.hasPrefix("web_v")
         }
-        return name.contains("_\(SceneBakeRenderer.wallpaperWgpu.rawValue)_")
+        return SceneOfflineBakeService.looksLikeBakeProductFilename(name)
     }
 
     private func restoreDownloadRecord(recordID: String, localFileURL: URL) {
@@ -633,6 +635,24 @@ final class MediaLibraryService: ObservableObject {
             return
         }
         let record = downloadRecords[index]
+
+        // 同一工程、同一 analysisId：只刷新 notes/score 时间戳类字段，不触发重复 auto-bake。
+        if let existing = record.sceneBakeEligibility,
+           existing.analysisId == snapshot.analysisId,
+           SceneBakeEligibilityAnalyzer.isSameContentRoot(existing.contentRootPath, snapshot.contentRootPath) {
+            downloadRecords[index].sceneBakeEligibility = snapshot
+            saveDlToCache(downloadRecords[index])
+            syncDlIndex()
+            downloadRecords = Array(downloadRecords)
+            if triggerAutoBake,
+               UserDefaults.standard.bool(forKey: "auto_bake_scene"),
+               snapshot.isEligibleForOfflineBake,
+               SceneOfflineBakeService.usableArtifact(from: downloadRecords[index]) == nil {
+                SceneOfflineBakeService.scheduleAutoBakeAfterEligibility(itemID: itemID)
+            }
+            return
+        }
+
         if let artifact = record.sceneBakeArtifact, artifact.analysisId != snapshot.analysisId {
             let isRecoveringLegacyAssociation = record.sceneBakeEligibility == nil
                 && record.hasSameLocalContent(as: URL(fileURLWithPath: snapshot.contentRootPath))
@@ -643,6 +663,7 @@ final class MediaLibraryService: ObservableObject {
                 downloadRecords[index].sceneBakeArtifact = reboundArtifact
                 print("[MediaLibraryService] Rebound recovered scene bake artifact for \(itemID)")
             } else {
+                // 指针先清；磁盘旧文件在新 bake 成功后由 cleanupStaleBakeFiles 统一删除
                 downloadRecords[index].sceneBakeArtifact = nil
             }
         }
@@ -669,9 +690,16 @@ final class MediaLibraryService: ObservableObject {
         syncDlIndex()
         downloadRecords = Array(downloadRecords)
 
+        // 绑定新成片时清掉同目录历史随机 UUID 残留
+        let videoURL = URL(fileURLWithPath: artifact.videoPath)
+        SceneOfflineBakeService.cleanupStaleBakeFiles(
+            inDirectory: videoURL.deletingLastPathComponent(),
+            keeping: videoURL
+        )
+
         // 确保烘焙视频有抽帧封面
         if regeneratePoster {
-            let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
+            let bakedVideoURL = videoURL
             Task { @MainActor in
                 await regenerateSceneBakePosterAndNotify(
                     itemID: itemID,

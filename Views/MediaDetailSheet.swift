@@ -3281,7 +3281,7 @@ struct MediaDetailSheet: View {
                 }
                 let eligibility: SceneBakeEligibilitySnapshot
                 if let existing = snapshotRecord?.sceneBakeEligibility,
-                   existing.contentRootPath == sceneContentRoot.path {
+                   SceneBakeEligibilityAnalyzer.isSameContentRoot(existing.contentRootPath, sceneContentRoot.path) {
                     eligibility = existing
                 } else {
                     guard SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() else {
@@ -3308,6 +3308,10 @@ struct MediaDetailSheet: View {
                 let persistID = await MainActor.run {
                     mediaLibrary.downloadedItems.first { $0.item.id == itemID && $0.isActive }?.id
                 }
+                let displayTitle = await MainActor.run {
+                    mediaLibrary.downloadedItems.first { $0.item.id == itemID && $0.isActive }?.item.title
+                        ?? resolvedItem.title
+                }
                 let cacheKey = persistID ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: sceneContentRoot.path)
 
                 // 使用 wallpaper-wgpu bake 子命令烘焙
@@ -3318,6 +3322,7 @@ struct MediaDetailSheet: View {
                     renderer: .wallpaperWgpu,
                     persistArtifactToItemID: persistID,
                     progressItemID: itemID,
+                    displayTitle: displayTitle,
                     progress: { progress in
                         // 全局 tracker 会广播通知；本地回调兜底当前页即时刷新
                         updateSceneBakeProgress(progress)

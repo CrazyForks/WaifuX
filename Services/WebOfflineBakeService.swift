@@ -71,6 +71,7 @@ enum WebOfflineBakeService {
         let effectiveUserProperties = await MainActor.run {
             try? WebWallpaperDesignService.shared.effectivePropertiesJSON(for: contentRoot.path)
         }
+        let displayTitle = record.item.title
         let cacheURL = await MainActor.run {
             makeCacheURL(
                 root: DownloadPathManager.shared.sceneBakesFolderURL,
@@ -80,7 +81,8 @@ enum WebOfflineBakeService {
                 height: targetSize.height,
                 fps: Int(effectiveFPS),
                 duration: effectiveDuration,
-                userPropertiesJSON: effectiveUserProperties
+                userPropertiesJSON: effectiveUserProperties,
+                displayTitle: displayTitle
             )
         }
 
@@ -136,6 +138,21 @@ enum WebOfflineBakeService {
                 withIntermediateDirectories: true
             )
 
+            // 兼容旧命名（无 title 段）
+            let legacyCacheURL = await MainActor.run {
+                makeCacheURL(
+                    root: DownloadPathManager.shared.sceneBakesFolderURL,
+                    itemID: record.id,
+                    analysisId: analysisId,
+                    width: targetSize.width,
+                    height: targetSize.height,
+                    fps: Int(effectiveFPS),
+                    duration: effectiveDuration,
+                    userPropertiesJSON: effectiveUserProperties,
+                    displayTitle: nil
+                )
+            }
+            var resolvedCacheURL = cacheURL
             if let inspection = await inspectVideo(
                 at: cacheURL,
                 expectedWidth: targetSize.width,
@@ -145,6 +162,48 @@ enum WebOfflineBakeService {
                 let artifact = SceneBakeArtifact(
                     analysisId: analysisId,
                     videoPath: cacheURL.path,
+                    width: inspection.width,
+                    height: inspection.height,
+                    fps: Int(effectiveFPS),
+                    durationSeconds: inspection.duration,
+                    bakedAt: bakedAt,
+                    renderer: .wallpaperEngineWeb
+                )
+                try await complete(
+                    artifact: artifact,
+                    record: record,
+                    contentRoot: contentRoot,
+                    jobID: jobID,
+                    progress: trackedProgress
+                )
+                await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
+                return artifact
+            }
+            if legacyCacheURL.path != cacheURL.path,
+               let inspection = await inspectVideo(
+                at: legacyCacheURL,
+                expectedWidth: targetSize.width,
+                expectedHeight: targetSize.height
+               ) {
+                try? FileManager.default.removeItem(at: cacheURL)
+                do {
+                    try FileManager.default.moveItem(at: legacyCacheURL, to: cacheURL)
+                    let legacyOpt = URL(fileURLWithPath: legacyCacheURL.path + ".waifux-optimization.json")
+                    let newOpt = URL(fileURLWithPath: cacheURL.path + ".waifux-optimization.json")
+                    if FileManager.default.fileExists(atPath: legacyOpt.path) {
+                        try? FileManager.default.removeItem(at: newOpt)
+                        try? FileManager.default.moveItem(at: legacyOpt, to: newOpt)
+                    }
+                    resolvedCacheURL = cacheURL
+                    print("[WebOfflineBake] renamed legacy bake cache → \(cacheURL.lastPathComponent)")
+                } catch {
+                    resolvedCacheURL = legacyCacheURL
+                    print("[WebOfflineBake] legacy bake rename failed, using old path: \(error.localizedDescription)")
+                }
+                let bakedAt = fileCreationDate(for: resolvedCacheURL) ?? .now
+                let artifact = SceneBakeArtifact(
+                    analysisId: analysisId,
+                    videoPath: resolvedCacheURL.path,
                     width: inspection.width,
                     height: inspection.height,
                     fps: Int(effectiveFPS),
@@ -282,6 +341,11 @@ enum WebOfflineBakeService {
         jobID: UUID,
         progress: (@MainActor (Double) -> Void)?
     ) async throws {
+        let videoURL = URL(fileURLWithPath: artifact.videoPath)
+        SceneOfflineBakeService.cleanupStaleBakeFiles(
+            inDirectory: videoURL.deletingLastPathComponent(),
+            keeping: videoURL
+        )
         await MainActor.run {
             MediaLibraryService.shared.attachSceneBakeArtifact(
                 itemID: record.id,
@@ -291,7 +355,7 @@ enum WebOfflineBakeService {
         }
         await regenerateSceneBakePosterAndNotify(
             itemID: record.item.id,
-            videoURL: URL(fileURLWithPath: artifact.videoPath)
+            videoURL: videoURL
         )
         await MainActor.run {
             progress?(1)
@@ -332,7 +396,8 @@ enum WebOfflineBakeService {
         return (width - (width % 2), height - (height % 2))
     }
 
-    /// Same layout as `SceneOfflineBakeService.cacheVideoURL`.
+    /// Web 仍保留 `wallpaperEngineWeb` 段以区分 Scene 成片；Scene 已去掉 `wallpaperWgpu`。
+    /// 格式：`{UUID}[_title]_wallpaperEngineWeb_{WxH}_{fps}fps_{duration}s[_props].mp4`
     private static func makeCacheURL(
         root: URL,
         itemID: String,
@@ -341,13 +406,15 @@ enum WebOfflineBakeService {
         height: Int,
         fps: Int,
         duration: Double,
-        userPropertiesJSON: String?
+        userPropertiesJSON: String?,
+        displayTitle: String? = nil
     ) -> URL {
         let safeItemID = itemID.replacingOccurrences(of: "/", with: "_")
         let dir = root.appendingPathComponent(safeItemID, isDirectory: true)
         let propertiesSuffix = propertiesCacheKey(for: userPropertiesJSON).map { "_props-\($0)" } ?? ""
+        let titleSegment = SceneOfflineBakeService.sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
         let name =
-            "\(analysisId.uuidString)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
+            "\(analysisId.uuidString)\(titleSegment)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
         return dir.appendingPathComponent(name)
     }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Models（与 scripts/scene_bake_eligibility.py 对齐；analysisId 供后续烘焙缓存键）
@@ -68,7 +69,10 @@ enum SceneBakeEligibilityIntent: String, Codable, Hashable, Sendable {
     case desktopLoop = "desktop-loop"
 }
 
-/// 单次分析快照；`analysisId` 建议作为离线烘焙产物缓存命名空间的一部分。
+/// 单次分析快照；`analysisId` 作为离线烘焙产物缓存命名空间的一部分。
+///
+/// **稳定策略：** `analysisId` 由内容根路径 + `project.json` + scene 包指纹派生，
+/// 同一工程重复分析应得到同一 UUID，避免 `SceneBakes/<item>/` 堆出多套同参 MP4。
 struct SceneBakeEligibilitySnapshot: Codable, Hashable, Sendable {
     var analysisId: UUID
     var analyzedAt: Date
@@ -110,15 +114,80 @@ enum SceneBakeEligibilityAnalyzer {
         intent: SceneBakeEligibilityIntent = .desktopLoop,
         strict: Bool = false
     ) throws -> SceneBakeEligibilitySnapshot {
-        let (sceneDict, _) = try loadScene(root: contentRoot)
-        let projectDict = loadProjectOptional(root: contentRoot)
+        let resolvedRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: contentRoot)
+        let (sceneDict, _) = try loadScene(root: resolvedRoot)
+        let projectDict = loadProjectOptional(root: resolvedRoot)
         return buildSnapshot(
             scene: sceneDict,
             project: projectDict,
-            contentRootPath: contentRoot.path,
+            contentRootPath: resolvedRoot.standardizedFileURL.path,
             intent: intent,
             strict: strict
         )
+    }
+
+    /// 内容确定性 analysisId：同一工程重复分析返回同一 UUID（不读全量 scene 正文，避免大包 IO）。
+    static func stableAnalysisId(for contentRoot: URL) -> UUID {
+        let root = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: contentRoot)
+            .standardizedFileURL
+        var data = Data(root.path.utf8)
+
+        let projectURL = root.appendingPathComponent("project.json")
+        if let projectData = try? Data(contentsOf: projectURL) {
+            data.append(projectData)
+        }
+        if let date = try? projectURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            data.append(Data(String(date.timeIntervalSince1970).utf8))
+        }
+
+        // project.json 的 file 字段可能指向 gifscene.pkg 等非 scene.pkg 主包
+        var sceneCandidates = ["scene.pkg", "scene.json"]
+        if let project = loadProjectOptional(root: root),
+           let fileField = project["file"] as? String {
+            let trimmed = fileField.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                sceneCandidates.insert(trimmed, at: 0)
+                sceneCandidates.insert((trimmed as NSString).lastPathComponent, at: 0)
+            }
+        }
+
+        var seen = Set<String>()
+        for relative in sceneCandidates {
+            let normalized = relative.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else { continue }
+            let url = root.appendingPathComponent(normalized)
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                  FileManager.default.fileExists(atPath: url.path) else {
+                continue
+            }
+            data.append(Data(normalized.utf8))
+            if let size = values.fileSize {
+                data.append(Data("\(size)".utf8))
+            }
+            if let date = values.contentModificationDate {
+                data.append(Data(String(date.timeIntervalSince1970).utf8))
+            }
+        }
+
+        let digest = Array(SHA256.hash(data: data))
+        return UUID(uuid: (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5],
+            (digest[6] & 0x0f) | 0x50, digest[7],
+            (digest[8] & 0x3f) | 0x80, digest[9],
+            digest[10], digest[11], digest[12], digest[13], digest[14], digest[15]
+        ))
+    }
+
+    /// 规范化比较两个内容根是否为同一 Scene 工程。
+    static func isSameContentRoot(_ lhs: String, _ rhs: String) -> Bool {
+        let left = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: URL(fileURLWithPath: lhs)
+        ).standardizedFileURL.path
+        let right = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: URL(fileURLWithPath: rhs)
+        ).standardizedFileURL.path
+        return left == right
     }
 
     // MARK: scene.pkg（与 Python 脚本相同布局）
@@ -528,7 +597,7 @@ enum SceneBakeEligibilityAnalyzer {
         )
 
         return SceneBakeEligibilitySnapshot(
-            analysisId: UUID(),
+            analysisId: stableAnalysisId(for: URL(fileURLWithPath: contentRootPath)),
             analyzedAt: Date(),
             score: score,
             rawDeduction: totalDeduction,
@@ -588,6 +657,34 @@ extension SceneBakeEligibilityAnalyzer {
               typeStr.lowercased() == "scene" else {
             return
         }
+
+        // 已有同工程 eligibility 时跳过重分析，避免无意义 IO 与历史随机 UUID 被反复覆盖。
+        // 若已有可用烘焙产物，也一并短路（内容未变时 analysisId 本应稳定）。
+        let shouldSkip = await MainActor.run { () -> Bool in
+            guard let record = MediaLibraryService.shared.downloadedItems.first(where: {
+                $0.item.id == itemID && $0.isActive
+            }), let existing = record.sceneBakeEligibility else {
+                return false
+            }
+            guard isSameContentRoot(existing.contentRootPath, contentURL.path) else {
+                return false
+            }
+            if let artifact = SceneOfflineBakeService.usableArtifact(from: record),
+               artifact.analysisId == existing.analysisId {
+                print("[SceneBakeEligibility] skip re-analyze \(itemID): usable bake already bound")
+                return true
+            }
+            // 内容指纹未变：保留已有 snapshot（含旧随机 UUID 的历史记录），避免换 id 触发无谓 auto-bake。
+            let stableId = stableAnalysisId(for: contentURL)
+            if existing.analysisId == stableId {
+                print("[SceneBakeEligibility] skip re-analyze \(itemID): stable analysisId already present")
+                return true
+            }
+            // 旧随机 UUID 且无可用产物：继续分析以升级到稳定 id。
+            return false
+        }
+        if shouldSkip { return }
+
         guard SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() else {
             print("[SceneBakeEligibility] skipped analyze for \(itemID): insufficient reclaimable memory")
             return

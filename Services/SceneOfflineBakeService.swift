@@ -550,7 +550,7 @@ enum SceneOfflineBakeService {
 
                 let eligibility: SceneBakeEligibilitySnapshot
                 if let existing = record?.sceneBakeEligibility,
-                   existing.contentRootPath == contentRoot.path {
+                   SceneBakeEligibilityAnalyzer.isSameContentRoot(existing.contentRootPath, contentRoot.path) {
                     eligibility = existing
                 } else {
                     guard SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() else {
@@ -572,6 +572,7 @@ enum SceneOfflineBakeService {
                 }
 
                 let itemID = record?.item.id
+                let displayTitle = record?.item.title
                 let cacheItemID = itemID ?? stableOrphanCacheItemID(contentRootPath: contentRoot.path)
                 let artifact = try await bake(
                     eligibility: eligibility,
@@ -579,7 +580,8 @@ enum SceneOfflineBakeService {
                     cacheItemID: cacheItemID,
                     renderer: .wallpaperWgpu,
                     persistArtifactToItemID: itemID,
-                    progressItemID: itemID
+                    progressItemID: itemID,
+                    displayTitle: displayTitle
                 )
                 print("[SceneOfflineBake] realtime companion bake finished (\(reason)): \(artifact.videoPath)")
                 await syncRealtimeBakeToLockScreen(artifact: artifact, itemID: itemID, displayIDs: displayIDs, reason: reason)
@@ -724,7 +726,15 @@ enum SceneOfflineBakeService {
         }
     }
 
-    /// 缓存文件路径：`analysisId + 分辨率 + fps + 时长`（根目录为 `DownloadPathManager.sceneBakesFolderURL`）
+    /// 缓存文件路径：`analysisId + 可选标题 + 分辨率 + fps + 时长`
+    ///（根目录为 `DownloadPathManager.sceneBakesFolderURL`）。
+    ///
+    /// **当前 Scene 格式（无 renderer 段）：**
+    /// `{UUID}[_title]_{WxH}_{fps}fps_{duration}s[_props-hash].mp4`
+    ///
+    /// 历史格式仍可通过 `legacyCacheCandidateURLs` 命中并迁移：
+    /// - `{UUID}_wallpaperWgpu_{WxH}_…`
+    /// - `{UUID}_{title}_wallpaperWgpu_{WxH}_…`
     private static func cacheVideoURL(
         baseDir: URL,
         itemID: String,
@@ -734,14 +744,198 @@ enum SceneOfflineBakeService {
         height: Int,
         fps: Int,
         durationSeconds: Double,
-        propertiesCacheKey: String?
+        propertiesCacheKey: String?,
+        displayTitle: String?
     ) -> URL {
-        let safeID = itemID.replacingOccurrences(of: "/", with: "_")
-        let dir = baseDir.appendingPathComponent(safeID, isDirectory: true)
+        let dir = bakeDirectory(baseDir: baseDir, itemID: itemID)
         let propertiesSuffix = propertiesCacheKey.map { "_props-\($0)" } ?? ""
-        let name =
-            "\(analysisId.uuidString)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+        let titleSegment = sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
+        // Scene 成片不再写入 wallpaperWgpu 段；Web 走 WebOfflineBakeService 自己的命名。
+        let name: String
+        switch renderer {
+        case .wallpaperWgpu:
+            name =
+                "\(analysisId.uuidString)\(titleSegment)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+        case .wallpaperEngineWeb:
+            name =
+                "\(analysisId.uuidString)\(titleSegment)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+        }
         return dir.appendingPathComponent(name)
+    }
+
+    private static func bakeDirectory(baseDir: URL, itemID: String) -> URL {
+        let safeID = itemID.replacingOccurrences(of: "/", with: "_")
+        return baseDir.appendingPathComponent(safeID, isDirectory: true)
+    }
+
+    /// 历史 Scene 文件名候选（仍含 `_wallpaperWgpu_` 或无标题段），用于 cache hit / 迁移。
+    private static func legacyCacheCandidateURLs(
+        baseDir: URL,
+        itemID: String,
+        analysisId: UUID,
+        renderer: SceneBakeRenderer,
+        width: Int,
+        height: Int,
+        fps: Int,
+        durationSeconds: Double,
+        propertiesCacheKey: String?,
+        displayTitle: String?
+    ) -> [URL] {
+        guard renderer == .wallpaperWgpu else { return [] }
+        let dir = bakeDirectory(baseDir: baseDir, itemID: itemID)
+        let propertiesSuffix = propertiesCacheKey.map { "_props-\($0)" } ?? ""
+        let dims = "\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+        let uuid = analysisId.uuidString
+        let title = sanitizedBakeFileTitle(displayTitle)
+        var names: [String] = []
+        // 上一版：带标题 + wallpaperWgpu
+        if let title {
+            names.append("\(uuid)_\(title)_wallpaperWgpu_\(dims)")
+        }
+        // 最早：无标题 + wallpaperWgpu
+        names.append("\(uuid)_wallpaperWgpu_\(dims)")
+        // 无标题的新格式（仅 UUID + 参数）
+        names.append("\(uuid)_\(dims)")
+        // 带标题但无 wallpaperWgpu 已是当前 canonical，不在 legacy 列表里
+
+        var seen = Set<String>()
+        return names.compactMap { name in
+            guard seen.insert(name).inserted else { return nil }
+            return dir.appendingPathComponent(name)
+        }
+    }
+
+    /// 是否像 bake 产物文件名（新旧格式均认）。恢复扫描 / 清理时用。
+    static func looksLikeBakeProductFilename(_ name: String) -> Bool {
+        if name.contains("_wallpaperWgpu_")
+            || name.contains("_wallpaperEngineWeb_")
+            || name.hasPrefix("web_v") {
+            return true
+        }
+        // 新 Scene 格式：UUID 开头 + `{W}x{H}_{fps}fps_{duration}s`
+        guard parseLeadingAnalysisId(from: name) != nil else { return false }
+        return name.range(of: #"_\d+x\d+_\d+fps_\d+s"#, options: .regularExpression) != nil
+    }
+
+    /// 从 bake 文件名解析前缀 UUID（兼容 `UUID_…` 与纯 UUID 段）。
+    static func parseLeadingAnalysisId(from name: String) -> UUID? {
+        let stem = (name as NSString).deletingPathExtension
+        // UUID 标准串 36 字符（含连字符）
+        let prefix = String(stem.prefix(36))
+        if prefix.count == 36, UUID(uuidString: prefix) != nil {
+            // 确保第 37 字符是分隔或结束，避免误吃
+            if stem.count == 36 { return UUID(uuidString: prefix) }
+            let next = stem[stem.index(stem.startIndex, offsetBy: 36)]
+            if next == "_" { return UUID(uuidString: prefix) }
+        }
+        let head = stem.split(separator: "_", maxSplits: 1, omittingEmptySubsequences: true).first
+            .map(String.init) ?? ""
+        return UUID(uuidString: head)
+    }
+
+    /// 文件名安全标题：保留中英文与数字，空白/非法字符压成 `_`，限制长度。
+    static func sanitizedBakeFileTitle(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        var result = ""
+        result.reserveCapacity(min(trimmed.count, 48))
+        var lastWasSeparator = false
+        for scalar in trimmed.unicodeScalars {
+            let isAllowed =
+                CharacterSet.alphanumerics.contains(scalar)
+                || scalar == "_"
+                || scalar == "-"
+                || (scalar.value >= 0x4E00 && scalar.value <= 0x9FFF) // CJK Unified
+                || (scalar.value >= 0x3400 && scalar.value <= 0x4DBF) // CJK Extension A
+                || (scalar.value >= 0x3040 && scalar.value <= 0x30FF) // Hiragana/Katakana
+                || (scalar.value >= 0xAC00 && scalar.value <= 0xD7AF) // Hangul
+            if isAllowed {
+                result.unicodeScalars.append(scalar)
+                lastWasSeparator = false
+            } else if !lastWasSeparator {
+                result.append("_")
+                lastWasSeparator = true
+            }
+            if result.count >= 48 { break }
+        }
+        while result.hasPrefix("_") { result.removeFirst() }
+        while result.hasSuffix("_") { result.removeLast() }
+        return result.isEmpty ? nil : result
+    }
+
+    /// 从媒体库记录解析展示标题（须在主线程调用）。
+    @MainActor
+    static func resolveBakeDisplayTitle(contentRoot: URL, itemID: String?) -> String? {
+        if let itemID,
+           let title = MediaLibraryService.shared.downloadedItems
+            .first(where: { $0.item.id == itemID && $0.isActive })?
+            .item.title
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title
+        }
+        return projectTitle(at: contentRoot)
+    }
+
+    /// 仅读 `project.json`，可在任意线程调用。
+    static func projectTitle(at contentRoot: URL) -> String? {
+        let projectURL = contentRoot.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: projectURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        for key in ["title", "name"] {
+            if let value = json[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        return nil
+    }
+
+    /// 新产物落地后清理同 item 目录下其它 bake mp4 / sidecar / optimization 元数据，避免堆出「两组一样」的文件。
+    static func cleanupStaleBakeFiles(
+        inDirectory directory: URL,
+        keeping keptURL: URL
+    ) {
+        let fm = FileManager.default
+        let keptPath = keptURL.standardizedFileURL.path
+        let keptName = keptURL.lastPathComponent
+        let keptStem = keptURL.deletingPathExtension().lastPathComponent
+        guard let entries = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        for url in entries {
+            let path = url.standardizedFileURL.path
+            if path == keptPath { continue }
+
+            let name = url.lastPathComponent
+            // 与当前成片配套的 sidecar / optimization 元数据保留
+            if name == "\(keptStem).json" { continue }
+            if name == "\(keptName).waifux-optimization.json" { continue }
+
+            guard looksLikeBakeProductFilename(name) else { continue }
+
+            let ext = url.pathExtension.lowercased()
+            let isVideo = ext == "mp4"
+            let isSidecar = ext == "json" && !name.hasSuffix(".waifux-optimization.json")
+            let isOptimization = name.hasSuffix(".waifux-optimization.json")
+            guard isVideo || isSidecar || isOptimization else { continue }
+
+            do {
+                try fm.removeItem(at: url)
+                print("[SceneOfflineBake] cleaned stale bake file: \(name)")
+            } catch {
+                print("[SceneOfflineBake] failed to clean stale bake file \(name): \(error.localizedDescription)")
+            }
+        }
     }
 
     /// 设计面板属性会改变输出画面，必须参与缓存区分。
@@ -796,6 +990,7 @@ enum SceneOfflineBakeService {
     /// 与资格快照配套；`cacheItemID` 通常等于 `MediaItem.id`，无记录时用 `stableOrphanCacheItemID`。
     /// - Parameter persistArtifactToItemID: 非 nil 时将成品写回对应下载记录。
     /// - Parameter progressItemID: 用于跨详情页恢复的进度追踪 item id；默认取 `persistArtifactToItemID`。
+    /// - Parameter displayTitle: 写入缓存文件名的壁纸标题；nil 时尝试从库/project.json 解析。
     static func bake(
         eligibility: SceneBakeEligibilitySnapshot,
         contentRoot: URL,
@@ -806,6 +1001,7 @@ enum SceneOfflineBakeService {
         persistArtifactToItemID: String? = nil,
         progressItemID: String? = nil,
         resumingJobID: UUID? = nil,
+        displayTitle: String? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
         let effectiveFPS = resolvedBakeFPS(requestedFPS: fps)
@@ -817,6 +1013,12 @@ enum SceneOfflineBakeService {
             effectiveDuration = saved >= 5 ? min(max(saved, 5), 60) : 15
         }
         let trackedItemID = progressItemID ?? persistArtifactToItemID
+        let resolvedTitle = await MainActor.run {
+            displayTitle ?? resolveBakeDisplayTitle(
+                contentRoot: contentRoot,
+                itemID: trackedItemID ?? persistArtifactToItemID
+            )
+        }
         let persistentJob = PersistentOfflineBakeJob.scene(
             id: resumingJobID ?? UUID(),
             eligibility: eligibility,
@@ -856,6 +1058,7 @@ enum SceneOfflineBakeService {
                 fps: effectiveFPS,
                 renderer: renderer,
                 persistArtifactToItemID: persistArtifactToItemID,
+                displayTitle: resolvedTitle,
                 progress: trackedProgress
             )
             await MainActor.run {
@@ -947,6 +1150,7 @@ enum SceneOfflineBakeService {
         fps: Int32,
         renderer: SceneBakeRenderer,
         persistArtifactToItemID: String?,
+        displayTitle: String?,
         progress: (@MainActor (Double) -> Void)?
     ) async throws -> SceneBakeArtifact {
         guard FileManager.default.fileExists(atPath: contentRoot.path) else {
@@ -972,6 +1176,8 @@ enum SceneOfflineBakeService {
             DownloadPathManager.shared.sceneBakesFolderURL
         }
         let cacheDurationSeconds = durationSeconds
+        // displayTitle 已在 bake() 主线程解析；此处仅回退 project.json，避免碰 @MainActor 媒体库
+        let titleForName = displayTitle ?? projectTitle(at: contentRoot)
         let outURL = cacheVideoURL(
             baseDir: sceneBakesRoot,
             itemID: cacheItemID,
@@ -981,24 +1187,82 @@ enum SceneOfflineBakeService {
             height: evenH,
             fps: Int(fps),
             durationSeconds: cacheDurationSeconds,
-            propertiesCacheKey: propertiesCacheKey(for: effectiveUserProperties)
+            propertiesCacheKey: propertiesCacheKey(for: effectiveUserProperties),
+            displayTitle: titleForName
         )
 
         try FileManager.default.createDirectory(at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
+        // 兼容历史命名（含 `_wallpaperWgpu_` / 无标题段）：命中后迁移到当前规范名，不重烘。
+        let legacyCandidates = legacyCacheCandidateURLs(
+            baseDir: sceneBakesRoot,
+            itemID: cacheItemID,
+            analysisId: eligibility.analysisId,
+            renderer: renderer,
+            width: evenW,
+            height: evenH,
+            fps: Int(fps),
+            durationSeconds: cacheDurationSeconds,
+            propertiesCacheKey: propertiesCacheKey(for: effectiveUserProperties),
+            displayTitle: titleForName
+        ).filter { $0.path != outURL.path }
+
         let cachedInspection: BakedVideoInspection? = await {
             switch renderer {
             case .wallpaperWgpu:
-                return await inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH)
+                if let hit = await inspectBakedVideo(at: outURL, expectedWidth: evenW, expectedHeight: evenH) {
+                    return hit
+                }
+                for legacyOutURL in legacyCandidates {
+                    guard let hit = await inspectBakedVideo(
+                        at: legacyOutURL,
+                        expectedWidth: evenW,
+                        expectedHeight: evenH
+                    ) else { continue }
+                    try? FileManager.default.removeItem(at: outURL)
+                    do {
+                        try FileManager.default.moveItem(at: legacyOutURL, to: outURL)
+                        let legacySidecar = legacyOutURL.deletingPathExtension().appendingPathExtension("json")
+                        let newSidecar = outURL.deletingPathExtension().appendingPathExtension("json")
+                        if FileManager.default.fileExists(atPath: legacySidecar.path) {
+                            try? FileManager.default.removeItem(at: newSidecar)
+                            try? FileManager.default.moveItem(at: legacySidecar, to: newSidecar)
+                        }
+                        let legacyOpt = URL(fileURLWithPath: legacyOutURL.path + ".waifux-optimization.json")
+                        let newOpt = URL(fileURLWithPath: outURL.path + ".waifux-optimization.json")
+                        if FileManager.default.fileExists(atPath: legacyOpt.path) {
+                            try? FileManager.default.removeItem(at: newOpt)
+                            try? FileManager.default.moveItem(at: legacyOpt, to: newOpt)
+                        }
+                        print("[SceneOfflineBake] renamed legacy bake cache → \(outURL.lastPathComponent)")
+                        return hit
+                    } catch {
+                        print("[SceneOfflineBake] legacy bake rename failed, using old path: \(error.localizedDescription)")
+                        // 迁移失败仍复用旧文件路径（由 resolvedCacheURL 回落）
+                        return hit
+                    }
+                }
+                return nil
             case .wallpaperEngineWeb:
                 return nil
             }
         }()
+
+        let resolvedCacheURL: URL = {
+            if FileManager.default.fileExists(atPath: outURL.path) {
+                return outURL
+            }
+            for legacy in legacyCandidates where FileManager.default.fileExists(atPath: legacy.path) {
+                return legacy
+            }
+            return outURL
+        }()
+
         if let cachedInspection,
-           let attrs = try? FileManager.default.attributesOfItem(atPath: outURL.path) {
+           let attrs = try? FileManager.default.attributesOfItem(atPath: resolvedCacheURL.path) {
             let artifact = SceneBakeArtifact(
                 analysisId: eligibility.analysisId,
-                videoPath: outURL.path,
+                videoPath: resolvedCacheURL.path,
                 width: cachedInspection.width,
                 height: cachedInspection.height,
                 fps: Int(fps),
@@ -1006,6 +1270,7 @@ enum SceneOfflineBakeService {
                 bakedAt: (attrs[.creationDate] as? Date) ?? .now,
                 renderer: renderer
             )
+            cleanupStaleBakeFiles(inDirectory: resolvedCacheURL.deletingLastPathComponent(), keeping: resolvedCacheURL)
             if let itemID = persistArtifactToItemID {
                 await MainActor.run {
                     MediaLibraryService.shared.attachSceneBakeArtifact(
@@ -1043,6 +1308,7 @@ enum SceneOfflineBakeService {
         case .wallpaperEngineWeb:
             throw SceneOfflineBakeError.ineligible
         }
+        cleanupStaleBakeFiles(inDirectory: outURL.deletingLastPathComponent(), keeping: outURL)
         if let itemID = persistArtifactToItemID {
             await MainActor.run {
                 MediaLibraryService.shared.attachSceneBakeArtifact(
@@ -1456,6 +1722,7 @@ enum SceneOfflineBakeService {
             renderer: renderer,
             persistArtifactToItemID: record.id,
             progressItemID: record.item.id,
+            displayTitle: record.item.title,
             progress: progress
         )
     }
