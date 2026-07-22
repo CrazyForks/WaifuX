@@ -348,7 +348,7 @@ struct FrameInterpolationRecordItem: Identifiable, Equatable, Codable {
 
 
 struct VideoOptimizationAutomaticPolicy: Equatable {
-    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」。
+    /// 下载 / 烘焙完成后是否自动「优化视频」。
     /// 与手动入口一致：先循环分析，再补帧（Scene bake 产物跳过循环分析）。
     var automaticallyOptimizeVideos: Bool
     var targetFPS: Int
@@ -371,7 +371,7 @@ final class VideoOptimizationQueueService: ObservableObject {
     @Published private(set) var completedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var blacklistedInterpolationItems: [FrameInterpolationRecordItem] = []
     @Published private(set) var history: [VideoOptimizationHistoryRecord] = []
-    /// 下载 / 设壁纸 / 烘焙完成后是否自动「优化视频」（循环 → 补帧）。
+    /// 下载/烘焙完成后是否自动进入优化流水线。
     @Published private(set) var automaticPolicy = VideoOptimizationAutomaticPolicy.disabled
 
     /// 兼容旧属性名：映射到统一自动优化开关。
@@ -473,9 +473,9 @@ final class VideoOptimizationQueueService: ObservableObject {
             needsLoop = false
         } else if preferDurableLoopState {
             switch VideoOptimizationRecordStore.shared.loopState(for: videoURL) {
-            case .applied, .notNeeded:
+            case .applied, .notNeeded, .noReliablePoint:
                 needsLoop = false
-            case .idle, .failed, .noReliablePoint:
+            case .idle, .failed:
                 needsLoop = true
             }
         } else {
@@ -531,7 +531,7 @@ final class VideoOptimizationQueueService: ObservableObject {
         planningVideoPaths.remove(videoURL.standardizedFileURL.path)
     }
 
-    /// 下载 / 设壁纸 / 烘焙完成后的统一自动入口。
+    /// 下载或烘焙完成后的统一自动入口。
     @discardableResult
     func enqueueAutomaticOptimizationIfNeeded(
         videoURL: URL,
@@ -736,21 +736,6 @@ final class VideoOptimizationQueueService: ObservableObject {
             title: title,
             targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
             operations: ops
-        )
-        persistQueueCheckpointImmediately()
-    }
-
-    /// Blacklist after a fresh source restore instead of stamping the old file.
-    func requestBlacklistAfterSourceRestore(
-        videoURL: URL,
-        title: String? = nil,
-        operation: FrameInterpolationQueueItem.Operation
-    ) {
-        sourceRestoreRequests[videoURL.standardizedFileURL.path] = .blacklist(
-            videoURL: videoURL,
-            title: title,
-            targetFPS: FrameInterpolationTargetFPSResolver.targetFPSForManualAction(),
-            operation: operation
         )
         persistQueueCheckpointImmediately()
     }
@@ -1403,29 +1388,50 @@ final class VideoOptimizationQueueService: ObservableObject {
 
     private func scheduleNext() {
         clearProgressForWaitingItems()
-        let runningCount = runningTasks.count
-        let availableSlots = max(0, 1 - runningCount)
-        guard availableSlots > 0 else { return }
+        // 循环分析与补帧是两条独立资源通道，各自最多运行 1 个任务。
+        // 同一视频仍不能跨通道并发，因为循环分析和补帧都会原地替换源文件。
+        for operation in FrameInterpolationQueueItem.Operation.allCases {
+            guard !isOperationLaneRunning(operation) else { continue }
 
-        let waitingIDs = items
-            .filter { item in
-                guard runningTasks[item.id] == nil else { return false }
-                if case .waiting = item.status { return true }
-                return false
+            let runningPaths = Set(runningTasks.keys.compactMap { runningID in
+                items.first(where: { $0.id == runningID })?.videoURL.standardizedFileURL.path
+            })
+            guard let nextID = items
+                .filter({ item in
+                    guard runningTasks[item.id] == nil,
+                          !runningPaths.contains(item.videoURL.standardizedFileURL.path),
+                          nextPendingOperation(for: item) == operation else {
+                        return false
+                    }
+                    if case .waiting = item.status { return true }
+                    return false
+                })
+                .sorted(by: { $0.addedAt < $1.addedAt })
+                .first?
+                .id else {
+                continue
             }
-            .sorted { $0.addedAt < $1.addedAt }
-            .prefix(availableSlots)
-            .map(\.id)
+            startItem(id: nextID)
+        }
+    }
 
-        for id in waitingIDs {
-            startItem(id: id)
+    private func nextPendingOperation(
+        for item: FrameInterpolationQueueItem
+    ) -> FrameInterpolationQueueItem.Operation? {
+        item.operations.first { !item.completedOperations.contains($0) }
+    }
+
+    private func isOperationLaneRunning(_ operation: FrameInterpolationQueueItem.Operation) -> Bool {
+        runningTasks.keys.contains { runningID in
+            items.first(where: { $0.id == runningID })?.currentOperation == operation
         }
     }
 
     private func startItem(id: UUID) {
         guard runningTasks[id] == nil,
-              runningTasks.count < 1,
-              let index = items.firstIndex(where: { $0.id == id }) else { return }
+              let index = items.firstIndex(where: { $0.id == id }),
+              let operation = nextPendingOperation(for: items[index]),
+              !isOperationLaneRunning(operation) else { return }
 
         items[index].status = .analyzing
         items[index].progress = 0
@@ -1434,18 +1440,18 @@ final class VideoOptimizationQueueService: ObservableObject {
         items[index].opticalFlowFrames = 0
         items[index].elapsedSeconds = 0
         items[index].remainingSeconds = nil
-        let initialOperations = items[index].operations
-        items[index].currentOperation = initialOperations.first
-        items[index].currentStage = initialOperations.first == .loopTransition
+        items[index].currentOperation = operation
+        items[index].currentStage = operation == .loopTransition
             ? t("videoOptimizationGeneratingLoopTransition")
             : t("frameInterpolationStageReadingFPS")
         let videoURL = items[index].videoURL
         let targetFPS = items[index].targetFPS
         startHeartbeat(id: id)
-        frameInterpolationDebugPrint("补帧队列：开始任务。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
+        frameInterpolationDebugPrint("视频优化队列：开始 \(operation.rawValue) 通道任务。视频=\(videoURL.lastPathComponent)，目标 FPS=\(targetFPS)")
 
         let task = Task.detached(priority: .utility) { [weak self] in
-            if initialOperations.contains(.loopTransition) {
+            switch operation {
+            case .loopTransition:
                 do {
                     let loopOutcome = try await VideoLoopAnalysisService.analyzeAndReplace(
                         videoURL: videoURL
@@ -1517,75 +1523,63 @@ final class VideoOptimizationQueueService: ObservableObject {
                     }
                 } catch is CancellationError {
                     await MainActor.run { self?.finishCancelled(id: id, reason: "任务已取消") }
-                    return
                 } catch {
                     await MainActor.run {
                         self?.finishFailed(id: id, message: error.localizedDescription)
                     }
-                    return
                 }
-            }
-
-            let shouldInterpolate = await MainActor.run {
-                self?.items.first(where: { $0.id == id })?.operations.contains(.frameInterpolation) ?? false
-            }
-            guard shouldInterpolate else {
-                await MainActor.run { self?.finishCompleted(id: id, message: "循环过渡生成完成") }
-                return
-            }
-
-            await MainActor.run {
-                guard let self,
-                      let itemIndex = self.items.firstIndex(where: { $0.id == id }) else { return }
-                self.items[itemIndex].currentOperation = .frameInterpolation
-                self.items[itemIndex].status = .analyzing
-                self.items[itemIndex].currentStage = t("frameInterpolationStageReadingFPS")
-            }
-
-            let decision = await VideoFrameInterpolationAnalyzer.decision(for: videoURL, targetFPS: targetFPS)
-            await MainActor.run {
-                guard let self,
-                      let itemIndex = self.items.firstIndex(where: { $0.id == id }) else { return }
-                self.items[itemIndex].sourceFPS = decision.sourceFPS
-                self.items[itemIndex].status = .running
-                self.items[itemIndex].currentStage = t("frameInterpolationStagePreparingExport")
-            }
-
-            guard !Task.isCancelled else {
-                await MainActor.run {
-                    self?.finishCancelled(id: id, reason: "任务已取消")
-                }
-                return
-            }
-            guard decision.shouldInterpolate else {
-                await MainActor.run {
-                    self?.finishWithoutExport(id: id, reason: decision.reason)
-                }
-                return
-            }
-
-            await MainActor.run {
-                guard let self,
-                      let item = self.items.first(where: { $0.id == id }) else {
-                    return
-                }
-                _ = VideoOptimizationRecordStore.shared.append(
-                    .frameStarted,
+            case .frameInterpolation:
+                let decision = await VideoFrameInterpolationAnalyzer.decision(
                     for: videoURL,
-                    metadata: [
-                        "targetFPS": String(item.targetFPS),
-                        "title": item.title,
-                    ]
+                    targetFPS: targetFPS
                 )
-            }
-            let result = await VideoFrameInterpolationExporter.exportIfNeeded(sourceURL: videoURL, targetFPS: targetFPS) { progress in
-                Task { @MainActor in
-                    VideoOptimizationQueueService.shared.updateProgress(id: id, progress: progress)
+                await MainActor.run {
+                    guard let self,
+                          let itemIndex = self.items.firstIndex(where: { $0.id == id }) else { return }
+                    self.items[itemIndex].sourceFPS = decision.sourceFPS
+                    self.items[itemIndex].status = .running
+                    self.items[itemIndex].currentStage = t("frameInterpolationStagePreparingExport")
                 }
-            }
 
-            await MainActor.run {
-                self?.finishInterpolationExport(id: id, result: result)
+                guard !Task.isCancelled else {
+                    await MainActor.run {
+                        self?.finishCancelled(id: id, reason: "任务已取消")
+                    }
+                    return
+                }
+                guard decision.shouldInterpolate else {
+                    await MainActor.run {
+                        self?.finishWithoutExport(id: id, reason: decision.reason)
+                    }
+                    return
+                }
+
+                await MainActor.run {
+                    guard let self,
+                          let item = self.items.first(where: { $0.id == id }) else {
+                        return
+                    }
+                    _ = VideoOptimizationRecordStore.shared.append(
+                        .frameStarted,
+                        for: videoURL,
+                        metadata: [
+                            "targetFPS": String(item.targetFPS),
+                            "title": item.title,
+                        ]
+                    )
+                }
+                let result = await VideoFrameInterpolationExporter.exportIfNeeded(
+                    sourceURL: videoURL,
+                    targetFPS: targetFPS
+                ) { progress in
+                    Task { @MainActor in
+                        VideoOptimizationQueueService.shared.updateProgress(id: id, progress: progress)
+                    }
+                }
+
+                await MainActor.run {
+                    self?.finishInterpolationExport(id: id, result: result)
+                }
             }
         }
         runningTasks[id] = task
@@ -1866,13 +1860,27 @@ final class VideoOptimizationQueueService: ObservableObject {
 
     private func finishLoopAnalysis(id: UUID, message: String) {
         markOperationCompleted(id: id, operation: .loopTransition)
-        let shouldInterpolate = items.first(where: { $0.id == id })?
-            .operations.contains(.frameInterpolation) ?? false
-        guard !shouldInterpolate else {
-            persistQueueCheckpointImmediately()
+        guard let item = items.first(where: { $0.id == id }) else {
+            runningTasks[id] = nil
+            stopHeartbeat(id: id)
+            scheduleNext()
             return
         }
-        finishCompleted(id: id, message: message)
+        if nextPendingOperation(for: item) != nil {
+            // 释放循环分析 lane，再由调度器等待独立的补帧 lane。
+            // 这样其它视频的循环分析可与当前补帧并行，但本视频顺序不会反转。
+            runningTasks[id] = nil
+            stopHeartbeat(id: id)
+            if let index = items.firstIndex(where: { $0.id == id }) {
+                items[index].status = .waiting
+                items[index].currentOperation = nil
+                clearProgress(at: index)
+            }
+            persistQueueCheckpointImmediately()
+            scheduleNext()
+        } else {
+            finishCompleted(id: id, message: message)
+        }
     }
 
     private func finishCompleted(id: UUID, message: String?) {
@@ -2062,10 +2070,8 @@ final class VideoOptimizationQueueService: ObservableObject {
     }
 
     var remainingWorkCount: Int {
-        let activeID = activeProcessingItem?.id
         return items.filter { item in
-            guard item.id != activeID else { return false }
-            return !item.isTerminalForCleanup
+            !runningTasks.keys.contains(item.id) && !item.isTerminalForCleanup
         }.count
     }
 

@@ -202,6 +202,8 @@ struct MyLibraryContentView: View {
     @State private var newFolderName = ""
     @State private var renamingFolder: LibraryFolder?
     @State private var renameFolderName = ""
+    @State private var pendingRedownloadMediaFolder: LibraryFolder?
+    @State private var showRedownloadMediaFolderConfirm = false
 
     // 添加壁纸到文件夹
     @State private var showAddToFolderSheet = false
@@ -511,6 +513,21 @@ struct MyLibraryContentView: View {
         }
         .sheet(isPresented: $showAddToFolderSheet) {
             addToFolderSheetContent
+        }
+        .alert(t("folder.redownload.all.media.confirm.title"), isPresented: $showRedownloadMediaFolderConfirm) {
+            Button(t("folder.redownload.all.media"), role: .destructive) {
+                guard let folder = pendingRedownloadMediaFolder else { return }
+                redownloadAllMedia(in: folder)
+                pendingRedownloadMediaFolder = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingRedownloadMediaFolder = nil
+            }
+        } message: {
+            let count = pendingRedownloadMediaFolder.map {
+                MediaLibraryService.shared.downloadedItems(inFolder: $0.id).count
+            } ?? 0
+            Text(String(format: t("folder.redownload.all.media.confirm.message"), count))
         }
         .sheet(isPresented: $showSyncProfileSheet) {
             syncProfileSheet
@@ -850,7 +867,8 @@ struct MyLibraryContentView: View {
             },
             onOptimizeVideos: {
                 _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
-            }
+            },
+            onRedownloadAll: nil
         )
     }
 
@@ -1276,7 +1294,11 @@ struct MyLibraryContentView: View {
             },
             onOptimizeVideos: {
                 _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
-            }
+            },
+            onRedownloadAll: selectedSubTab == .downloads && display.itemCount > 0 ? {
+                pendingRedownloadMediaFolder = folder
+                showRedownloadMediaFolderConfirm = true
+            } : nil
         )
     }
 
@@ -2853,6 +2875,36 @@ struct MyLibraryContentView: View {
         gridOrderStore.removeIDs(["folder_\(folderID)"], from: currentGridOrderScope)
         updateWallpaperItems()
         updateMediaItems()
+    }
+
+    /// 将视频文件夹中的现有下载先登记到下载任务列表，再删除旧文件并重新下载。
+    /// 下载落盘时始终携带原 folderID，避免重建下载记录后掉回媒体库根目录。
+    private func redownloadAllMedia(in folder: LibraryFolder) {
+        guard folder.contentType == .media, folder.collection == .downloads else { return }
+
+        let records = MediaLibraryService.shared.downloadedItems(inFolder: folder.id)
+        guard !records.isEmpty else { return }
+
+        // 先持久化整个 FIFO 队列并展示任务；实际传输在旧记录清理完成后启动。
+        guard PersistentDownloadQueueService.shared.stage(
+            records.map(\.item),
+            folderID: folder.id
+        ) else {
+            mediaViewModel.errorMessage = "无法保存下载队列，已取消删除旧文件"
+            return
+        }
+
+        // 新文件需要重新建立自己的优化判断，不能继承已删除文件的 sidecar 终态。
+        for videoURL in records.compactMap(\.resolvedVideoFileURL) {
+            VideoOptimizationQueueService.shared.cancelSourceRestoreRequest(videoURL: videoURL)
+            VideoOptimizationQueueService.shared.resetOptimizationState(videoURL: videoURL)
+        }
+
+        let itemIDs = Set(records.map(\.item.id))
+        mediaViewModel.removeDownloads(withIDs: itemIDs)
+        updateMediaItems()
+
+        PersistentDownloadQueueService.shared.start(using: mediaViewModel)
     }
 
     private func matchesLibrarySearch(for folder: LibraryFolder, query: String) -> Bool {

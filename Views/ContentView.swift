@@ -264,6 +264,9 @@ struct ContentView: View {
     // 顶层仅在 .task 中一次性轮询 isInitialSourceSelectionComplete，无需响应式；
     // 数据源切换提示由独立的 SourceSwitchToast / WorkshopSourceSwitchToast 子视图各自观察。
     @State private var detailPath: [MainDetailRoute] = []
+    /// 状态栏可在已有详情页上请求另一个详情；重建栈以避免 SwiftUI 复用旧 destination。
+    @State private var detailNavigationStackID = UUID()
+    @State private var pendingCurrentWallpaperRoute: MainDetailRoute?
     @State private var detailBackSwipeRegistration: UUID?
 
     init(
@@ -288,6 +291,7 @@ struct ContentView: View {
                         detailDestination(for: route)
                     }
             }
+            .id(detailNavigationStackID)
 
             globalOverlayLayer
         }
@@ -297,6 +301,7 @@ struct ContentView: View {
             AppResponsivenessMonitor.noteDetailDepth(detailPath.count)
             AppResponsivenessMonitor.noteScenePhase("contentViewVisible")
             registerDetailBackSwipeHandler()
+            consumePendingWallpaperDetailRequest()
         }
         .onDisappear {
             unregisterDetailBackSwipeHandler()
@@ -306,6 +311,10 @@ struct ContentView: View {
         }
         .onChange(of: detailPath.count) { _, depth in
             AppResponsivenessMonitor.noteDetailDepth(depth)
+        }
+        // 必须位于详情页 NavigationStack 的外层，已有详情页显示时也要能收到替换请求。
+        .onReceive(NotificationCenter.default.publisher(for: .openCurrentWallpaperDetail)) { _ in
+            consumePendingWallpaperDetailRequest()
         }
         .onChange(of: navigationState.selectedWallpaper) { _, wallpaper in
             guard let wallpaper else { return }
@@ -510,6 +519,42 @@ struct ContentView: View {
             return
         }
         navigationState.selectedTab = .myMedia
+    }
+
+    private func consumePendingWallpaperDetailRequest() {
+        guard let request = MainNavigationRequestStore.consumeWallpaperDetailRequest() else { return }
+
+        navigationState.selectedTab = .myMedia
+        switch request {
+        case .media(let item):
+            replaceDetailWithCurrentWallpaper(.media(item, context: [item]))
+        case .wallpaper(let wallpaper):
+            if wallpaper.isPixivManga {
+                let route = MangaRoutePayload(
+                    source: .pixiv,
+                    illustId: String(wallpaper.id.dropFirst("pixiv_".count)),
+                    seedTitle: wallpaper.title,
+                    seedCoverURL: wallpaper.path
+                )
+                replaceDetailWithCurrentWallpaper(.manga(route))
+            } else {
+                replaceDetailWithCurrentWallpaper(.wallpaper(wallpaper, context: [wallpaper]))
+            }
+        }
+    }
+
+    /// 先完整关闭当前详情页，再在下一轮主线程事件重建并打开目标详情。
+    private func replaceDetailWithCurrentWallpaper(_ route: MainDetailRoute) {
+        pendingCurrentWallpaperRoute = route
+        detailPath.removeAll()
+        clearSelectedDetailBindings()
+        detailNavigationStackID = UUID()
+        Task { @MainActor in
+            await Task.yield()
+            guard pendingCurrentWallpaperRoute == route else { return }
+            pendingCurrentWallpaperRoute = nil
+            openDetail(route)
+        }
     }
 
     @ViewBuilder

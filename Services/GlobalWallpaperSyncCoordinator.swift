@@ -192,6 +192,20 @@ final class GlobalWallpaperSyncCoordinator {
         synchronizeCurrentWallpaperAfterEnabling()
     }
 
+    /// 全局同步关闭时停止接受旧的排队事务，并等待当前事务完整收尾。
+    /// 当前事务不能直接半途杀掉，否则可能只改完部分显示器；等待结束后再由各屏调度覆盖。
+    func drainBeforeLeavingGlobalMode() async {
+        let abandoned = pendingRequests
+        pendingRequests.removeAll()
+        for request in abandoned {
+            request.continuation.resume(throwing: CancellationError())
+        }
+
+        if let activeTask {
+            await activeTask.value
+        }
+    }
+
     private func startNextRequestIfNeeded() {
         guard activeTask == nil, !pendingRequests.isEmpty else { return }
         let request = pendingRequests.removeFirst()

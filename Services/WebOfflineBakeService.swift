@@ -53,6 +53,7 @@ enum WebOfflineBakeService {
         record: MediaDownloadRecord,
         durationSeconds: Double? = nil,
         fps: Int32? = nil,
+        resumingJobID: UUID? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: record.localFileURL)
@@ -86,12 +87,35 @@ enum WebOfflineBakeService {
         if let existing = SceneOfflineBakeService.usableArtifact(from: record),
            existing.renderer == .wallpaperEngineWeb,
            existing.videoPath == cacheURL.path {
+            if let resumingJobID {
+                await MainActor.run {
+                    SceneOfflineBakeProgressTracker.shared.finish(
+                        jobID: resumingJobID,
+                        success: true
+                    )
+                }
+            }
             return existing
         }
 
-        let jobID = await MainActor.run {
-            SceneOfflineBakeProgressTracker.shared.enqueue(itemID: record.item.id)
+        let persistentJob = PersistentOfflineBakeJob.web(
+            id: resumingJobID ?? UUID(),
+            record: record,
+            contentRoot: contentRoot,
+            outputURL: cacheURL,
+            durationSeconds: effectiveDuration,
+            fps: effectiveFPS
+        )
+        let enqueueResult = await MainActor.run {
+            SceneOfflineBakeProgressTracker.shared.enqueue(
+                job: persistentJob,
+                resumingJobID: resumingJobID
+            )
         }
+        guard enqueueResult.shouldExecute else {
+            throw SceneOfflineBakeError.concurrentBakeInProgress
+        }
+        let jobID = enqueueResult.jobID
 
         await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
         await MainActor.run {
@@ -200,6 +224,31 @@ enum WebOfflineBakeService {
             await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             throw error
         }
+    }
+
+    @MainActor
+    static func resumePersistedBakeJob(
+        _ job: PersistentOfflineBakeJob
+    ) async throws -> SceneBakeArtifact {
+        guard job.kind == .web else {
+            throw SceneOfflineBakeError.ineligible
+        }
+        let record = MediaLibraryService.shared.downloadedItems.first { record in
+            record.id == job.recordID || record.item.id == job.itemID
+        }
+        guard let record else {
+            SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                id: job.id,
+                reason: "download record no longer exists"
+            )
+            throw SceneOfflineBakeError.contentRootMissing
+        }
+        return try await bake(
+            record: record,
+            durationSeconds: job.durationSeconds,
+            fps: Int32(job.fps),
+            resumingJobID: job.id
+        )
     }
 
     static func scheduleAutoBakeAfterDownload(itemID: String, localFileURL: URL) {

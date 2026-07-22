@@ -264,7 +264,6 @@
 		E989D6EC4EC646557E114D01 /* SceneOfflineBakeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F629610BC109E8BDF65491C /* SceneOfflineBakeService.swift */; };
 		E9B5A2CFB8630BDB70B9226E /* VideoLoopAnalysisMetalComparator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0439A89A279EE5718DA1AD57 /* VideoLoopAnalysisMetalComparator.swift */; };
 		ED8CC76A6300E215C960C06E /* AnimeRules in Resources */ = {isa = PBXBuildFile; fileRef = 222C8AA50BDCFF9AD85ABF2C /* AnimeRules */; };
-		EF88E6CA3EC19C94309BD08E /* VideoOptimizationAutomationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 410C2955CED920FD746A05AD /* VideoOptimizationAutomationService.swift */; };
 		F0448F711A615AC3653D7D60 /* DynamicWallpaperService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67C8922986259825170C5975 /* DynamicWallpaperService.swift */; };
 		F0CD11A67E854F0FC8892F46 /* AnimeSearchHeuristics.swift in Sources */ = {isa = PBXBuildFile; fileRef = F811DCEB4E7240A71F2AFC97 /* AnimeSearchHeuristics.swift */; };
 		F0FD4304E81DF63495497CFE /* CloudSyncConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3772811EA029208208E5520D /* CloudSyncConflictResolver.swift */; };
@@ -385,7 +384,6 @@
 		3EF268EC8CBE8BF9D9FFCDF0 /* CropLayoutEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CropLayoutEngine.swift; sourceTree = "<group>"; };
 		404E1B6C897DB662F6D35134 /* AnimeProgressStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimeProgressStore.swift; sourceTree = "<group>"; };
 		40B45046169B42DA3C7D81AE /* VideoRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoRenderer.swift; sourceTree = "<group>"; };
-		410C2955CED920FD746A05AD /* VideoOptimizationAutomationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoOptimizationAutomationService.swift; sourceTree = "<group>"; };
 		41B90FB7E5E929B342AD6FB7 /* WebWallpaperDesignService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebWallpaperDesignService.swift; sourceTree = "<group>"; };
 		4327334BCEFE99F8F0378880 /* MediaService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaService.swift; sourceTree = "<group>"; };
 		43498E7A9DF3A409E2F15E14 /* LiquidGlassClockConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassClockConfiguration.swift; sourceTree = "<group>"; };
@@ -818,7 +816,6 @@
 				F10D22664E97E9D4B1A5B73E /* UpdateChecker.swift */,
 				A66BCEAF473D8316F61C67BB /* UserLibrary.swift */,
 				8A135CF6306459AB0F5588EB /* VideoLoopAnalysisService.swift */,
-				410C2955CED920FD746A05AD /* VideoOptimizationAutomationService.swift */,
 				B3C6624481F67E607F0B80A8 /* VideoOptimizationQueueCheckpointStore.swift */,
 				13EC1B2564D63C35D0C2FC82 /* VideoOptimizationQueueService.swift */,
 				6CF2A6B0DAA0C8F5FE072A3A /* VideoOptimizationRecordStore.swift */,
@@ -1382,7 +1379,6 @@
 				CC45C217C242AAC9FCC2AFDF /* UserLibrary.swift in Sources */,
 				E9B5A2CFB8630BDB70B9226E /* VideoLoopAnalysisMetalComparator.swift in Sources */,
 				D5FFB271B5019647DE2B5944 /* VideoLoopAnalysisService.swift in Sources */,
-				EF88E6CA3EC19C94309BD08E /* VideoOptimizationAutomationService.swift in Sources */,
 				D9BFE89E3FA703E1754973F0 /* VideoOptimizationQueueCheckpointStore.swift in Sources */,
 				4A833BE40B9022E62B797BDA /* VideoOptimizationQueueService.swift in Sources */,
 				869E9182B661FDE0DFDCBFA0 /* VideoOptimizationRecordStore.swift in Sources */,

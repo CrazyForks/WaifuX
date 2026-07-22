@@ -56,7 +56,9 @@ class SettingsViewModel: ObservableObject {
     @Published var pauseOnBatteryPower = false { didSet { UserDefaults.standard.set(pauseOnBatteryPower, forKey: "pause_on_battery_power") } }
     @Published var pauseWhenWindowCoverage = false { didSet { UserDefaults.standard.set(pauseWhenWindowCoverage, forKey: "pause_when_window_coverage") } }
     @Published var windowCoveragePauseThreshold: Double = 50 { didSet { UserDefaults.standard.set(windowCoveragePauseThreshold, forKey: "window_coverage_pause_threshold") } }
-    @Published var hdrEnabled = true { didSet { UserDefaults.standard.set(hdrEnabled, forKey: "hdr_enabled") } }
+    /// 默认关闭：桌面 AVPlayerLayer 开启逐帧 HDR 元数据时，在部分 15.x + XDR 上会偶发整层 tone-map 闪暗。
+    /// 用户仍可在设置里手动打开；仅影响新创建的 AVPlayerItem。
+    @Published var hdrEnabled = false { didSet { UserDefaults.standard.set(hdrEnabled, forKey: "hdr_enabled") } }
     @Published var autoRemoveVideoLetterbox = false {
         didSet {
             guard !isBatchUpdating else { return }
@@ -85,7 +87,7 @@ class SettingsViewModel: ObservableObject {
             applyVideoOptimizationSettings()
         }
     }
-    /// 视频下载、设壁纸或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
+    /// 视频下载或烘焙完成后，自动「优化视频」（先循环分析再补帧）。
     /// 与详情页 / 我的库手动「优化视频」同一流水线；手动入口不依赖此开关。
     @Published var autoOptimizeVideosAfterDownload = false {
         didSet {
@@ -473,7 +475,7 @@ class SettingsViewModel: ObservableObject {
             pauseWhenWindowCoverage = defaults.bool(forKey: "pause_when_window_coverage")
             let savedThreshold = defaults.double(forKey: "window_coverage_pause_threshold")
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50
-            hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? true
+            hdrEnabled = defaults.object(forKey: "hdr_enabled") as? Bool ?? false
             autoRemoveVideoLetterbox = defaults.object(forKey: "auto_remove_video_letterbox") as? Bool ?? false
             portraitBlurFillEnabled = defaults.object(forKey: "portrait_blur_fill_enabled") as? Bool ?? false
             frameInterpolationTargetFPS = Double(FrameInterpolationTargetFPSResolver.nearestAllowedFixedFPS(Int((defaults.object(forKey: "frame_interpolation_target_fps") as? Double ?? 60.0).rounded())))

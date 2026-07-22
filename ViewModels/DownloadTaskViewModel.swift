@@ -75,12 +75,7 @@ class DownloadTaskViewModel: ObservableObject {
     }
 
     func retryTask(_ task: DownloadTask) {
-        downloadService.removeTask(id: task.id)
-        if let wallpaper = task.wallpaper {
-            _ = downloadService.addTask(wallpaper: wallpaper)
-        } else if let mediaItem = task.mediaItem {
-            _ = downloadService.addTask(mediaItem: mediaItem)
-        }
+        PersistentDownloadQueueService.shared.retry(task)
     }
 
     // MARK: - Computed Properties

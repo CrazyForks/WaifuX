@@ -1030,32 +1030,7 @@ final class MediaExploreViewModel: ObservableObject {
     private let persistDownloadedMediaToAppLibrary: Bool
 
     func download(_ item: MediaItem, preferredOption: MediaDownloadOption? = nil) async throws {
-        let task = downloadTaskService.addTask(mediaItem: item)
-
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
-
-            _ = try await ensureLocalVideoFile(
-                for: item,
-                preferredOption: preferredOption,
-                saveToDownloads: persistDownloadedMediaToAppLibrary,
-                taskID: task.id
-            )
-            downloadTaskService.markCompleted(id: task.id)
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
-            }
-            throw error
-        }
+        _ = try await downloadMedia(item, option: preferredOption)
     }
 
     // MARK: - 便捷方法（用于 MediaDetailSheet）
@@ -1085,44 +1060,59 @@ final class MediaExploreViewModel: ObservableObject {
     /// - Returns: 下载后的本地文件 URL
     /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
     ///   为 nil 时不改动已有 folderID；新建记录则落在根目录。
-    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption, folderID: String? = nil) async throws -> URL {
-        let task = downloadTaskService.addTask(mediaItem: item)
-        // 作者批量下载需要库记录才能归夹：即使设置关闭“写入媒体库”，有 folderID 时也强制入库
+    func downloadMedia(_ item: MediaItem, option: MediaDownloadOption?, folderID: String? = nil) async throws -> URL {
         let saveToLibrary = persistDownloadedMediaToAppLibrary
             || MediaLibraryService.normalizedFolderID(folderID) != nil
+        return try await PersistentDownloadQueueService.shared.enqueueMediaAndWait(
+            item,
+            option: option,
+            saveToLibrary: saveToLibrary,
+            folderID: folderID,
+            using: self
+        )
+    }
 
-        // 创建真正执行下载逻辑的 Task（有返回值）
-        let valueTask = Task { [weak self] () -> URL in
-            guard let self else { throw CancellationError() }
+    /// 只执行媒体文件下载；队列统一管理任务生命周期。
+    func executeQueuedMediaDownload(
+        _ item: MediaItem,
+        option: MediaDownloadOption?,
+        saveToLibrary: Bool,
+        folderID: String?,
+        taskID: String
+    ) async throws -> URL {
+        return try await ensureLocalVideoFile(
+            for: item,
+            preferredOption: option,
+            saveToDownloads: saveToLibrary,
+            taskID: taskID,
+            folderID: folderID
+        )
+    }
 
-            let localURL = try await ensureLocalVideoFile(
-                for: item,
-                preferredOption: option,
-                saveToDownloads: saveToLibrary,
-                taskID: task.id,
-                folderID: folderID
-            )
-            downloadTaskService.markCompleted(id: task.id)
-            return localURL
+    /// 只执行 Workshop 下载；Steam Guard 码仅由当次内存任务传入。
+    func executeQueuedWorkshopDownload(
+        _ item: MediaItem,
+        guardCode: String?,
+        folderID: String?,
+        taskID: String
+    ) async throws -> URL {
+        guard item.id.hasPrefix("workshop_") else {
+            throw WorkshopError.workshopNotSupported
         }
 
-        // 包装为 Void Task 用于注册（DownloadTaskStorage 要求 Task<Void, Error>）
-        let downloadTask = Task<Void, Error> {
-            _ = try await valueTask.value
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: task.id, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: task.id) }
-
-        do {
-            return try await valueTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: task.id)
+        let workshopID = String(item.id.dropFirst("workshop_".count))
+        let localURL = try await workshopService.downloadWorkshopItem(
+            workshopID: workshopID,
+            guardCode: guardCode,
+            progressHandler: { progress in
+                Task { @MainActor in
+                    DownloadTaskService.shared.updateProgress(id: taskID, progress: progress)
+                }
             }
-            throw error
-        }
+        )
+        let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
+        mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
+        return normalizedURL
     }
 
     func applyDynamicWallpaper(
@@ -1168,10 +1158,12 @@ final class MediaExploreViewModel: ObservableObject {
         }
 
         // 网络媒体文件：下载后使用
-        let localVideoURL = try await ensureLocalVideoFile(
-            for: item,
-            preferredOption: preferredWallpaperOption(for: item),
-            saveToDownloads: true
+        let localVideoURL = try await PersistentDownloadQueueService.shared.enqueueMediaAndWait(
+            item,
+            option: preferredWallpaperOption(for: item),
+            saveToLibrary: true,
+            folderID: nil,
+            using: self
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
         try videoWallpaperManager.applyVideoWallpaper(
@@ -1553,22 +1545,16 @@ final class MediaExploreViewModel: ObservableObject {
     func retryDownload(task: DownloadTask) async throws {
         switch task.kind {
         case .media:
-            guard let item = task.mediaItem else {
+            guard task.mediaItem != nil else {
                 throw NetworkError.invalidResponse
             }
-            let resolvedItem = try await loadDetail(for: item)
-            guard let option = preferredWallpaperOption(for: resolvedItem) else {
-                throw NetworkError.invalidResponse
-            }
-            downloadTaskService.removeTask(id: task.id)
-            _ = try await downloadMedia(resolvedItem, option: option)
+            try await PersistentDownloadQueueService.shared.retryAndWait(task)
 
         case .workshop:
-            guard let item = task.workshopItem ?? task.mediaItem else {
+            guard task.workshopItem != nil || task.mediaItem != nil else {
                 throw NetworkError.invalidResponse
             }
-            downloadTaskService.removeTask(id: task.id)
-            try await downloadWorkshopWallpaper(item)
+            try await PersistentDownloadQueueService.shared.retryAndWait(task)
 
         case .wallpaper:
             throw NetworkError.invalidResponse
@@ -2399,47 +2385,17 @@ final class MediaExploreViewModel: ObservableObject {
             throw WorkshopError.workshopNotSupported
         }
 
-        let workshopID = String(item.id.dropFirst("workshop_".count))
         AppLogger.info(.download, "downloadWorkshopWallpaper", metadata: [
             "item.id": item.id,
-            "workshopID": workshopID,
+            "workshopID": String(item.id.dropFirst("workshop_".count)),
             "title": item.title
         ])
-        let task = downloadTaskService.addTask(workshopWallpaper: item)
-        let taskID = task.id
-        downloadTaskService.markDownloading(id: taskID)
-
-        let downloadTask = Task { [weak self] in
-            guard let self else { throw CancellationError() }
-
-            let localURL = try await workshopService.downloadWorkshopItem(
-                workshopID: workshopID,
-                guardCode: guardCode,
-                progressHandler: { [weak self] progress in
-                    Task { @MainActor in
-                        self?.downloadTaskService.updateProgress(id: taskID, progress: progress)
-                    }
-                }
-            )
-            let normalizedURL = normalizeWorkshopDownloadLocation(localURL, workshopID: workshopID)
-            // 作者批量下载把 folderID 和落盘登记绑在同一步
-            mediaLibrary.recordDownload(item: item, localFileURL: normalizedURL, folderID: folderID)
-            downloadTaskService.markCompleted(id: taskID)
-            print("[MediaExploreViewModel] downloadWorkshopWallpaper completed: \(normalizedURL)")
-        }
-
-        // 注册任务以便支持取消
-        downloadTaskService.registerDownloadTask(id: taskID, task: downloadTask)
-        defer { downloadTaskService.unregisterDownloadTask(id: taskID) }
-
-        do {
-            try await downloadTask.value
-        } catch {
-            if !(error is CancellationError) {
-                downloadTaskService.markFailed(id: taskID)
-            }
-            throw error
-        }
+        try await PersistentDownloadQueueService.shared.enqueueWorkshopAndWait(
+            item,
+            guardCode: guardCode,
+            folderID: folderID,
+            using: self
+        )
     }
 
     private func normalizeWorkshopDownloadLocation(_ url: URL, workshopID: String) -> URL {

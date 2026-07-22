@@ -556,6 +556,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                         DispatchQueue.main.async {
                             PlaybackProgressCache.shared.restoreSavedData()
                             DownloadTaskService.shared.restoreSavedTasks()
+                            if let self {
+                                PersistentDownloadQueueService.shared.configure(
+                                    wallpaperViewModel: self.wallpaperViewModel,
+                                    mediaViewModel: self.mediaViewModel
+                                )
+                            }
                             WallpaperSchedulerService.shared.restoreSavedConfig()
                             ExternalDisplayConnectionCoordinator.shared.start()
 

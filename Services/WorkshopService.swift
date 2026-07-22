@@ -26,18 +26,21 @@ private actor SteamCMDDownloadLimiter {
     private let pollInterval: UInt64 = 500_000_000 // 0.5s
 
     /// 获取一个下载槽位；若已满则每隔 0.5s 轮询一次
-    func acquire() async {
+    func acquire() async throws {
         while true {
+            try Task.checkCancellation()
             if activeCount < maxConcurrent {
                 activeCount += 1
                 return
             }
             waitCount += 1
-            // 休眠期间若 Task 被取消，CancellationError 被 try? 静默吞掉，
-            // 循环继续检查槽位。实际下载操作在 acquire 返回后进行，
-            // 那里会通过 try await 抛出 CancellationError 并被外层捕获。
-            try? await Task.sleep(nanoseconds: pollInterval)
-            waitCount = max(0, waitCount - 1)
+            do {
+                try await Task.sleep(nanoseconds: pollInterval)
+                waitCount = max(0, waitCount - 1)
+            } catch {
+                waitCount = max(0, waitCount - 1)
+                throw error
+            }
         }
     }
 
@@ -1606,7 +1609,7 @@ class WorkshopService: ObservableObject {
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         // 获取并发下载槽位（超出上限则排队等待）
-        await downloadLimiter.acquire()
+        try await downloadLimiter.acquire()
         // 更新排队计数
         let queued = await downloadLimiter.queuedCount()
         await MainActor.run { steamCMDQueuedCount = queued }

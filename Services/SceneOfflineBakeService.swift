@@ -88,6 +88,145 @@ func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> 
     return displayURL
 }
 
+/// Enough information to rebuild an unfinished Scene/Web bake after relaunch.
+struct PersistentOfflineBakeJob: Codable, Hashable, Sendable, Identifiable {
+    enum Kind: String, Codable, Hashable, Sendable {
+        case scene
+        case web
+    }
+
+    let id: UUID
+    let key: String
+    let kind: Kind
+    let itemID: String?
+    let recordID: String?
+    let contentRootPath: String
+    let eligibility: SceneBakeEligibilitySnapshot?
+    let cacheItemID: String?
+    let durationSeconds: Double
+    let fps: Int
+    let renderer: SceneBakeRenderer
+    let persistArtifactToItemID: String?
+    let progressItemID: String?
+    let addedAt: Date
+
+    static func scene(
+        id: UUID = UUID(),
+        eligibility: SceneBakeEligibilitySnapshot,
+        contentRoot: URL,
+        cacheItemID: String,
+        durationSeconds: Double,
+        fps: Int32,
+        renderer: SceneBakeRenderer,
+        persistArtifactToItemID: String?,
+        progressItemID: String?
+    ) -> PersistentOfflineBakeJob {
+        let normalizedRoot = contentRoot.standardizedFileURL.path
+        let key = [
+            Kind.scene.rawValue,
+            normalizedRoot,
+            eligibility.analysisId.uuidString,
+            cacheItemID,
+            renderer.rawValue,
+            String(fps),
+            String(format: "%.3f", durationSeconds),
+        ].joined(separator: "|")
+        return PersistentOfflineBakeJob(
+            id: id,
+            key: key,
+            kind: .scene,
+            itemID: progressItemID ?? persistArtifactToItemID,
+            recordID: persistArtifactToItemID,
+            contentRootPath: normalizedRoot,
+            eligibility: eligibility,
+            cacheItemID: cacheItemID,
+            durationSeconds: durationSeconds,
+            fps: Int(fps),
+            renderer: renderer,
+            persistArtifactToItemID: persistArtifactToItemID,
+            progressItemID: progressItemID,
+            addedAt: .now
+        )
+    }
+
+    static func web(
+        id: UUID = UUID(),
+        record: MediaDownloadRecord,
+        contentRoot: URL,
+        outputURL: URL,
+        durationSeconds: Double,
+        fps: Int32
+    ) -> PersistentOfflineBakeJob {
+        PersistentOfflineBakeJob(
+            id: id,
+            key: "\(Kind.web.rawValue)|\(outputURL.standardizedFileURL.path)",
+            kind: .web,
+            itemID: record.item.id,
+            recordID: record.id,
+            contentRootPath: contentRoot.standardizedFileURL.path,
+            eligibility: nil,
+            cacheItemID: record.id,
+            durationSeconds: durationSeconds,
+            fps: Int(fps),
+            renderer: .wallpaperEngineWeb,
+            persistArtifactToItemID: record.id,
+            progressItemID: record.item.id,
+            addedAt: .now
+        )
+    }
+}
+
+private struct OfflineBakeQueueCheckpointStore {
+    private struct Snapshot: Codable {
+        let version: Int
+        let jobs: [PersistentOfflineBakeJob]
+    }
+
+    static let shared = OfflineBakeQueueCheckpointStore()
+
+    private var fileURL: URL {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        return support
+            .appendingPathComponent("WaifuX", isDirectory: true)
+            .appendingPathComponent("SceneBake", isDirectory: true)
+            .appendingPathComponent("pending-queue.json")
+    }
+
+    func load() -> [PersistentOfflineBakeJob] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
+              snapshot.version == 1 else {
+            return []
+        }
+        var seen = Set<String>()
+        return snapshot.jobs
+            .sorted { $0.addedAt < $1.addedAt }
+            .filter { seen.insert($0.key).inserted }
+    }
+
+    func save(_ jobs: [PersistentOfflineBakeJob]) {
+        guard !jobs.isEmpty else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
+            try encoder.encode(Snapshot(version: 1, jobs: jobs))
+                .write(to: fileURL, options: .atomic)
+        } catch {
+            print("[OfflineBakeQueue] checkpoint write failed: \(error.localizedDescription)")
+        }
+    }
+}
+
 /// 所有离线烘焙共用的串行 FIFO 队列。
 ///
 /// Scene / Web 烘焙都会占用大量 GPU、内存和编码资源。这里允许用户连续提交任务，
@@ -139,11 +278,38 @@ final class SceneOfflineBakeProgressTracker {
     struct Entry: Identifiable, Equatable {
         let id: UUID
         let itemID: String?
+        let persistentJob: PersistentOfflineBakeJob?
         var state: State
         var progress: Double
     }
 
-    private(set) var entries: [Entry] = []
+    struct EnqueueResult {
+        let jobID: UUID
+        let shouldExecute: Bool
+    }
+
+    private(set) var entries: [Entry]
+    private var claimedRestoredJobIDs = Set<UUID>()
+
+    private init() {
+        let restoredJobs = OfflineBakeQueueCheckpointStore.shared.load()
+        entries = restoredJobs.map {
+            Entry(
+                id: $0.id,
+                itemID: $0.itemID,
+                persistentJob: $0,
+                state: .queued,
+                progress: 0
+            )
+        }
+        guard !restoredJobs.isEmpty else { return }
+        print("[OfflineBakeQueue] restored \(restoredJobs.count) unfinished bake job(s)")
+        Task { @MainActor in
+            // MediaLibraryService finishes its own persisted-record load during app startup.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            await SceneOfflineBakeService.resumePersistedBakeQueue()
+        }
+    }
 
     var activeItemID: String? {
         entries.first(where: { $0.state == .running })?.itemID
@@ -155,11 +321,32 @@ final class SceneOfflineBakeProgressTracker {
 
     var isBaking: Bool { !entries.isEmpty }
 
-    func enqueue(itemID: String?) -> UUID {
-        let jobID = UUID()
-        entries.append(Entry(id: jobID, itemID: itemID, state: .queued, progress: 0))
-        notifyProgress(itemID: itemID, progress: 0)
-        return jobID
+    func enqueue(
+        job: PersistentOfflineBakeJob,
+        resumingJobID: UUID? = nil
+    ) -> EnqueueResult {
+        if let resumingJobID,
+           let existing = entries.first(where: { $0.id == resumingJobID }) {
+            let claimed = claimedRestoredJobIDs.insert(resumingJobID).inserted
+            return EnqueueResult(jobID: existing.id, shouldExecute: claimed)
+        }
+        if let existing = entries.first(where: { $0.persistentJob?.key == job.key }) {
+            print("[OfflineBakeQueue] duplicate bake excluded: \(job.key)")
+            return EnqueueResult(jobID: existing.id, shouldExecute: false)
+        }
+
+        entries.append(
+            Entry(
+                id: job.id,
+                itemID: job.itemID,
+                persistentJob: job,
+                state: .queued,
+                progress: 0
+            )
+        )
+        persistPendingJobs()
+        notifyProgress(itemID: job.itemID, progress: 0)
+        return EnqueueResult(jobID: job.id, shouldExecute: true)
     }
 
     func begin(jobID: UUID) {
@@ -182,10 +369,30 @@ final class SceneOfflineBakeProgressTracker {
             notifyProgress(itemID: entry.itemID, progress: 1)
         }
         entries.remove(at: index)
+        claimedRestoredJobIDs.remove(jobID)
+        persistPendingJobs()
     }
 
     func progress(for itemID: String) -> Double? {
         entries.first(where: { $0.itemID == itemID })?.progress
+    }
+
+    var pendingPersistentJobs: [PersistentOfflineBakeJob] {
+        entries.compactMap(\.persistentJob).sorted { $0.addedAt < $1.addedAt }
+    }
+
+    func discardPersistedJob(id: UUID, reason: String) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        let itemID = entries[index].itemID
+        entries.remove(at: index)
+        claimedRestoredJobIDs.remove(id)
+        persistPendingJobs()
+        notifyProgress(itemID: itemID, progress: 0)
+        print("[OfflineBakeQueue] dropped restored job \(id): \(reason)")
+    }
+
+    private func persistPendingJobs() {
+        OfflineBakeQueueCheckpointStore.shared.save(entries.compactMap(\.persistentJob))
     }
 
     private func notifyProgress(itemID: String?, progress: Double) {
@@ -598,6 +805,7 @@ enum SceneOfflineBakeService {
         renderer: SceneBakeRenderer = .wallpaperWgpu,
         persistArtifactToItemID: String? = nil,
         progressItemID: String? = nil,
+        resumingJobID: UUID? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
         let effectiveFPS = resolvedBakeFPS(requestedFPS: fps)
@@ -609,9 +817,27 @@ enum SceneOfflineBakeService {
             effectiveDuration = saved >= 5 ? min(max(saved, 5), 60) : 15
         }
         let trackedItemID = progressItemID ?? persistArtifactToItemID
-        let jobID = await MainActor.run {
-            SceneOfflineBakeProgressTracker.shared.enqueue(itemID: trackedItemID)
+        let persistentJob = PersistentOfflineBakeJob.scene(
+            id: resumingJobID ?? UUID(),
+            eligibility: eligibility,
+            contentRoot: contentRoot,
+            cacheItemID: cacheItemID,
+            durationSeconds: effectiveDuration,
+            fps: effectiveFPS,
+            renderer: renderer,
+            persistArtifactToItemID: persistArtifactToItemID,
+            progressItemID: trackedItemID
+        )
+        let enqueueResult = await MainActor.run {
+            SceneOfflineBakeProgressTracker.shared.enqueue(
+                job: persistentJob,
+                resumingJobID: resumingJobID
+            )
         }
+        guard enqueueResult.shouldExecute else {
+            throw SceneOfflineBakeError.concurrentBakeInProgress
+        }
+        let jobID = enqueueResult.jobID
 
         await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
         await MainActor.run {
@@ -658,6 +884,58 @@ enum SceneOfflineBakeService {
             }
             await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
             throw error
+        }
+    }
+
+    /// Re-enqueues unfinished checkpoint entries after relaunch. The original
+    /// UUID is reused so recovery does not create a second visible queue item.
+    @MainActor
+    static func resumePersistedBakeQueue() async {
+        let jobs = SceneOfflineBakeProgressTracker.shared.pendingPersistentJobs
+        guard !jobs.isEmpty else { return }
+
+        for job in jobs {
+            switch job.kind {
+            case .scene:
+                guard let eligibility = job.eligibility,
+                      let cacheItemID = job.cacheItemID else {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: "scene checkpoint is incomplete"
+                    )
+                    continue
+                }
+                do {
+                    _ = try await bake(
+                        eligibility: eligibility,
+                        contentRoot: URL(fileURLWithPath: job.contentRootPath),
+                        cacheItemID: cacheItemID,
+                        durationSeconds: job.durationSeconds,
+                        fps: Int32(job.fps),
+                        renderer: job.renderer,
+                        persistArtifactToItemID: job.persistArtifactToItemID,
+                        progressItemID: job.progressItemID,
+                        resumingJobID: job.id
+                    )
+                } catch {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: error.localizedDescription
+                    )
+                    print("[OfflineBakeQueue] restored scene bake failed: \(error.localizedDescription)")
+                }
+
+            case .web:
+                do {
+                    _ = try await WebOfflineBakeService.resumePersistedBakeJob(job)
+                } catch {
+                    SceneOfflineBakeProgressTracker.shared.discardPersistedJob(
+                        id: job.id,
+                        reason: error.localizedDescription
+                    )
+                    print("[OfflineBakeQueue] restored web bake failed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
