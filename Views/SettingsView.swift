@@ -56,6 +56,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
     case general
     case modules
     case download
+    case wallhaven
     case workshop
     case pixiv
     case konachan
@@ -70,6 +71,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return t("general")
         case .modules: return t("settings.modules")
         case .download: return t("download")
+        case .wallhaven: return t("wallhaven")
         case .workshop: return t("wallpaperEngine")
         case .pixiv: return "Pixiv"
         case .konachan: return "Konachan"
@@ -84,6 +86,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return "gearshape"
         case .modules: return "square.grid.2x2"
         case .download: return "arrow.down.circle"
+        case .wallhaven: return "w.circle"
         case .workshop: return "gearshape.2" // Steam/Workshop 风格
         case .pixiv: return "p.circle"
         case .konachan: return "k.circle"
@@ -180,6 +183,8 @@ struct SettingsView: View {
                         ModulesSettingsTab(viewModel: viewModel)
                     case .download:
                         DownloadSettingsTab(viewModel: viewModel)
+                    case .wallhaven:
+                        WallhavenSettingsTab(viewModel: viewModel)
                     case .workshop:
                         WorkshopSettingsTab(viewModel: viewModel)
                     case .pixiv:
@@ -312,13 +317,8 @@ private struct ModulesSettingsTab: View {
 private struct GeneralSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
-    @State private var showClearCacheAlert = false
     @State private var showClearLockScreenAlert = false
     @State private var importProfileURL = ""
-
-    private var apiKeyBinding: Binding<String> {
-        Binding(get: { viewModel.apiKey }, set: { viewModel.apiKey = $0 })
-    }
 
     private var languageBinding: Binding<LocalizationService.Language> {
         Binding(
@@ -578,33 +578,6 @@ private struct GeneralSettingsTab: View {
 
             }
 
-            // 动态壁纸优化设置组。自动任务均由公共优化队列串行处理。
-            // 手动「优化视频」始终可走循环分析 + 补帧；此处只控制下载后自动优化与目标帧率。
-            MacSettingsSection(header: t("videoOptimizationSection")) {
-                MacSettingsRow(
-                    title: t("videoOptimizationAutoAfterDownload"),
-                    subtitle: t("videoOptimizationAutoAfterDownloadDesc"),
-                    showDivider: true
-                ) {
-                    MacToggle(isOn: $viewModel.autoOptimizeVideosAfterDownload)
-                }
-
-                MacSettingsRow(
-                    title: t("frameInterpolationTargetFPS"),
-                    subtitle: nil,
-                    showDivider: false
-                ) {
-                    Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
-                        ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
-                            Text("\(fps)")
-                                .tag(Double(fps))
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 180)
-                }
-            }
-
             MacSettingsSection(header: t("dynamicLockScreen")) {
                 // 动态锁屏壁纸开关（仅 macOS 26+ 可用）
                 if #available(macOS 26.0, *) {
@@ -722,80 +695,6 @@ private struct GeneralSettingsTab: View {
                     MacToggle(isOn: $viewModel.saveToDownloads)
                 }
             }
-
-            // 数据管理组
-            MacSettingsSection(header: t("dataManagement")) {
-                // API Key
-                HStack(spacing: 12) {
-                    Text(t("apiKey"))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.9))
-
-                    Spacer()
-
-                    TextField(t("api.key.placeholder"), text: apiKeyBinding)
-                        .font(.system(size: 12, weight: .regular))
-                        .textFieldStyle(.plain)
-                        .frame(width: 200)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(Color.white.opacity(0.07))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
-                                )
-                        )
-                        .foregroundStyle(Color.white.opacity(0.85))
-
-                    Link(destination: URL(string: "https://wallhaven.cc/settings/account")!) {
-                        Image(systemName: "arrow.up.right.square")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(Color(hex: "0A84FF").opacity(0.7))
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-
-                Text(t("apiKeyDescription"))
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(Color.white.opacity(0.4))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-
-                Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
-
-                // 缓存管理
-                HStack(spacing: 12) {
-                    Text(t("clearCache"))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.9))
-
-                    Spacer()
-
-                    Text(viewModel.cacheSize)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.4))
-
-                    Button(t("clear")) {
-                        showClearCacheAlert = true
-                    }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color(hex: "FF453A"))
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-            }
-        }
-        .alert(t("clearCache"), isPresented: $showClearCacheAlert) {
-            Button(t("cancel"), role: .cancel) {}
-            Button(t("clear"), role: .destructive) {
-                Task { await viewModel.clearCache() }
-            }
-        } message: {
-            Text(t("clearCacheConfirm"))
         }
         .alert(t("clearLockScreenInstances"), isPresented: $showClearLockScreenAlert) {
             Button(t("cancel"), role: .cancel) {}
@@ -815,6 +714,7 @@ private struct DownloadSettingsTab: View {
     @State private var showMigrationSheet = false
     @State private var isRepairing = false
     @State private var showRepairAlert = false
+    @State private var showClearCacheAlert = false
     @State private var repairResultMessage = ""
     @State private var pathRefreshID = UUID()
 
@@ -891,6 +791,56 @@ private struct DownloadSettingsTab: View {
                     .disabled(isRepairing)
                 }
             }
+
+            // 动态壁纸优化设置组。自动任务均由公共优化队列串行处理。
+            // 手动「优化视频」始终可走循环分析 + 补帧；此处只控制下载后自动优化与目标帧率。
+            MacSettingsSection(header: t("videoOptimizationSection")) {
+                MacSettingsRow(
+                    title: t("videoOptimizationAutoAfterDownload"),
+                    subtitle: t("videoOptimizationAutoAfterDownloadDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.autoOptimizeVideosAfterDownload)
+                }
+
+                MacSettingsRow(
+                    title: t("frameInterpolationTargetFPS"),
+                    subtitle: nil,
+                    showDivider: false
+                ) {
+                    Picker("", selection: $viewModel.frameInterpolationTargetFPS) {
+                        ForEach(FrameInterpolationTargetFPSResolver.allowedFixedFPSValues, id: \.self) { fps in
+                            Text("\(fps)")
+                                .tag(Double(fps))
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                }
+            }
+
+            // 缓存管理
+            MacSettingsSection(header: t("dataManagement")) {
+                HStack(spacing: 12) {
+                    Text(t("clearCache"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.9))
+
+                    Spacer()
+
+                    Text(viewModel.cacheSize)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.4))
+
+                    Button(t("clear")) {
+                        showClearCacheAlert = true
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color(hex: "FF453A"))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+            }
         }
         .id(pathRefreshID)
         .sheet(isPresented: $showMigrationSheet) {
@@ -903,6 +853,14 @@ private struct DownloadSettingsTab: View {
             }
         } message: {
             Text(t("repairDataConfirm"))
+        }
+        .alert(t("clearCache"), isPresented: $showClearCacheAlert) {
+            Button(t("cancel"), role: .cancel) {}
+            Button(t("clear"), role: .destructive) {
+                Task { await viewModel.clearCache() }
+            }
+        } message: {
+            Text(t("clearCacheConfirm"))
         }
         .alert(repairResultMessage, isPresented: Binding(
             get: { !repairResultMessage.isEmpty && !isRepairing },

@@ -641,12 +641,16 @@ final class PersistentDownloadQueueService {
         _ = try await waitForCompletion(of: id)
     }
 
-    /// 文件夹重下载必须先完整落盘 Job，再允许调用方删除旧文件。
+    /// 重新下载必须先完整落盘 Job，再允许调用方删除旧文件。
+    /// `folderID` 为 nil 或空时，下载完成后回到库根目录。
     @discardableResult
-    func stage(_ items: [MediaItem], folderID: String) -> Bool {
-        guard !folderID.isEmpty else { return false }
+    func stage(_ items: [MediaItem], folderID: String?) -> Bool {
+        guard !items.isEmpty else { return false }
         let originalJobs = jobs
         var presentationPayloads: [Payload] = []
+        let normalizedFolderID = folderID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedFolderID = (normalizedFolderID?.isEmpty == false) ? normalizedFolderID : nil
         for item in items {
             let payload: Payload = item.id.hasPrefix("workshop_")
                 ? .workshop(item)
@@ -661,7 +665,7 @@ final class PersistentDownloadQueueService {
             do {
                 _ = try upsert(
                     payload: payload,
-                    folderID: folderID,
+                    folderID: resolvedFolderID,
                     source: .folderRedownload,
                     persistImmediately: false,
                     updatePresentation: false

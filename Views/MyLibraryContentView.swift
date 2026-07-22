@@ -204,6 +204,8 @@ struct MyLibraryContentView: View {
     @State private var renameFolderName = ""
     @State private var pendingRedownloadMediaFolder: LibraryFolder?
     @State private var showRedownloadMediaFolderConfirm = false
+    @State private var pendingRedownloadMediaItem: MediaItem?
+    @State private var showRedownloadMediaItemConfirm = false
 
     // 添加壁纸到文件夹
     @State private var showAddToFolderSheet = false
@@ -528,6 +530,18 @@ struct MyLibraryContentView: View {
                 MediaLibraryService.shared.downloadedItems(inFolder: $0.id).count
             } ?? 0
             Text(String(format: t("folder.redownload.all.media.confirm.message"), count))
+        }
+        .alert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadMediaItemConfirm) {
+            Button(t("library.redownload.item"), role: .destructive) {
+                guard let item = pendingRedownloadMediaItem else { return }
+                redownloadMediaItem(item)
+                pendingRedownloadMediaItem = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingRedownloadMediaItem = nil
+            }
+        } message: {
+            Text(t("library.redownload.item.confirm.message"))
         }
         .sheet(isPresented: $showSyncProfileSheet) {
             syncProfileSheet
@@ -1386,7 +1400,19 @@ struct MyLibraryContentView: View {
                     Label(t("remove.from.folder"), systemImage: "folder.badge.minus")
                 }
             }
-            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(from: item.localFileURL) {
+            if selectedSubTab == .downloads, canRedownloadMediaItem(item.mediaItem) {
+                Button {
+                    pendingRedownloadMediaItem = item.mediaItem
+                    showRedownloadMediaItemConfirm = true
+                } label: {
+                    Label(t("library.redownload.item"), systemImage: "arrow.clockwise.circle")
+                }
+            }
+            // Scene 烘焙 MP4 优先：纯 scene 工程目录本身没有视频，不能只看 localFileURL。
+            if let videoURL = VideoOptimizationQueueService.shared.optimizableVideoURL(
+                forMediaItem: item.mediaItem,
+                localURL: item.localFileURL
+            ) {
                 Divider()
                 Button {
                     _ = VideoOptimizationQueueService.shared.enqueueOptimizeVideo(
@@ -2884,11 +2910,33 @@ struct MyLibraryContentView: View {
 
         let records = MediaLibraryService.shared.downloadedItems(inFolder: folder.id)
         guard !records.isEmpty else { return }
+        redownloadMediaRecords(records, folderID: folder.id)
+    }
 
-        // 先持久化整个 FIFO 队列并展示任务；实际传输在旧记录清理完成后启动。
+    /// 单个库内壁纸重新下载：保留原文件夹归属（若有），先入队再删旧文件。
+    private func redownloadMediaItem(_ item: MediaItem) {
+        guard canRedownloadMediaItem(item) else { return }
+        guard let record = MediaLibraryService.shared.downloadRecord(for: item.id),
+              record.isActive else {
+            return
+        }
+        redownloadMediaRecords([record], folderID: record.folderID)
+    }
+
+    private func canRedownloadMediaItem(_ item: MediaItem) -> Bool {
+        // 本地导入文件没有远端源，无法重新拉取。
+        if item.id.hasPrefix("local_") { return false }
+        if item.sourceName == t("local") { return false }
+        return MediaLibraryService.shared.downloadRecord(for: item.id)?.isActive == true
+    }
+
+    /// 先持久化下载队列，再清优化状态与旧文件，最后启动传输。
+    private func redownloadMediaRecords(_ records: [MediaDownloadRecord], folderID: String?) {
+        guard !records.isEmpty else { return }
+
         guard PersistentDownloadQueueService.shared.stage(
             records.map(\.item),
-            folderID: folder.id
+            folderID: folderID
         ) else {
             mediaViewModel.errorMessage = "无法保存下载队列，已取消删除旧文件"
             return

@@ -194,6 +194,7 @@
 		ABDBB0CB8253528AA412E7B9 /* ModuleAvailability.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D8F142992839C20F4F40DE9 /* ModuleAvailability.swift */; };
 		AC0CF820458DAF2FC11FA7BE /* LockedFolderOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 228ED6F6B2A0D9D2F9A87934 /* LockedFolderOverlay.swift */; };
 		AD6374C31D343F8D56E8378C /* PixivSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7443AC63532A05488FF1BE4 /* PixivSettingsTab.swift */; };
+		35822013DDDC4885A2FEECBB /* WallhavenSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 18F5E080C7E74B94AF9942D1 /* WallhavenSettingsTab.swift */; };
 		AD9A1E478CF8CD54925E71C4 /* PixivModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8FE3D9C9145F594CCD7BE7C /* PixivModels.swift */; };
 		AFD3EFA7EE4DBCA87D47E2F9 /* AnimeDetailViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A5CE931C51165763414BC25 /* AnimeDetailViewModel.swift */; };
 		B051739C27A7C23D6D91A33C /* FourKWallpapersService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94A1E8E7D55E0BF7960198BE /* FourKWallpapersService.swift */; };
@@ -516,6 +517,7 @@
 		C50A2C1E05CEFE851FCCE28B /* WallpaperPrefs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperPrefs.swift; sourceTree = "<group>"; };
 		C5A6FAAE3D996B466B7354FC /* LiquidGlassDesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidGlassDesignSystem.swift; sourceTree = "<group>"; };
 		C7443AC63532A05488FF1BE4 /* PixivSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PixivSettingsTab.swift; sourceTree = "<group>"; };
+		18F5E080C7E74B94AF9942D1 /* WallhavenSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallhavenSettingsTab.swift; sourceTree = "<group>"; };
 		C7E5EA68B40F08C0C4032C1D /* FourKWallpapersParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FourKWallpapersParser.swift; sourceTree = "<group>"; };
 		C82778D3A307A22A7032D5B6 /* WebViewCookieSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewCookieSync.swift; sourceTree = "<group>"; };
 		C9FBFD203D24AC295FEDADA9 /* StatusBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarController.swift; sourceTree = "<group>"; };
@@ -663,6 +665,7 @@
 			children = (
 				DE49EE46468342C942DAD404 /* KonachanSettingsTab.swift */,
 				C7443AC63532A05488FF1BE4 /* PixivSettingsTab.swift */,
+				18F5E080C7E74B94AF9942D1 /* WallhavenSettingsTab.swift */,
 				D824E8097B5FCF9DB139FB72 /* SyncSettingsTab.swift */,
 			);
 			path = Settings;
@@ -1337,6 +1340,7 @@
 				AD9A1E478CF8CD54925E71C4 /* PixivModels.swift in Sources */,
 				FC64F1732397FF11214E9EFD /* PixivService.swift in Sources */,
 				AD6374C31D343F8D56E8378C /* PixivSettingsTab.swift in Sources */,
+				35822013DDDC4885A2FEECBB /* WallhavenSettingsTab.swift in Sources */,
 				3695929AAE5E4DBD62681D6D /* PlaybackProgressCache.swift in Sources */,
 				DB3C45216E9CC68BCAC555A8 /* PowerSourceMonitor.swift in Sources */,
 				D4E05F5C7852AF98EB7C9B88 /* Print.swift in Sources */,

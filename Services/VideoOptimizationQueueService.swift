@@ -1018,6 +1018,31 @@ final class VideoOptimizationQueueService: ObservableObject {
         return videoURL
     }
 
+    /// 库内媒体下载记录：优先 Scene 烘焙 MP4（纯 scene 工程目录本身没有可优化视频）。
+    /// 与详情页 `currentOptimizationVideoURL` 一致，避免「详情可优化、列表右键没有」分叉。
+    func optimizableVideoURL(forDownloadRecord record: MediaDownloadRecord) -> URL? {
+        if let bakePath = record.sceneBakeArtifact?.videoPath, !bakePath.isEmpty {
+            let bakeURL = URL(fileURLWithPath: bakePath)
+            if let videoURL = optimizableVideoURL(from: bakeURL) {
+                return videoURL
+            }
+        }
+        // 部分历史路径写在 resolved 侧；再回退工程目录内嵌视频 / 原生 mp4。
+        if let resolved = record.resolvedVideoFileURL,
+           let videoURL = optimizableVideoURL(from: resolved) {
+            return videoURL
+        }
+        return optimizableVideoURL(from: record.localFileURL)
+    }
+
+    /// 按媒体项解析可优化视频：有下载记录时走烘焙优先路径。
+    func optimizableVideoURL(forMediaItem item: MediaItem, localURL: URL? = nil) -> URL? {
+        if let record = MediaLibraryService.shared.downloadRecord(for: item.id) {
+            return optimizableVideoURL(forDownloadRecord: record)
+        }
+        return optimizableVideoURL(from: localURL)
+    }
+
     /// `localURL` 通常是工程根目录，但旧下载记录可能直接指向工程内的视频资源。
     /// 向上检查有限层级，确保 Web 工程不会通过该兼容路径进入原地替换流程。
     private func isWebWallpaperEngineAsset(at url: URL) -> Bool {
@@ -2001,34 +2026,42 @@ final class VideoOptimizationQueueService: ObservableObject {
         switch (folder.contentType, folder.collection) {
         case (.media, .downloads):
             return MediaLibraryService.shared.downloadedItems(inFolder: folder.id).compactMap { record in
-                makeLibraryOptimizationTarget(localURL: record.localFileURL, title: record.item.title)
+                makeLibraryOptimizationTarget(
+                    videoURL: optimizableVideoURL(forDownloadRecord: record),
+                    title: record.item.title
+                )
             }
         case (.media, .favorites):
             return MediaLibraryService.shared.favoriteItems(inFolder: folder.id).compactMap { item in
                 makeLibraryOptimizationTarget(
-                    localURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item),
+                    videoURL: optimizableVideoURL(
+                        forMediaItem: item,
+                        localURL: MediaLibraryService.shared.localFileURLIfAvailable(for: item)
+                    ),
                     title: item.title
                 )
             }
         case (.wallpaper, .downloads):
             return WallpaperLibraryService.shared.downloadedWallpapers(inFolder: folder.id).compactMap { record in
                 makeLibraryOptimizationTarget(
-                    localURL: record.localFileURL,
+                    videoURL: optimizableVideoURL(from: record.localFileURL),
                     title: record.wallpaper.title ?? record.localFileURL.deletingPathExtension().lastPathComponent
                 )
             }
         case (.wallpaper, .favorites):
             return WallpaperLibraryService.shared.favoriteWallpapers(inFolder: folder.id).compactMap { wallpaper in
                 makeLibraryOptimizationTarget(
-                    localURL: WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper),
+                    videoURL: optimizableVideoURL(
+                        from: WallpaperLibraryService.shared.localFileURLIfAvailable(for: wallpaper)
+                    ),
                     title: wallpaper.title ?? wallpaper.id
                 )
             }
         }
     }
 
-    private func makeLibraryOptimizationTarget(localURL: URL?, title: String) -> LibraryOptimizationTarget? {
-        guard let videoURL = optimizableVideoURL(from: localURL) else { return nil }
+    private func makeLibraryOptimizationTarget(videoURL: URL?, title: String) -> LibraryOptimizationTarget? {
+        guard let videoURL else { return nil }
         return LibraryOptimizationTarget(videoURL: videoURL, title: title)
     }
 
