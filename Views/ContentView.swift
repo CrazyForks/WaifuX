@@ -363,6 +363,12 @@ struct ContentView: View {
             openDetail(.anime(anime))
         }
         .task {
+            // 主窗口从菜单栏重新打开时，前一次隐藏可能已释放本地库的内存索引。
+            // 在创建库卡片前先从持久化记录恢复，避免只剩文件夹、项目列表为空。
+            async let wallpaperLibraryRestore: Void = viewModel.restoreLocalLibraryCache()
+            async let mediaLibraryRestore: Void = mediaViewModel.restoreLocalLibraryCache()
+            _ = await (wallpaperLibraryRestore, mediaLibraryRestore)
+
             // ⚠️ 等待启动时数据源选择完成（ping Google 决策）
             // 在确定数据源之前不加载壁纸列表数据
             // 直接读单例（非观察）：isInitialSourceSelectionComplete 只在启动决策时变化一次，无需响应式

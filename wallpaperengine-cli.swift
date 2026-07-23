@@ -1481,6 +1481,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     /// 每个屏幕独立的 Web 渲染状态
     private struct ScreenState {
         var window: NSWindow?
+        /// 离线烘焙期间覆盖在渲染窗口之上的桌面静帧。
+        /// 底层窗口仍保持 WindowServer 合成，SCStream 仅抓取底层窗口。
+        var bakeShieldWindow: NSWindow?
         /// 仅裁切容器裁掉超出 viewport 的区域，WebView 本身始终保留完整逻辑尺寸。
         var cropContainer: NSView?
         var webView: WKWebView?
@@ -1516,6 +1519,54 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         /// 连续多少次「近似」后认为加载动画结束
         static let stablePassesRequired: Int = 2
         static let thumbDimension: Int = 48
+    }
+
+    /// WebKit 会在窗口未参与合成时节流视频解码。离线烘焙因此必须把渲染窗口
+    /// 保持在桌面层，但用系统桌面壁纸盖住它。不要截取整块显示器，否则窗口移动、
+    /// 桌面图标或通知会留下旧画面的残影，看起来像用户桌面被冻住。
+    private func makeOfflineBakeShield(for screen: NSScreen) -> NSWindow? {
+        let desktopImage: NSImage?
+        if let desktopURL = NSWorkspace.shared.desktopImageURL(for: screen),
+           let image = NSImage(contentsOf: desktopURL) {
+            desktopImage = image
+        } else if let screenNumber = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber,
+        let image = CGDisplayCreateImage(CGDirectDisplayID(screenNumber.uint32Value)) {
+            // Fallback only for unusual desktop providers without a readable image URL.
+            desktopImage = NSImage(cgImage: image, size: screen.frame.size)
+        } else {
+            dlog("[WebRendererBridge] Failed to resolve desktop image for offline bake shield")
+            return nil
+        }
+
+        let shield = NSWindow(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        let desktopLevel = CGWindowLevelForKey(.desktopWindow)
+        shield.level = .init(rawValue: Int(desktopLevel) + 2)
+        shield.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        shield.isOpaque = true
+        shield.backgroundColor = .black
+        shield.hasShadow = false
+        shield.ignoresMouseEvents = true
+        shield.isReleasedWhenClosed = false
+        shield.setFrame(screen.frame, display: false)
+
+        guard let contentView = shield.contentView else {
+            shield.close()
+            return nil
+        }
+        let imageView = NSImageView(frame: contentView.bounds)
+        imageView.image = desktopImage
+        imageView.imageScaling = .scaleAxesIndependently
+        imageView.imageAlignment = .alignCenter
+        imageView.autoresizingMask = [.width, .height]
+        contentView.addSubview(imageView)
+        return shield
     }
 
     func loadWallpaper(
@@ -1610,7 +1661,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             completion?(false)
             return
         }
-
         // 创建无边框窗口
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -1626,8 +1676,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         w.hasShadow = false
         if offscreen {
             // SCStream captures the WindowServer-composited surface. A transparent window
-            // produces a transparent/static stream, so bake windows intentionally occupy
-            // the desktop layer while recording rather than attempting invisible snapshots.
+            // produces a transparent/static stream, so the bake surface remains opaque and
+            // desktop-composited while `bakeShieldWindow` preserves the visible desktop.
             w.setFrame(targetScreen.frame, display: false)
             w.alphaValue = 1
         } else {
@@ -1682,6 +1732,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         contentView.addSubview(cropContainer)
 
         screenStates[screenIdx]?.window = w
+        if offscreen {
+            screenStates[screenIdx]?.bakeShieldWindow = makeOfflineBakeShield(for: targetScreen)
+        }
         screenStates[screenIdx]?.cropContainer = cropContainer
         screenStates[screenIdx]?.webView = web
         applyCropLayout(for: screenIdx)
@@ -1695,7 +1748,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         web.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
         if offscreen {
             // `orderBack` makes the WebKit surface occluded, which throttles video decode.
-            // The bake window remains below normal apps but stays fronted in the desktop level.
+            // The bake window remains desktop-composited. The static shield is higher in the
+            // desktop level, so the user keeps seeing the pre-bake desktop instead of the Web page.
+            screenStates[screenIdx]?.bakeShieldWindow?.orderFrontRegardless()
             w.orderFrontRegardless()
         } else {
             w.orderBack(nil)
@@ -2097,6 +2152,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         state.webView = nil
         state.cropContainer?.removeFromSuperview()
         state.cropContainer = nil
+        state.bakeShieldWindow?.close()
+        state.bakeShieldWindow = nil
         state.window?.close()
         state.window = nil
         state.isLoaded = false
@@ -2547,14 +2604,15 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
     private let progress: (Int, TimeInterval) -> Void
     private let completion: (Result<Void, Error>) -> Void
     private let sampleQueue = DispatchQueue(label: "com.waifux.web-bake.stream")
-    private let targetFrameCount: Int
 
     private var stream: SCStream?
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var firstPresentationTime: CMTime?
+    private var lastPresentationTimeValue: CMTimeValue?
     private var writtenFrameCount = 0
+    private var writerBackpressureDropCount = 0
     private var isFinishing = false
 
     init(
@@ -2565,7 +2623,6 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
         self.options = options
         self.progress = progress
         self.completion = completion
-        self.targetFrameCount = max(1, Int((options.duration * 60).rounded()))
     }
 
     func start() {
@@ -2597,6 +2654,9 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
                         ] as [String: Any]
                     ]
                 )
+                // ScreenCaptureKit supplies the source at compositor cadence. Treat it as
+                // real time so AVAssetWriter keeps its hardware encode path draining instead
+                // of accumulating a large offline backlog.
                 input.expectsMediaDataInRealTime = true
                 let adaptor = AVAssetWriterInputPixelBufferAdaptor(
                     assetWriterInput: input,
@@ -2672,17 +2732,29 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
         let elapsed = CMTimeGetSeconds(CMTimeSubtract(sourceTime, firstPresentationTime))
         guard elapsed.isFinite else { return }
 
-        if elapsed >= options.duration || writtenFrameCount >= targetFrameCount {
+        if elapsed >= options.duration {
             finishWriting()
             return
         }
-        guard videoInput.isReadyForMoreMediaData else { return }
-        // SCStream can emit duplicate/irregular source timestamps around compositor
-        // transactions. The stream is capped at 60 Hz, so a dense 60 FPS timeline gives
-        // the MP4 strict monotonic DTS while preserving every delivered compositor frame.
+        guard videoInput.isReadyForMoreMediaData else {
+            writerBackpressureDropCount += 1
+            return
+        }
+        // Preserve the compositor's real cadence. ScreenCaptureKit occasionally emits
+        // repeated timestamps around transactions, so normalize only those collisions.
+        let relativeSourceTime = CMTimeSubtract(sourceTime, firstPresentationTime)
+        let scaledSourceTime = CMTimeConvertScale(
+            relativeSourceTime,
+            timescale: 600,
+            method: .roundHalfAwayFromZero
+        )
+        let presentationTimeValue = max(
+            scaledSourceTime.value,
+            (lastPresentationTimeValue ?? -1) + 1
+        )
         let presentationTime = CMTime(
-            value: CMTimeValue(writtenFrameCount),
-            timescale: 60
+            value: presentationTimeValue,
+            timescale: 600
         )
         guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
             finish(.failure(
@@ -2694,10 +2766,8 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
         }
 
         writtenFrameCount += 1
+        lastPresentationTimeValue = presentationTimeValue
         progress(writtenFrameCount, elapsed)
-        if writtenFrameCount >= targetFrameCount {
-            finishWriting()
-        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -2719,6 +2789,11 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
             writer.finishWriting { [weak self] in
                 guard let self else { return }
                 if completedWriter.status == .completed, self.writtenFrameCount > 0 {
+                    fputs(
+                        "[web-bake] compositor stream writer-backpressure-drops=\(self.writerBackpressureDropCount)\n",
+                        stderr
+                    )
+                    fflush(stderr)
                     self.finish(.success(()))
                 } else {
                     self.finish(.failure(
@@ -2779,6 +2854,7 @@ private final class WebOfflineBakeRunner {
     private var didComplete = false
     private var bakeClockEnabled = false
     private var realtimeRecorder: WebRealtimeStreamRecorder?
+    private var lastProgressEmissionDate: Date?
 
     private static let fallbackFrameRate = 60.0
     private static let minimumAutomaticFrameRate = 15.0
@@ -3226,6 +3302,13 @@ private final class WebOfflineBakeRunner {
     }
 
     private func emitProgress(phase: String, progress: Double) {
+        let now = Date()
+        if phase == "录制",
+           let lastProgressEmissionDate,
+           now.timeIntervalSince(lastProgressEmissionDate) < (1.0 / 12.0) {
+            return
+        }
+        lastProgressEmissionDate = now
         let currentFrame = min(totalFrameCount, max(0, nextFrameIndex))
         let line = String(
             format: "[web-bake] %@ %d/%d [%.1f%%]\n",

@@ -155,22 +155,22 @@ class WallpaperSchedulerService: ObservableObject {
     func triggerNextWallpaperNow(for screenID: String) {
         print("\(logTag) Manual next wallpaper requested for screen \(screenID)")
         if config.isGlobalDisplaySyncEnabled {
-            applyNextGlobalWallpaper(requiredMode: nil)
+            applyNextGlobalWallpaper(requiredMode: nil, preferImmediatePresentation: true)
             return
         }
-        applyNextWallpaper(for: screenID, requiredMode: nil)
+        applyNextWallpaper(for: screenID, requiredMode: nil, preferImmediatePresentation: true)
     }
 
     func triggerNextGlobalWallpaperNow() {
-        applyNextGlobalWallpaper(requiredMode: nil)
+        applyNextGlobalWallpaper(requiredMode: nil, preferImmediatePresentation: true)
     }
 
     func triggerRandomWallpaperNow(for screenID: String) {
         if config.isGlobalDisplaySyncEnabled {
-            applyNextGlobalWallpaper(requiredMode: nil, overrideOrder: .random)
+            applyNextGlobalWallpaper(requiredMode: nil, overrideOrder: .random, preferImmediatePresentation: true)
             return
         }
-        applyNextWallpaper(for: screenID, requiredMode: nil, overrideOrder: .random)
+        applyNextWallpaper(for: screenID, requiredMode: nil, overrideOrder: .random, preferImmediatePresentation: true)
     }
 
     func hasSchedulableItems(for screenID: String) -> Bool {
@@ -223,7 +223,8 @@ class WallpaperSchedulerService: ObservableObject {
     private func applyNextWallpaper(
         for screenID: String,
         requiredMode: RequiredSwitchMode?,
-        overrideOrder: ScheduleOrder? = nil
+        overrideOrder: ScheduleOrder? = nil,
+        preferImmediatePresentation: Bool = false
     ) {
         // 手动“下一张”允许在锁屏标志异常时继续；自动 on-end 仍尊重锁屏状态。
         // screenIsUnlocked DistributedNotification 偶发丢失时，isScreenLocked 会永久卡死。
@@ -294,7 +295,11 @@ class WallpaperSchedulerService: ObservableObject {
             var didApply = false
             defer { self.finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: didApply) }
             print("\(logTag) Applying next wallpaper '\(item.title)' (\(item.fileURL.lastPathComponent)) to screen \(screenID)")
-            let success = await applyItem(item, toScreenID: screenID)
+            let success = await applyItem(
+                item,
+                toScreenID: screenID,
+                preferImmediatePresentation: preferImmediatePresentation
+            )
             if success {
                 didApply = true
                 self.lastChangeTimes[screenID] = now
@@ -308,7 +313,11 @@ class WallpaperSchedulerService: ObservableObject {
                 while !remaining.isEmpty {
                     guard let retryItem = selectNextItem(from: remaining, lastID: lastChangedItemID, screenID: screenID, order: order) else { break }
                     remaining.removeAll { $0.id == retryItem.id }
-                    let retrySuccess = await applyItem(retryItem, toScreenID: screenID)
+                    let retrySuccess = await applyItem(
+                        retryItem,
+                        toScreenID: screenID,
+                        preferImmediatePresentation: preferImmediatePresentation
+                    )
                     if retrySuccess {
                         didApply = true
                         self.lastChangeTimes[screenID] = now
@@ -345,7 +354,8 @@ class WallpaperSchedulerService: ObservableObject {
     /// coordinator has applied the same source to the full current screen set.
     private func applyNextGlobalWallpaper(
         requiredMode: RequiredSwitchMode?,
-        overrideOrder: ScheduleOrder? = nil
+        overrideOrder: ScheduleOrder? = nil,
+        preferImmediatePresentation: Bool = false
     ) {
         guard globalRotationTask == nil else {
             print("\(logTag) Global rotation already in flight; coalescing trigger")
@@ -392,6 +402,7 @@ class WallpaperSchedulerService: ObservableObject {
         }
 
         let generation = globalRotationGeneration
+        let immediate = preferImmediatePresentation
         let task = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -405,7 +416,11 @@ class WallpaperSchedulerService: ObservableObject {
                 }
             }
 
-            let success = await self.applyItemGlobally(item, to: screens)
+            let success = await self.applyItemGlobally(
+                item,
+                to: screens,
+                preferImmediatePresentation: immediate
+            )
             guard !Task.isCancelled,
                   self.globalRotationGeneration == generation,
                   self.config.isGlobalDisplaySyncEnabled else {
@@ -1821,7 +1836,12 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     /// 调度只选片 + 触发；真正设壁纸与详情页共用 `LocalWallpaperApplyService`。
-    private func applyItem(_ item: SchedulableItem, toScreenID screenID: String) async -> Bool {
+    /// - Parameter preferImmediatePresentation: 状态栏/手动下一张为 true，跳过黑场预热并强制桌面合帧。
+    private func applyItem(
+        _ item: SchedulableItem,
+        toScreenID screenID: String,
+        preferImmediatePresentation: Bool = false
+    ) async -> Bool {
         guard let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) else {
             return false
         }
@@ -1840,12 +1860,13 @@ class WallpaperSchedulerService: ObservableObject {
         defer { ProcessInfo.processInfo.endActivity(applyActivity) }
 
         do {
-            print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName)")
+            print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName) immediate=\(preferImmediatePresentation)")
+            // 自动轮播保留平滑预热；状态栏/手动「下一张」立刻提交，避免菜单栏路径桌面层挂起。
             let ok = try await LocalWallpaperApplyService.apply(
                 localURL: item.fileURL,
                 targetScreens: [screen],
                 options: LocalWallpaperApplyService.Options(
-                    animatedTransition: true,
+                    animatedTransition: !preferImmediatePresentation,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,
@@ -1853,9 +1874,12 @@ class WallpaperSchedulerService: ObservableObject {
                     generatePosterFromVideoIfNeeded: true,
                     sceneBakeItemID: item.sceneBakeItemID,
                     bakedVideoPath: item.bakedVideoPath,
-                    reason: "scheduler"
+                    reason: preferImmediatePresentation ? "scheduler-manual-next" : "scheduler"
                 )
             )
+            if ok {
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: [screen])
+            }
             return ok
         } catch LocalWallpaperApplyService.ApplyError.missingFile {
             unavailableSchedulableItemIDs.insert(item.id)
@@ -1893,7 +1917,11 @@ class WallpaperSchedulerService: ObservableObject {
         return globalRotationTask != nil
     }
 
-    private func applyItemGlobally(_ item: SchedulableItem, to screens: [NSScreen]) async -> Bool {
+    private func applyItemGlobally(
+        _ item: SchedulableItem,
+        to screens: [NSScreen],
+        preferImmediatePresentation: Bool = false
+    ) async -> Bool {
         let displayConfig = config.globalDisplayConfig
         let requirePlaybackEndSupport = displayConfig.isOnEndMode
             && displayConfig.webSceneSwitchSeconds == nil
@@ -1905,11 +1933,11 @@ class WallpaperSchedulerService: ObservableObject {
         defer { ProcessInfo.processInfo.endActivity(applyActivity) }
 
         do {
-            return try await LocalWallpaperApplyService.apply(
+            let ok = try await LocalWallpaperApplyService.apply(
                 localURL: item.fileURL,
                 targetScreens: screens,
                 options: LocalWallpaperApplyService.Options(
-                    animatedTransition: true,
+                    animatedTransition: !preferImmediatePresentation,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,
@@ -1918,9 +1946,13 @@ class WallpaperSchedulerService: ObservableObject {
                     sceneBakeItemID: item.sceneBakeItemID,
                     bakedVideoPath: item.bakedVideoPath,
                     usesSharedVideoDecoder: screens.count > 1,
-                    reason: "globalScheduler"
+                    reason: preferImmediatePresentation ? "globalScheduler-manual-next" : "globalScheduler"
                 )
             )
+            if ok {
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
+            }
+            return ok
         } catch LocalWallpaperApplyService.ApplyError.missingFile {
             unavailableSchedulableItemIDs.insert(item.id)
             print("\(logTag) Removed missing global item '\(item.title)' from this session's rotation pool")

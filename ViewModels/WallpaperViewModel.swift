@@ -383,6 +383,14 @@ class WallpaperViewModel: ObservableObject {
         cachedAllLocalWallpapers
     }
 
+    /// 主窗口从状态栏重新挂载后，立即从持久化记录恢复本地库索引。
+    /// 隐藏窗口会主动清空该内存缓存，不能等待下一次下载记录变更才重建。
+    func restoreLocalLibraryCache() async {
+        rebuildLocalWallpaperCacheTask?.cancel()
+        rebuildLocalWallpaperCacheTask = nil
+        await rebuildLocalWallpaperCache()
+    }
+
     /// 重建本地壁纸缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalWallpaperCacheRebuild(delayNanoseconds: UInt64) {
         rebuildLocalWallpaperCacheTask?.cancel()
@@ -1668,9 +1676,18 @@ class WallpaperViewModel: ObservableObject {
             from: imageURL,
             for: screens
         )
+        WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
+            on: screens,
+            reason: "applyStaticWallpaper"
+        )
 
-        WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
-        VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+        let preservesDynamicWallpaperUntilReady = VideoWallpaperManager.shared
+            .hasNativeVideoWallpaper(on: screens)
+            || screens.contains { WallpaperEngineXBridge.shared.isManaging(screen: $0) }
+        if !preservesDynamicWallpaperUntilReady {
+            WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper()
+            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly()
+        }
 
         // macOS 26+：仅当用户未启用动态锁屏时才清空锁屏扩展状态。
         // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive。
@@ -1704,6 +1721,10 @@ class WallpaperViewModel: ObservableObject {
             // 互斥：清除可能残留的静态图 overlay
             StaticImageWallpaperOverlayManager.shared.clearState()
             print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将静态图同步到 WaifuX 锁屏/桌面实例")
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: screens,
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
             return
         }
 
@@ -1722,6 +1743,10 @@ class WallpaperViewModel: ObservableObject {
                 )
             }
             StaticWallpaperGrainManager.shared.updateOverlay()
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: screens,
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
             return
         }
 
@@ -1743,6 +1768,10 @@ class WallpaperViewModel: ObservableObject {
 
         // 更新静态壁纸颗粒蒙层（独立窗口，不受壁纸切换影响）
         StaticWallpaperGrainManager.shared.updateOverlay()
+        await finishStaticWallpaperTransitionIfNeeded(
+            screens: screens,
+            preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+        )
     }
 
     // MARK: - 设置壁纸到指定屏幕
@@ -1757,13 +1786,23 @@ class WallpaperViewModel: ObservableObject {
                 from: imageURL,
                 for: targetScreen
             )
+            WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
+                on: [targetScreen],
+                reason: "applyStaticWallpaperForScreen"
+            )
+
+            let preservesDynamicWallpaperUntilReady = VideoWallpaperManager.shared
+                .hasNativeVideoWallpaper(on: [targetScreen])
+                || WallpaperEngineXBridge.shared.isManaging(screen: targetScreen)
 
             // 切到静态图前如果目标屏幕被 CLI 管理则停 CLI 引擎
-            if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
-                WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)
+            if !preservesDynamicWallpaperUntilReady {
+                if WallpaperEngineXBridge.shared.isManaging(screen: targetScreen) {
+                    WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaper(for: targetScreen)
+                }
+                // 只停目标屏幕的动态壁纸，避免影响其他屏幕
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: targetScreen)
             }
-            // 只停目标屏幕的动态壁纸，避免影响其他屏幕
-            VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: targetScreen)
             // macOS 26+：仅当用户未启用动态锁屏时才清空锁屏镜像帧源缓存。
             // 使用持久化设置 isLockScreenEnabled 而非 isLockScreenMirroringActive。
             let shouldClearExtension: Bool = {
@@ -1789,6 +1828,10 @@ class WallpaperViewModel: ObservableObject {
                     StaticImageWallpaperOverlayManager.shared.clearState()
                     print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将单屏静态图同步到 WaifuX 实例")
                 }
+                await finishStaticWallpaperTransitionIfNeeded(
+                    screens: [targetScreen],
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                )
                 return
             }
 
@@ -1801,6 +1844,10 @@ class WallpaperViewModel: ObservableObject {
                     for: targetScreen
                 )
                 StaticWallpaperGrainManager.shared.updateOverlay()
+                await finishStaticWallpaperTransitionIfNeeded(
+                    screens: [targetScreen],
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                )
                 return
             }
 
@@ -1816,8 +1863,30 @@ class WallpaperViewModel: ObservableObject {
 
             // 互斥：走系统壁纸时关闭并清除静态图 overlay 持久化状态
             StaticImageWallpaperOverlayManager.shared.clearState()
+            await finishStaticWallpaperTransitionIfNeeded(
+                screens: [targetScreen],
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            )
         } else {
             try await setWallpaper(from: imageURL, option: option)
+        }
+    }
+
+    private func finishStaticWallpaperTransitionIfNeeded(
+        screens: [NSScreen],
+        preservesDynamicWallpaperUntilReady: Bool
+    ) async {
+        guard preservesDynamicWallpaperUntilReady else { return }
+        // 独立静态 overlay 与视频窗处于同一 desktop level。overlay 准备完成时
+        // 先把仍在播放的旧视频提回前方，避免新图片在黑场出现前闪一帧。
+        VideoWallpaperManager.shared.keepNativeVideoPresentationFront(on: screens)
+        await WallpaperCrossTypeTransitionCoordinator.shared.commitPreparedContent(on: screens) {
+            for screen in screens {
+                await WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaperForTransition(
+                    for: screen
+                )
+                VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screen)
+            }
         }
     }
 

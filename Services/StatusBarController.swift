@@ -779,24 +779,34 @@ final class StatusBarController: NSObject {
 
     @objc private func nextWallpaperForScreen(_ sender: NSMenuItem) {
         guard let screen = sender.representedObject as? NSScreen else { return }
-        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
-            let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier)
-            print("[StatusBar] nextWallpaperForScreen global hasItems=\(hasItems)")
-            guard hasItems else {
-                print("[StatusBar] nextWallpaper ignored: no schedulable items in global mode")
+        // 菜单 tracking 模式下立刻 apply 时，desktop 层合帧常被推迟到点一下其它 App。
+        // 先关掉菜单，再在下一拍主线程 runloop 里切换，并强制提交桌面窗。
+        statusItem.menu?.cancelTracking()
+        let targetScreen = screen
+        DispatchQueue.main.async {
+            if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+                let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(
+                    for: targetScreen.wallpaperScreenIdentifier
+                )
+                print("[StatusBar] nextWallpaperForScreen global hasItems=\(hasItems)")
+                guard hasItems else {
+                    print("[StatusBar] nextWallpaper ignored: no schedulable items in global mode")
+                    return
+                }
+                WallpaperSchedulerService.shared.triggerNextGlobalWallpaperNow()
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation()
                 return
             }
-            WallpaperSchedulerService.shared.triggerNextGlobalWallpaperNow()
-            return
+            let screenID = targetScreen.wallpaperScreenIdentifier
+            let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screenID)
+            print("[StatusBar] nextWallpaperForScreen screen=\(targetScreen.localizedName) id=\(screenID) hasItems=\(hasItems)")
+            guard hasItems else {
+                print("[StatusBar] nextWallpaper ignored: no schedulable items for \(screenID)")
+                return
+            }
+            WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screenID)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: [targetScreen])
         }
-        let screenID = screen.wallpaperScreenIdentifier
-        let hasItems = WallpaperSchedulerService.shared.hasSchedulableItems(for: screenID)
-        print("[StatusBar] nextWallpaperForScreen screen=\(screen.localizedName) id=\(screenID) hasItems=\(hasItems)")
-        guard hasItems else {
-            print("[StatusBar] nextWallpaper ignored: no schedulable items for \(screenID)")
-            return
-        }
-        WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screenID)
     }
 
     @objc private func openCurrentWallpaper(_ sender: NSMenuItem) {
@@ -844,10 +854,14 @@ final class StatusBarController: NSObject {
     }
 
     private func currentWallpaperURL(for screen: NSScreen) -> URL? {
-        if let videoURL = videoWallpaperManager.videoURL(for: screen) { return videoURL }
+        // “打开当前壁纸”必须严格按屏查询。`videoURL(for:)` 为兼容旧的
+        // 单屏调用会回退到全局 `currentVideoURL`；多屏下目标屏是 Scene/Web、
+        // 其它屏是视频时，这个回退会把其它屏的视频误认成目标屏当前壁纸。
+        if let videoURL = videoWallpaperManager.assignedVideoURL(for: screen) { return videoURL }
         if let rendererPath = weBridge.currentWallpaperPath(for: screen) {
             return URL(fileURLWithPath: rendererPath)
         }
+        if let imageURL = LockScreenWallpaperService.shared.staticImageSourceURL(for: screen) { return imageURL }
         if let imageURL = StaticImageWallpaperOverlayManager.shared.imageURL(for: screen) { return imageURL }
         return DesktopWallpaperSyncManager.shared.imageURL(for: screen)
     }

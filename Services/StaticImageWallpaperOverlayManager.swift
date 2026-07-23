@@ -166,7 +166,10 @@ final class StaticImageWallpaperOverlayManager {
         if let existing = imageWindows[screenID] {
             // 复用窗口，只更新图片
             updateContentView(of: existing, imageURL: imageURL, screenID: screenID, screen: screen)
-            existing.orderFront(nil)
+            // 菜单栏/非 key 时 orderFront 可能推迟合帧，表现为要点一下其它 App 才更新。
+            existing.orderFrontRegardless()
+            existing.displayIfNeeded()
+            CATransaction.flush()
         } else {
             createWindow(for: screen, imageURL: imageURL)
         }
@@ -227,6 +230,22 @@ final class StaticImageWallpaperOverlayManager {
         let screenID = screen.wallpaperScreenIdentifier
         let fingerprint = screen.wallpaperScreenFingerprint
         return imageByScreen[screenID] ?? imageByScreenFingerprint[fingerprint]
+    }
+
+    func hasActiveWallpaper(on screens: [NSScreen]) -> Bool {
+        screens.contains { screen in
+            imageWindows[screen.wallpaperScreenIdentifier] != nil
+        }
+    }
+
+    /// 动态目标在后方加载时保持旧静态图可见，避免新 renderer 的未稳定首帧抢到前方。
+    func keepPresentationFront(on screens: [NSScreen]) {
+        for screen in screens {
+            guard let window = imageWindows[screen.wallpaperScreenIdentifier] else { continue }
+            window.orderFrontRegardless()
+            window.displayIfNeeded()
+        }
+        CATransaction.flush()
     }
 
     /// 返回指定屏幕的静态图原始像素尺寸（供 CropAdjustOverlayController 预览使用）。
@@ -346,7 +365,9 @@ final class StaticImageWallpaperOverlayManager {
         updateContentView(of: window, imageURL: imageURL, screenID: screenID, screen: screen)
 
         imageWindows[screenID] = window
-        window.orderFront(nil)
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        CATransaction.flush()
     }
 
     /// 设置/更新窗口内容视图，使用 CropLayoutEngine 实现与视频壁纸一致的裁切逻辑。

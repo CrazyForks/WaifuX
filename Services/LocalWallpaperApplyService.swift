@@ -20,7 +20,7 @@ enum LocalWallpaperApplyService {
     }
 
     struct Options {
-        /// 调度切换淡入；手动默认 false
+        /// 手动/快速切换默认 false（立刻停旧上新）；调度轮播可显式 true 走首帧预热平滑过渡。
         var animatedTransition: Bool = false
         /// 播完即换且未开 web/scene 定时：跳过无播放完成事件的类型
         var requirePlaybackEndSupport: Bool = false
@@ -69,10 +69,14 @@ enum LocalWallpaperApplyService {
 
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled,
            !options.isGlobalTransaction {
-            return try await GlobalWallpaperSyncCoordinator.shared.apply(
+            let ok = try await GlobalWallpaperSyncCoordinator.shared.apply(
                 localURL: localURL,
                 options: options
             )
+            if ok {
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
+            }
+            return ok
         }
 
         let ext = localURL.pathExtension.lowercased()
@@ -85,6 +89,7 @@ enum LocalWallpaperApplyService {
         // 1) 直接视频文件
         if !isDirectory.boolValue, videoExts.contains(ext) {
             try await applyVideo(localURL, to: screens, options: options)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
         }
 
@@ -92,6 +97,7 @@ enum LocalWallpaperApplyService {
         if !isDirectory.boolValue, imageExts.contains(ext) {
             if options.requirePlaybackEndSupport { return false }
             try await applyStaticImage(localURL, to: screens)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
         }
 
@@ -107,11 +113,13 @@ enum LocalWallpaperApplyService {
         case .video:
             if let videoURL = findVideoFile(in: contentRoot) {
                 try await applyVideo(videoURL, to: screens, options: options)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }
             // 无内嵌视频文件的 video 工程：退回 CLI/web 渲染，不按 scene 做 companion bake
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
 
         case .scene:
@@ -119,6 +127,7 @@ enum LocalWallpaperApplyService {
                 guard allowNonVideoInOnEnd else { return false }
                 // 详情页实时 scene：只 setWallpaper；companion bake 仅在已有产物时推锁屏，无产物且关自动烘焙则不烘不推
                 try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: true)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             // 非实时：优先烘焙 MP4（与详情页 applySceneWallpaperPreferringBake 一致）
@@ -128,15 +137,18 @@ enum LocalWallpaperApplyService {
                 if FileManager.default.fileExists(atPath: webDirPath) {
                     guard allowNonVideoInOnEnd else { return false }
                     try await applyRenderer(path: webDirPath, to: screens, options: options, scheduleSceneCompanionBake: false)
+                    VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                     return true
                 }
                 try await applyVideo(bakedURL, to: screens, options: options)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             // 无烘焙：不在此阻塞长烘焙。
             // 调度器：退回实时渲染（能设上桌面）；详情页应先 bake UI 再调本方法。
             guard allowNonVideoInOnEnd else { return false }
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: true)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
 
         case .web:
@@ -147,16 +159,19 @@ enum LocalWallpaperApplyService {
             if !isRealtime,
                let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
                 try await applyVideo(bakedURL, to: screens, options: options)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
 
         case .image:
             guard !options.requirePlaybackEndSupport else { return false }
             if let imageURL = findImageFile(in: contentRoot) {
                 try await applyStaticImage(imageURL, to: screens)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             throw ApplyError.unsupported("image-directory")
@@ -167,18 +182,22 @@ enum LocalWallpaperApplyService {
         case .unknown:
             if let videoURL = findVideoFile(in: contentRoot) {
                 try await applyVideo(videoURL, to: screens, options: options)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             if let bakedURL = usableBakedVideoURL(options: options, contentRoot: contentRoot) {
                 try await applyVideo(bakedURL, to: screens, options: options)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             guard allowNonVideoInOnEnd else { return false }
             if let imageURL = findImageFile(in: contentRoot) {
                 try await applyStaticImage(imageURL, to: screens)
+                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
                 return true
             }
             try await applyRenderer(path: contentRoot.path, to: screens, options: options, scheduleSceneCompanionBake: false)
+            VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
             return true
         }
     }

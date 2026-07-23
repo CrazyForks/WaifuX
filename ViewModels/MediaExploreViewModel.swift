@@ -312,6 +312,14 @@ final class MediaExploreViewModel: ObservableObject {
         cachedAllLocalMedia
     }
 
+    /// 主窗口从状态栏重新挂载后，立即从持久化记录恢复本地库索引。
+    /// 隐藏窗口会主动清空该内存缓存，不能等待下一次下载记录变更才重建。
+    func restoreLocalLibraryCache() async {
+        rebuildLocalMediaCacheTask?.cancel()
+        rebuildLocalMediaCacheTask = nil
+        await rebuildLocalMediaCache()
+    }
+
     /// 重建本地媒体缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalMediaCacheRebuild(delayNanoseconds: UInt64) {
         rebuildLocalMediaCacheTask?.cancel()
@@ -1137,6 +1145,7 @@ final class MediaExploreViewModel: ObservableObject {
                 posterURL: posterURL,
                 muted: muted,
                 targetScreens: resolvedTargetScreens,
+                animatedTransition: false,
                 usesSharedVideoDecoder: usesSharedVideoDecoder
             )
             return
@@ -1154,6 +1163,7 @@ final class MediaExploreViewModel: ObservableObject {
                     posterURL: posterURL,
                     muted: muted,
                     targetScreens: resolvedTargetScreens,
+                    animatedTransition: false,
                     usesSharedVideoDecoder: usesSharedVideoDecoder
                 )
                 return
@@ -1174,6 +1184,7 @@ final class MediaExploreViewModel: ObservableObject {
             posterURL: posterURL,
             muted: muted,
             targetScreens: resolvedTargetScreens,
+            animatedTransition: false,
             usesSharedVideoDecoder: usesSharedVideoDecoder
         )
     }
