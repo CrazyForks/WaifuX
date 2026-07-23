@@ -275,6 +275,14 @@ final class VideoWallpaperManager: ObservableObject {
     private let delayedCleanupRetention: TimeInterval = 0.5
     private let localVideoForwardBufferDuration: TimeInterval = 5.0
     private let largeLocalVideoForwardBufferDuration: TimeInterval = 2.0
+    /// 外置盘视频缓冲：慢速外置盘 IO 带宽有限，需要更大的前向缓冲防止 stall。
+    private let externalVolumeVideoForwardBufferDuration: TimeInterval = 12.0
+    /// 外置盘大文件（>1GB）缓冲：在大缓冲基础上再上调，应对 4K 120Hz 高码率。
+    private let externalVolumeLargeVideoForwardBufferDuration: TimeInterval = 20.0
+    /// 机会式共享解码的最大屏幕数上限。
+    /// 超过此数时为新屏创建独立 player，避免单 player 驱动多块高刷屏时 VSync 对齐压力导致卡顿。
+    /// 显式全局同步（usesSharedVideoDecoder）路径不受此限制，尊重用户主动选择。
+    private let maxOpportunisticShareScreenCount = 2
     private let automaticSwitchTransitionDuration: TimeInterval = 0.28
     private let automaticSwitchReadyTimeout: TimeInterval = 1.2
     /// 自动切换时 poster 写入系统桌面的短延迟。
@@ -4079,6 +4087,24 @@ final class VideoWallpaperManager: ObservableObject {
             guard existingIsOnEnd == !enableLooping else { continue }
             guard let item = player.currentItem ?? player.items().first else { continue }
 
+            // 机会式复用限制：统计该 player 已挂载的、与目标屏刷新率相同的屏幕数。
+            // 相同刷新率的屏 VSync 信号频率一致，单 player 同时对齐多路时竞争更激烈：
+            //   实测：3块 4K 120Hz 共享 1 路 player → 卡顿；各自独立 → 不卡。
+            // 不同刷新率（如 60Hz + 120Hz）的屏 VSync 信号天然错开，共享无竞争，不限制。
+            // 显式全局同步（usesSharedVideoDecoder）路径已在上方优先返回，不受此限制。
+            let attachingRate = attachingScreen.maximumFramesPerSecond
+            let sameRateShareCount = players
+                .compactMap { screenID, p -> NSScreen? in
+                    guard p === player, screenID != excludingScreenID else { return nil }
+                    return NSScreen.screens.first { $0.wallpaperScreenIdentifier == screenID }
+                }
+                .filter { $0.maximumFramesPerSecond == attachingRate }
+                .count
+            guard sameRateShareCount < maxOpportunisticShareScreenCount else {
+                NSLog("[VideoWallpaperManager] Opportunistic share skipped for \(attachingScreen.localizedName) (\(attachingRate)Hz): player already shared by \(sameRateShareCount) same-rate screens (limit \(maxOpportunisticShareScreenCount))")
+                continue
+            }
+
             let looper: AVPlayerLooper?
             if player === sharedVideoPlayer {
                 looper = sharedVideoLooper
@@ -4246,15 +4272,21 @@ final class VideoWallpaperManager: ObservableObject {
             screenPixelHeight = max(screenPixelHeight, s.frame.height * scale)
         }
 
-        // 1) 动态峰值码率限制
-        // 根据屏幕分辨率计算合理的峰值码率上限，避免超大码率视频导致持续性磁盘 I/O 和内存带宽压力。
-        // 桌面壁纸通常远距离观看，可容忍较低码率。
-        let totalPixels = screenPixelWidth * screenPixelHeight
-        // 估算：~0.05 bits/pixel/s（H.265 良好质量），
-        // 4K@30fps → ~20 Mbps, 5K → ~37 Mbps, 6K → ~51 Mbps
-        let estimatedBitrate = Double(totalPixels) * 0.05
-        let maxBitrate: Double = 50_000_000 // 50 Mbps 硬上限
-        playerItem.preferredPeakBitRate = min(estimatedBitrate, maxBitrate)
+        // 1) 动态峰值码率限制（仅对网络流有意义）
+        // preferredPeakBitRate 是 AVFoundation 自适应码率选轨的 hint，对本地单码率
+        // 文件（MP4/MOV）无效果，不设即可（默认 0 = 无限制）。
+        // 网络流（HLS 等）才需要限制，按屏幕分辨率 + 30fps 估算合理上限：
+        //   公式：totalPixels × fps × bitsPerPixelPerFrame
+        //   H.265 良好质量约 0.05 bits/pixel/frame：
+        //   4K@30fps → 3840×2160×30×0.05 ≈ 12.4 Mbps（合理）
+        //   4K@120fps → 3840×2160×120×0.05 ≈ 49.8 Mbps
+        if !videoURL.isFileURL {
+            let totalPixels = screenPixelWidth * screenPixelHeight
+            let estimatedBitrate = totalPixels * 30 * 0.05  // 保守按 30fps 估算，避免过限
+            let maxBitrate: Double = 80_000_000             // 80 Mbps 硬上限
+            playerItem.preferredPeakBitRate = min(estimatedBitrate, maxBitrate)
+        }
+        // 本地文件保持默认 0（无限制），让 AVFoundation 自行决定缓冲分配。
 
         // 2) 解码分辨率上限
         playerItem.preferredMaximumResolution = CGSize(width: screenPixelWidth, height: screenPixelHeight)
@@ -4264,16 +4296,24 @@ final class VideoWallpaperManager: ObservableObject {
         }
         playerItem.audioTimePitchAlgorithm = .timeDomain
         if videoURL.isFileURL {
-            // 三屏同时切换时，如果本地文件一 ready 就立即播放，外屏更容易在前几秒边读边解码而卡顿。
-            // 这里给普通文件稍多缓冲；超大文件仍收紧，避免 page cache 压力过高。
+            // 外置盘（含慢速 USB HDD）IO 带宽有限，需要更大的前向缓冲防止 stall；
+            // 内置盘超大文件收紧缓冲，避免 page cache 压力过高；
+            // 内置盘普通文件使用标准缓冲。
+            let isExternal = Self.isExternalVolume(videoURL)
             let effectiveBufferDuration: TimeInterval = {
-                // 对于超大文件（>1GB），进一步缩减缓冲以降低持续性磁盘 I/O 和 page cache 压力
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: videoURL.path),
-                   let fileSize = attrs[.size] as? UInt64,
-                   fileSize > 1_000_000_000 {
-                    return largeLocalVideoForwardBufferDuration
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path))?[.size] as? UInt64 ?? 0
+                let isLargeFile = fileSize > 1_000_000_000
+                if isExternal {
+                    // 外置盘：大文件给更多缓冲，应对 4K 高码率 + 慢速 IO
+                    return isLargeFile
+                        ? externalVolumeLargeVideoForwardBufferDuration
+                        : externalVolumeVideoForwardBufferDuration
+                } else {
+                    // 内置盘：大文件适当收紧，普通文件走标准
+                    return isLargeFile
+                        ? largeLocalVideoForwardBufferDuration
+                        : localVideoForwardBufferDuration
                 }
-                return localVideoForwardBufferDuration
             }()
             playerItem.preferredForwardBufferDuration = effectiveBufferDuration
         }
@@ -4285,10 +4325,11 @@ final class VideoWallpaperManager: ObservableObject {
         applyPlayerAudioPolicy(queuePlayer, muted: muted, volume: screenVolume)
         // AVPlayerLooper 会基于 templateItem 复制循环 item，模板本身必须先禁用音频轨。
         applyPlayerItemAudioPolicy(playerItem, muted: muted)
-        // 本地短环壁纸：等 stall 缓冲反而容易在 looper/IO 边界把 AVPlayerLayer 闪黑一帧。
+        // 外置盘：IO 带宽有限，开启防卡顿等待让系统在 stall 前提前缓冲。
+        // 内置盘本地短环壁纸：关闭等待，避免 looper/IO 边界把 AVPlayerLayer 闪黑一帧。
         // 网络源仍走系统默认「尽量不卡顿」策略。
         if videoURL.isFileURL {
-            queuePlayer.automaticallyWaitsToMinimizeStalling = false
+            queuePlayer.automaticallyWaitsToMinimizeStalling = Self.isExternalVolume(videoURL)
         } else {
             queuePlayer.automaticallyWaitsToMinimizeStalling = true
         }
@@ -4304,6 +4345,14 @@ final class VideoWallpaperManager: ObservableObject {
         anchoredVideoPathByPlayerID[ObjectIdentifier(queuePlayer)] = videoURL.standardizedFileURL.path
 
         return (queuePlayer, looper, playerItem)
+    }
+
+    /// 判断视频文件是否位于外置卷宗（如 USB HDD/SSD、NAS 等）。
+    /// 用于决定播放缓冲策略：外置盘 IO 带宽受限，需要更大的前向缓冲。
+    private static func isExternalVolume(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.volumeIsInternalKey])
+        // volumeIsInternal 为 nil（无法读取）时保守按内置处理，避免误判
+        return values?.volumeIsInternal == false
     }
 
     private func applyPlayerAudioPolicy(_ player: AVQueuePlayer, muted: Bool, volume: Double) {

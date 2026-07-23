@@ -7,6 +7,7 @@ import CoreMedia
 import CoreVideo
 import IOKit
 import CryptoKit
+import ScreenCaptureKit
 import WebKit
 
 // MARK: - NSScreen Extension
@@ -50,17 +51,12 @@ extension NSScreen {
 private let SOCKET_PATH = "/tmp/wallpaperengine-cli.sock"
 private let PID_PATH = "/tmp/wallpaperengine-cli.pid"
 private let DEBUG_LOG_PATH = "/tmp/wallpaperengine-cli-debug.log"
-/// Scene/Web 截图写入；推系统桌面时再复制到 desk-0/1 交替路径
+/// Scene/Web 截图写入；Host 会将 Web capture 转码为 canonical poster 后再同步静态目标。
 private let PRIMARY_CAPTURE_PATH = "/tmp/wallpaperengine-cli-capture.png"
-private let DESK_CAPTURE_PATH_0 = "/tmp/wallpaperengine-cli-desk-0.png"
-private let DESK_CAPTURE_PATH_1 = "/tmp/wallpaperengine-cli-desk-1.png"
 
 /// Per-screen capture paths（多屏并行壁纸避免共享文件竞争）
 private func primaryCapturePath(for screen: Int) -> String {
     return "/tmp/wallpaperengine-cli-capture-s\(screen).png"
-}
-private func deskCapturePath(for screen: Int, slot: Int) -> String {
-    return "/tmp/wallpaperengine-cli-desk-s\(screen)-\(slot).png"
 }
 
 private func isDynamicLockScreenEnabledForCurrentLaunch() -> Bool {
@@ -157,7 +153,7 @@ private func waifuXGrayscaleThumb(from cgImage: CGImage, dimension: Int) -> [UIn
 
 // MARK: - IPC
 private enum IPCCommand: String, Codable {
-    case set, pause, resume, stop, capture, applyProperties, audioControl, audioData
+    case set, pause, resume, stop, capture, applyProperties, crop, audioControl, audioData
     /// Host → daemon：系统 Now Playing 元数据（低频）
     case mediaUpdate, mediaThumbnail
     /// Host → daemon：Apple Music 歌词（整首 / 当前行）；Web 只收 JSON
@@ -170,11 +166,27 @@ private struct IPCLyricLine: Codable {
     let text: String
 }
 
+/// App 在首次 set 时把初始裁切编码为 base64 JSON 传给 CLI client。
+private struct InitialWebCropPayload: Codable {
+    let crop: [Double]?
+    let viewport: [Double]?
+    let letterboxColorHex: String?
+    let cropRevision: UInt64
+}
+
 private struct IPCMessage: Codable {
     let command: IPCCommand
     let path: String?
     let screen: Int?
     let propertiesJSON: String?
+    /// Web 壁纸裁切参数。均为 0...1 的 [x, y, w, h]，原点左上、y 向下。
+    let crop: [Double]?
+    let viewport: [Double]?
+    let letterboxColorHex: String?
+    /// 每屏单调递增；乱序 crop 消息会被 daemon 丢弃。
+    let cropRevision: UInt64?
+    /// crop 命令可选择等待响应；拖拽中的高频更新不响应，避免 socket 堆积。
+    let expectsResponse: Bool?
     let muted: Bool?
     let volume: Double?
     /// WE 音频频谱（128 floats; 0..63 = L, 64..127 = R）；仅 `.audioData` 命令使用。
@@ -213,6 +225,11 @@ private struct IPCMessage: Codable {
         path: String?,
         screen: Int?,
         propertiesJSON: String? = nil,
+        crop: [Double]? = nil,
+        viewport: [Double]? = nil,
+        letterboxColorHex: String? = nil,
+        cropRevision: UInt64? = nil,
+        expectsResponse: Bool? = nil,
         muted: Bool? = nil,
         volume: Double? = nil,
         spectrum: [Float]? = nil,
@@ -245,6 +262,11 @@ private struct IPCMessage: Codable {
         self.path = path
         self.screen = screen
         self.propertiesJSON = propertiesJSON
+        self.crop = crop
+        self.viewport = viewport
+        self.letterboxColorHex = letterboxColorHex
+        self.cropRevision = cropRevision
+        self.expectsResponse = expectsResponse
         self.muted = muted
         self.volume = volume
         self.spectrum = spectrum
@@ -942,9 +964,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
           var origRAF = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : null;
           var origCAF = window.cancelAnimationFrame ? window.cancelAnimationFrame.bind(window) : null;
           var origSTO = window.setTimeout.bind(window);
+          var origCTO = window.clearTimeout.bind(window);
           var origDateNow = Date.now.bind(Date);
           var origPerfNow = (window.performance && performance.now)
             ? performance.now.bind(performance) : function() { return origDateNow(); };
+          var videoTargets = typeof WeakMap === 'function' ? new WeakMap() : null;
 
           function nowMs() {
             return running ? contentMs : origPerfNow();
@@ -971,28 +995,155 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             }
           }
 
+          function waitForVideoFrame(el) {
+            return new Promise(function(resolve) {
+              var finished = false;
+              var timeout = origSTO(finish, 800);
+              function finish() {
+                if (finished) return;
+                finished = true;
+                try { origCTO(timeout); } catch (e) {}
+                resolve();
+              }
+              try {
+                if (typeof el.requestVideoFrameCallback === 'function') {
+                  el.requestVideoFrameCallback(function() { finish(); });
+                  return;
+                }
+              } catch (e) {}
+              if (origRAF) {
+                origRAF(function() { finish(); });
+              } else {
+                origSTO(finish, 0);
+              }
+            });
+          }
+
+          function seekVideo(el, target) {
+            return new Promise(function(resolve) {
+              var finished = false;
+              var timeout = origSTO(finish, 1200);
+              function finish() {
+                if (finished) return;
+                finished = true;
+                try { origCTO(timeout); } catch (e) {}
+                try { el.removeEventListener('seeked', onSeeked); } catch (e) {}
+                waitForVideoFrame(el).then(resolve, resolve);
+              }
+              function onSeeked() { finish(); }
+              try {
+                el.pause();
+                if (!isFinite(el.duration) || el.duration <= 0) {
+                  resolve();
+                  return;
+                }
+                if (isFinite(el.currentTime)
+                    && Math.abs(el.currentTime - target) <= 0.0005
+                    && !el.seeking) {
+                  finish();
+                  return;
+                }
+                el.addEventListener('seeked', onSeeked, { once: true });
+                el.currentTime = target;
+                if (!el.seeking
+                    && isFinite(el.currentTime)
+                    && Math.abs(el.currentTime - target) <= 0.0005) {
+                  finish();
+                }
+              } catch (e) {
+                resolve();
+              }
+            });
+          }
+
+          function lastVideoTarget(el) {
+            try {
+              return videoTargets ? videoTargets.get(el) : el.__wxBakeLastTarget;
+            } catch (e) {
+              return undefined;
+            }
+          }
+
+          function rememberVideoTarget(el, target) {
+            try {
+              if (videoTargets) videoTargets.set(el, target);
+              else el.__wxBakeLastTarget = target;
+            } catch (e) {}
+          }
+
+          function playVideoUntil(el, target) {
+            return new Promise(function(resolve) {
+              var finished = false;
+              var timeout = origSTO(finish, 1800);
+              function finish() {
+                if (finished) return;
+                finished = true;
+                try { origCTO(timeout); } catch (e) {}
+                try { el.pause(); } catch (e) {}
+                rememberVideoTarget(el, target);
+                waitForVideoFrame(el).then(resolve, resolve);
+              }
+              function poll() {
+                if (finished) return;
+                try {
+                  if (isFinite(el.currentTime) && el.currentTime + 0.0005 >= target) {
+                    finish();
+                    return;
+                  }
+                } catch (e) {}
+                if (origRAF) origRAF(poll);
+                else origSTO(poll, 8);
+              }
+              try {
+                el.playbackRate = 1;
+                var p = el.play();
+                if (p && typeof p.catch === 'function') p.catch(function(){});
+              } catch (e) {}
+              poll();
+            });
+          }
+
+          function synchronizeVideo(el, target) {
+            var prior = lastVideoTarget(el);
+            var current = NaN;
+            try { current = el.currentTime; } catch (e) {}
+            // Seek only for the first capture, a loop/source reset, or a large drift.
+            // Every regular next frame stays on the decoder's sequential playback path.
+            var needsSeek = !isFinite(prior)
+              || target + 0.001 < prior
+              || !isFinite(current)
+              || Math.abs(current - prior) > 0.12;
+            if (needsSeek) {
+              return seekVideo(el, target).then(function() {
+                rememberVideoTarget(el, target);
+              });
+            }
+            return playVideoUntil(el, target);
+          }
+
           function syncMedia() {
             var sec = (contentMs - startMs) / 1000.0;
+            var waits = [];
             try {
               var nodes = document.querySelectorAll('video,audio');
               for (var i = 0; i < nodes.length; i++) {
                 var el = nodes[i];
                 try {
-                  if (el.paused) {
-                    var p = el.play();
-                    if (p && typeof p.catch === 'function') p.catch(function(){});
-                  }
-                  if (isFinite(el.duration) && el.duration > 0) {
-                    var target = sec % el.duration;
-                    if (!isFinite(el.currentTime) || Math.abs(el.currentTime - target) > 0.04) {
+                  var target = (isFinite(el.duration) && el.duration > 0)
+                    ? sec % el.duration
+                    : sec;
+                  if (el.tagName === 'VIDEO') {
+                    waits.push(synchronizeVideo(el, target));
+                  } else {
+                    el.pause();
+                    if (!isFinite(el.currentTime) || Math.abs(el.currentTime - target) > 0.0005) {
                       el.currentTime = target;
                     }
-                  } else if (!isFinite(el.currentTime) || Math.abs(el.currentTime - sec) > 0.04) {
-                    el.currentTime = sec;
                   }
                 } catch (e) {}
               }
             } catch (e) {}
+            return Promise.all(waits);
           }
 
           // Always wrap rAF so bake mode can inject virtual timestamps.
@@ -1056,8 +1207,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
               var offset = Math.max(0, Number(ms) || 0);
               contentMs = startMs + offset;
               flushTimers();
-              syncMedia();
-              return contentMs - startMs;
+              return syncMedia().then(function() {
+                return contentMs - startMs;
+              }, function() {
+                return contentMs - startMs;
+              });
             },
             /// Wait for `count` real animation frames after time advance (lets Spine/WebGL paint).
             afterFrames: function(count, token) {
@@ -1079,6 +1233,82 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 origRAF(step);
               });
             },
+            /// Completes only after media seek and the requested real paints. Native polls
+            /// `lastReadyToken` because WKWebView does not consistently await Promises.
+            advanceAndPaint: function(ms, count, token) {
+              var self = this;
+              return Promise.resolve(self.setContentTime(ms))
+                .then(function() {
+                  return self.afterFrames(count, token);
+                })
+                .then(function() {
+                  self.lastReadyToken = String(token || '');
+                  return true;
+                }, function() {
+                  self.lastReadyToken = String(token || '');
+                  return false;
+                });
+            },
+            /// Probe the active video cadence before the virtual clock freezes media.
+            probeMediaFrameRate: function() {
+              return new Promise(function(resolve) {
+                var videos = [];
+                try {
+                  videos = Array.prototype.slice.call(document.querySelectorAll('video'))
+                    .filter(function(el) {
+                      return el.readyState >= 2 && isFinite(el.duration) && el.duration > 0;
+                    })
+                    .sort(function(a, b) {
+                      var scoreA = (a.paused ? 0 : 1000000) + a.videoWidth * a.videoHeight;
+                      var scoreB = (b.paused ? 0 : 1000000) + b.videoWidth * b.videoHeight;
+                      return scoreB - scoreA;
+                    });
+                } catch (e) {}
+                var video = videos[0];
+                if (!video || typeof video.requestVideoFrameCallback !== 'function') {
+                  resolve(null);
+                  return;
+                }
+
+                var done = false;
+                var first = null;
+                var last = null;
+                var timeout = origSTO(function() { finish(null); }, 2200);
+                function finish(rate) {
+                  if (done) return;
+                  done = true;
+                  try { origCTO(timeout); } catch (e) {}
+                  resolve(rate);
+                }
+                function sample(_, metadata) {
+                  if (done) return;
+                  var mediaTime = Number(metadata && metadata.mediaTime);
+                  var presented = Number(metadata && metadata.presentedFrames);
+                  if (isFinite(mediaTime) && isFinite(presented)) {
+                    if (!first) first = { mediaTime: mediaTime, presented: presented };
+                    last = { mediaTime: mediaTime, presented: presented };
+                    var dt = last.mediaTime - first.mediaTime;
+                    var frames = last.presented - first.presented;
+                    if (dt >= 0.45 && frames >= 12) {
+                      var rate = frames / dt;
+                      finish(isFinite(rate) && rate >= 10 ? rate : null);
+                      return;
+                    }
+                  }
+                  try { video.requestVideoFrameCallback(sample); } catch (e) { finish(null); }
+                }
+                try {
+                  if (video.paused) {
+                    var p = video.play();
+                    if (p && typeof p.catch === 'function') p.catch(function(){});
+                  }
+                  video.requestVideoFrameCallback(sample);
+                } catch (e) {
+                  finish(null);
+                }
+              });
+            },
+            lastReadyToken: '',
             getContentTime: function() { return contentMs - startMs; },
             isEnabled: function() { return running; }
           };
@@ -1190,19 +1420,84 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         forMainFrameOnly: false
     )
 
+    private struct WebCropRect {
+        var x: CGFloat
+        var y: CGFloat
+        var w: CGFloat
+        var h: CGFloat
+
+        static let full = WebCropRect(x: 0, y: 0, w: 1, h: 1)
+
+        static func normalized(from values: [Double]?) -> WebCropRect {
+            guard let values, values.count == 4, values.allSatisfy(\.isFinite) else {
+                return .full
+            }
+            let minimumSize: CGFloat = 0.0001
+            let x = max(0, min(1 - minimumSize, CGFloat(values[0])))
+            let y = max(0, min(1 - minimumSize, CGFloat(values[1])))
+            let w = min(1 - x, max(minimumSize, CGFloat(values[2])))
+            let h = min(1 - y, max(minimumSize, CGFloat(values[3])))
+            return WebCropRect(x: x, y: y, w: w, h: h)
+        }
+
+    }
+
+    private struct WebCropLayout {
+        var crop: WebCropRect
+        var viewport: WebCropRect
+        var letterboxColor: NSColor
+
+        static let full = WebCropLayout(crop: .full, viewport: .full, letterboxColor: .black)
+
+        static func make(
+            crop: [Double]?,
+            viewport: [Double]?,
+            letterboxColorHex: String?
+        ) -> WebCropLayout {
+            WebCropLayout(
+                crop: WebCropRect.normalized(from: crop),
+                viewport: WebCropRect.normalized(from: viewport),
+                letterboxColor: color(from: letterboxColorHex)
+            )
+        }
+
+        private static func color(from hex: String?) -> NSColor {
+            var value = (hex ?? "000000")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased()
+            if value.hasPrefix("#") { value.removeFirst() }
+            guard value.count == 6, let rgb = UInt32(value, radix: 16) else {
+                return .black
+            }
+            return NSColor(
+                red: CGFloat((rgb >> 16) & 0xFF) / 255,
+                green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                blue: CGFloat(rgb & 0xFF) / 255,
+                alpha: 1
+            )
+        }
+    }
+
     /// 每个屏幕独立的 Web 渲染状态
     private struct ScreenState {
         var window: NSWindow?
+        /// 仅裁切容器裁掉超出 viewport 的区域，WebView 本身始终保留完整逻辑尺寸。
+        var cropContainer: NSView?
         var webView: WKWebView?
+        var cropLayout: WebCropLayout = .full
+        /// 乱序 socket 消息只允许前进，避免拖拽结束后被旧位置覆盖。
+        var lastCropRevision: UInt64 = 0
         var pendingCompletion: ((Bool) -> Void)?
         var extractedPKGDir: URL?
         var mergedDependencyDir: URL?
         var injectedPropertiesJSON: String?
-        /// 每次 load/stop 递增。首帧 settle 与 30s 超时回调必须比对 generation，
+        /// 每次 load/stop 递增。离线烘焙 settle 与 30s 超时回调必须比对 generation，
         /// 否则旧 load 的 asyncAfter 会误杀后续 set 的 pendingCompletion（exit=1 竞态）。
         var firstFrameSettleGeneration: UInt64 = 0
         var isLoaded: Bool = false
         var isOffscreen: Bool = false
+        /// 在线静帧 capture 期间暂停该屏的鼠标注入，避免视差/交互效果在 snapshot 中途跳动。
+        var mouseCaptureSuppressionDepth: Int = 0
         var mouseEventMonitors: [Any] = []
         var lastMouseMoveTime: TimeInterval = 0
     }
@@ -1210,7 +1505,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     private var screenStates: [Int: ScreenState] = [:]
     private let mouseMoveThrottle: TimeInterval = 1.0 / 30.0
 
-    private enum FirstFramePolicy {
+    private enum OfflineBakeFirstFramePolicy {
         /// 至少经历此时长后才允许「稳定」判真，避免白屏/首帧未绘制误判
         static let minElapsed: TimeInterval = 3.0
         /// 含加载动画时最长等到此时长，取最后一帧作为首帧
@@ -1230,6 +1525,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         screen: Int? = nil,
         offscreen: Bool = false,
         userPropertiesJSON: String? = nil,
+        initialCrop: [Double]? = nil,
+        initialViewport: [Double]? = nil,
+        initialLetterboxColorHex: String? = nil,
+        initialCropRevision: UInt64? = nil,
         completion: ((Bool) -> Void)? = nil
     ) {
         // 解析目标屏幕索引（与 App 共用稳定顺序，禁止依赖系统枚举）
@@ -1257,6 +1556,12 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         screenStates[screenIdx]?.firstFrameSettleGeneration = loadGeneration
         screenStates[screenIdx]?.pendingCompletion = completion
         screenStates[screenIdx]?.isOffscreen = offscreen
+        screenStates[screenIdx]?.cropLayout = WebCropLayout.make(
+            crop: initialCrop,
+            viewport: initialViewport,
+            letterboxColorHex: initialLetterboxColorHex
+        )
+        screenStates[screenIdx]?.lastCropRevision = initialCropRevision ?? 0
 
         // 超时安全网：30 秒后如果本代 load 的 pendingCompletion 仍在，强制回调防止 IPC 卡死。
         // 必须比对 firstFrameSettleGeneration：否则前一次 set 的 30s 定时器会误杀下一次 set。
@@ -1267,7 +1572,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                   let pending = state.pendingCompletion else { return }
             let alreadyLoaded = state.isLoaded
             dlog("[WebRendererBridge] ⚠️ loadWallpaper 30s timeout screen=\(screenIdx) gen=\(loadGeneration) isLoaded=\(alreadyLoaded)")
-            // 页面已 didFinish 但首帧 settle 过慢：仍视为成功，避免大体积 Web 壁纸误报 exit=1
+            // 在线壁纸会在 didFinish 后立即完成；走到这里说明导航未完成。
             pending(alreadyLoaded)
             self.screenStates[screenIdx]?.pendingCompletion = nil
             if !alreadyLoaded {
@@ -1320,16 +1625,33 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         w.backgroundColor = .clear
         w.hasShadow = false
         if offscreen {
-            // WebGL needs a display-backed surface. Keep it fully transparent
-            // above the desktop so Finder's desktop contents are never replaced.
+            // SCStream captures the WindowServer-composited surface. A transparent window
+            // produces a transparent/static stream, so bake windows intentionally occupy
+            // the desktop layer while recording rather than attempting invisible snapshots.
             w.setFrame(targetScreen.frame, display: false)
-            w.alphaValue = 0
+            w.alphaValue = 1
         } else {
             w.setFrame(targetScreen.frame, display: true)
         }
         w.acceptsMouseMovedEvents = true
         w.ignoresMouseEvents = offscreen
         w.isReleasedWhenClosed = false
+
+        guard let contentView = w.contentView else {
+            screenStates[screenIdx]?.pendingCompletion = nil
+            completion?(false)
+            return
+        }
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.black.cgColor
+
+        // 外层仅负责 viewport 裁切。WebView 保持完整屏幕尺寸，避免固定定位/WebGL
+        // 壁纸因 crop 而重排或收到错误的 window.innerWidth/window.innerHeight。
+        let cropContainer = NSView(frame: contentView.bounds)
+        cropContainer.wantsLayer = true
+        cropContainer.layer?.masksToBounds = true
+        cropContainer.layer?.backgroundColor = NSColor.clear.cgColor
+        cropContainer.autoresizingMask = []
 
         // 配置 WKWebView
         let config = WKWebViewConfiguration()
@@ -1349,17 +1671,20 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
         config.mediaTypesRequiringUserActionForPlayback = []
 
-        let web = WKWebView(frame: w.contentView!.bounds, configuration: config)
-        web.autoresizingMask = [.width, .height]
+        let web = WKWebView(frame: cropContainer.bounds, configuration: config)
+        web.autoresizingMask = []
         web.navigationDelegate = self
         web.wantsLayer = true
         web.layer?.backgroundColor = NSColor.clear.cgColor
         web.layer?.contentsScale = targetScreen.backingScaleFactor
 
-        w.contentView?.addSubview(web)
+        cropContainer.addSubview(web)
+        contentView.addSubview(cropContainer)
 
         screenStates[screenIdx]?.window = w
+        screenStates[screenIdx]?.cropContainer = cropContainer
         screenStates[screenIdx]?.webView = web
+        applyCropLayout(for: screenIdx)
 
         let fileURL = baseURL.appendingPathComponent(indexFile)
         let readAccessURL = webWallpaperFileReadAccessURL(projectContentDir: baseURL, cliWallpaperPath: path)
@@ -1368,7 +1693,13 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
         autoFixSpineConfigIfNeeded(projectContentDir: baseURL)
         web.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
-        w.orderBack(nil)
+        if offscreen {
+            // `orderBack` makes the WebKit surface occluded, which throttles video decode.
+            // The bake window remains below normal apps but stays fronted in the desktop level.
+            w.orderFrontRegardless()
+        } else {
+            w.orderBack(nil)
+        }
 
         let destination = offscreen ? "offscreen bake surface" : "screen \(screenIdx) (\(targetScreen.localizedName))"
         dlog("[WebRendererBridge] Loading web wallpaper: \(fileURL.path) on \(destination)")
@@ -1434,7 +1765,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         screenStates[s]?.isLoaded = true
         runWebWallpaperBootstrap(screen: s) { [weak self] in
             guard let self = self else { return }
-            self.beginSettlingFirstFrame(screen: s)
+            if self.screenStates[s]?.isOffscreen == true {
+                self.beginSettlingOfflineBakeFirstFrame(screen: s)
+            } else {
+                self.completeLiveWallpaperLoad(screen: s)
+            }
             // Offline bake surfaces are full-screen transparent windows; never bridge
             // mouse into them or the bake will follow the cursor / parallax props.
             if self.screenStates[s]?.isOffscreen != true {
@@ -1668,6 +2003,87 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         return true
     }
 
+    /// 热更新 Web 壁纸的裁切与可视框。WebView 保持全尺寸，通过父容器裁切和 layer
+    /// 缩放实现，避免 WebGL / fixed 布局因改变 viewport 而重新排版。
+    @discardableResult
+    func applyCrop(
+        crop: [Double]?,
+        viewport: [Double]?,
+        letterboxColorHex: String?,
+        cropRevision: UInt64?,
+        screen: Int = 0
+    ) -> Bool {
+        guard var state = screenStates[screen],
+              state.window != nil,
+              state.cropContainer != nil,
+              state.webView != nil else {
+            return false
+        }
+        if let cropRevision, cropRevision < state.lastCropRevision {
+            dlog("[WebRendererBridge] Ignored stale crop screen=\(screen) revision=\(cropRevision) latest=\(state.lastCropRevision)")
+            return true
+        }
+        state.cropLayout = WebCropLayout.make(
+            crop: crop,
+            viewport: viewport,
+            letterboxColorHex: letterboxColorHex
+        )
+        if let cropRevision {
+            state.lastCropRevision = cropRevision
+        }
+        screenStates[screen] = state
+        applyCropLayout(for: screen)
+        return true
+    }
+
+    private func applyCropLayout(for screen: Int) {
+        guard let state = screenStates[screen],
+              let window = state.window,
+              let contentView = window.contentView,
+              let cropContainer = state.cropContainer,
+              let webView = state.webView else {
+            return
+        }
+
+        let targetSize = contentView.bounds.size
+        let sourceSize = webView.bounds.size
+        guard targetSize.width > 0, targetSize.height > 0,
+              sourceSize.width > 0, sourceSize.height > 0 else {
+            return
+        }
+
+        let layout = state.cropLayout
+        let viewport = layout.viewport
+        let crop = layout.crop
+        let viewportWidth = viewport.w * targetSize.width
+        let viewportHeight = viewport.h * targetSize.height
+        let viewportX = viewport.x * targetSize.width
+        // AppKit view 坐标原点在左下；Crop 参数 y 原点在左上。
+        let viewportY = (1 - viewport.y - viewport.h) * targetSize.height
+        let scaleX = viewportWidth / (crop.w * sourceSize.width)
+        let scaleY = viewportHeight / (crop.h * sourceSize.height)
+
+        contentView.layer?.backgroundColor = layout.letterboxColor.cgColor
+        cropContainer.frame = CGRect(
+            x: viewportX,
+            y: viewportY,
+            width: viewportWidth,
+            height: viewportHeight
+        )
+        cropContainer.layer?.masksToBounds = true
+
+        // 先恢复 WebView 的完整逻辑 bounds，再只对合成层缩放/平移。
+        webView.frame = CGRect(origin: .zero, size: sourceSize)
+        guard let layer = webView.layer else { return }
+        layer.anchorPoint = CGPoint(x: 0, y: 0)
+        layer.setAffineTransform(CGAffineTransform(scaleX: scaleX, y: scaleY))
+        // crop.y 是从顶部量起；layer/container 坐标则从底部量起。
+        layer.position = CGPoint(
+            x: -crop.x * sourceSize.width * scaleX,
+            y: -(1 - crop.y - crop.h) * sourceSize.height * scaleY
+        )
+    }
+
     func stop(screen: Int = 0) {
         guard var state = screenStates[screen] else { return }
         state.firstFrameSettleGeneration &+= 1
@@ -1679,6 +2095,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         state.webView?.navigationDelegate = nil
         state.webView?.removeFromSuperview()
         state.webView = nil
+        state.cropContainer?.removeFromSuperview()
+        state.cropContainer = nil
         state.window?.close()
         state.window = nil
         state.isLoaded = false
@@ -1736,13 +2154,30 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         let mouseLocation = NSEvent.mouseLocation
         for (_, state) in screenStates {
             // Offline bake uses a full-screen transparent window; never inject into it.
-            guard !state.isOffscreen else { continue }
+            guard !state.isOffscreen, state.mouseCaptureSuppressionDepth == 0 else { continue }
             guard state.isLoaded, let window = state.window, let webView = state.webView else { continue }
             guard window.frame.contains(mouseLocation) else { continue }
             let relX = mouseLocation.x - window.frame.origin.x
             let relY = mouseLocation.y - window.frame.origin.y
-            let webViewX = relX
-            let webViewY = window.frame.height - relY
+            let sourceX = relX
+            let sourceY = window.frame.height - relY
+            let layout = state.cropLayout
+            let viewport = layout.viewport
+            let crop = layout.crop
+            let targetWidth = window.frame.width
+            let targetHeight = window.frame.height
+            let viewportX = viewport.x * targetWidth
+            let viewportY = viewport.y * targetHeight
+            let viewportWidth = viewport.w * targetWidth
+            let viewportHeight = viewport.h * targetHeight
+            guard sourceX >= viewportX, sourceX <= viewportX + viewportWidth,
+                  sourceY >= viewportY, sourceY <= viewportY + viewportHeight else {
+                continue
+            }
+            let scaleX = viewportWidth / max(0.0001, crop.w * webView.bounds.width)
+            let scaleY = viewportHeight / max(0.0001, crop.h * webView.bounds.height)
+            let webViewX = crop.x * webView.bounds.width + (sourceX - viewportX) / scaleX
+            let webViewY = crop.y * webView.bounds.height + (sourceY - viewportY) / scaleY
             guard webViewX >= 0, webViewX <= webView.bounds.width,
                   webViewY >= 0, webViewY <= webView.bounds.height else { continue }
             let xStr = String(Double(webViewX))
@@ -1787,7 +2222,18 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
     }
 
-    private func beginSettlingFirstFrame(screen: Int) {
+    private func completeLiveWallpaperLoad(screen: Int) {
+        guard let state = screenStates[screen],
+              state.isLoaded,
+              state.webView != nil else {
+            return
+        }
+        state.pendingCompletion?(true)
+        screenStates[screen]?.pendingCompletion = nil
+        dlog("[WebRendererBridge] live Web load complete screen=\(screen)")
+    }
+
+    private func beginSettlingOfflineBakeFirstFrame(screen: Int) {
         // 不递增 generation：loadWallpaper 已为本次 set 分配 loadGeneration；
         // settle 复用同一 gen，便于 30s 超时与 stop 统一取消。
         let gen = screenStates[screen]?.firstFrameSettleGeneration ?? 0
@@ -1796,47 +2242,51 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         let ss = SettleState()
         func finish(_ image: NSImage?, reason: String) {
             guard self.screenStates[screen]?.firstFrameSettleGeneration == gen else { return }
-            var ok = image.map { self.saveImage($0, screen: screen) } ?? false
-            // 页面已加载但截图失败/始终空白：仍返回成功，动态窗口已在渲染
+            // 离线烘焙只需在内存中判断首帧稳定；不能写入在线 poster 的 /tmp capture 路径。
+            let ok = image != nil
+            // 页面已加载但截图失败/始终空白：仍返回成功，后续烘焙帧会在虚拟时钟下重新截图。
             if !ok, self.screenStates[screen]?.isLoaded == true {
-                dlog("[WebRendererBridge] first-frame capture weak path screen=\(screen) reason=\(reason); treating as success")
-                ok = true
+                dlog("[WebRendererBridge] offline first-frame weak path screen=\(screen) reason=\(reason); treating as success")
             } else {
-                dlog("[WebRendererBridge] first-frame settle screen=\(screen) reason=\(reason) ok=\(ok)")
+                dlog("[WebRendererBridge] offline first-frame settle screen=\(screen) reason=\(reason) hasImage=\(ok)")
             }
-            self.screenStates[screen]?.pendingCompletion?(ok)
+            self.screenStates[screen]?.pendingCompletion?(ok || self.screenStates[screen]?.isLoaded == true)
             self.screenStates[screen]?.pendingCompletion = nil
         }
         func scheduleStep() {
             guard self.screenStates[screen]?.firstFrameSettleGeneration == gen,
                   self.screenStates[screen]?.webView != nil else { return }
             let elapsed = Date().timeIntervalSince(t0)
-            if elapsed >= FirstFramePolicy.maxElapsed { finish(ss.lastImage, reason: "timeout"); return }
+            if elapsed >= OfflineBakeFirstFramePolicy.maxElapsed { finish(ss.lastImage, reason: "timeout"); return }
             self.snapshotWebView(screen: screen) { image in
                 guard self.screenStates[screen]?.firstFrameSettleGeneration == gen else { return }
                 guard let image = image else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + FirstFramePolicy.pollInterval) { scheduleStep() }; return
+                    DispatchQueue.main.asyncAfter(deadline: .now() + OfflineBakeFirstFramePolicy.pollInterval) { scheduleStep() }; return
                 }
                 ss.lastImage = image
-                let thumb = self.grayscaleThumb(from: image, dimension: FirstFramePolicy.thumbDimension)
+                let thumb = self.grayscaleThumb(from: image, dimension: OfflineBakeFirstFramePolicy.thumbDimension)
                 defer { if let t = thumb { ss.lastThumb = t } }
                 if let prev = ss.lastThumb, let curr = thumb {
                     let diff = Self.meanAbsDiffGrayscale(prev, curr)
-                    if diff < FirstFramePolicy.diffThreshold, elapsed >= FirstFramePolicy.minElapsed { ss.stablePasses += 1 }
+                    if diff < OfflineBakeFirstFramePolicy.diffThreshold, elapsed >= OfflineBakeFirstFramePolicy.minElapsed { ss.stablePasses += 1 }
                     else { ss.stablePasses = 0 }
-                    if ss.stablePasses >= FirstFramePolicy.stablePassesRequired { finish(image, reason: "stable"); return }
+                    if ss.stablePasses >= OfflineBakeFirstFramePolicy.stablePassesRequired { finish(image, reason: "stable"); return }
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + FirstFramePolicy.pollInterval) { scheduleStep() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + OfflineBakeFirstFramePolicy.pollInterval) { scheduleStep() }
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { scheduleStep() }
     }
 
     private func snapshotWebView(screen: Int, completion: @escaping (NSImage?) -> Void) {
-        guard let webView = screenStates[screen]?.webView else { completion(nil); return }
+        guard let webView = screenStates[screen]?.webView else {
+            completion(nil)
+            return
+        }
         if #available(macOS 11.0, *) {
             let config = WKSnapshotConfiguration()
             config.rect = CGRect(origin: .zero, size: webView.bounds.size)
+            // 海报、锁屏和暂停静态帧保持 Web 壁纸的原始全画面，不跟随实时 crop 改动。
             webView.takeSnapshot(with: config) { image, _ in DispatchQueue.main.async { completion(image) } }
         } else {
             completion(nil)
@@ -1870,6 +2320,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     private func saveImage(_ image: NSImage, screen: Int = 0) -> Bool {
+        guard screen >= 0 else {
+            dlog("[WebRendererBridge] refusing to write capture for invalid screen=\(screen)")
+            return false
+        }
         guard let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
               let png = bitmap.representation(using: .png, properties: [:]) else { return false }
         let path = primaryCapturePath(for: screen)
@@ -1878,6 +2332,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     private func saveBitmap(_ bitmap: NSBitmapImageRep, screen: Int = 0) -> Bool {
+        guard screen >= 0 else {
+            dlog("[WebRendererBridge] refusing to write bitmap capture for invalid screen=\(screen)")
+            return false
+        }
         guard let png = bitmap.representation(using: .png, properties: [:]) else { return false }
         let path = primaryCapturePath(for: screen)
         do { try png.write(to: URL(fileURLWithPath: path), options: .atomic); return true }
@@ -1885,14 +2343,49 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     func captureFrame(screen: Int = 0, completion: ((Bool) -> Void)? = nil) {
+        guard screen >= 0 else {
+            dlog("[WebRendererBridge] refusing capture request for invalid screen=\(screen)")
+            completion?(false)
+            return
+        }
+        guard let state = screenStates[screen], state.webView != nil else {
+            completion?(false)
+            return
+        }
+        let generation = state.firstFrameSettleGeneration
+        let suppressMouse = !state.isOffscreen
+        if suppressMouse {
+            screenStates[screen]?.mouseCaptureSuppressionDepth += 1
+        }
         snapshotWebView(screen: screen) { [weak self] image in
-            guard let image = image else { completion?(false); return }
-            completion?(self?.saveImage(image, screen: screen) ?? false)
+            guard let self,
+                  var currentState = self.screenStates[screen],
+                  currentState.firstFrameSettleGeneration == generation else {
+                completion?(false)
+                return
+            }
+            if suppressMouse {
+                currentState.mouseCaptureSuppressionDepth = max(0, currentState.mouseCaptureSuppressionDepth - 1)
+                self.screenStates[screen] = currentState
+            }
+            guard let image else {
+                completion?(false)
+                return
+            }
+            completion?(self.saveImage(image, screen: screen))
         }
     }
 
     func captureImage(screen: Int, completion: @escaping (NSImage?) -> Void) {
         snapshotWebView(screen: screen, completion: completion)
+    }
+
+    func windowID(for screen: Int) -> CGWindowID? {
+        guard let window = screenStates[screen]?.window,
+              window.windowNumber > 0 else {
+            return nil
+        }
+        return CGWindowID(window.windowNumber)
     }
 
     /// Enable offline-bake virtual clock (no-op if script missing).
@@ -1908,8 +2401,39 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
     }
 
+    /// Samples the active HTML video's presented-frame cadence before bake mode freezes media.
+    func probeOfflineBakeMediaFrameRate(
+        screen: Int,
+        completion: @escaping (Double?) -> Void
+    ) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion(nil)
+            return
+        }
+        let js = """
+        (function() {
+          try {
+            if (!window.__wxBakeClock
+                || typeof window.__wxBakeClock.probeMediaFrameRate !== 'function') {
+              return Promise.resolve(null);
+            }
+            return window.__wxBakeClock.probeMediaFrameRate();
+          } catch (e) {
+            return Promise.resolve(null);
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js) { result, _ in
+            let value = (result as? NSNumber)?.doubleValue
+            DispatchQueue.main.async {
+                completion(value?.isFinite == true && (value ?? 0) >= 10 ? value : nil)
+            }
+        }
+    }
+
     /// Advance wallpaper content time to `seconds`, then wait for real rAF paints.
-    /// Real rAF keeps Spine/WebGL loops alive; virtual `performance.now` makes dt match content step.
+    /// Real rAF keeps Spine/WebGL loops alive. This also awaits media seek/present before
+    /// returning, so the snapshot corresponds to the requested virtual content timestamp.
     func setOfflineBakeContentTime(
         screen: Int,
         seconds: Double,
@@ -1922,25 +2446,65 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
         let ms = max(0, seconds) * 1000.0
         let frames = max(1, paintFrames)
-        // setContentTime then wait N real animation frames so the pose is painted before snapshot.
+        let token = UUID().uuidString
+        // `evaluateJavaScript` does not reliably await a returned JavaScript Promise.
+        // Start the async page work, then poll a token written only after media seek + paint.
         let js = String(
             format: """
             (function(){
               try {
-                if (!window.__wxBakeClock) return Promise.resolve(-1);
-                window.__wxBakeClock.setContentTime(%.3f);
-                if (typeof window.__wxBakeClock.afterFrames === 'function') {
-                  return window.__wxBakeClock.afterFrames(%d, 1);
-                }
-                return Promise.resolve(0);
-              } catch (e) { return Promise.resolve(-2); }
+                if (!window.__wxBakeClock
+                    || typeof window.__wxBakeClock.advanceAndPaint !== 'function') return false;
+                window.__wxBakeClock.advanceAndPaint(%.3f, %d, '%@');
+                return true;
+              } catch (e) { return false; }
             })();
             """,
             ms,
-            frames
+            frames,
+            token
         )
-        webView.evaluateJavaScript(js) { _, _ in
-            DispatchQueue.main.async { completion?() }
+        webView.evaluateJavaScript(js) { result, _ in
+            guard (result as? Bool) == true else {
+                DispatchQueue.main.async { completion?() }
+                return
+            }
+            self.waitForOfflineBakeFrameReady(
+                webView: webView,
+                token: token,
+                completion: completion
+            )
+        }
+    }
+
+    private func waitForOfflineBakeFrameReady(
+        webView: WKWebView,
+        token: String,
+        attempt: Int = 0,
+        completion: (() -> Void)?
+    ) {
+        let escapedToken = token.replacingOccurrences(of: "'", with: "\\'")
+        let js = """
+        Boolean(window.__wxBakeClock
+          && window.__wxBakeClock.lastReadyToken === '\(escapedToken)');
+        """
+        webView.evaluateJavaScript(js) { result, _ in
+            if (result as? Bool) == true || attempt >= 240 {
+                DispatchQueue.main.async { completion?() }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self, weak webView] in
+                guard let self, let webView else {
+                    completion?()
+                    return
+                }
+                self.waitForOfflineBakeFrameReady(
+                    webView: webView,
+                    token: token,
+                    attempt: attempt + 1,
+                    completion: completion
+                )
+            }
         }
     }
 
@@ -1953,6 +2517,7 @@ private enum WebOfflineBakeError: LocalizedError {
     case rendererFailed(String)
     case writerFailed(String)
     case captureFailed
+    case streamCaptureFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -1960,7 +2525,225 @@ private enum WebOfflineBakeError: LocalizedError {
         case .rendererFailed(let message): return message
         case .writerFailed(let message): return message
         case .captureFailed: return "无法从 Web 渲染器捕获画面"
+        case .streamCaptureFailed(let message): return message
         }
+    }
+}
+
+/// Records a display-backed Web window at its actual compositor cadence. Unlike
+/// `WKWebView.takeSnapshot`, SCStream delivers new WindowServer frames only when
+/// the page has genuinely presented them, so Web videos are not converted into
+/// a fixed-FPS sequence of stale snapshots.
+private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    struct Options {
+        let windowID: CGWindowID
+        let width: Int
+        let height: Int
+        let duration: TimeInterval
+        let outputURL: URL
+    }
+
+    private let options: Options
+    private let progress: (Int, TimeInterval) -> Void
+    private let completion: (Result<Void, Error>) -> Void
+    private let sampleQueue = DispatchQueue(label: "com.waifux.web-bake.stream")
+    private let targetFrameCount: Int
+
+    private var stream: SCStream?
+    private var writer: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var firstPresentationTime: CMTime?
+    private var writtenFrameCount = 0
+    private var isFinishing = false
+
+    init(
+        options: Options,
+        progress: @escaping (Int, TimeInterval) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        self.options = options
+        self.progress = progress
+        self.completion = completion
+        self.targetFrameCount = max(1, Int((options.duration * 60).rounded()))
+    }
+
+    func start() {
+        Task {
+            do {
+                try FileManager.default.createDirectory(
+                    at: options.outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try? FileManager.default.removeItem(at: options.outputURL)
+
+                let writer = try AVAssetWriter(outputURL: options.outputURL, fileType: .mp4)
+                let input = AVAssetWriterInput(
+                    mediaType: .video,
+                    outputSettings: [
+                        AVVideoCodecKey: AVVideoCodecType.h264,
+                        AVVideoWidthKey: options.width,
+                        AVVideoHeightKey: options.height,
+                        AVVideoCompressionPropertiesKey: [
+                            AVVideoAverageBitRateKey: Self.averageBitRate(
+                                width: options.width,
+                                height: options.height,
+                                fps: 60
+                            ),
+                            AVVideoExpectedSourceFrameRateKey: 60,
+                            AVVideoMaxKeyFrameIntervalKey: 120,
+                            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                            AVVideoAllowFrameReorderingKey: false
+                        ] as [String: Any]
+                    ]
+                )
+                input.expectsMediaDataInRealTime = true
+                let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                    assetWriterInput: input,
+                    sourcePixelBufferAttributes: [
+                        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                        kCVPixelBufferWidthKey as String: options.width,
+                        kCVPixelBufferHeightKey as String: options.height
+                    ]
+                )
+                guard writer.canAdd(input) else {
+                    throw WebOfflineBakeError.writerFailed("无法添加 Web 流视频编码输入")
+                }
+                writer.add(input)
+                guard writer.startWriting() else {
+                    throw WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "无法启动 Web 流视频编码")
+                }
+                writer.startSession(atSourceTime: .zero)
+                self.writer = writer
+                self.videoInput = input
+                self.adaptor = adaptor
+
+                let content = try await SCShareableContent.current
+                guard let window = content.windows.first(where: { $0.windowID == options.windowID }) else {
+                    throw WebOfflineBakeError.streamCaptureFailed("ScreenCaptureKit 未找到 Web 烘焙窗口")
+                }
+                let filter = SCContentFilter(desktopIndependentWindow: window)
+                let configuration = SCStreamConfiguration()
+                configuration.width = options.width
+                configuration.height = options.height
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+                configuration.pixelFormat = kCVPixelFormatType_32BGRA
+                configuration.queueDepth = 8
+                configuration.scalesToFit = true
+                configuration.showsCursor = false
+                configuration.ignoreShadowsSingleWindow = true
+                configuration.ignoreGlobalClipSingleWindow = true
+                configuration.captureResolution = .nominal
+
+                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+                self.stream = stream
+                try await stream.startCapture()
+            } catch {
+                finish(.failure(error))
+            }
+        }
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard outputType == .screen,
+              CMSampleBufferIsValid(sampleBuffer),
+              let pixelBuffer = sampleBuffer.imageBuffer else {
+            return
+        }
+        guard !isFinishing,
+              let writer,
+              let videoInput,
+              let adaptor,
+              writer.status == .writing else {
+            return
+        }
+
+        let sourceTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard sourceTime.isValid else { return }
+        if firstPresentationTime == nil {
+            firstPresentationTime = sourceTime
+        }
+        guard let firstPresentationTime else { return }
+        let elapsed = CMTimeGetSeconds(CMTimeSubtract(sourceTime, firstPresentationTime))
+        guard elapsed.isFinite else { return }
+
+        if elapsed >= options.duration || writtenFrameCount >= targetFrameCount {
+            finishWriting()
+            return
+        }
+        guard videoInput.isReadyForMoreMediaData else { return }
+        // SCStream can emit duplicate/irregular source timestamps around compositor
+        // transactions. The stream is capped at 60 Hz, so a dense 60 FPS timeline gives
+        // the MP4 strict monotonic DTS while preserving every delivered compositor frame.
+        let presentationTime = CMTime(
+            value: CMTimeValue(writtenFrameCount),
+            timescale: 60
+        )
+        guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+            finish(.failure(
+                WebOfflineBakeError.writerFailed(
+                    writer.error?.localizedDescription ?? "写入 Web 流视频帧失败"
+                )
+            ))
+            return
+        }
+
+        writtenFrameCount += 1
+        progress(writtenFrameCount, elapsed)
+        if writtenFrameCount >= targetFrameCount {
+            finishWriting()
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        finish(.failure(WebOfflineBakeError.streamCaptureFailed(error.localizedDescription)))
+    }
+
+    private func finishWriting() {
+        guard !isFinishing else { return }
+        isFinishing = true
+        let stream = stream
+        Task {
+            try? await stream?.stopCapture()
+            guard let writer, let videoInput else {
+                finish(.failure(WebOfflineBakeError.writerFailed("Web 流视频编码器未初始化")))
+                return
+            }
+            videoInput.markAsFinished()
+            nonisolated(unsafe) let completedWriter = writer
+            writer.finishWriting { [weak self] in
+                guard let self else { return }
+                if completedWriter.status == .completed, self.writtenFrameCount > 0 {
+                    self.finish(.success(()))
+                } else {
+                    self.finish(.failure(
+                        WebOfflineBakeError.writerFailed(
+                            completedWriter.error?.localizedDescription ?? "Web 流视频编码完成失败"
+                        )
+                    ))
+                }
+            }
+        }
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        guard !isFinishing || writer?.status != .writing else { return }
+        isFinishing = true
+        if case .failure = result {
+            writer?.cancelWriting()
+            try? FileManager.default.removeItem(at: options.outputURL)
+        }
+        completion(result)
+    }
+
+    private static func averageBitRate(width: Int, height: Int, fps: Double) -> Int {
+        let raw = Double(max(1, width) * max(1, height)) * max(15, fps) * 0.10
+        return Int(min(max(raw, 8_000_000), 100_000_000))
     }
 }
 
@@ -1969,7 +2752,8 @@ private final class WebOfflineBakeRunner {
         let path: String
         let width: Int
         let height: Int
-        let fps: Int
+        /// `nil` means profile the loaded wallpaper's active video cadence.
+        let requestedFPS: Double?
         let duration: TimeInterval
         let outputURL: URL
         let userPropertiesJSON: String?
@@ -1979,9 +2763,10 @@ private final class WebOfflineBakeRunner {
     private let completion: (Result<Void, Error>) -> Void
     private let renderer = WebRendererBridge.shared
     /// 目标成片帧数（固定 PTS = index/fps，保证均匀帧间隔）。
-    private let totalFrameCount: Int
+    private var totalFrameCount = 0
     /// 内容时间步长（秒）。虚拟时钟按此推进，与墙钟无关。
-    private let contentFrameInterval: TimeInterval
+    private var contentFrameInterval: TimeInterval = 1.0 / 60.0
+    private var effectiveFPS: Double = 60
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -1993,30 +2778,163 @@ private final class WebOfflineBakeRunner {
     private var isFinishing = false
     private var didComplete = false
     private var bakeClockEnabled = false
+    private var realtimeRecorder: WebRealtimeStreamRecorder?
+
+    private static let fallbackFrameRate = 60.0
+    private static let minimumAutomaticFrameRate = 15.0
+    private static let maximumAutomaticFrameRate = 120.0
+    private static let presentationTimescale: CMTimeScale = 1_000_000
 
     /// 4K60 下约 50Mbps（~0.1 bpp），明显优于旧的 width×height×3（~25Mbps）。
-    private static func averageBitRate(width: Int, height: Int, fps: Int) -> Int {
+    private static func averageBitRate(width: Int, height: Int, fps: Double) -> Int {
         let pixels = max(1, width) * max(1, height)
-        let safeFPS = max(15, fps)
+        let safeFPS = max(minimumAutomaticFrameRate, fps)
         // ~0.10 bit/pixel/frame，并按分辨率夹紧，避免 1080p 过低或 5K 失控。
-        let raw = Double(pixels) * Double(safeFPS) * 0.10
+        let raw = Double(pixels) * safeFPS * 0.10
         return Int(min(max(raw, 8_000_000), 100_000_000))
     }
 
     init(options: Options, completion: @escaping (Result<Void, Error>) -> Void) {
         self.options = options
         self.completion = completion
-        self.totalFrameCount = max(1, Int((options.duration * Double(options.fps)).rounded(.up)))
-        self.contentFrameInterval = 1.0 / Double(max(1, options.fps))
     }
 
     func start() {
-        guard options.width >= 2, options.height >= 2, options.fps >= 1, options.duration > 0 else {
+        let requestedFPSIsValid = options.requestedFPS.map {
+            $0.isFinite && $0 >= Self.minimumAutomaticFrameRate
+        } ?? true
+        guard options.width >= 2,
+              options.height >= 2,
+              options.duration > 0,
+              requestedFPSIsValid else {
             finish(.failure(WebOfflineBakeError.invalidArguments("烘焙尺寸、帧率或时长无效")))
             return
         }
 
+        // 旧版本的首帧稳定逻辑可能误写离线 screen=-1 的 PNG；本次烘焙先清理残留。
+        try? FileManager.default.removeItem(
+            atPath: primaryCapturePath(for: WebRendererBridge.offlineBakeScreen)
+        )
+        renderer.loadWallpaper(
+            path: options.path,
+            width: options.width,
+            height: options.height,
+            screen: nil,
+            offscreen: true,
+            userPropertiesJSON: options.userPropertiesJSON
+        ) { [weak self] success in
+            guard let self else { return }
+            guard success else {
+                self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
+                return
+            }
+            // Wait for the wallpaper's own property/bootstrap work before probing
+            // an active video. Web projects choose their cadence independently.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self, !self.isFinishing else { return }
+                self.resolveFrameRateAndStartEncoding()
+            }
+        }
+    }
+
+    private func resolveFrameRateAndStartEncoding() {
+        if let requestedFPS = options.requestedFPS {
+            beginEncoding(frameRate: normalizedFrameRate(requestedFPS), source: "requested")
+            return
+        }
+        guard let windowID = renderer.windowID(for: WebRendererBridge.offlineBakeScreen) else {
+            beginEncoding(frameRate: Self.fallbackFrameRate, source: "snapshot-fallback")
+            return
+        }
+        beginRealtimeStreamCapture(windowID: windowID)
+    }
+
+    private func beginRealtimeStreamCapture(windowID: CGWindowID) {
+        guard !isFinishing else { return }
+
+        totalFrameCount = max(1, Int((options.duration * Self.fallbackFrameRate).rounded(.up)))
+        nextFrameIndex = 0
+        writtenFrameCount = 0
+        captureStartedAt = Date()
+        let temporaryURL = options.outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).stream.mp4")
+        try? FileManager.default.removeItem(at: temporaryURL)
+        temporaryOutputURL = temporaryURL
+        emitProgress(phase: "准备", progress: 0)
+        fputs(
+            String(
+                format: "[web-bake] compositor stream target=%dx%d duration=%.1fs cadence=wallpaper\n",
+                options.width,
+                options.height,
+                options.duration
+            ),
+            stderr
+        )
+        fflush(stderr)
+
+        let recorder = WebRealtimeStreamRecorder(
+            options: .init(
+                windowID: windowID,
+                width: options.width,
+                height: options.height,
+                duration: options.duration,
+                outputURL: temporaryURL
+            ),
+            progress: { [weak self] frameCount, elapsed in
+                DispatchQueue.main.async {
+                    guard let self, !self.isFinishing else { return }
+                    self.writtenFrameCount = frameCount
+                    self.nextFrameIndex = frameCount
+                    self.emitProgress(
+                        phase: "录制",
+                        progress: min(0.99, max(0, elapsed / self.options.duration))
+                    )
+                }
+            },
+            completion: { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.realtimeRecorder = nil
+                    if case .success = result {
+                        let wall = self.captureStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                        fputs(
+                            String(
+                                format: "[web-bake] compositor stream finished frames=%d wall=%.1fs\n",
+                                self.writtenFrameCount,
+                                wall
+                            ),
+                            stderr
+                        )
+                        fflush(stderr)
+                    }
+                    self.finish(result)
+                }
+            }
+        )
+        realtimeRecorder = recorder
+        recorder.start()
+    }
+
+    private func normalizedFrameRate(_ candidate: Double) -> Double {
+        let clamped = min(
+            max(candidate, Self.minimumAutomaticFrameRate),
+            Self.maximumAutomaticFrameRate
+        )
+        // Preserve non-integer video cadences such as 59.94/62.5 without propagating
+        // browser timing noise into the MP4 timescale.
+        return (clamped * 1000).rounded() / 1000
+    }
+
+    private func beginEncoding(frameRate: Double, source: String) {
+        guard !isFinishing else { return }
+
         do {
+            effectiveFPS = frameRate
+            totalFrameCount = max(1, Int((options.duration * frameRate).rounded(.up)))
+            contentFrameInterval = 1.0 / frameRate
+            nextFrameIndex = 0
+            writtenFrameCount = 0
+
             try FileManager.default.createDirectory(
                 at: options.outputURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -2026,7 +2944,11 @@ private final class WebOfflineBakeRunner {
             try? FileManager.default.removeItem(at: temporaryURL)
             temporaryOutputURL = temporaryURL
 
-            let bitrate = Self.averageBitRate(width: options.width, height: options.height, fps: options.fps)
+            let bitrate = Self.averageBitRate(
+                width: options.width,
+                height: options.height,
+                fps: frameRate
+            )
             let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: .mp4)
             let input = AVAssetWriterInput(
                 mediaType: .video,
@@ -2036,8 +2958,8 @@ private final class WebOfflineBakeRunner {
                     AVVideoHeightKey: options.height,
                     AVVideoCompressionPropertiesKey: [
                         AVVideoAverageBitRateKey: bitrate,
-                        AVVideoExpectedSourceFrameRateKey: options.fps,
-                        AVVideoMaxKeyFrameIntervalKey: options.fps * 2,
+                        AVVideoExpectedSourceFrameRateKey: frameRate,
+                        AVVideoMaxKeyFrameIntervalKey: max(1, Int((frameRate * 2).rounded())),
                         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
                         AVVideoAllowFrameReorderingKey: false
                     ] as [String: Any]
@@ -2069,54 +2991,34 @@ private final class WebOfflineBakeRunner {
             emitProgress(phase: "准备", progress: 0)
             fputs(
                 String(
-                    format: "[web-bake] encoder bitrate=%d target=%dx%d@%dfps duration=%.1fs dense+virtual-clock\n",
+                    format: "[web-bake] encoder bitrate=%d target=%dx%d@%.3ffps duration=%.1fs source=%@ precise-media-seek\n",
                     bitrate,
                     options.width,
                     options.height,
-                    options.fps,
-                    options.duration
+                    frameRate,
+                    options.duration,
+                    source
                 ),
                 stderr
             )
             fflush(stderr)
 
-            renderer.loadWallpaper(
-                path: options.path,
-                width: options.width,
-                height: options.height,
-                screen: nil,
-                offscreen: true,
-                userPropertiesJSON: options.userPropertiesJSON
-            ) { [weak self] success in
-                guard let self else { return }
-                guard success else {
-                    self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
-                    return
-                }
-                // Wait for Spine/WebGL init + property reapply (bootstrap uses ~0.5s reapply).
-                // Wait for Spine/WebGL init + property reapply (~0.5s in bootstrap).
-                // Then enable virtual clock and allow one real rAF turn so the page
-                // re-registers its loop under the hooked requestAnimationFrame.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            renderer.enableOfflineBakeClock(screen: WebRendererBridge.offlineBakeScreen) { [weak self] in
+                guard let self, !self.isFinishing else { return }
+                self.bakeClockEnabled = true
+                fputs("[web-bake] virtual clock enabled; waiting for loop rebind\n", stderr)
+                fflush(stderr)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
                     guard let self, !self.isFinishing else { return }
-                    self.renderer.enableOfflineBakeClock(screen: WebRendererBridge.offlineBakeScreen) { [weak self] in
+                    self.renderer.setOfflineBakeContentTime(
+                        screen: WebRendererBridge.offlineBakeScreen,
+                        seconds: 0
+                    ) { [weak self] in
                         guard let self, !self.isFinishing else { return }
-                        self.bakeClockEnabled = true
-                        fputs("[web-bake] virtual clock enabled; waiting for loop rebind\n", stderr)
+                        self.captureStartedAt = Date()
+                        fputs("[web-bake] capturing dense frames (virtual content clock)\n", stderr)
                         fflush(stderr)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                            guard let self, !self.isFinishing else { return }
-                            self.renderer.setOfflineBakeContentTime(
-                                screen: WebRendererBridge.offlineBakeScreen,
-                                seconds: 0
-                            ) { [weak self] in
-                                guard let self, !self.isFinishing else { return }
-                                self.captureStartedAt = Date()
-                                fputs("[web-bake] capturing dense frames (virtual content clock)\n", stderr)
-                                fflush(stderr)
-                                self.captureNextFrame()
-                            }
-                        }
+                        self.captureNextFrame()
                     }
                 }
             }
@@ -2183,10 +3085,12 @@ private final class WebOfflineBakeRunner {
         // Dense capture: every index is written. Content time is virtual-clock driven,
         // so wall-clock snapshot lag no longer drops intermediate frames.
         let writtenIndex = nextFrameIndex
-        let timescale = CMTimeScale(options.fps * 100)
         let presentationTime = CMTime(
-            value: CMTimeValue(writtenIndex * 100),
-            timescale: timescale
+            value: CMTimeValue(
+                (Double(writtenIndex) * contentFrameInterval * Double(Self.presentationTimescale))
+                    .rounded()
+            ),
+            timescale: Self.presentationTimescale
         )
         guard pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
             finish(.failure(WebOfflineBakeError.writerFailed(writer.error?.localizedDescription ?? "写入视频帧失败")))
@@ -2201,7 +3105,9 @@ private final class WebOfflineBakeRunner {
             phase: "录制",
             progress: min(0.99, Double(nextFrameIndex) / Double(totalFrameCount))
         )
-        if writtenFrameCount == 1 || writtenFrameCount % max(1, options.fps) == 0 || nextFrameIndex >= totalFrameCount {
+        if writtenFrameCount == 1
+            || writtenFrameCount % max(1, Int(effectiveFPS.rounded())) == 0
+            || nextFrameIndex >= totalFrameCount {
             fputs(
                 String(
                     format: "[web-bake] dense frame %d/%d content=%.3fs wall=%.1fs\n",
@@ -2292,6 +3198,9 @@ private final class WebOfflineBakeRunner {
         didComplete = true
         isFinishing = true
         renderer.stop(screen: WebRendererBridge.offlineBakeScreen)
+        try? FileManager.default.removeItem(
+            atPath: primaryCapturePath(for: WebRendererBridge.offlineBakeScreen)
+        )
 
         switch result {
         case .success:
@@ -2340,7 +3249,6 @@ private final class DesktopWallpaperManager {
         var isWebMode: Bool = false
         var isRunning: Bool = false
         var isPaused: Bool = false
-        var desktopCaptureSlot: Int = 0
     }
 
     private var screenStates: [Int: ScreenState] = [:]
@@ -2388,7 +3296,17 @@ private final class DesktopWallpaperManager {
         }
     }
 
-    func setWallpaper(path: String, width: Int = 1920, height: Int = 1080, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
+    func setWallpaper(
+        path: String,
+        width: Int = 1920,
+        height: Int = 1080,
+        screen: Int? = nil,
+        initialCrop: [Double]? = nil,
+        initialViewport: [Double]? = nil,
+        initialLetterboxColorHex: String? = nil,
+        initialCropRevision: UInt64? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         let path = resolveSteamWorkshopDirectoryIfNeeded(path)
         let screenIdx = screen ?? 0
         dlog("[DesktopWallpaperManager] setWallpaper path=\(path) width=\(width) height=\(height) screen=\(screenIdx)")
@@ -2420,11 +3338,9 @@ private final class DesktopWallpaperManager {
             saveOriginalWallpaper()
         }
 
-        // 清掉该屏幕的旧截图与桌面用副本
+        // 清掉该屏幕的旧截图
         let capPath = primaryCapturePath(for: screenIdx)
         try? FileManager.default.removeItem(atPath: capPath)
-        try? FileManager.default.removeItem(atPath: deskCapturePath(for: screenIdx, slot: 0))
-        try? FileManager.default.removeItem(atPath: deskCapturePath(for: screenIdx, slot: 1))
 
         // 初始化该屏幕的壁纸状态
         var state = ScreenState()
@@ -2432,12 +3348,20 @@ private final class DesktopWallpaperManager {
         state.isWebMode = webMode
         state.isRunning = true
         state.isPaused = false
-        state.desktopCaptureSlot = 0
         screenStates[screenIdx] = state
         activeScreenCount += 1
 
         if webMode {
-            WebRendererBridge.shared.loadWallpaper(path: path, width: width, height: height, screen: screenIdx) { [weak self] success in
+            WebRendererBridge.shared.loadWallpaper(
+                path: path,
+                width: width,
+                height: height,
+                screen: screenIdx,
+                initialCrop: initialCrop,
+                initialViewport: initialViewport,
+                initialLetterboxColorHex: initialLetterboxColorHex,
+                initialCropRevision: initialCropRevision
+            ) { [weak self] success in
                 guard let self = self else { return }
                 print("[DesktopWallpaperManager] Web wallpaper load result: \(success) screen=\(screenIdx)")
                 if !success {
@@ -2449,9 +3373,6 @@ private final class DesktopWallpaperManager {
                     if self.activeScreenCount == 0 {
                         self.restoreOriginalWallpaper()
                     }
-                } else {
-                    // 首帧截图推系统桌面（锁屏/调度中心等），之后由 desktopWindow 层级的动态窗口直接渲染
-                    self.applyCaptureAsDesktopWallpaper(screen: screenIdx)
                 }
                 NSApp.setActivationPolicy(.prohibited)
                 completion?(success)
@@ -2465,12 +3386,7 @@ private final class DesktopWallpaperManager {
     func pauseWallpaper(screen: Int = 0) {
         guard let state = screenStates[screen], state.isRunning, !state.isPaused else { return }
         WebRendererBridge.shared.pause(screen: screen)
-        // 暂停后截取一帧推送系统桌面（动态窗口已隐藏，桌面需要静态图兜底）
-        WebRendererBridge.shared.captureFrame(screen: screen) { [weak self] success in
-            if success {
-                self?.applyCaptureAsDesktopWallpaper(screen: screen)
-            }
-        }
+        // 系统桌面/锁屏已由 Host 的 canonical poster 同步；暂停不再把 raw capture 写成另一套壁纸源。
         screenStates[screen]?.isPaused = true
     }
 
@@ -2493,6 +3409,24 @@ private final class DesktopWallpaperManager {
     func applyWebWallpaperProperties(_ jsonString: String, screen: Int = 0) -> Bool {
         guard let state = screenStates[screen], state.isRunning, state.isWebMode else { return false }
         return WebRendererBridge.shared.applyUserProperties(jsonString: jsonString, screen: screen)
+    }
+
+    @discardableResult
+    func applyWebWallpaperCrop(
+        crop: [Double]?,
+        viewport: [Double]?,
+        letterboxColorHex: String?,
+        cropRevision: UInt64?,
+        screen: Int = 0
+    ) -> Bool {
+        guard let state = screenStates[screen], state.isRunning, state.isWebMode else { return false }
+        return WebRendererBridge.shared.applyCrop(
+            crop: crop,
+            viewport: viewport,
+            letterboxColorHex: letterboxColorHex,
+            cropRevision: cropRevision,
+            screen: screen
+        )
     }
 
     /// 设置 Web 壁纸的音频控制（静音/音量）
@@ -2594,8 +3528,6 @@ private final class DesktopWallpaperManager {
         WebRendererBridge.shared.stop(screen: screen)
         // 清理该屏幕的截图文件
         try? FileManager.default.removeItem(atPath: primaryCapturePath(for: screen))
-        try? FileManager.default.removeItem(atPath: deskCapturePath(for: screen, slot: 0))
-        try? FileManager.default.removeItem(atPath: deskCapturePath(for: screen, slot: 1))
         screenStates[screen] = nil
         activeScreenCount -= 1
         if activeScreenCount == 0 {
@@ -2609,56 +3541,6 @@ private final class DesktopWallpaperManager {
             stopWallpaper(screen: screenIdx)
         }
     }
-
-    // MARK: - Desktop Wallpaper Capture Updates
-
-    /// 将主截图复制到交替路径再设为桌面图，避免系统因固定路径缓存上一张壁纸（锁屏/静态桌面不更新）
-    private func applyCaptureAsDesktopWallpaper(screen: Int) {
-        let capPath = primaryCapturePath(for: screen)
-        guard FileManager.default.fileExists(atPath: capPath) else { return }
-        guard !isDynamicLockScreenEnabledForCurrentLaunch() else {
-            dlog("[DesktopWallpaperManager] Dynamic lock screen enabled; skip static capture desktop apply")
-            return
-        }
-        guard isSystemWallpaperSyncEnabledForCurrentLaunch() else {
-            dlog("[DesktopWallpaperManager] System wallpaper sync disabled; skip static capture desktop apply")
-            return
-        }
-        let src = URL(fileURLWithPath: capPath)
-        // 交替 slot 避免系统缓存
-        let currentSlot = screenStates[screen]?.desktopCaptureSlot ?? 0
-        let newSlot = 1 - currentSlot
-        screenStates[screen]?.desktopCaptureSlot = newSlot
-        let dstPath = deskCapturePath(for: screen, slot: newSlot)
-        let dst = URL(fileURLWithPath: dstPath)
-        let fm = FileManager.default
-        try? fm.removeItem(at: dst)
-        do {
-            try fm.copyItem(at: src, to: dst)
-        } catch {
-            print("[DesktopWallpaperManager] Failed to copy capture for desktop: \(error)")
-            return
-        }
-
-        let workspace = NSWorkspace.shared
-        let screens = NSScreen.screensOrderedForDisplay
-        guard screen >= 0, screen < screens.count else { return }
-        let targetScreen = screens[screen]
-
-        do {
-            // 使用 "充满屏幕" 缩放模式，与 App 内其他壁纸设置行为一致
-            try workspace.setDesktopImageURLForAllSpaces(dst, for: targetScreen, options: [
-                .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
-                .allowClipping: true
-            ])
-        } catch {
-            print("[DesktopWallpaperManager] Failed to set desktop image: \(error)")
-        }
-        dlog("[DesktopWallpaperManager] Applied capture as desktop wallpaper for screen \(screen) via \(dstPath)")
-    }
-
-    // （已移除 startPeriodicCapture：不再持续截图推送系统桌面）
-
 
     // MARK: - Original Wallpaper Management
 
@@ -3067,7 +3949,11 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                             path: path,
                             width: targetSize.0,
                             height: targetSize.1,
-                            screen: msg.screen
+                            screen: msg.screen,
+                            initialCrop: msg.crop,
+                            initialViewport: msg.viewport,
+                            initialLetterboxColorHex: msg.letterboxColorHex,
+                            initialCropRevision: msg.cropRevision
                         ) { success in
                             dlog("[Daemon] setWallpaper completion: \(success)")
                             if success {
@@ -3096,6 +3982,10 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                     sendResponse("OK")
                 case .capture:
                     let screen = msg.screen ?? 0
+                    guard screen >= 0 else {
+                        sendResponse("ERROR:无效的屏幕索引")
+                        return
+                    }
                     DesktopWallpaperManager.shared.captureWallpaperFrame(screen: screen) { success in
                         if success {
                             sendResponse("OK")
@@ -3114,6 +4004,21 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                         }
                     } else {
                         sendResponse("ERROR:缺少 propertiesJSON")
+                    }
+                case .crop:
+                    let applied = DesktopWallpaperManager.shared.applyWebWallpaperCrop(
+                        crop: msg.crop,
+                        viewport: msg.viewport,
+                        letterboxColorHex: msg.letterboxColorHex,
+                        cropRevision: msg.cropRevision,
+                        screen: msg.screen ?? 0
+                    )
+                    dlog("[Daemon] crop applied=\(applied) screen=\(msg.screen ?? 0)")
+                    if msg.expectsResponse == true {
+                        sendResponse(applied ? "OK" : "ERROR:当前屏幕没有运行中的 Web 壁纸可应用裁切")
+                    } else {
+                        // 拖拽时的高频更新不回响应，Host 也不会 recv，避免 socket 堆积。
+                        close(fd)
                     }
                 case .audioControl:
                     DesktopWallpaperManager.shared.setWebAudioControl(muted: msg.muted, volume: msg.volume, screen: msg.screen)
@@ -3242,10 +4147,21 @@ struct WallpaperEngineCLI {
             let msg: IPCMessage
             switch command {
             case "set":
-                let setArgs = Array(remainingArgs.dropFirst())
+                var setArgs = Array(remainingArgs.dropFirst())
                 guard !setArgs.isEmpty else {
-                    print("Usage: wallpaperengine-cli set <path> [screen_index]")
+                    print("Usage: wallpaperengine-cli set <path> [screen_index] [--initial-crop <base64-json>]")
                     exit(1)
+                }
+                var initialCrop: InitialWebCropPayload?
+                if let cropFlagIndex = setArgs.lastIndex(of: "--initial-crop") {
+                    guard cropFlagIndex + 2 == setArgs.count,
+                          let cropData = Data(base64Encoded: setArgs[cropFlagIndex + 1]),
+                          let decoded = try? JSONDecoder().decode(InitialWebCropPayload.self, from: cropData) else {
+                        print("Invalid --initial-crop payload")
+                        exit(1)
+                    }
+                    initialCrop = decoded
+                    setArgs.removeSubrange(cropFlagIndex...)
                 }
                 var path = setArgs.joined(separator: " ")
                 var screen: Int? = nil
@@ -3253,7 +4169,15 @@ struct WallpaperEngineCLI {
                     screen = s
                     path = setArgs.dropLast().joined(separator: " ")
                 }
-                msg = IPCMessage(command: .set, path: path, screen: screen)
+                msg = IPCMessage(
+                    command: .set,
+                    path: path,
+                    screen: screen,
+                    crop: initialCrop?.crop,
+                    viewport: initialCrop?.viewport,
+                    letterboxColorHex: initialCrop?.letterboxColorHex,
+                    cropRevision: initialCrop?.cropRevision
+                )
             case "apply-properties":
                 let applyArgs = Array(remainingArgs.dropFirst())
                 guard !applyArgs.isEmpty else {
@@ -3372,13 +4296,14 @@ struct WallpaperEngineCLI {
 
     private static func parseOfflineBakeOptions(_ arguments: [String]) -> WebOfflineBakeRunner.Options? {
         guard let path = arguments.first, !path.hasPrefix("--") else {
-            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps auto|N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
             return nil
         }
 
         var width: Int?
         var height: Int?
-        var fps: Int?
+        var requestedFPS: Double?
+        var hasFrameRateOption = false
         var duration: TimeInterval?
         var outputPath: String?
         var userPropertiesJSON: String?
@@ -3403,7 +4328,17 @@ struct WallpaperEngineCLI {
                 width = max(2, parsedWidth - (parsedWidth % 2))
                 height = max(2, parsedHeight - (parsedHeight % 2))
             case "--fps":
-                fps = Int(value)
+                hasFrameRateOption = true
+                if value.lowercased() == "auto" {
+                    requestedFPS = nil
+                } else if let parsedFPS = Double(value),
+                          parsedFPS.isFinite,
+                          parsedFPS > 0 {
+                    requestedFPS = parsedFPS
+                } else {
+                    fputs("Invalid --fps value: \(value)\n", stderr)
+                    return nil
+                }
             case "--duration":
                 duration = Double(value)
             case "--out":
@@ -3422,17 +4357,17 @@ struct WallpaperEngineCLI {
             index += 2
         }
 
-        guard let width, let height, let fps, fps > 0,
+        guard let width, let height, hasFrameRateOption,
               let duration, duration > 0,
               let outputPath, !outputPath.isEmpty else {
-            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
+            fputs("Usage: wallpaperengine-cli bake <path> --size WxH --fps auto|N --duration S --out <path> [--properties-base64 <base64>]\n", stderr)
             return nil
         }
         return WebOfflineBakeRunner.Options(
             path: path,
             width: width,
             height: height,
-            fps: fps,
+            requestedFPS: requestedFPS,
             duration: duration,
             outputURL: URL(fileURLWithPath: outputPath),
             userPropertiesJSON: userPropertiesJSON
@@ -3503,9 +4438,9 @@ struct WallpaperEngineCLI {
         Usage: wallpaperengine-cli <command>
         Commands:
           set <path> [screen_index]   Set wallpaper
-          bake <path> --size WxH --fps N --duration S --out <path>
+          bake <path> --size WxH --fps auto|N --duration S --out <path>
                                      Export a Web wallpaper as dense H.264 MP4
-                                     (virtual content clock; no wall-clock frame drops)
+                                     (auto profiles active video cadence; precise media seek)
           capture <screen_index>    Capture the current Web wallpaper frame
           pause                       Pause wallpaper
           resume                      Resume wallpaper

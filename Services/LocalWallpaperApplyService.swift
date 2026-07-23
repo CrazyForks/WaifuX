@@ -341,7 +341,7 @@ enum LocalWallpaperApplyService {
             targetScreens: screens,
             userProperties: userProps
         )
-        // companion bake：有产物才推锁屏；无产物且关自动烘焙则不烘不推（设壁纸本身不强制烘）
+        // companion bake：已有产物直接复用；关闭自动烘焙且无产物时临时烘 1 秒，只保留高清 poster。
         if scheduleSceneCompanionBake {
             SceneOfflineBakeService.scheduleRealtimeCompanionBake(
                 path: path,

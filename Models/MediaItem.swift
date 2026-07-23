@@ -276,6 +276,52 @@ extension MediaItem {
         !downloadOptions.isEmpty || previewVideoURL != nil
     }
 
+    /// Merges persisted fields absent from a newer, sparse representation.
+    ///
+    /// Feed refreshes and local/bake lifecycle updates can describe the same
+    /// item with less metadata. Persisted Workshop details must not be erased
+    /// by those partial payloads.
+    func preservingPersistedMetadata(from existing: MediaItem) -> MediaItem {
+        guard id == existing.id else { return self }
+
+        let incomingSourceIsGeneric = Self.isGenericLocalSource(sourceName)
+        let existingSourceIsGeneric = Self.isGenericLocalSource(existing.sourceName)
+        let resolvedSourceName = incomingSourceIsGeneric && !existingSourceIsGeneric
+            ? existing.sourceName
+            : sourceName
+        let resolvedPageURL = pageURL.isFileURL && !existing.pageURL.isFileURL
+            ? existing.pageURL
+            : pageURL
+
+        return MediaItem(
+            slug: slug,
+            title: title,
+            pageURL: resolvedPageURL,
+            thumbnailURL: thumbnailURL,
+            resolutionLabel: resolutionLabel,
+            collectionTitle: collectionTitle ?? existing.collectionTitle,
+            summary: summary ?? existing.summary,
+            previewVideoURL: previewVideoURL ?? existing.previewVideoURL,
+            posterURL: posterURL ?? existing.posterURL,
+            tags: tags.isEmpty ? existing.tags : tags,
+            exactResolution: exactResolution ?? existing.exactResolution,
+            durationSeconds: durationSeconds ?? existing.durationSeconds,
+            downloadOptions: downloadOptions.isEmpty ? existing.downloadOptions : downloadOptions,
+            sourceName: resolvedSourceName,
+            isAnimatedImage: isAnimatedImage ?? existing.isAnimatedImage,
+            subscriptionCount: subscriptionCount ?? existing.subscriptionCount,
+            favoriteCount: favoriteCount ?? existing.favoriteCount,
+            viewCount: viewCount ?? existing.viewCount,
+            ratingScore: ratingScore ?? existing.ratingScore,
+            authorName: Self.meaningful(authorName) ?? Self.meaningful(existing.authorName),
+            authorSteamID: Self.meaningful(authorSteamID) ?? Self.meaningful(existing.authorSteamID),
+            authorAvatarURL: authorAvatarURL ?? existing.authorAvatarURL,
+            fileSize: fileSize ?? existing.fileSize,
+            createdAt: createdAt ?? existing.createdAt,
+            updatedAt: updatedAt ?? existing.updatedAt
+        )
+    }
+
     /// 从 `exactResolution` 或 `resolutionLabel` 解析是否为竖屏（如 "1080x1920" → true）；无法判断时返回 nil
     var isPortrait: Bool? {
         // 优先使用 exactResolution
@@ -289,6 +335,23 @@ extension MediaItem {
               let h = Double(parts[1]),
               h > 0 else { return nil }
         return h > w
+    }
+
+    private static func meaningful(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value.caseInsensitiveCompare("unknown") != .orderedSame else {
+            return nil
+        }
+        return value
+    }
+
+    private static func isGenericLocalSource(_ sourceName: String) -> Bool {
+        let normalized = sourceName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty
+            || normalized == "local"
+            || normalized == "本地"
+            || normalized == "ローカル"
     }
 }
 

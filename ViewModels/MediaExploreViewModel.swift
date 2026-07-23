@@ -948,6 +948,26 @@ final class MediaExploreViewModel: ObservableObject {
             return try await runningTask.value
         }
 
+        if shouldHydrateWorkshopMetadata(for: item) {
+            let workshopID = String(item.id.dropFirst("workshop_".count))
+            let task = Task<MediaItem, Error> {
+                let remoteItem = try await self.workshopService.resolveWorkshopItemByURL(
+                    "https://steamcommunity.com/sharedfiles/filedetails/?id=\(workshopID)"
+                )
+                return remoteItem.preservingPersistedMetadata(from: item)
+            }
+            detailTasks[item.id] = task
+
+            defer {
+                detailTasks[item.id] = nil
+            }
+
+            let resolvedItem = try await task.value
+            replaceItem(with: resolvedItem)
+            mediaLibrary.upsert(resolvedItem)
+            return resolvedItem
+        }
+
         let alreadyHasPlaybackDetail = !item.downloadOptions.isEmpty || item.previewVideoURL != nil
         if alreadyHasPlaybackDetail, item.posterURL != nil {
             mediaLibrary.upsert(item)
@@ -967,6 +987,24 @@ final class MediaExploreViewModel: ObservableObject {
         replaceItem(with: resolvedItem)
         mediaLibrary.upsert(resolvedItem)
         return resolvedItem
+    }
+
+    private func shouldHydrateWorkshopMetadata(for item: MediaItem) -> Bool {
+        guard item.id.hasPrefix("workshop_") else { return false }
+
+        let lacksAuthorIdentity = item.authorSteamID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty ?? true
+        let normalizedAuthorName = item.authorName?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let lacksAuthorDisplayName = normalizedAuthorName.isEmpty
+            || normalizedAuthorName.caseInsensitiveCompare("unknown") == .orderedSame
+        let lacksAllWorkshopStats = item.subscriptionCount == nil
+            && item.favoriteCount == nil
+            && item.viewCount == nil
+            && item.ratingScore == nil
+            && item.fileSize == nil
+        return lacksAuthorIdentity || lacksAuthorDisplayName || lacksAllWorkshopStats
     }
 
     func toggleFavorite(_ item: MediaItem) {

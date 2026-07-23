@@ -474,6 +474,15 @@ struct MediaDetailSheet: View {
             isMediaLoaded = false
             mediaBackgroundEpoch &+= 1
         }
+        .onReceive(NotificationCenter.default.publisher(for: .localMediaPosterDidUpdate)) { notification in
+            guard let itemID = notification.object as? String,
+                  itemID == resolvedItem.id,
+                  cachedSceneBakeVideoURL == nil else {
+                return
+            }
+            isMediaLoaded = false
+            mediaBackgroundEpoch &+= 1
+        }
         .onDisappear {
             isVisible = false
             ForegroundPrefetchManager.shared.stop(namespace: prefetchNamespace)
@@ -494,6 +503,12 @@ struct MediaDetailSheet: View {
             if let posterURL = cachedSceneBakePosterURL {
                 return posterURL
             }
+            if let posterURL = cachedLocalVideoPosterURL {
+                return posterURL
+            }
+            if let previewURL = localWorkshopPreviewFallbackURL {
+                return previewURL
+            }
             return undownloadedStylePreviewImageURL
         }
         return resolvedItem.coverImageURL
@@ -507,6 +522,26 @@ struct MediaDetailSheet: View {
             return nil
         }
         return VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: itemID)
+    }
+
+    /// 普通本地视频抽出的高清 poster。Scene 未烘焙时可作为详情页背景兜底，
+    /// 避免 Scene 识别先关掉视频背景而静帧尚未接入，退化为黑底。
+    private var cachedLocalVideoPosterURL: URL? {
+        guard let videoURL = currentDownloadRecord?.resolvedVideoFileURL,
+              Self.previewVideoExtensions.contains(videoURL.pathExtension.lowercased()) else {
+            return nil
+        }
+        return VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: videoURL)
+    }
+
+    /// 下载的 Workshop 工程自带预览图。静帧未生成前优先于远程 Steam 缩略图，
+    /// 确保离线或远程预览失效时仍有可显示的本地背景。
+    private var localWorkshopPreviewFallbackURL: URL? {
+        if let recordURL = currentDownloadRecord?.localFileURL,
+           let previewURL = MediaItem.resolveLocalWorkshopPreviewImage(from: recordURL) {
+            return previewURL
+        }
+        return localWorkshopPreviewImageURL(for: resolvedItem)
     }
 
     /// 列表/探索未下载时常用的封面：thumbnail 优先，再 poster，最后 initialItem。
@@ -540,15 +575,15 @@ struct MediaDetailSheet: View {
             return backgroundSceneBakeVideoURL
         }
 
-        // Scene / Web 可烘焙项：没有烘焙产物时不再播任何视频背景，
-        // 直接显示未下载风格静态预览（避免死路径 / 工程内误匹配小视频 / 远程预览视频黑屏）
-        if sceneOfflineBakeButtonVisible {
-            return nil
-        }
-
-        // 普通视频壁纸：本地可播文件
+        // 只有资源本身是视频时才播放本地视频；Scene/Web 工程内的素材视频不能当详情背景。
         if let localVideo = resolvedLocalPreviewVideoURL() {
             return localVideo
+        }
+
+        // Scene / Web 等非视频工程没有烘焙成片时只显示静态 poster / preview，
+        // 不播放工程内或远程预览视频。
+        if isKnownNonVideoLocalProject || sceneOfflineBakeButtonVisible {
+            return nil
         }
 
         if let preview = resolvedItem.previewVideoURL {
@@ -566,7 +601,28 @@ struct MediaDetailSheet: View {
 
     private static let previewVideoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
 
-    /// 从下载记录 / Workshop 本地路径解析可用于详情页背景循环的视频文件。
+    /// 已下载工程的明确内容类型。`nil` 表示没有 project.json，例如直接导入的普通视频。
+    private var localProjectContentType: WorkshopContentType? {
+        guard let localURL = currentDownloadRecord?.localFileURL else { return nil }
+        let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: localURL)
+        guard FileManager.default.fileExists(
+            atPath: contentRoot.appendingPathComponent("project.json").path
+        ) else {
+            return nil
+        }
+        return determineWorkshopContentType(at: contentRoot)
+    }
+
+    private var isKnownNonVideoLocalProject: Bool {
+        guard let localProjectContentType else { return false }
+        if case .video = localProjectContentType {
+            return false
+        }
+        return true
+    }
+
+    /// 从下载记录 / Workshop 本地路径解析可用于详情页背景循环的原始视频。
+    /// 仅允许直接视频文件或 `project.json.type == "video"` 的工程。
     private func resolvedLocalPreviewVideoURL() -> URL? {
         let fileCache = FileExistenceCache.shared
         var candidates: [URL] = []
@@ -583,10 +639,19 @@ struct MediaDetailSheet: View {
             guard seen.insert(path).inserted else { continue }
             guard fileCache.fileExists(atPath: path) else { continue }
 
+            let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: candidate)
+            let projectType: WorkshopContentType? = FileManager.default.fileExists(
+                atPath: contentRoot.appendingPathComponent("project.json").path
+            ) ? determineWorkshopContentType(at: contentRoot) : nil
+
+            if let projectType, projectType != .video {
+                continue
+            }
+
             if Self.previewVideoExtensions.contains(candidate.pathExtension.lowercased()) {
                 return candidate
             }
-            // Workshop content 目录 / project 根：解析内嵌视频
+            // 明确 video 类型的 Workshop 工程：解析其实际视频文件。
             if let videoURL = MediaItem.resolveLocalVideoFile(from: candidate),
                fileCache.fileExists(atPath: videoURL.path) {
                 return videoURL

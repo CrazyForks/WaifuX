@@ -1550,15 +1550,16 @@ class WorkshopService: ObservableObject {
             throw WorkshopError.workshopNotSupported
         }
 
+        let profile = try? await fetchSteamProfile(profileID: detail.creator)
         let wallpaper = WorkshopWallpaper(
             id: detail.publishedfileid,
             title: detail.title,
             description: detail.description,
             previewURL: detail.preview_url.flatMap { URL(string: $0) },
             author: WorkshopAuthor(
-                steamID: detail.creator,
-                name: "Unknown",
-                avatarURL: nil
+                steamID: profile?.steamID ?? detail.creator,
+                name: bestAuthorName("Unknown", fallback: profile?.name ?? detail.creator),
+                avatarURL: profile?.avatarURL
             ),
             fileSize: Int64(detail.file_size ?? "0"),
             fileURL: detail.file_url.flatMap { URL(string: $0) },

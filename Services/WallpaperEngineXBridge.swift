@@ -1,29 +1,12 @@
 import Foundation
 import AppKit
 import Combine
-import WebKit
 
-private let webPrimaryCapturePath = "/tmp/wallpaperengine-web-capture.png"
-private let webDeskCapturePath0 = "/tmp/wallpaperengine-web-desk-0.png"
-private let webDeskCapturePath1 = "/tmp/wallpaperengine-web-desk-1.png"
 private let legacyCLIWebCapturePath = "/tmp/wallpaperengine-cli-capture.png"
 
 /// CLI daemon 的 per-screen 截图路径（与 wallpaperengine-cli.swift 中 primaryCapturePath(for:) 保持一致）
 private func legacyCLICapturePath(for screen: Int) -> String {
     return "/tmp/wallpaperengine-cli-capture-s\(screen).png"
-}
-
-private struct SavedOriginalWallpaperState: Codable {
-    let configs: [ScreenWallpaperConfig]
-    let savedAt: Date
-    let appVersion: String
-}
-
-private struct ScreenWallpaperConfig: Codable {
-    let screenID: String
-    let screenName: String
-    let wallpaperURL: String
-    let isMainScreen: Bool
 }
 
 /// 与 wallpaperengine-cli daemon IPC 的音频控制消息
@@ -39,6 +22,26 @@ private struct WebDaemonAudioMessage: Codable {
 private struct WebDaemonAudioDataMessage: Codable {
     let command: String
     let spectrum: [Float]
+}
+
+/// Web 壁纸裁切参数。crop/viewport 都是原点左上、y 向下的归一化矩形。
+private struct WebCropParameters: Codable {
+    let crop: [Double]?
+    let viewport: [Double]?
+    let letterboxColorHex: String?
+    /// 每屏单调递增；daemon 用它丢弃乱序的拖拽更新。
+    let cropRevision: UInt64
+}
+
+/// Host → daemon：Web 壁纸可视区域。
+private struct WebDaemonCropMessage: Codable {
+    let command: String
+    let crop: [Double]?
+    let viewport: [Double]?
+    let letterboxColorHex: String?
+    let cropRevision: UInt64
+    let screen: Int
+    let expectsResponse: Bool
 }
 
 /// Host → daemon：系统 Now Playing 元数据（低频，fire-and-forget）。
@@ -190,7 +193,6 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 每个屏幕的 wallpaper-wgpu 进程信息（key = screenID）
     private var screenProcesses: [String: ScreenProcessInfo] = [:]
-    private let webRenderer = WebRendererBridge.shared
     private enum RenderKind: String, Codable {
         case scene
         case web
@@ -275,6 +277,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     private var targetScreenIDs = Set<String>()
     private var targetScreenFingerprints = Set<String>()
     private var cancellables = Set<AnyCancellable>()
+    /// 每个 daemon 屏幕索引的最新 Web crop 版本；用于抵御并发 socket 到达乱序。
+    private var webCropRevisionByScreenIndex: [Int: UInt64] = [:]
 
     /// WE Web 壁纸音频中继当前是否对应于活跃壁纸（基于 project.json audio 标志）
     private var audioRelayActiveForCurrentWallpaper = false
@@ -334,6 +338,17 @@ final class WallpaperEngineXBridge: ObservableObject {
             self.handleCropDidChange(note)
         }
         .store(in: &self.cancellables)
+
+        // Web 烘焙完成后，若该工程正作为实时 Web 壁纸运行，立刻将新 MP4 同步给锁屏。
+        // 不能等首次静帧兜底的 6 秒定时器，否则会出现已有 MP4 仍短暂走静态帧的竞态。
+        NotificationCenter.default.publisher(for: .sceneOfflineBakeDidComplete)
+            .compactMap { $0.object as? SceneBakeArtifact }
+            .filter { $0.renderer == .wallpaperEngineWeb }
+            .receive(on: DispatchQueue.main)
+            .sink { @MainActor [weak self] artifact in
+                self?.syncCompletedWebBakeIfActive(artifact)
+            }
+            .store(in: &self.cancellables)
     }
 
     deinit {
@@ -495,7 +510,6 @@ final class WallpaperEngineXBridge: ObservableObject {
                     print("[WallpaperEngineXBridge] ⚠️ 按屏停止 Web 壁纸失败 screen=\(screenIdx) exit=\(status)")
                 }
             }
-            webRenderer.stop()
             for state in targetWebStates {
                 screenRenderStates.removeValue(forKey: state.screenID)
             }
@@ -961,7 +975,6 @@ final class WallpaperEngineXBridge: ObservableObject {
         if screenRenderStates.values.contains(where: { $0.renderKind == .web }) || activeRenderKind == .web {
             // web 渲染由旧 CLI 的 daemon 持有，必须通过其 IPC 暂停
             sendLegacyWebPlaybackCommand("pause", to: webRenderScreenIDs)
-            webRenderer.pause()
         }
         guard isControllingExternalEngine else { return }
         isExternalPaused = true
@@ -990,7 +1003,6 @@ final class WallpaperEngineXBridge: ObservableObject {
     func resumeWallpaper() {
         if screenRenderStates.values.contains(where: { $0.renderKind == .web }) || activeRenderKind == .web {
             sendLegacyWebPlaybackCommand("resume", to: webRenderScreenIDs)
-            webRenderer.resume()
         }
         guard isControllingExternalEngine else { return }
         for (screenID, info) in screenProcesses {
@@ -1346,6 +1358,54 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
+    /// 拖拽期间的高频 Web crop 更新：daemon 不响应，避免 30fps 下 socket 读写堆积。
+    private func sendWebCropToWebDaemon(for screen: NSScreen) {
+        guard let data = webCropMessageData(for: screen, expectsResponse: false) else { return }
+        sendFireAndForgetToWebDaemon(data)
+    }
+
+    private func webCropMessageData(for screen: NSScreen, expectsResponse: Bool) -> Data? {
+        guard let target = nextWebCropParameters(for: screen) else { return nil }
+        let message = WebDaemonCropMessage(
+            command: "crop",
+            crop: target.parameters.crop,
+            viewport: target.parameters.viewport,
+            letterboxColorHex: target.parameters.letterboxColorHex,
+            cropRevision: target.parameters.cropRevision,
+            screen: target.screenIndex,
+            expectsResponse: expectsResponse
+        )
+        return try? JSONEncoder().encode(message)
+    }
+
+    private func nextWebCropParameters(for screen: NSScreen) -> (screenIndex: Int, parameters: WebCropParameters)? {
+        guard let screenIndex = Self.legacyCLIScreenIndex(for: screen) else { return nil }
+        let revision = (webCropRevisionByScreenIndex[screenIndex] ?? 0) &+ 1
+        webCropRevisionByScreenIndex[screenIndex] = revision
+
+        let settings = DisplayCropSettingsStore.shared.settings(for: screen)
+        let layout = CropLayoutEngine.compute(
+            wallpaperSize: screen.frame.size,
+            screenSize: screen.frame.size,
+            settings: settings
+        )
+        let shouldApplyCrop = settings.shouldApplyCrop
+        let viewport = layout.viewportRect
+        let isFullViewport = abs(viewport.x) < 0.0001 && abs(viewport.y) < 0.0001
+            && abs(viewport.w - 1) < 0.0001 && abs(viewport.h - 1) < 0.0001
+        let parameters = WebCropParameters(
+            crop: shouldApplyCrop
+                ? [layout.wallpaperCropRect.x, layout.wallpaperCropRect.y, layout.wallpaperCropRect.w, layout.wallpaperCropRect.h]
+                : nil,
+            viewport: shouldApplyCrop && !isFullViewport
+                ? [viewport.x, viewport.y, viewport.w, viewport.h]
+                : nil,
+            letterboxColorHex: settings.letterboxColorHex,
+            cropRevision: revision
+        )
+        return (screenIndex, parameters)
+    }
+
     /// 解析 WE project.json 判断是否需要实时音频频谱。
     /// 命中规则任一为真：`audio.enabled == true` 或 `general.supportsaudioprocessing == true`。
     /// JSON 损坏 / 字段缺失 / 类型错误 → false（不抛）。
@@ -1466,7 +1526,6 @@ final class WallpaperEngineXBridge: ObservableObject {
         StaticImageWallpaperOverlayManager.shared.hideAll()
         let statesToRestore = Array(screenRenderStates.values)
         stopRenderProcess()
-        webRenderer.stop()
         Task { try? await Self.runLegacyCLIClientCommand(["stop"]) }
         stopAudioRelayIfActive()
         stopMediaRelayIfActive()
@@ -1495,7 +1554,6 @@ final class WallpaperEngineXBridge: ObservableObject {
         // 同步杀掉旧 CLI daemon（fire-and-forget 的 client 命令在 App 退出场景来不及发出，
         // 且 stop client 自己还会再 fork daemon — 直接按 PID kill 最稳妥）
         Task { await Self.killLegacyDaemonIfRunning(waitForExit: false) }
-        webRenderer.stop()
         activeRenderKind = nil
         stopAudioRelayIfActive()
         stopMediaRelayIfActive()
@@ -1536,7 +1594,6 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         let targetState = renderState(for: targetScreen)
         if targetState?.renderKind == .web || (targetState == nil && activeRenderKind == .web) {
-            webRenderer.stop()
             if let screenIndex = Self.legacyCLIScreenIndex(for: targetScreen) {
                 Task {
                     do {
@@ -1597,7 +1654,6 @@ final class WallpaperEngineXBridge: ObservableObject {
         _deinitPIDs.removeAll()
         screenWatchdogs.values.forEach { $0.cancel() }
         screenWatchdogs.removeAll()
-        webRenderer.stop()
         stopAudioRelayIfActive()
         stopMediaRelayIfActive()
         isControllingExternalEngine = false
@@ -1673,21 +1729,31 @@ final class WallpaperEngineXBridge: ObservableObject {
         print("[WallpaperEngineXBridge] 使用旧 wallpaperengine-cli 设置 Web 壁纸: \(path) screenIdx=\(targetIndexes)")
         // 清理旧的 legacy 路径和 per-screen 路径（CLI daemon 写入 per-screen 路径）
         try? FileManager.default.removeItem(atPath: legacyCLIWebCapturePath)
+        // 旧版离线 Web 烘焙曾错误写入隐藏 screen=-1 的 PNG；设 Web 时顺手清除遗留。
+        try? FileManager.default.removeItem(atPath: legacyCLICapturePath(for: -1))
         for i in 0..<NSScreen.screens.count {
             try? FileManager.default.removeItem(atPath: legacyCLICapturePath(for: i))
         }
 
-        for screenIndex in targetIndexes {
+        for screen in screens {
+            guard let initialCrop = nextWebCropParameters(for: screen) else {
+                throw WallpaperEngineError.executionFailed("Web 壁纸目标显示器已变化，请重试")
+            }
+            guard let cropData = try? JSONEncoder().encode(initialCrop.parameters) else {
+                throw WallpaperEngineError.executionFailed("Web 壁纸裁切参数编码失败")
+            }
             let result = try await Self.runLegacyCLIClientCommandDetailed([
-                "set", path, String(screenIndex)
+                "set", path, String(initialCrop.screenIndex), "--initial-crop", cropData.base64EncodedString()
             ])
             guard result.status == 0 else {
                 let detail = result.output.isEmpty ? "" : ": \(result.output)"
                 throw WallpaperEngineError.executionFailed(
-                    "wallpaperengine-cli set 失败 (screen=\(screenIndex), exit=\(result.status))\(detail)"
+                    "wallpaperengine-cli set 失败 (screen=\(initialCrop.screenIndex), exit=\(result.status))\(detail)"
                 )
             }
         }
+
+        // 初始 crop 已随 `set` 在窗口显示前应用。海报、锁屏和系统静态帧仍保持原始 Web 截图。
 
         if let propertiesJSON = try? WebWallpaperDesignService.shared.effectivePropertiesJSON(for: path),
            !propertiesJSON.isEmpty {
@@ -1705,9 +1771,6 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         scheduleWebPosterCapture(path: path, targetScreens: screens)
 
-        let captureURLs = await captureWebFallbackFramesForLockScreenIfNeeded(targetScreens: targetScreens)
-        await syncWebStaticFramesToLockScreenIfNeeded(imageURLs: captureURLs, targetScreens: targetScreens)
-
         // 初始化 Web 壁纸的音频状态（同步当前 mute/volume）
         let isMuted = VideoWallpaperManager.shared.isMuted
         let volume = VideoWallpaperManager.shared.volume
@@ -1720,26 +1783,114 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    /// Web renderer 可直接通过 WKWebView 截图，无需生成临时 MP4。
+    /// Web daemon 可直接通过其 WKWebView 截图，无需生成临时 MP4。
     ///
-    /// 仅在没有可播放离线烘焙视频时生成详情页 poster；有成片时详情页继续优先播放成片。
+    /// 仅在没有可播放离线烘焙视频时，等待 Web 页面完成异步资源加载后截取 canonical poster。
     private func scheduleWebPosterCapture(path: String, targetScreens: [NSScreen]) {
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
             startingAt: URL(fileURLWithPath: path)
         )
         let record = webPosterRecord(for: contentRoot)
-        guard SceneOfflineBakeService.usableArtifact(from: record) == nil else {
+        if let record,
+           let artifact = SceneOfflineBakeService.usableArtifact(from: record) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.isCurrentWebWallpaper(
+                    path: path,
+                    on: Set(targetScreens.map(\.wallpaperScreenIdentifier))
+                ) else {
+                    return
+                }
+
+                let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
+                if #available(macOS 26.0, *),
+                   VideoWallpaperManager.shared.isLockScreenEnabled {
+                    let displayIDs = targetScreens.compactMap {
+                        ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+                    }
+                    if !displayIDs.isEmpty {
+                        await LockScreenWallpaperService.shared.switchActiveInstancesToLocalDecode(
+                            videoURL: bakedVideoURL,
+                            videoID: record.item.id,
+                            displayIDs: displayIDs
+                        )
+                        print("[WallpaperEngineXBridge] 🎬 已将 Web 烘焙 MP4 同步到锁屏扩展: display=\(displayIDs) video=\(record.item.id)")
+                    }
+
+                    // 锁屏已经使用 MP4；poster 仅用于详情页/封面缓存，绝不降级覆盖为静态锁屏源。
+                    _ = await ensureSceneBakePosterAndNotify(
+                        itemID: record.item.id,
+                        videoURL: bakedVideoURL
+                    )
+                    return
+                }
+
+                guard let posterURL = await ensureSceneBakePosterAndNotify(
+                    itemID: record.item.id,
+                    videoURL: bakedVideoURL
+                ) else {
+                    print("[WallpaperEngineXBridge] Web 烘焙 MP4 poster 补抽失败: \(artifact.videoPath)")
+                    return
+                }
+                await self.syncWebPosterToStaticTargets(
+                    posterURL,
+                    path: path,
+                    targetScreens: targetScreens
+                )
+            }
             return
         }
 
         let cacheItemID = record?.item.id
             ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: contentRoot.path)
+        if let cachedPoster = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(
+            itemID: cacheItemID
+        ) {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.isCurrentWebWallpaper(
+                          path: path,
+                          on: Set(targetScreens.map(\.wallpaperScreenIdentifier))
+                      ) else {
+                    return
+                }
+                await self.syncWebPosterToStaticTargets(
+                    cachedPoster,
+                    path: path,
+                    targetScreens: targetScreens
+                )
+            }
+            return
+        }
+
         guard let posterScreen = targetScreens.first(where: { $0 == NSScreen.main }) ?? targetScreens.first,
               let screenIndex = Self.legacyCLIScreenIndex(for: posterScreen) else {
             return
         }
 
-        Task(priority: .utility) { @MainActor in
+        // 仅首次缺少 canonical poster 时，待页面完成异步资源加载后再截一帧。
+        // 所有静态消费方都只使用该 poster，绝不把 /tmp 中的 raw capture 直接设为系统壁纸。
+        let captureDelay: UInt64 = 6_000_000_000
+        Task(priority: .utility) { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: captureDelay)
+            } catch {
+                return
+            }
+
+            guard let self,
+                  self.activeRenderKind == .web,
+                  self.screenRenderStates.values.contains(where: {
+                      $0.renderKind == .web && $0.path == path
+                  }) else {
+                return
+            }
+
+            let currentRecord = self.webPosterRecord(for: contentRoot)
+            guard SceneOfflineBakeService.usableArtifact(from: currentRecord) == nil else {
+                return
+            }
+
             do {
                 let status = try await Self.runLegacyCLIClientCommand(["capture", String(screenIndex)])
                 guard status == 0 else {
@@ -1758,13 +1909,18 @@ final class WallpaperEngineXBridge: ObservableObject {
                     return
                 }
 
-                if let itemID = record?.item.id {
+                if let itemID = currentRecord?.item.id ?? record?.item.id {
                     NotificationCenter.default.post(
                         name: .sceneOfflineBakeThumbnailDidUpdate,
                         object: itemID,
                         userInfo: ["thumbnailURL": posterURL]
                     )
                 }
+                await self.syncWebPosterToStaticTargets(
+                    posterURL,
+                    path: path,
+                    targetScreens: targetScreens
+                )
                 print("[WallpaperEngineXBridge] Web poster cached screen=\(screenIndex): \(posterURL.path)")
             } catch {
                 print("[WallpaperEngineXBridge] Web poster capture failed screen=\(screenIndex): \(error.localizedDescription)")
@@ -1785,68 +1941,79 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    private func syncWebStaticFramesToLockScreenIfNeeded(imageURLs: [UInt32: URL], targetScreens: [NSScreen]?) async {
-        guard #available(macOS 26.0, *) else { return }
-        guard VideoWallpaperManager.shared.isLockScreenEnabled else { return }
-        guard UserDefaults.standard.object(forKey: "dynamic_lock_screen_enabled") as? Bool ?? true else { return }
-        guard !imageURLs.isEmpty else {
-            print("[WallpaperEngineXBridge] ⚠️ Web 锁屏静态帧未生成，跳过扩展静态图同步")
+    /// Web MP4 烘焙完成时立即复用成片；实时渲染无需重启，锁屏只切换其本地解码源。
+    private func syncCompletedWebBakeIfActive(_ artifact: SceneBakeArtifact) {
+        guard activeRenderKind == .web else { return }
+        guard let record = MediaLibraryService.shared.downloadedItems.first(where: {
+            $0.sceneBakeArtifact?.videoPath == artifact.videoPath
+                && $0.sceneBakeArtifact?.renderer == .wallpaperEngineWeb
+        }) else {
             return
         }
 
-        for (displayID, imageURL) in imageURLs {
-            guard FileManager.default.fileExists(atPath: imageURL.path) else {
-                print("[WallpaperEngineXBridge] ⚠️ Web 锁屏静态帧不存在 display=\(displayID) path=\(imageURL.path)")
-                continue
-            }
-            do {
-                try await LockScreenWallpaperService.shared.cacheStaticImageSource(imageURL: imageURL, displayIDs: [displayID])
-                print("[WallpaperEngineXBridge] 🖼️ 已将 Web 首帧按静态图同步到锁屏扩展 display=\(displayID)")
-            } catch {
-                print("[WallpaperEngineXBridge] ⚠️ Web 锁屏静态帧同步失败 display=\(displayID): \(error.localizedDescription)")
-            }
+        let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: URL(fileURLWithPath: record.localFilePath)
+        )
+        let matchingStates = screenRenderStates.values.filter { state in
+            guard state.renderKind == .web else { return false }
+            return WorkshopService.resolveWallpaperEngineProjectRoot(
+                startingAt: URL(fileURLWithPath: state.path)
+            ).path == contentRoot.path
         }
+        guard !matchingStates.isEmpty else { return }
+
+        let targetScreenIDs = Set(matchingStates.map(\.screenID))
+        let targetScreens = NSScreen.screens.filter {
+            targetScreenIDs.contains($0.wallpaperScreenIdentifier)
+        }
+        guard !targetScreens.isEmpty else { return }
+
+        scheduleWebPosterCapture(
+            path: matchingStates[0].path,
+            targetScreens: targetScreens
+        )
     }
 
-    private func captureWebFallbackFramesForLockScreenIfNeeded(targetScreens: [NSScreen]?) async -> [UInt32: URL] {
-        guard #available(macOS 26.0, *) else { return [:] }
-        guard VideoWallpaperManager.shared.isLockScreenEnabled else { return [:] }
-        guard UserDefaults.standard.object(forKey: "dynamic_lock_screen_enabled") as? Bool ?? true else { return [:] }
+    /// Web/MP4 共用 canonical poster；锁屏与系统桌面只消费该文件，不直接引用 daemon 的 /tmp 截图。
+    private func syncWebPosterToStaticTargets(
+        _ posterURL: URL,
+        path: String,
+        targetScreens: [NSScreen]
+    ) async {
+        guard FileManager.default.fileExists(atPath: posterURL.path) else { return }
 
-        let screens = targetScreens?.isEmpty == false ? targetScreens! : NSScreen.screens
-        var result: [UInt32: URL] = [:]
-
-        for screen in screens {
-            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
-            let displayID = screenNumber.uint32Value
-            let screenIdx = WallpaperScreenIdentity.stableIndex(of: screen) ?? 0
-            let capturePath = legacyCLICapturePath(for: screenIdx)
-
-            if FileManager.default.fileExists(atPath: capturePath) {
-                result[displayID] = URL(fileURLWithPath: capturePath)
-                continue
+        if #available(macOS 26.0, *),
+           VideoWallpaperManager.shared.isLockScreenEnabled {
+            let displayIDs = targetScreens.compactMap {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
             }
-
-            let deadline = Date().addingTimeInterval(3.0)
-            while Date() < deadline {
-                try? await Task.sleep(nanoseconds: 120_000_000)
-                if FileManager.default.fileExists(atPath: capturePath) {
-                    result[displayID] = URL(fileURLWithPath: capturePath)
-                    break
-                }
+            guard !displayIDs.isEmpty else { return }
+            do {
+                try await LockScreenWallpaperService.shared.cacheStaticImageSource(
+                    imageURL: posterURL,
+                    displayIDs: displayIDs
+                )
+                print("[WallpaperEngineXBridge] 🖼️ 已将 Web canonical poster 同步到锁屏扩展: \(posterURL.lastPathComponent)")
+            } catch {
+                print("[WallpaperEngineXBridge] ⚠️ Web canonical poster 锁屏同步失败: \(error.localizedDescription)")
             }
+            return
         }
 
-        // 兜底：检查 legacy 单屏路径（兼容旧版 CLI daemon）
-        if result.isEmpty && FileManager.default.fileExists(atPath: legacyCLIWebCapturePath) {
-            let screens2 = targetScreens?.isEmpty == false ? targetScreens! : NSScreen.screens
-            for screen in screens2 {
-                guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
-                result[screenNumber.uint32Value] = URL(fileURLWithPath: legacyCLIWebCapturePath)
-            }
-        }
+        _ = applyBakedStaticImage(
+            posterURL,
+            for: path,
+            targetScreens: targetScreens,
+            updateGeneration: nil
+        )
+    }
 
-        return result
+    private func isCurrentWebWallpaper(path: String, on screenIDs: Set<String>) -> Bool {
+        guard activeRenderKind == .web else { return false }
+        return screenIDs.allSatisfy { screenID in
+            guard let state = screenRenderStates[screenID] else { return false }
+            return state.renderKind == .web && state.path == path
+        }
     }
 
     /// 启动旧 `wallpaperengine-cli` 的客户端子命令（set/pause/resume/stop-screen）。
@@ -2837,7 +3004,7 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 显示器热拔插的运行时回收请走 `cleanupOrphanedScreenRuntimes`，
     /// 以便保留 fingerprint 状态供重插恢复。
     func discardPersistedWallpaperState(screenID: String, fingerprint: String) async {
-        // 先停掉该屏的运行时（scene 进程 / web WKWebView），再清持久化
+        // 先停掉该屏的运行时（scene 进程 / web daemon），再清持久化
         await stopRuntimeForDisconnectedScreen(screenID: screenID, fingerprint: fingerprint, preferredCLIIndex: nil)
 
         screenRenderStates = screenRenderStates.filter {
@@ -2948,8 +3115,6 @@ final class WallpaperEngineXBridge: ObservableObject {
                     print("[WallpaperEngineXBridge] ⚠️ 断屏 stop-screen 异常 index=\(index): \(error.localizedDescription)")
                 }
             }
-            // 进程内遗留的旧 WKWebView bridge（非 daemon 路径）一并清掉
-            webRenderer.stop()
         }
     }
 
@@ -3193,13 +3358,20 @@ final class WallpaperEngineXBridge: ObservableObject {
         path: String,
         targetScreens: [NSScreen]
     ) {
+        // 每次设壁纸都先作废上一轮异步同步；动态锁屏接管后绝不能让旧任务回写桌面。
+        bakedStaticUpdateGeneration &+= 1
+        let generation = bakedStaticUpdateGeneration
+
         guard !targetScreens.isEmpty else {
             print("[WallpaperEngineXBridge] ⚠️ 无可用目标屏幕，跳过烘焙静态资源同步")
             return
         }
 
-        bakedStaticUpdateGeneration &+= 1
-        let generation = bakedStaticUpdateGeneration
+        if #available(macOS 26.0, *),
+           VideoWallpaperManager.shared.isLockScreenEnabled {
+            print("[WallpaperEngineXBridge] 🔒 动态锁屏已接管，跳过 Scene 烘焙封面的桌面同步")
+            return
+        }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -3208,7 +3380,7 @@ final class WallpaperEngineXBridge: ObservableObject {
                 return
             }
 
-            guard let existing = self.existingBakedCoverURL(forScenePath: path) else {
+            guard let existing = await self.existingBakedCoverURL(forScenePath: path) else {
                 print("[WallpaperEngineXBridge] Scene 烘焙封面读取不到，不更新系统桌面/锁屏")
                 return
             }
@@ -3225,7 +3397,7 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 读取 scene 已有的烘焙静态资源：优先稳定封面，其次读取可用烘焙 MP4 的已缓存 poster。
     /// 两者都不存在时直接返回 nil，不从实时渲染窗口生成替代截图。
-    private func existingBakedCoverURL(forScenePath path: String) -> URL? {
+    private func existingBakedCoverURL(forScenePath path: String) async -> URL? {
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: URL(fileURLWithPath: path))
         let record = MediaLibraryService.shared.downloadRecord(forLocalFilePath: contentRoot.path)
             ?? MediaLibraryService.shared.downloadedItems.first { record in
@@ -3240,10 +3412,15 @@ final class WallpaperEngineXBridge: ObservableObject {
             return scenePoster
         }
 
+        if let itemID = record?.item.id,
+           let artifact = SceneOfflineBakeService.usableArtifact(from: record) {
+            let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
+            return await ensureSceneBakePosterAndNotify(itemID: itemID, videoURL: bakedVideoURL)
+        }
+
         if let artifact = record?.sceneBakeArtifact {
             let bakedVideoURL = URL(fileURLWithPath: artifact.videoPath)
-            if SceneOfflineBakeService.isUsableBakedVideo(at: bakedVideoURL),
-               let poster = VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: bakedVideoURL) {
+            if let poster = VideoThumbnailCache.shared.cachedPosterJPEGFileURLIfExists(forLocalVideo: bakedVideoURL) {
                 return poster
             }
         }
@@ -3263,13 +3440,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         guard FileManager.default.fileExists(atPath: imageURL.path) else { return false }
 
-        let cacheKey = Self.bakedStaticCacheKey(for: path)
-        UserDefaults.standard.set(imageURL.path, forKey: cacheKey)
-
         if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             print("[WallpaperEngineXBridge] 🔒 动态锁屏已启用，跳过烘焙封面的系统桌面写入")
             return true
         }
+
+        let cacheKey = Self.bakedStaticCacheKey(for: path)
+        UserDefaults.standard.set(imageURL.path, forKey: cacheKey)
 
         // 系统壁纸同步关闭时：动态 scene 仍由 wgpu 渲染，但不得写系统桌面静态图。
         guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
@@ -3336,16 +3513,19 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    /// 可视区域 crop 变更：把最新裁切写入该屏的 `--crop-control` JSON，wgpu 50ms 内热更新。
-    /// 不再重启进程；拖拽和落定都共享同一通路，避免进程频繁起停。
+    /// 可视区域 crop 变更：scene 写入 `--crop-control` JSON，web 走 daemon IPC；
+    /// 两者都支持拖拽期间实时热更新，无需重启渲染器。
     @MainActor
     private func handleCropDidChange(_ note: Notification) {
         guard isControllingExternalEngine else { return }
         guard !isSettingWallpaper else { return }
         guard let screenID = note.userInfo?["screenID"] as? String,
               let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
-              isManaging(screen: screen),
-              !isWebWallpaperOn(screen: screen) else { return }
+              isManaging(screen: screen) else { return }
+        if isWebWallpaperOn(screen: screen) {
+            sendWebCropToWebDaemon(for: screen)
+            return
+        }
         // 找到该屏（或同 fingerprint）的运行进程及其 cropControlURL
         let info = screenProcesses[screenID]
             ?? screenProcesses.values.first(where: { $0.screenID == screenID })
@@ -3408,7 +3588,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             guard !self.isSettingWallpaper else { return }
 
             Task { @MainActor in
-                // 1) 先回收已断屏的 scene 进程 / web WKWebView（保留 restore 状态）
+                // 1) 先回收已断屏的 scene 进程 / web daemon（保留 restore 状态）
                 let didCleanOrphans = await self.cleanupOrphanedScreenRuntimes()
 
                 self.relinkTargetScreens()
@@ -3526,7 +3706,7 @@ final class WallpaperEngineXBridge: ObservableObject {
     }
 }
 
-// MARK: - Web 壁纸旧流程（WKWebView）
+// MARK: - Wallpaper Engine Project Type Detection
 
 private func isWebWallpaper(path: String) -> Bool {
     detectWallpaperProjectType(path: path)?.lowercased() == "web"
@@ -3591,1011 +3771,8 @@ private func extractPKG(at url: URL) -> URL? {
         process.waitUntilExit()
         return process.terminationStatus == 0 ? tempDir : nil
     } catch {
-        print("[WebRendererBridge] extractPKG failed: \(error.localizedDescription)")
+        print("[WallpaperEngineXBridge] extractPKG failed: \(error.localizedDescription)")
         return nil
-    }
-}
-
-private func steamWorkshopContentInstallRootIfApplicable(forProjectDir projectDir: URL) -> URL? {
-    let comps = projectDir.standardizedFileURL.pathComponents
-    guard let idx = comps.firstIndex(of: "431960"), idx + 1 < comps.count else {
-        return nil
-    }
-    let prefix = comps.prefix(through: idx + 1)
-    let path = "/" + prefix.dropFirst().joined(separator: "/")
-    let url = URL(fileURLWithPath: path, isDirectory: true)
-    var isDir: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
-        return nil
-    }
-    return url
-}
-
-private func webWallpaperFileReadAccessURL(projectContentDir: URL, wallpaperPath: String) -> URL {
-    if wallpaperPath.contains("/steamapps/workshop/content/"),
-       let root = steamWorkshopContentInstallRootIfApplicable(forProjectDir: projectContentDir) {
-        return root
-    }
-    return projectContentDir
-}
-
-private func resolveWallpaperDependencyPath(from contentDir: URL, dependencyID: String) -> URL? {
-    let fm = FileManager.default
-    let sibling = contentDir.deletingLastPathComponent().appendingPathComponent(dependencyID)
-    if fm.fileExists(atPath: sibling.path) { return sibling }
-
-    var current = contentDir
-    for _ in 0..<6 {
-        current = current.deletingLastPathComponent()
-        let candidate = current.appendingPathComponent("steamapps/workshop/content/431960/\(dependencyID)")
-        if fm.fileExists(atPath: candidate.path) { return candidate }
-    }
-    return nil
-}
-
-private func mergeWallpaperWithDependency(contentDir: URL, dependencyDir: URL) -> URL? {
-    let fm = FileManager.default
-    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("wallpaperengine_merged_\(contentDir.lastPathComponent)_\(dependencyDir.lastPathComponent)_\(UUID().uuidString.prefix(8))")
-    do {
-        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        if let depEntries = try? fm.contentsOfDirectory(at: dependencyDir, includingPropertiesForKeys: nil) {
-            for entry in depEntries {
-                let dest = tempDir.appendingPathComponent(entry.lastPathComponent)
-                if !fm.fileExists(atPath: dest.path) {
-                    try? fm.copyItem(at: entry, to: dest)
-                }
-            }
-        }
-        if let entries = try? fm.contentsOfDirectory(at: contentDir, includingPropertiesForKeys: nil) {
-            for entry in entries {
-                let dest = tempDir.appendingPathComponent(entry.lastPathComponent)
-                if fm.fileExists(atPath: dest.path) {
-                    try? fm.removeItem(at: dest)
-                }
-                try? fm.copyItem(at: entry, to: dest)
-            }
-        }
-        return tempDir
-    } catch {
-        print("[WebRendererBridge] dependency merge failed: \(error.localizedDescription)")
-        return nil
-    }
-}
-
-private func resolveWebWallpaperEntry(path: String) -> (baseURL: URL, indexFile: String)? {
-    let url = URL(fileURLWithPath: path)
-    let contentDir: URL
-    if url.pathExtension.lowercased() == "pkg" {
-        guard let extracted = extractPKG(at: url) else { return nil }
-        contentDir = extracted
-    } else {
-        contentDir = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: url)
-    }
-
-    let projectJSON = contentDir.appendingPathComponent("project.json")
-    guard FileManager.default.fileExists(atPath: projectJSON.path),
-          let data = try? Data(contentsOf: projectJSON),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        if url.pathExtension.lowercased() == "html" || url.pathExtension.lowercased() == "htm" {
-            return (url.deletingLastPathComponent(), url.lastPathComponent)
-        }
-        let index = contentDir.appendingPathComponent("index.html")
-        return FileManager.default.fileExists(atPath: index.path) ? (contentDir, "index.html") : nil
-    }
-
-    let file = json["file"] as? String ?? "index.html"
-    if let dependency = json["dependency"] as? String, !dependency.isEmpty,
-       let depDir = resolveWallpaperDependencyPath(from: contentDir, dependencyID: dependency),
-       let merged = mergeWallpaperWithDependency(contentDir: contentDir, dependencyDir: depDir) {
-        if FileManager.default.fileExists(atPath: merged.appendingPathComponent(file).path) {
-            return (merged, file)
-        }
-        if FileManager.default.fileExists(atPath: merged.appendingPathComponent("index.html").path) {
-            return (merged, "index.html")
-        }
-        try? FileManager.default.removeItem(at: merged)
-    }
-
-    if FileManager.default.fileExists(atPath: contentDir.appendingPathComponent(file).path) {
-        return (contentDir, file)
-    }
-    if FileManager.default.fileExists(atPath: contentDir.appendingPathComponent("index.html").path) {
-        return (contentDir, "index.html")
-    }
-    return nil
-}
-
-private func readWebWallpaperUserPropertiesJSON(contentDir: URL) -> String? {
-    let projectURL = contentDir.appendingPathComponent("project.json")
-    guard let data = try? Data(contentsOf: projectURL),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let general = json["general"] as? [String: Any],
-          let props = general["properties"] as? [String: Any],
-          !props.isEmpty,
-          let out = try? JSONSerialization.data(withJSONObject: props, options: []),
-          let str = String(data: out, encoding: .utf8) else {
-        return nil
-    }
-    return str
-}
-
-private final class WebRendererBridge: NSObject, WKNavigationDelegate {
-    static let shared = WebRendererBridge()
-
-    private struct WebInteractionEvent: @unchecked Sendable {
-        let type: String
-        let screenX: Double
-        let screenY: Double
-        let button: Int
-        let buttons: Int
-        let clickCount: Int
-        let deltaX: Double
-        let deltaY: Double
-        let key: String
-        let code: String
-        let keyCode: Int
-        let ctrlKey: Bool
-        let altKey: Bool
-        let shiftKey: Bool
-        let metaKey: Bool
-    }
-
-    private static let wallpaperEngineWebAPIShim = WKUserScript(
-        source: """
-        (function() {
-          try {
-            window.wallpaperMediaIntegration = { playback: { PLAYING: 1, PAUSED: 2, STOPPED: 0 } };
-            var __wxAudioCbs = [];
-            var __wxAudioBuf = new Float32Array(128);
-            window.wallpaperRegisterAudioListener = function(cb) {
-              if (typeof cb === 'function') __wxAudioCbs.push(cb);
-            };
-            setInterval(function() {
-              for (var j = 0; j < __wxAudioCbs.length; j++) {
-                try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
-              }
-            }, 33);
-            var __wxMedia = { status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: [] };
-            var __wxMediaState = { enabled: false, title: "", artist: "", albumTitle: "", state: 0, position: 0, duration: 0, rate: 1, thumbnail: "", lyrics: null, lyricsLine: null };
-            function __wxFire(list, payload) {
-              for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) {} }
-            }
-            window.wallpaperRegisterMediaStatusListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.status.push(cb);
-              try { cb({ enabled: !!__wxMediaState.enabled }); } catch (e) {}
-            };
-            window.wallpaperRegisterMediaPropertiesListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.properties.push(cb);
-              try {
-                cb({ title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
-              } catch (e) {}
-            };
-            window.wallpaperRegisterMediaThumbnailListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.thumbnail.push(cb);
-              try { cb({ thumbnail: __wxMediaState.thumbnail||"" }); } catch (e) {}
-            };
-            window.wallpaperRegisterMediaPlaybackListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.playback.push(cb);
-              try { cb({ state: __wxMediaState.state|0 }); } catch (e) {}
-            };
-            window.wallpaperRegisterMediaTimelineListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.timeline.push(cb);
-              try { cb({ position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 }); } catch (e) {}
-            };
-            window.wallpaperRegisterMediaLyricsListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.lyrics.push(cb);
-              try { if (__wxMediaState.lyrics) cb(__wxMediaState.lyrics); } catch (e) {}
-            };
-            window.wallpaperRegisterMediaLyricsLineListener = function(cb) {
-              if (typeof cb !== 'function') return;
-              __wxMedia.lyricsLine.push(cb);
-              try { if (__wxMediaState.lyricsLine) cb(__wxMediaState.lyricsLine); } catch (e) {}
-            };
-            window.__wxParseB64JSON = function(b64) {
-              if (!b64) return null;
-              try {
-                var bin = atob(b64);
-                var bytes = new Uint8Array(bin.length);
-                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xff;
-                var text = (typeof TextDecoder !== 'undefined')
-                  ? new TextDecoder('utf-8').decode(bytes)
-                  : decodeURIComponent(escape(bin));
-                return JSON.parse(text);
-              } catch (e) {
-                try { return JSON.parse(atob(b64)); } catch (e2) { return null; }
-              }
-            };
-            window.__wxPushMediaUpdate = function(obj) {
-              if (!obj || typeof obj !== 'object') return;
-              if (typeof obj.enabled === 'boolean') __wxMediaState.enabled = obj.enabled;
-              if (typeof obj.title === 'string') __wxMediaState.title = obj.title;
-              if (typeof obj.artist === 'string') __wxMediaState.artist = obj.artist;
-              if (typeof obj.albumTitle === 'string') __wxMediaState.albumTitle = obj.albumTitle;
-              if (typeof obj.state === 'number') __wxMediaState.state = obj.state;
-              if (typeof obj.position === 'number') __wxMediaState.position = obj.position;
-              if (typeof obj.duration === 'number') __wxMediaState.duration = obj.duration;
-              if (typeof obj.rate === 'number') __wxMediaState.rate = obj.rate;
-              __wxFire(__wxMedia.status, { enabled: !!__wxMediaState.enabled });
-              __wxFire(__wxMedia.properties, { title: __wxMediaState.title||"", artist: __wxMediaState.artist||"", albumTitle: __wxMediaState.albumTitle||"", subTitle: __wxMediaState.artist||"" });
-              __wxFire(__wxMedia.playback, { state: __wxMediaState.state|0 });
-              __wxFire(__wxMedia.timeline, { position: __wxMediaState.position||0, duration: __wxMediaState.duration||0 });
-            };
-            window.__wxPushMediaThumbnail = function(obj) {
-              if (!obj || typeof obj !== 'object') return;
-              __wxMediaState.thumbnail = (typeof obj.thumbnail === 'string') ? obj.thumbnail : "";
-              __wxFire(__wxMedia.thumbnail, { thumbnail: __wxMediaState.thumbnail });
-            };
-            window.__wxPushMediaLyrics = function(obj) {
-              if (!obj || typeof obj !== 'object') return;
-              __wxMediaState.lyrics = obj;
-              __wxFire(__wxMedia.lyrics, obj);
-            };
-            window.__wxPushMediaLyricsLine = function(obj) {
-              if (!obj || typeof obj !== 'object') return;
-              __wxMediaState.lyricsLine = obj;
-              __wxFire(__wxMedia.lyricsLine, obj);
-            };
-          } catch (e) {}
-        })();
-        """,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-    )
-
-    private static let localFileCompatScript = WKUserScript(
-        source: """
-        (function() {
-          try {
-            if (location.protocol !== "file:") return;
-            var proto = HTMLImageElement.prototype;
-            var srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
-            if (srcDesc && srcDesc.set) {
-              Object.defineProperty(proto, "src", {
-                set: function(value) {
-                  try {
-                    var s = String(value || "");
-                    if (s.indexOf("http:") !== 0 && s.indexOf("https:") !== 0 && s.indexOf("data:") !== 0 && s.indexOf("blob:") !== 0) {
-                      this.removeAttribute("crossorigin");
-                    }
-                  } catch (e) {}
-                  srcDesc.set.call(this, value);
-                },
-                get: srcDesc.get,
-                configurable: true
-              });
-            }
-            var origFetch = window.fetch;
-            if (typeof origFetch === "function") {
-              window.fetch = function(input, init) {
-                var url = typeof input === "string" ? input : (input && input.url) ? input.url : "";
-                if (url && url.indexOf("http:") !== 0 && url.indexOf("https:") !== 0 && url.indexOf("data:") !== 0 && url.indexOf("blob:") !== 0) {
-                  return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", url, true);
-                    xhr.responseType = "arraybuffer";
-                    xhr.onload = function() {
-                      if (xhr.status === 200 || xhr.status === 0) {
-                        var headers = new Headers();
-                        try {
-                          var contentType = xhr.getResponseHeader("Content-Type");
-                          if (contentType) headers.set("Content-Type", contentType);
-                        } catch (e) {}
-                        resolve(new Response(xhr.response, {
-                          status: xhr.status === 0 ? 200 : xhr.status,
-                          statusText: xhr.statusText || "OK",
-                          headers: headers
-                        }));
-                      } else {
-                        reject(new Error("HTTP " + xhr.status));
-                      }
-                    };
-                    xhr.onerror = function() { reject(new Error("network error")); };
-                    xhr.send();
-                  });
-                }
-                return origFetch.call(this, input, init);
-              };
-            }
-          } catch (e) {}
-        })();
-        """,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-    )
-
-    private static let interactionBridgeScript = WKUserScript(
-        source: """
-        (function() {
-          if (window.__waifuXDispatchInput) return;
-          function targetAt(x, y) {
-            return document.elementFromPoint(x, y) || document.body || document.documentElement || document;
-          }
-          function mouseInit(e) {
-            return {
-              bubbles: true,
-              cancelable: true,
-              composed: true,
-              view: window,
-              clientX: e.x || 0,
-              clientY: e.y || 0,
-              screenX: e.screenX || 0,
-              screenY: e.screenY || 0,
-              button: e.button || 0,
-              buttons: e.buttons || 0,
-              ctrlKey: !!e.ctrlKey,
-              altKey: !!e.altKey,
-              shiftKey: !!e.shiftKey,
-              metaKey: !!e.metaKey
-            };
-          }
-          function firePointer(target, type, init) {
-            try {
-              if (window.PointerEvent) {
-                target.dispatchEvent(new PointerEvent(type, Object.assign({}, init, {
-                  pointerId: 1,
-                  pointerType: "mouse",
-                  isPrimary: true
-                })));
-              }
-            } catch (e) {}
-          }
-          window.__waifuXDispatchInput = function(e) {
-            try {
-              if (!e || !e.type) return;
-              if (e.type === "keydown" || e.type === "keyup") {
-                var keyTarget = document.activeElement || document.body || document.documentElement || document;
-                var keyInit = {
-                  bubbles: true,
-                  cancelable: true,
-                  composed: true,
-                  key: e.key || "",
-                  code: e.code || "",
-                  keyCode: e.keyCode || 0,
-                  which: e.keyCode || 0,
-                  ctrlKey: !!e.ctrlKey,
-                  altKey: !!e.altKey,
-                  shiftKey: !!e.shiftKey,
-                  metaKey: !!e.metaKey
-                };
-                keyTarget.dispatchEvent(new KeyboardEvent(e.type, keyInit));
-                if (keyTarget !== window) window.dispatchEvent(new KeyboardEvent(e.type, keyInit));
-                return;
-              }
-
-              var target = targetAt(e.x || 0, e.y || 0);
-              var init = mouseInit(e);
-              if (e.type === "wheel") {
-                target.dispatchEvent(new WheelEvent("wheel", Object.assign({}, init, {
-                  deltaX: e.deltaX || 0,
-                  deltaY: e.deltaY || 0,
-                  deltaMode: 0
-                })));
-                return;
-              }
-
-              var pointerType = {
-                mousemove: "pointermove",
-                mousedown: "pointerdown",
-                mouseup: "pointerup"
-              }[e.type];
-              if (pointerType) firePointer(target, pointerType, init);
-              target.dispatchEvent(new MouseEvent(e.type, init));
-              if (e.type === "mouseup") {
-                target.dispatchEvent(new MouseEvent("click", init));
-                if ((e.clickCount || 0) >= 2) {
-                  target.dispatchEvent(new MouseEvent("dblclick", init));
-                }
-              }
-            } catch (err) {}
-          };
-        })();
-        """,
-        injectionTime: .atDocumentStart,
-        forMainFrameOnly: false
-    )
-
-    private var window: NSWindow?
-    private var webView: WKWebView?
-    private var pendingCompletion: ((Bool) -> Void)?
-    private var extractedPKGDir: URL?
-    private var mergedDependencyDir: URL?
-    private var injectedPropertiesJSON: String?
-    private var firstFrameSettleGeneration: UInt64 = 0
-    private var currentScreenIndex: Int?
-    private var desktopCaptureSlot = 0
-    private var interactionMonitors: [Any] = []
-    private(set) var isLoaded = false
-
-    private enum FirstFramePolicy {
-        static let minElapsed: TimeInterval = 6.0
-        static let maxElapsed: TimeInterval = 24
-        static let pollInterval: TimeInterval = 0.5
-        static let diffThreshold: Double = 0.014
-        static let stablePassesRequired: Int = 2
-        static let thumbDimension: Int = 48
-    }
-
-    func loadWallpaper(path: String, width: Int, height: Int, screen: Int? = nil, completion: ((Bool) -> Void)? = nil) {
-        stop()
-        pendingCompletion = completion
-        injectedPropertiesJSON = nil
-        currentScreenIndex = screen
-
-        guard let (baseURL, indexFile) = resolveWebWallpaperEntry(path: path) else {
-            print("[WebRendererBridge] 无法解析 Web 壁纸入口: \(path)")
-            completion?(false)
-            return
-        }
-
-        injectedPropertiesJSON = readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
-        if URL(fileURLWithPath: path).pathExtension.lowercased() == "pkg" {
-            extractedPKGDir = baseURL
-        } else if baseURL.path.contains("wallpaperengine_merged_") {
-            mergedDependencyDir = baseURL
-        }
-
-        let screens = NSScreen.screens
-        let targetScreen: NSScreen
-        if let s = screen, screens.indices.contains(s) {
-            targetScreen = screens[s]
-        } else if let main = NSScreen.main {
-            targetScreen = main
-        } else if let first = screens.first {
-            targetScreen = first
-        } else {
-            completion?(false)
-            return
-        }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false
-        )
-        window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.setFrame(targetScreen.frame, display: true)
-        window.ignoresMouseEvents = true
-        window.isReleasedWhenClosed = false
-
-        let config = WKWebViewConfiguration()
-        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
-        config.websiteDataStore = .nonPersistent()
-        config.mediaTypesRequiringUserActionForPlayback = []
-        if #available(macOS 14.0, *) {
-            config.defaultWebpagePreferences.allowsContentJavaScript = true
-        }
-        let ucc = WKUserContentController()
-        ucc.addUserScript(Self.wallpaperEngineWebAPIShim)
-        ucc.addUserScript(Self.localFileCompatScript)
-        ucc.addUserScript(Self.interactionBridgeScript)
-        config.userContentController = ucc
-
-        let webView = WKWebView(frame: window.contentView?.bounds ?? .zero, configuration: config)
-        webView.autoresizingMask = [.width, .height]
-        webView.navigationDelegate = self
-        webView.wantsLayer = true
-        webView.layer?.backgroundColor = NSColor.black.cgColor
-        window.contentView?.addSubview(webView)
-
-        self.window = window
-        self.webView = webView
-        startInteractionBridge()
-
-        let fileURL = baseURL.appendingPathComponent(indexFile)
-        let readAccessURL = webWallpaperFileReadAccessURL(projectContentDir: baseURL, wallpaperPath: path)
-        autoFixSpineConfigIfNeeded(projectContentDir: baseURL)
-        webView.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
-        window.orderBack(nil)
-
-        let generation = firstFrameSettleGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self, self.firstFrameSettleGeneration == generation, self.pendingCompletion != nil else { return }
-            print("[WebRendererBridge] Web 壁纸加载超时: \(path)")
-            self.pendingCompletion?(false)
-            self.pendingCompletion = nil
-        }
-    }
-
-    private func autoFixSpineConfigIfNeeded(projectContentDir: URL) {
-        let fm = FileManager.default
-        let imageDir = projectContentDir.appendingPathComponent("image")
-        let configURL = imageDir.appendingPathComponent(".config.json")
-        guard fm.fileExists(atPath: imageDir.path),
-              !fm.fileExists(atPath: configURL.path),
-              let skelFiles = try? fm.contentsOfDirectory(at: imageDir, includingPropertiesForKeys: [.fileSizeKey])
-                .filter({ $0.pathExtension.lowercased() == "skel" }),
-              !skelFiles.isEmpty else { return }
-
-        let targetSkel = skelFiles.max { a, b in
-            let sizeA = (try? fm.attributesOfItem(atPath: a.path)[.size] as? Int) ?? 0
-            let sizeB = (try? fm.attributesOfItem(atPath: b.path)[.size] as? Int) ?? 0
-            return sizeA < sizeB
-        } ?? skelFiles[0]
-        let config: [String: String] = ["skeleton": targetSkel.lastPathComponent]
-        if let data = try? JSONSerialization.data(withJSONObject: config, options: []) {
-            try? data.write(to: configURL, options: .atomic)
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        isLoaded = true
-        runWebWallpaperBootstrap { [weak self] in
-            self?.beginSettlingFirstFrame()
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        finishLoad(success: false)
-    }
-
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        finishLoad(success: false)
-    }
-
-    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        isLoaded = false
-        finishLoad(success: false)
-    }
-
-    func pause() {
-        window?.orderOut(nil)
-        webView?.evaluateJavaScript("""
-            document.querySelectorAll('video, audio').forEach(m => m.pause());
-            document.querySelectorAll('*').forEach(el => {
-                const st = window.getComputedStyle(el);
-                if (st.animationName !== 'none') el.style.animationPlayState = 'paused';
-            });
-        """) { _, _ in }
-    }
-
-    func resume() {
-        guard isLoaded else { return }
-        window?.orderBack(nil)
-        webView?.evaluateJavaScript("""
-            document.querySelectorAll('video, audio').forEach(m => { if(m.paused) m.play().catch(()=>{}); });
-            document.querySelectorAll('*').forEach(el => {
-                if (el.style.animationPlayState === 'paused') el.style.animationPlayState = 'running';
-            });
-            window.dispatchEvent(new Event('resize'));
-        """) { _, _ in }
-    }
-
-    func stop() {
-        firstFrameSettleGeneration += 1
-        pendingCompletion = nil
-        stopInteractionBridge()
-        webView?.stopLoading()
-        webView?.navigationDelegate = nil
-        webView?.removeFromSuperview()
-        webView = nil
-        window?.close()
-        window = nil
-        isLoaded = false
-        currentScreenIndex = nil
-        if let dir = extractedPKGDir {
-            try? FileManager.default.removeItem(at: dir)
-            extractedPKGDir = nil
-        }
-        if let dir = mergedDependencyDir {
-            try? FileManager.default.removeItem(at: dir)
-            mergedDependencyDir = nil
-        }
-        injectedPropertiesJSON = nil
-    }
-
-    private func startInteractionBridge() {
-        stopInteractionBridge()
-        let mask: NSEvent.EventTypeMask = [
-            .mouseMoved,
-            .leftMouseDown,
-            .leftMouseUp,
-            .rightMouseDown,
-            .rightMouseUp,
-            .otherMouseDown,
-            .otherMouseUp,
-            .leftMouseDragged,
-            .rightMouseDragged,
-            .otherMouseDragged,
-            .scrollWheel,
-            .keyDown,
-            .keyUp
-        ]
-
-        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
-            guard let payload = Self.webInteractionEvent(from: event) else { return }
-            Task { @MainActor [weak self] in
-                self?.dispatchInteractionEvent(payload)
-            }
-        }) {
-            interactionMonitors.append(globalMonitor)
-        }
-
-        let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            guard let payload = Self.webInteractionEvent(from: event) else { return event }
-            Task { @MainActor [weak self] in
-                self?.dispatchInteractionEvent(payload)
-            }
-            return event
-        }
-        if let localMonitor {
-            interactionMonitors.append(localMonitor)
-        }
-    }
-
-    private func stopInteractionBridge() {
-        for monitor in interactionMonitors {
-            NSEvent.removeMonitor(monitor)
-        }
-        interactionMonitors.removeAll()
-    }
-
-    private static func webInteractionEvent(from event: NSEvent) -> WebInteractionEvent? {
-        let type: String
-        switch event.type {
-        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            type = "mousemove"
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            type = "mousedown"
-        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
-            type = "mouseup"
-        case .scrollWheel:
-            type = "wheel"
-        case .keyDown:
-            type = "keydown"
-        case .keyUp:
-            type = "keyup"
-        default:
-            return nil
-        }
-
-        let flags = event.modifierFlags
-        let key = event.charactersIgnoringModifiers ?? event.characters ?? ""
-        let location = NSEvent.mouseLocation
-        let isRightButton = event.type == .rightMouseDown || event.type == .rightMouseUp || event.type == .rightMouseDragged
-        let button = isRightButton ? 2 : (event.buttonNumber == 0 ? 0 : Int(event.buttonNumber))
-        let buttons: Int
-        switch event.type {
-        case .leftMouseDown, .leftMouseDragged:
-            buttons = 1
-        case .rightMouseDown, .rightMouseDragged:
-            buttons = 2
-        case .otherMouseDown, .otherMouseDragged:
-            buttons = 4
-        default:
-            buttons = 0
-        }
-
-        return WebInteractionEvent(
-            type: type,
-            screenX: Double(location.x),
-            screenY: Double(location.y),
-            button: button,
-            buttons: buttons,
-            clickCount: max(1, event.clickCount),
-            deltaX: Double(event.scrollingDeltaX),
-            deltaY: Double(event.scrollingDeltaY),
-            key: key,
-            code: Self.domCode(for: event),
-            keyCode: Self.domKeyCode(for: event),
-            ctrlKey: flags.contains(.control),
-            altKey: flags.contains(.option),
-            shiftKey: flags.contains(.shift),
-            metaKey: flags.contains(.command)
-        )
-    }
-
-    private static func domCode(for event: NSEvent) -> String {
-        if let scalar = (event.charactersIgnoringModifiers ?? event.characters)?.unicodeScalars.first {
-            if scalar.value >= 65 && scalar.value <= 90 {
-                return "Key\(Character(scalar))"
-            }
-            if scalar.value >= 97 && scalar.value <= 122,
-               let upper = UnicodeScalar(scalar.value - 32) {
-                return "Key\(Character(upper))"
-            }
-            if scalar.value >= 48 && scalar.value <= 57 {
-                return "Digit\(Character(scalar))"
-            }
-        }
-        switch event.keyCode {
-        case 36: return "Enter"
-        case 48: return "Tab"
-        case 49: return "Space"
-        case 51: return "Backspace"
-        case 53: return "Escape"
-        case 123: return "ArrowLeft"
-        case 124: return "ArrowRight"
-        case 125: return "ArrowDown"
-        case 126: return "ArrowUp"
-        default: return "Unidentified"
-        }
-    }
-
-    private static func domKeyCode(for event: NSEvent) -> Int {
-        switch event.keyCode {
-        case 36: return 13
-        case 48: return 9
-        case 49: return 32
-        case 51: return 8
-        case 53: return 27
-        case 123: return 37
-        case 124: return 39
-        case 125: return 40
-        case 126: return 38
-        default:
-            if let scalar = (event.charactersIgnoringModifiers ?? event.characters)?.unicodeScalars.first {
-                return Int(scalar.value)
-            }
-            return Int(event.keyCode)
-        }
-    }
-
-    private func dispatchInteractionEvent(_ event: WebInteractionEvent) {
-        guard let webView, let window else { return }
-        let frame = window.frame
-        guard frame.width > 0, frame.height > 0 else { return }
-
-        let screenPoint = CGPoint(x: CGFloat(event.screenX), y: CGFloat(event.screenY))
-        guard frame.contains(screenPoint) || event.type == "keyup" else { return }
-
-        let xInWindow = screenPoint.x - frame.minX
-        let yInWindow = screenPoint.y - frame.minY
-        let xScale = Double(webView.bounds.width / frame.width)
-        let yScale = Double(webView.bounds.height / frame.height)
-        let x = max(0, min(Double(webView.bounds.width), Double(xInWindow) * xScale))
-        let y = max(0, min(Double(webView.bounds.height), (Double(frame.height) - Double(yInWindow)) * yScale))
-
-        let payload: [String: Any] = [
-            "type": event.type,
-            "x": x,
-            "y": y,
-            "screenX": event.screenX,
-            "screenY": event.screenY,
-            "button": event.button,
-            "buttons": event.buttons,
-            "clickCount": event.clickCount,
-            "deltaX": event.deltaX,
-            "deltaY": event.deltaY,
-            "key": event.key,
-            "code": event.code,
-            "keyCode": event.keyCode,
-            "ctrlKey": event.ctrlKey,
-            "altKey": event.altKey,
-            "shiftKey": event.shiftKey,
-            "metaKey": event.metaKey
-        ]
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8) else { return }
-
-        webView.evaluateJavaScript("window.__waifuXDispatchInput && window.__waifuXDispatchInput(\(json));") { _, _ in }
-    }
-
-    private func runWebWallpaperBootstrap(completion: (() -> Void)? = nil) {
-        var propsBlock = ""
-        if let json = injectedPropertiesJSON,
-           let data = json.data(using: .utf8) {
-            let b64 = data.base64EncodedString()
-            propsBlock = """
-            try {
-              var props = JSON.parse(atob("\(b64)"));
-              if (window.wallpaperPropertyListener && typeof window.wallpaperPropertyListener.applyUserProperties === 'function') {
-                window.wallpaperPropertyListener.applyUserProperties(props);
-              }
-            } catch(e) {}
-            """
-        }
-        let source = """
-        (function(){
-          \(propsBlock)
-          try {
-            if (window.wallpaperPropertyListener && typeof window.wallpaperPropertyListener.applyGeneralProperties === 'function') {
-              window.wallpaperPropertyListener.applyGeneralProperties({ fps: { value: 30, type: 'slider' } });
-            }
-            document.documentElement.style.cssText = 'width:100%;height:100%;margin:0;padding:0;background:transparent;overflow:hidden;';
-            document.body.style.setProperty('background-image', 'none', 'important');
-            document.body.style.setProperty('width', '100%');
-            document.body.style.setProperty('height', '100%');
-            document.body.style.setProperty('margin', '0');
-            document.body.style.setProperty('overflow', 'hidden');
-            var pc = document.getElementById('player-container');
-            if (pc) { pc.style.width = '100%'; pc.style.height = '100%'; }
-            window.dispatchEvent(new Event('resize'));
-          } catch(e) {}
-          return true;
-        })();
-        """
-        webView?.evaluateJavaScript(source) { _, _ in
-            DispatchQueue.main.async { completion?() }
-        }
-    }
-
-    private func beginSettlingFirstFrame() {
-        firstFrameSettleGeneration += 1
-        let generation = firstFrameSettleGeneration
-        let start = Date()
-
-        final class SettleState {
-            var lastThumb: [UInt8]?
-            var stablePasses = 0
-            var lastImage: NSImage?
-        }
-        let state = SettleState()
-
-        func scheduleStep() {
-            guard generation == firstFrameSettleGeneration, webView != nil else { return }
-            let elapsed = Date().timeIntervalSince(start)
-            if elapsed >= FirstFramePolicy.maxElapsed {
-                finishFirstFrame(state.lastImage)
-                return
-            }
-
-            snapshotWebView { [weak self] image in
-                guard let self, generation == self.firstFrameSettleGeneration else { return }
-                guard let image else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + FirstFramePolicy.pollInterval) { scheduleStep() }
-                    return
-                }
-                state.lastImage = image
-                let thumb = self.grayscaleThumb(from: image, dimension: FirstFramePolicy.thumbDimension)
-                defer { if let thumb { state.lastThumb = thumb } }
-                if let prev = state.lastThumb, let curr = thumb {
-                    let diff = Self.meanAbsDiffGrayscale(prev, curr)
-                    if diff < FirstFramePolicy.diffThreshold, elapsed >= FirstFramePolicy.minElapsed {
-                        state.stablePasses += 1
-                    } else {
-                        state.stablePasses = 0
-                    }
-                    if state.stablePasses >= FirstFramePolicy.stablePassesRequired {
-                        finishFirstFrame(image)
-                        return
-                    }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + FirstFramePolicy.pollInterval) { scheduleStep() }
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { scheduleStep() }
-    }
-
-    private func snapshotWebView(completion: @escaping (NSImage?) -> Void) {
-        guard let webView else {
-            completion(nil)
-            return
-        }
-        if #available(macOS 11.0, *) {
-            let config = WKSnapshotConfiguration()
-            config.rect = CGRect(origin: .zero, size: webView.bounds.size)
-            webView.takeSnapshot(with: config) { image, _ in
-                DispatchQueue.main.async { completion(image) }
-            }
-        } else {
-            completion(nil)
-        }
-    }
-
-    private func finishFirstFrame(_ image: NSImage?) {
-        let success = image.flatMap { saveImage($0) } ?? false
-        if success {
-            applyCaptureAsDesktopWallpaper()
-        }
-        finishLoad(success: success || isLoaded)
-    }
-
-    private func finishLoad(success: Bool) {
-        guard let completion = pendingCompletion else { return }
-        pendingCompletion = nil
-        completion(success)
-    }
-
-    private func grayscaleThumb(from image: NSImage, dimension: Int) -> [UInt8]? {
-        guard dimension > 0 else { return nil }
-        let target = NSSize(width: dimension, height: dimension)
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: dimension,
-            pixelsHigh: dimension,
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 0
-        ) else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSColor.clear.set()
-        NSRect(origin: .zero, size: target).fill()
-        image.draw(
-            in: NSRect(origin: .zero, size: target),
-            from: NSRect(origin: .zero, size: image.size),
-            operation: .copy,
-            fraction: 1.0,
-            respectFlipped: false,
-            hints: [.interpolation: NSImageInterpolation.low]
-        )
-        NSGraphicsContext.restoreGraphicsState()
-        var out = [UInt8](repeating: 0, count: dimension * dimension)
-        for y in 0..<dimension {
-            for x in 0..<dimension {
-                guard let c = rep.colorAt(x: x, y: y) else { continue }
-                let g = UInt8(min(255, max(0, (c.redComponent * 0.299 + c.greenComponent * 0.587 + c.blueComponent * 0.114) * 255.0)))
-                out[y * dimension + x] = g
-            }
-        }
-        return out
-    }
-
-    private static func meanAbsDiffGrayscale(_ a: [UInt8], _ b: [UInt8]) -> Double {
-        guard a.count == b.count, !a.isEmpty else { return 1 }
-        var sum = 0
-        for i in 0..<a.count {
-            sum += abs(Int(a[i]) - Int(b[i]))
-        }
-        return Double(sum) / Double(a.count * 255)
-    }
-
-    private func saveImage(_ image: NSImage) -> Bool {
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else { return false }
-        do {
-            try png.write(to: URL(fileURLWithPath: webPrimaryCapturePath), options: .atomic)
-            return true
-        } catch {
-            print("[WebRendererBridge] 首帧保存失败: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    private func applyCaptureAsDesktopWallpaper() {
-        guard FileManager.default.fileExists(atPath: webPrimaryCapturePath) else { return }
-
-        // 始终递增 slot，保证下次截帧不会覆盖同一个文件（锁屏关闭后需要拿到新鲜截图）
-        desktopCaptureSlot = 1 - desktopCaptureSlot
-
-        if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
-            print("[WebRendererBridge] 🔒 动态锁屏已启用，跳过 Web 捕获静态桌面写入")
-            return
-        }
-        guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
-            print("[WebRendererBridge] 🧊 系统壁纸同步已关闭，跳过 Web 捕获静态桌面写入")
-            return
-        }
-
-        let dstPath = desktopCaptureSlot == 0 ? webDeskCapturePath0 : webDeskCapturePath1
-        let src = URL(fileURLWithPath: webPrimaryCapturePath)
-        let dst = URL(fileURLWithPath: dstPath)
-        try? FileManager.default.removeItem(at: dst)
-        guard (try? FileManager.default.copyItem(at: src, to: dst)) != nil else { return }
-
-        let orderedScreens = NSScreen.screensOrderedForDisplay
-        let screens: [NSScreen]
-        if let idx = currentScreenIndex, orderedScreens.indices.contains(idx) {
-            screens = [orderedScreens[idx]]
-        } else {
-            screens = orderedScreens
-        }
-        for screen in screens {
-            try? NSWorkspace.shared.setDesktopImageURLForAllSpaces(dst, for: screen, options: [
-                .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
-                .allowClipping: true
-            ])
-            DesktopWallpaperSyncManager.shared.registerWallpaperSet(dst, for: screen)
-        }
     }
 }
 

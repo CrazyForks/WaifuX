@@ -169,6 +169,8 @@ class SettingsViewModel: ObservableObject {
             UserDefaults.standard.set(dynamicLockScreenEnabled, forKey: "dynamic_lock_screen_enabled")
             // 开启时立即同步显示器实例到共享容器，使系统锁屏设置能发现 WaifuX 实例
             if dynamicLockScreenEnabled {
+                // 动态锁屏接管后，停止保留旧静态桌面同步登记，避免后续 Space 切换重放 poster。
+                DesktopWallpaperSyncManager.shared.clearRegistration()
                 LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
             }
         }

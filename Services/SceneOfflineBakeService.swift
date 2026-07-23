@@ -88,6 +88,32 @@ func regenerateSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> 
     return displayURL
 }
 
+/// 确保已有烘焙 MP4 具备高清 poster；命中缓存时不重复解码视频。
+@discardableResult
+@MainActor
+func ensureSceneBakePosterAndNotify(itemID: String, videoURL: URL) async -> URL? {
+    guard SceneOfflineBakeService.isUsableBakedVideo(at: videoURL),
+          let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+              forLocalVideo: videoURL,
+              itemID: itemID
+          ) else {
+        return nil
+    }
+
+    let processor = DownsamplingImageProcessor(size: CGSize(width: 512, height: 512))
+    try? await ImageCache.default.removeImage(forKey: posterURL.cacheKey)
+    try? await ImageCache.default.removeImage(
+        forKey: posterURL.cacheKey,
+        processorIdentifier: processor.identifier
+    )
+    NotificationCenter.default.post(
+        name: .sceneOfflineBakeThumbnailDidUpdate,
+        object: itemID,
+        userInfo: ["thumbnailURL": posterURL]
+    )
+    return posterURL
+}
+
 /// Enough information to rebuild an unfinished Scene/Web bake after relaunch.
 struct PersistentOfflineBakeJob: Codable, Hashable, Sendable, Identifiable {
     enum Kind: String, Codable, Hashable, Sendable {
@@ -522,7 +548,6 @@ enum SceneOfflineBakeService {
     /// 关闭自动烘焙时，缓存未命中会改为临时烘焙 1 秒，仅保留抽出的 poster。
     @MainActor
     static func scheduleRealtimeCompanionBake(path: String, targetScreens: [NSScreen]? = nil, reason: String) {
-        guard #available(macOS 26.0, *) else { return }
         let autoBakeEnabled = UserDefaults.standard.bool(forKey: "auto_bake_scene")
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: URL(fileURLWithPath: path))
         guard SceneBakeEligibilityAnalyzer.sceneContentRootIfEligibleForAnalysis(localFileURL: contentRoot) != nil else {
@@ -601,7 +626,6 @@ enum SceneOfflineBakeService {
     ///
     /// 临时 MP4 仅用于给 `AVAssetImageGenerator` 提供抽帧源：不会进入 SceneBakes、
     /// 不写 `sceneBakeArtifact`、不持久化任务，也不会进入视频优化队列。
-    @available(macOS 26.0, *)
     @MainActor
     private static func generateTransientRealtimePoster(
         contentRoot: URL,
@@ -739,7 +763,6 @@ enum SceneOfflineBakeService {
         print("[SceneOfflineBake] transient poster finished (\(reason)): \(posterURL.path)")
     }
 
-    @available(macOS 26.0, *)
     @MainActor
     private static func syncRealtimeBakeToLockScreen(
         artifact: SceneBakeArtifact,
@@ -750,7 +773,7 @@ enum SceneOfflineBakeService {
         let videoURL = URL(fileURLWithPath: artifact.videoPath)
         guard isUsableBakedVideo(at: videoURL) else { return }
 
-        if VideoWallpaperManager.shared.isLockScreenEnabled {
+        if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             // 动态锁屏开启：推送烘焙视频到锁屏实例
             guard !displayIDs.isEmpty else { return }
             let videoID = itemID ?? URL(fileURLWithPath: artifact.videoPath).deletingPathExtension().lastPathComponent
@@ -775,14 +798,13 @@ enum SceneOfflineBakeService {
     /// 将已抽出的静帧推送到当前可用的静态承载层。
     ///
     /// 动态锁屏开启时使用静态图片源，避免短暂的 1 秒 MP4 被删除后仍被扩展引用。
-    @available(macOS 26.0, *)
     @MainActor
     private static func syncRealtimeStaticPoster(
         _ posterURL: URL,
         displayIDs: [UInt32],
         reason: String
     ) async {
-        if VideoWallpaperManager.shared.isLockScreenEnabled {
+        if #available(macOS 26.0, *), VideoWallpaperManager.shared.isLockScreenEnabled {
             guard !displayIDs.isEmpty else {
                 print("[SceneOfflineBake] static poster skipped (\(reason)): no lock-screen display IDs")
                 return

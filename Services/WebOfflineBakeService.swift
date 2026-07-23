@@ -8,18 +8,20 @@ import Foundation
 /// The renderer runs in a dedicated CLI process with an offscreen WKWebView, so
 /// baking neither replaces nor pauses the user's currently applied wallpaper.
 ///
-/// Cache naming matches scene bake:
-/// `{analysisId}_{renderer}_{w}x{h}_{fps}fps_{duration}s[_props-{hash}].mp4`
+/// Cache naming matches scene bake, but Web exports use a renderer-selected frame rate:
+/// `{analysisId}_{renderer}_{w}x{h}_autofps-v3_{duration}s[_props-{hash}].mp4`
 enum WebOfflineBakeService {
     private struct VideoInspection {
         let duration: TimeInterval
         let width: Int
         let height: Int
+        let fps: Int
     }
 
-    private static var maximumBakeFPS: Double {
-        Double(NSScreen.screens.map(\.maxRefreshRate).max() ?? 60)
-    }
+    /// Web projects own their animation cadence. The CLI records their actual compositor
+    /// stream, so this deliberately ignores `scene_bake_fps`.
+    private static let automaticFrameRateCacheLabel = "autofps-v3"
+    private static let automaticFrameRateJobSentinel: Int32 = 0
 
     static func isWebProject(at localURL: URL) -> Bool {
         let root = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: localURL)
@@ -52,7 +54,6 @@ enum WebOfflineBakeService {
     static func bake(
         record: MediaDownloadRecord,
         durationSeconds: Double? = nil,
-        fps: Int32? = nil,
         resumingJobID: UUID? = nil,
         progress: (@MainActor (Double) -> Void)? = nil
     ) async throws -> SceneBakeArtifact {
@@ -65,7 +66,6 @@ enum WebOfflineBakeService {
         }
 
         let analysisId = stableAnalysisId(for: contentRoot)
-        let effectiveFPS = resolvedFPS(requested: fps)
         let effectiveDuration = resolvedDuration(requested: durationSeconds)
         let targetSize = mainDisplayPixelSize()
         let effectiveUserProperties = await MainActor.run {
@@ -79,7 +79,7 @@ enum WebOfflineBakeService {
                 analysisId: analysisId,
                 width: targetSize.width,
                 height: targetSize.height,
-                fps: Int(effectiveFPS),
+                frameRateLabel: automaticFrameRateCacheLabel,
                 duration: effectiveDuration,
                 userPropertiesJSON: effectiveUserProperties,
                 displayTitle: displayTitle
@@ -106,7 +106,7 @@ enum WebOfflineBakeService {
             contentRoot: contentRoot,
             outputURL: cacheURL,
             durationSeconds: effectiveDuration,
-            fps: effectiveFPS
+            fps: automaticFrameRateJobSentinel
         )
         let enqueueResult = await MainActor.run {
             SceneOfflineBakeProgressTracker.shared.enqueue(
@@ -138,21 +138,6 @@ enum WebOfflineBakeService {
                 withIntermediateDirectories: true
             )
 
-            // 兼容旧命名（无 title 段）
-            let legacyCacheURL = await MainActor.run {
-                makeCacheURL(
-                    root: DownloadPathManager.shared.sceneBakesFolderURL,
-                    itemID: record.id,
-                    analysisId: analysisId,
-                    width: targetSize.width,
-                    height: targetSize.height,
-                    fps: Int(effectiveFPS),
-                    duration: effectiveDuration,
-                    userPropertiesJSON: effectiveUserProperties,
-                    displayTitle: nil
-                )
-            }
-            var resolvedCacheURL = cacheURL
             if let inspection = await inspectVideo(
                 at: cacheURL,
                 expectedWidth: targetSize.width,
@@ -164,49 +149,7 @@ enum WebOfflineBakeService {
                     videoPath: cacheURL.path,
                     width: inspection.width,
                     height: inspection.height,
-                    fps: Int(effectiveFPS),
-                    durationSeconds: inspection.duration,
-                    bakedAt: bakedAt,
-                    renderer: .wallpaperEngineWeb
-                )
-                try await complete(
-                    artifact: artifact,
-                    record: record,
-                    contentRoot: contentRoot,
-                    jobID: jobID,
-                    progress: trackedProgress
-                )
-                await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
-                return artifact
-            }
-            if legacyCacheURL.path != cacheURL.path,
-               let inspection = await inspectVideo(
-                at: legacyCacheURL,
-                expectedWidth: targetSize.width,
-                expectedHeight: targetSize.height
-               ) {
-                try? FileManager.default.removeItem(at: cacheURL)
-                do {
-                    try FileManager.default.moveItem(at: legacyCacheURL, to: cacheURL)
-                    let legacyOpt = URL(fileURLWithPath: legacyCacheURL.path + ".waifux-optimization.json")
-                    let newOpt = URL(fileURLWithPath: cacheURL.path + ".waifux-optimization.json")
-                    if FileManager.default.fileExists(atPath: legacyOpt.path) {
-                        try? FileManager.default.removeItem(at: newOpt)
-                        try? FileManager.default.moveItem(at: legacyOpt, to: newOpt)
-                    }
-                    resolvedCacheURL = cacheURL
-                    print("[WebOfflineBake] renamed legacy bake cache → \(cacheURL.lastPathComponent)")
-                } catch {
-                    resolvedCacheURL = legacyCacheURL
-                    print("[WebOfflineBake] legacy bake rename failed, using old path: \(error.localizedDescription)")
-                }
-                let bakedAt = fileCreationDate(for: resolvedCacheURL) ?? .now
-                let artifact = SceneBakeArtifact(
-                    analysisId: analysisId,
-                    videoPath: resolvedCacheURL.path,
-                    width: inspection.width,
-                    height: inspection.height,
-                    fps: Int(effectiveFPS),
+                    fps: inspection.fps,
                     durationSeconds: inspection.duration,
                     bakedAt: bakedAt,
                     renderer: .wallpaperEngineWeb
@@ -231,7 +174,7 @@ enum WebOfflineBakeService {
                 "bake",
                 contentRoot.path,
                 "--size", "\(targetSize.width)x\(targetSize.height)",
-                "--fps", String(effectiveFPS),
+                "--fps", "auto",
                 "--duration", String(Int(effectiveDuration.rounded())),
                 "--out", temporaryURL.path
             ]
@@ -261,7 +204,7 @@ enum WebOfflineBakeService {
                 videoPath: cacheURL.path,
                 width: inspection.width,
                 height: inspection.height,
-                fps: Int(effectiveFPS),
+                fps: inspection.fps,
                 durationSeconds: inspection.duration,
                 bakedAt: .now,
                 renderer: .wallpaperEngineWeb
@@ -305,7 +248,6 @@ enum WebOfflineBakeService {
         return try await bake(
             record: record,
             durationSeconds: job.durationSeconds,
-            fps: Int32(job.fps),
             resumingJobID: job.id
         )
     }
@@ -373,12 +315,6 @@ enum WebOfflineBakeService {
         }
     }
 
-    private static func resolvedFPS(requested: Int32?) -> Int32 {
-        let saved = UserDefaults.standard.double(forKey: "scene_bake_fps")
-        let value = requested.map(Double.init) ?? (saved >= 15 ? saved : 30)
-        return Int32(min(max(value, 15), maximumBakeFPS))
-    }
-
     private static func resolvedDuration(requested: Double?) -> Double {
         if let requested {
             return min(max(requested, 5), 60)
@@ -396,15 +332,15 @@ enum WebOfflineBakeService {
         return (width - (width % 2), height - (height % 2))
     }
 
-    /// Web 仍保留 `wallpaperEngineWeb` 段以区分 Scene 成片；Scene 已去掉 `wallpaperWgpu`。
-    /// 格式：`{UUID}[_title]_wallpaperEngineWeb_{WxH}_{fps}fps_{duration}s[_props].mp4`
+    /// Web 仍保留 `wallpaperEngineWeb` 段以区分 Scene 成片；帧率标签用于缓存失效。
+    /// 格式：`{UUID}[_title]_wallpaperEngineWeb_{WxH}_{frameRateLabel}_{duration}s[_props].mp4`
     private static func makeCacheURL(
         root: URL,
         itemID: String,
         analysisId: UUID,
         width: Int,
         height: Int,
-        fps: Int,
+        frameRateLabel: String,
         duration: Double,
         userPropertiesJSON: String?,
         displayTitle: String? = nil
@@ -414,7 +350,7 @@ enum WebOfflineBakeService {
         let propertiesSuffix = propertiesCacheKey(for: userPropertiesJSON).map { "_props-\($0)" } ?? ""
         let titleSegment = SceneOfflineBakeService.sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
         let name =
-            "\(analysisId.uuidString)\(titleSegment)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
+            "\(analysisId.uuidString)\(titleSegment)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(frameRateLabel)_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
         return dir.appendingPathComponent(name)
     }
 
@@ -458,6 +394,10 @@ enum WebOfflineBakeService {
         let transformed = naturalSize.applying(transform)
         let width = Int(abs(transformed.width).rounded())
         let height = Int(abs(transformed.height).rounded())
+        let nominalFrameRate = (try? await track.load(.nominalFrameRate)) ?? 0
+        let fps = nominalFrameRate.isFinite && nominalFrameRate >= 1
+            ? Int(nominalFrameRate.rounded())
+            : 60
         let assetDuration = (try? await asset.load(.duration)) ?? .zero
         let duration = CMTimeGetSeconds(assetDuration)
         guard width == expectedWidth,
@@ -465,7 +405,7 @@ enum WebOfflineBakeService {
               duration > 0.2 else {
             return nil
         }
-        return VideoInspection(duration: duration, width: width, height: height)
+        return VideoInspection(duration: duration, width: width, height: height, fps: fps)
     }
 
     private static func runCLI(

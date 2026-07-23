@@ -153,6 +153,11 @@ final class DesktopWallpaperSyncManager {
             print("[DesktopWallpaperSyncManager] 🧊 系统壁纸同步已关闭，跳过注册")
             return
         }
+        if #available(macOS 26.0, *),
+           VideoWallpaperManager.shared.isLockScreenEnabled {
+            print("[DesktopWallpaperSyncManager] 🔒 动态锁屏已启用，跳过静态桌面壁纸注册")
+            return
+        }
 
         let targetScreens: [NSScreen]
         if let screen = screen {

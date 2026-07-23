@@ -555,14 +555,6 @@ final class StatusBarController: NSObject {
                 screenHasWallpaper = videoWallpaperManager.hasActiveWallpaper(on: screen)
             }
 
-            // 该屏壁纸是否为 web（web 暂不支持可视区域调节）
-            let isWebWallpaper: Bool
-            if isGlobalDisplaySyncEnabled {
-                isWebWallpaper = NSScreen.screens.contains { weBridge.isWebWallpaperOn(screen: $0) }
-            } else {
-                isWebWallpaper = weBridge.isWebWallpaperOn(screen: screen)
-            }
-
             // 暂停状态
             let isScreenPaused: Bool
             if isGlobalDisplaySyncEnabled {
@@ -661,10 +653,6 @@ final class StatusBarController: NSObject {
                 keyEquivalent: "")
             cropAdjustItem.target = self
             cropAdjustItem.representedObject = screen
-            if isWebWallpaper {
-                cropAdjustItem.isEnabled = false
-                cropAdjustItem.toolTip = t("statusbar.cropUnsupported")
-            }
             screenSubMenu.addItem(cropAdjustItem)
 
             // 比例子菜单
@@ -679,14 +667,9 @@ final class StatusBarController: NSObject {
                 item.target = self
                 item.representedObject = CropAspectPayload(screen: screen, preset: preset)
                 item.state = (currentSettings.aspectPreset == preset) ? .on : .off
-                if isWebWallpaper { item.isEnabled = false }
                 aspectMenu.addItem(item)
             }
             aspectItem.submenu = aspectMenu
-            if isWebWallpaper {
-                aspectItem.isEnabled = false
-                aspectItem.toolTip = t("statusbar.cropUnsupported")
-            }
             screenSubMenu.addItem(aspectItem)
 
             // 重置
@@ -696,10 +679,6 @@ final class StatusBarController: NSObject {
                 keyEquivalent: "")
             resetItem.target = self
             resetItem.representedObject = screen
-            if isWebWallpaper {
-                resetItem.isEnabled = false
-                resetItem.toolTip = t("statusbar.cropUnsupported")
-            }
             screenSubMenu.addItem(resetItem)
 
             wallpaperControlItems.append(screenMenuItem)

@@ -196,6 +196,7 @@ struct MyLibraryContentView: View {
 
     // 触摸板双指右滑返回（文件夹内）
     @State private var folderBackSwipeRegistration: UUID?
+    @State private var folderBackKeyboardMonitor: Any?
 
     // 新建文件夹
     @State private var showNewFolderSheet = false
@@ -390,9 +391,11 @@ struct MyLibraryContentView: View {
             }
             // 注册触摸板双指右滑返回手势（文件夹内）。
             registerFolderBackSwipeHandler()
+            registerFolderBackKeyboardHandler()
         }
         .onDisappear {
             unregisterFolderBackSwipeHandler()
+            unregisterFolderBackKeyboardHandler()
         }
         .onReceive(animeFavoriteStore.$favorites) { _ in
             Task {
@@ -944,6 +947,60 @@ struct MyLibraryContentView: View {
         }
         currentWallpaperFolderID = wallpaperFolderStack.popLast()
         updateWallpaperItems()
+    }
+
+    /// Esc navigates up one folder level. Keep the focused search field's own Esc behavior intact.
+    private func handleEscapeKey() -> Bool {
+        guard isVisible, !isLibrarySearchFocused else { return false }
+
+        switch selectedContentType {
+        case .wallpaper:
+            guard currentWallpaperFolderID != nil else { return false }
+            popWallpaperFolder()
+            return true
+        case .video:
+            guard currentMediaFolderID != nil else { return false }
+            popMediaFolder()
+            return true
+        case .anime:
+            return false
+        }
+    }
+
+    private var isPresentingLibraryModal: Bool {
+        showNewFolderSheet ||
+        renamingFolder != nil ||
+        showAddToFolderSheet ||
+        showRedownloadMediaFolderConfirm ||
+        showRedownloadMediaItemConfirm ||
+        pendingWallpaperDeletion != nil ||
+        pendingMediaDeletion != nil ||
+        showSyncProfileSheet ||
+        showSyncSelectionSheet ||
+        showSteamLoginSheet ||
+        NSApp.modalWindow != nil
+    }
+
+    private func registerFolderBackKeyboardHandler() {
+        guard folderBackKeyboardMonitor == nil else { return }
+
+        folderBackKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard NSApp.isActive,
+                  event.window?.isKeyWindow == true,
+                  event.keyCode == 53,
+                  event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                  !self.isPresentingLibraryModal else {
+                return event
+            }
+
+            return self.handleEscapeKey() ? nil : event
+        }
+    }
+
+    private func unregisterFolderBackKeyboardHandler() {
+        guard let folderBackKeyboardMonitor else { return }
+        NSEvent.removeMonitor(folderBackKeyboardMonitor)
+        self.folderBackKeyboardMonitor = nil
     }
 
     // MARK: - 触摸板双指右滑返回

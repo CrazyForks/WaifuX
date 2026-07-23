@@ -1,6 +1,11 @@
 import Foundation
 import Combine
 
+extension Notification.Name {
+    /// 本地媒体高清静帧已生成。`object` 为 `String`（itemID），`userInfo["posterURL"]` 为 `URL`。
+    static let localMediaPosterDidUpdate = Notification.Name("localMediaPosterDidUpdate")
+}
+
 private func mergedByStableID<Record>(
     primary: [Record],
     fallback: [Record],
@@ -218,8 +223,10 @@ final class MediaLibraryService: ObservableObject {
     ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
     func recordDownload(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
         let targetFolderID = Self.normalizedFolderID(folderID)
+        var persistedItem = item
         if let index = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
-            downloadRecords[index].item = item
+            persistedItem = item.preservingPersistedMetadata(from: downloadRecords[index].item)
+            downloadRecords[index].item = persistedItem
             downloadRecords[index].localFilePath = localFileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
@@ -230,7 +237,7 @@ final class MediaLibraryService: ObservableObject {
         } else {
             downloadRecords.insert(
                 MediaDownloadRecord(
-                    item: item,
+                    item: persistedItem,
                     localFilePath: localFileURL.path,
                     folderID: targetFolderID
                 ),
@@ -247,10 +254,10 @@ final class MediaLibraryService: ObservableObject {
         }
         syncDlIndex()
         downloadRecords = Array(downloadRecords)
-        upsert(item)
+        upsert(persistedItem)
 
-        SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: item.id, localFileURL: localFileURL)
-        WebOfflineBakeService.scheduleAutoBakeAfterDownload(itemID: item.id, localFileURL: localFileURL)
+        SceneBakeEligibilityAnalyzer.scheduleAnalysisIfSceneProject(itemID: persistedItem.id, localFileURL: localFileURL)
+        WebOfflineBakeService.scheduleAutoBakeAfterDownload(itemID: persistedItem.id, localFileURL: localFileURL)
 
         // 视频文件下载完成后异步生成**高清** poster（锁屏/桌面用，最大 3840×2160）；
         // 列表 800×600 小图由 UI 侧按需 generateThumbnail，二者隔离。
@@ -263,10 +270,16 @@ final class MediaLibraryService: ObservableObject {
             MediaItem.resolveLocalVideoFile(from: localFileURL)
         }
         if let videoFileURL {
-            let title = item.title
-            let pageURL = item.pageURL
+            let title = persistedItem.title
+            let pageURL = persistedItem.pageURL
             Task { @MainActor in
-                _ = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL)
+                if let posterURL = await VideoThumbnailCache.shared.posterJPEGFileURL(forLocalVideo: videoFileURL) {
+                    NotificationCenter.default.post(
+                        name: .localMediaPosterDidUpdate,
+                        object: persistedItem.id,
+                        userInfo: ["posterURL": posterURL]
+                    )
+                }
                 VideoOptimizationQueueService.shared.registerDownloadedSource(
                     videoURL: videoFileURL,
                     sourceURL: pageURL
@@ -599,7 +612,7 @@ final class MediaLibraryService: ObservableObject {
             bakedAt: bakedAt,
             renderer: renderer
         )
-        attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: false)
+        attachSceneBakeArtifact(itemID: itemID, artifact: artifact, regeneratePoster: true)
     }
 
     /// 标准 bake 命名优先于杂散 mp4。Web 认 wallpaperEngineWeb / web_v*；Scene 认新格式与历史 wallpaperWgpu。
@@ -704,20 +717,32 @@ final class MediaLibraryService: ObservableObject {
     }
 
     func upsert(_ item: MediaItem) {
+        var persistedItem = item
+
         if let favoriteIndex = favoriteRecords.firstIndex(where: { $0.item.id == item.id }) {
-            favoriteRecords[favoriteIndex].item = item
+            persistedItem = persistedItem.preservingPersistedMetadata(from: favoriteRecords[favoriteIndex].item)
+        }
+        if let recentIndex = recentItems.firstIndex(where: { $0.id == item.id }) {
+            persistedItem = persistedItem.preservingPersistedMetadata(from: recentItems[recentIndex])
+        }
+        if let downloadIndex = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
+            persistedItem = persistedItem.preservingPersistedMetadata(from: downloadRecords[downloadIndex].item)
+        }
+
+        if let favoriteIndex = favoriteRecords.firstIndex(where: { $0.item.id == item.id }) {
+            favoriteRecords[favoriteIndex].item = persistedItem
             saveFavToCache(favoriteRecords[favoriteIndex])
             syncFavIndex()
             favoriteRecords = Array(favoriteRecords)
         }
 
         if let recentIndex = recentItems.firstIndex(where: { $0.id == item.id }) {
-            recentItems[recentIndex] = item
+            recentItems[recentIndex] = persistedItem
             persistRecents()
         }
 
         if let downloadIndex = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
-            downloadRecords[downloadIndex].item = item
+            downloadRecords[downloadIndex].item = persistedItem
             saveDlToCache(downloadRecords[downloadIndex])
             syncDlIndex()
             downloadRecords = Array(downloadRecords)
