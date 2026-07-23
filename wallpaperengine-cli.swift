@@ -157,7 +157,7 @@ private func waifuXGrayscaleThumb(from cgImage: CGImage, dimension: Int) -> [UIn
 
 // MARK: - IPC
 private enum IPCCommand: String, Codable {
-    case set, pause, resume, stop, applyProperties, audioControl, audioData
+    case set, pause, resume, stop, capture, applyProperties, audioControl, audioData
     /// Host → daemon：系统 Now Playing 元数据（低频）
     case mediaUpdate, mediaThumbnail
     /// Host → daemon：Apple Music 歌词（整首 / 当前行）；Web 只收 JSON
@@ -2480,6 +2480,15 @@ private final class DesktopWallpaperManager {
         screenStates[screen]?.isPaused = false
     }
 
+    /// Capture the currently rendered WebView without changing playback or desktop state.
+    func captureWallpaperFrame(screen: Int = 0, completion: @escaping (Bool) -> Void) {
+        guard let state = screenStates[screen], state.isRunning, state.isWebMode else {
+            completion(false)
+            return
+        }
+        WebRendererBridge.shared.captureFrame(screen: screen, completion: completion)
+    }
+
     @discardableResult
     func applyWebWallpaperProperties(_ jsonString: String, screen: Int = 0) -> Bool {
         guard let state = screenStates[screen], state.isRunning, state.isWebMode else { return false }
@@ -3085,6 +3094,15 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                         DesktopWallpaperManager.shared.stopAllWallpapers()
                     }
                     sendResponse("OK")
+                case .capture:
+                    let screen = msg.screen ?? 0
+                    DesktopWallpaperManager.shared.captureWallpaperFrame(screen: screen) { success in
+                        if success {
+                            sendResponse("OK")
+                        } else {
+                            sendResponse("ERROR:当前屏幕没有可捕获的 Web 壁纸画面")
+                        }
+                    }
                 case .applyProperties:
                     if let propertiesJSON = msg.propertiesJSON {
                         let applied = DesktopWallpaperManager.shared.applyWebWallpaperProperties(propertiesJSON, screen: msg.screen ?? 0)
@@ -3189,7 +3207,7 @@ struct WallpaperEngineCLI {
         case "bake":
             runOfflineBake(arguments: Array(remainingArgs.dropFirst()))
 
-        case "set", "pause", "resume", "stop", "stop-screen", "exit", "apply-properties":
+        case "set", "pause", "resume", "stop", "stop-screen", "exit", "capture", "apply-properties":
             if command == "stop" || command == "exit" {
                 stopDaemonIfRunning()
                 exit(0)
@@ -3263,6 +3281,15 @@ struct WallpaperEngineCLI {
                     resumeScreen = screenIdx
                 }
                 msg = IPCMessage(command: .resume, path: nil, screen: resumeScreen)
+            case "capture":
+                let captureArgs = Array(remainingArgs.dropFirst())
+                guard captureArgs.count <= 1,
+                      let captureScreen = captureArgs.first.flatMap(Int.init),
+                      captureScreen >= 0 else {
+                    print("Usage: wallpaperengine-cli capture <screen_index>")
+                    exit(1)
+                }
+                msg = IPCMessage(command: .capture, path: nil, screen: captureScreen)
             case "stop-screen":
                 let stopArgs = Array(remainingArgs.dropFirst())
                 guard stopArgs.count == 1,
@@ -3284,7 +3311,7 @@ struct WallpaperEngineCLI {
                 exit(1)
             }
 
-            let responseTimeout: TimeInterval = command == "set" ? 35.0 : 5.0
+            let responseTimeout: TimeInterval = command == "set" ? 35.0 : (command == "capture" ? 10.0 : 5.0)
             if let err = Client.sendAndWaitForOK(msg, timeout: responseTimeout) {
                 if err == "OK" {
                     // success
@@ -3479,6 +3506,7 @@ struct WallpaperEngineCLI {
           bake <path> --size WxH --fps N --duration S --out <path>
                                      Export a Web wallpaper as dense H.264 MP4
                                      (virtual content clock; no wall-clock frame drops)
+          capture <screen_index>    Capture the current Web wallpaper frame
           pause                       Pause wallpaper
           resume                      Resume wallpaper
           stop-screen <screen_index>  Stop wallpaper on one display

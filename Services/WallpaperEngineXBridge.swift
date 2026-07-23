@@ -1703,6 +1703,8 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
         }
 
+        scheduleWebPosterCapture(path: path, targetScreens: screens)
+
         let captureURLs = await captureWebFallbackFramesForLockScreenIfNeeded(targetScreens: targetScreens)
         await syncWebStaticFramesToLockScreenIfNeeded(imageURLs: captureURLs, targetScreens: targetScreens)
 
@@ -1715,6 +1717,71 @@ final class WallpaperEngineXBridge: ObservableObject {
                 volume: isMuted ? nil : volume,
                 screen: screenIndex
             )
+        }
+    }
+
+    /// Web renderer 可直接通过 WKWebView 截图，无需生成临时 MP4。
+    ///
+    /// 仅在没有可播放离线烘焙视频时生成详情页 poster；有成片时详情页继续优先播放成片。
+    private func scheduleWebPosterCapture(path: String, targetScreens: [NSScreen]) {
+        let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: URL(fileURLWithPath: path)
+        )
+        let record = webPosterRecord(for: contentRoot)
+        guard SceneOfflineBakeService.usableArtifact(from: record) == nil else {
+            return
+        }
+
+        let cacheItemID = record?.item.id
+            ?? SceneOfflineBakeService.stableOrphanCacheItemID(contentRootPath: contentRoot.path)
+        guard let posterScreen = targetScreens.first(where: { $0 == NSScreen.main }) ?? targetScreens.first,
+              let screenIndex = Self.legacyCLIScreenIndex(for: posterScreen) else {
+            return
+        }
+
+        Task(priority: .utility) { @MainActor in
+            do {
+                let status = try await Self.runLegacyCLIClientCommand(["capture", String(screenIndex)])
+                guard status == 0 else {
+                    print("[WallpaperEngineXBridge] Web poster capture command failed screen=\(screenIndex) exit=\(status)")
+                    return
+                }
+
+                let captureURL = URL(fileURLWithPath: legacyCLICapturePath(for: screenIndex))
+                guard FileManager.default.fileExists(atPath: captureURL.path),
+                      let posterURL = await VideoThumbnailCache.shared.wallpaperEnginePosterJPEGFileURL(
+                          forImageFile: captureURL,
+                          itemID: cacheItemID,
+                          forceRegenerate: true
+                      ) else {
+                    print("[WallpaperEngineXBridge] Web poster capture output missing screen=\(screenIndex)")
+                    return
+                }
+
+                if let itemID = record?.item.id {
+                    NotificationCenter.default.post(
+                        name: .sceneOfflineBakeThumbnailDidUpdate,
+                        object: itemID,
+                        userInfo: ["thumbnailURL": posterURL]
+                    )
+                }
+                print("[WallpaperEngineXBridge] Web poster cached screen=\(screenIndex): \(posterURL.path)")
+            } catch {
+                print("[WallpaperEngineXBridge] Web poster capture failed screen=\(screenIndex): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func webPosterRecord(for contentRoot: URL) -> MediaDownloadRecord? {
+        let library = MediaLibraryService.shared
+        if let exact = library.downloadRecord(forLocalFilePath: contentRoot.path) {
+            return exact
+        }
+        return library.downloadedItems.first { record in
+            record.hasSameLocalContent(as: contentRoot)
+                || WorkshopService.resolveWallpaperEngineProjectRoot(
+                    startingAt: URL(fileURLWithPath: record.localFilePath)
+                ).path == contentRoot.path
         }
     }
 

@@ -160,6 +160,13 @@ struct MediaDetailSheet: View {
         return url
     }
 
+    /// 烘焙服务会在任务完全收尾前写回 MP4 成品。详情背景必须等 UI 的烘焙态结束，
+    /// 否则会过早销毁静态封面、切到尚未准备好的 AVPlayer，导致黑屏加载。
+    private var backgroundSceneBakeVideoURL: URL? {
+        guard !isBakingScene else { return nil }
+        return cachedSceneBakeVideoURL
+    }
+
     private var isCurrentDownloadedWebProject: Bool {
         guard let record = currentDownloadRecord else { return false }
         return WebOfflineBakeService.isWebProject(at: record.localFileURL)
@@ -458,6 +465,15 @@ struct MediaDetailSheet: View {
                 bakeProgress = 0
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeThumbnailDidUpdate)) { notification in
+            guard let itemID = notification.object as? String,
+                  itemID == resolvedItem.id,
+                  cachedSceneBakeVideoURL == nil else {
+                return
+            }
+            isMediaLoaded = false
+            mediaBackgroundEpoch &+= 1
+        }
         .onDisappear {
             isVisible = false
             ForegroundPrefetchManager.shared.stop(namespace: prefetchNamespace)
@@ -470,13 +486,27 @@ struct MediaDetailSheet: View {
         }
     }
 
-    /// 详情静态底图：与「未下载」进详情一致，优先 catalog/远程缩略图，不强制 bake 抽帧。
+    /// 无循环烘焙视频时，优先复用 Scene 高清抽帧，再回退 catalog/远程缩略图。
     private var heroImageURL: URL {
-        // 无可用烘焙循环视频时：严格走未下载预览链路（thumbnail → poster → initial）
-        if cachedSceneBakeVideoURL == nil {
+        // 临时 1 秒烘焙不会写入 artifact，但会留下稳定的 item 级 JPEG poster。
+        // 详情页应优先展示它，避免退化到 Workshop 的低分辨率 preview.*。
+        if backgroundSceneBakeVideoURL == nil {
+            if let posterURL = cachedSceneBakePosterURL {
+                return posterURL
+            }
             return undownloadedStylePreviewImageURL
         }
         return resolvedItem.coverImageURL
+    }
+
+    /// 仅在不存在可播放的烘焙视频时读取静帧缓存。
+    /// 烘焙正在收尾时继续沿用原有预览图，避免旧 poster 抢占即将切入的循环视频。
+    private var cachedSceneBakePosterURL: URL? {
+        guard cachedSceneBakeVideoURL == nil,
+              let itemID = currentDownloadRecord?.item.id else {
+            return nil
+        }
+        return VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: itemID)
     }
 
     /// 列表/探索未下载时常用的封面：thumbnail 优先，再 poster，最后 initialItem。
@@ -506,8 +536,8 @@ struct MediaDetailSheet: View {
 
     private var previewVideoURL: URL? {
         // 仅在有可用烘焙 MP4 时用循环视频作详情背景
-        if let cachedSceneBakeVideoURL {
-            return cachedSceneBakeVideoURL
+        if let backgroundSceneBakeVideoURL {
+            return backgroundSceneBakeVideoURL
         }
 
         // Scene / Web 可烘焙项：没有烘焙产物时不再播任何视频背景，

@@ -177,9 +177,10 @@ final class ImportService: ObservableObject {
                 skippedImports: totalSkipped
             )
 
-            // 第三步：完成后触发扫描刷新
+            // 导入过程已同步写入持久化壁纸/媒体库；发布变更即可刷新
+            // 所有消费方，不需要再枚举外置下载目录。
             if result.allSucceeded || result.hasFailures || totalSkipped > 0 {
-                await LocalWallpaperScanner.shared.forceRescan()
+                NotificationCenter.default.post(name: .managedLibraryContentsChanged, object: nil)
                 // 发送变更通知，让 ViewModel 知道内容变了
                 NotificationCenter.default.post(name: .wallpaperDataSourceChanged, object: nil)
                 print("[ImportService] Import completed: \(result.message)")

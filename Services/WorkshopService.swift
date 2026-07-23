@@ -510,7 +510,6 @@ class WorkshopService: ObservableObject {
             case .video: requiredTags.append("Video")
             case .scene: requiredTags.append("Scene")
             case .web: requiredTags.append("Web")
-            case .application: requiredTags.append("Application")
             default: break
             }
         }

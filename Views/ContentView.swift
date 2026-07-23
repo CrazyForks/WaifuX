@@ -249,7 +249,7 @@ struct ContentView: View {
     // 全局 ViewModel：由 AppDelegate 持有，通过 init 参数注入；
     // 用普通 let 持有而非 @StateObject —— ContentView 本身不响应这 3 个 ViewModel 的
     // @Published 变化（body 内只命令式调用其方法，不读响应式属性），从而不会因
-    // 例如 LocalWallpaperScanner 完成时 WallpaperViewModel 的多次 @Published 更新
+    // 例如下载库记录变更时 WallpaperViewModel 的多次 @Published 更新
     // 而连锁触发整个 ContentView body 及下游 tab 子视图的反复重算。
     // 子视图（5 个 TabPage）继续以 @ObservedObject 接收这些 ViewModel —— 该响应链是必要的。
     let viewModel: WallpaperViewModel

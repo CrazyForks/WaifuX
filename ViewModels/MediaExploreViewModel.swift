@@ -30,7 +30,6 @@ final class MediaExploreViewModel: ObservableObject {
     private let videoWallpaperManager = VideoWallpaperManager.shared
     private let downloadTaskService = DownloadTaskService.shared
     private let downloadPathManager = DownloadPathManager.shared
-    private let localScanner = LocalWallpaperScanner.shared
     let workshopService = WorkshopService.shared
     private let workshopSourceManager = WorkshopSourceManager.shared
     private let dynamicWallpaperService = DynamicWallpaperService.shared
@@ -167,10 +166,9 @@ final class MediaExploreViewModel: ObservableObject {
         }
 
         // MARK: - 优化后的 Service 数据变更监听：保护主线程免受 I/O 阻塞
-        Publishers.Merge3(
+        Publishers.Merge(
             mediaLibrary.$favoriteRecords.map { _ in () },
-            mediaLibrary.$downloadRecords.map { _ in () },
-            localScanner.$scanRevision.map { _ in () }
+            mediaLibrary.$downloadRecords.map { _ in () }
         )
         // 1. ⚙️ 不要在主线程接收原始通知，直接在当前的后台或默认管道处理
         .sink { [weak self] _ in
@@ -308,18 +306,13 @@ final class MediaExploreViewModel: ObservableObject {
         mediaLibrary.downloadedItems
     }
 
-    /// 本地扫描的媒体（用户手动复制到目录的文件）
-    var localMediaItems: [LocalMediaItem] {
-        localScanner.getLocalMedia()
-    }
-
-    /// 所有可显示的本地媒体（下载记录 + 扫描到的本地文件）
-    /// 用于库页面显示。现在返回内存缓存，避免重复文件 I/O。
+    /// 所有可显示的本地媒体。导入和下载都会同步创建持久化记录，
+    /// 因此库页面只读该记录缓存，不再枚举下载目录。
     var allLocalMedia: [UnifiedLocalMedia] {
         cachedAllLocalMedia
     }
 
-    /// 重建本地媒体缓存（在 downloadRecords / favoriteRecords / scanRevision 变化时自动调用）
+    /// 重建本地媒体缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalMediaCacheRebuild(delayNanoseconds: UInt64) {
         rebuildLocalMediaCacheTask?.cancel()
         rebuildLocalMediaCacheTask = Task { @MainActor [weak self] in
@@ -331,18 +324,12 @@ final class MediaExploreViewModel: ObservableObject {
         }
     }
 
-    /// 主线程只取快照和发布结果；路径标准化、文件存在性检查和排序放到后台，避免上千条本地数据卡住 UI。
+    /// 从持久化下载记录重建库页面缓存。此路径不访问文件系统。
     private func rebuildLocalMediaCache() async {
         let downloads = mediaLibrary.downloadedItems
-        let locals = localScanner.getLocalMedia()
-        let downloadedIDs = mediaLibrary.downloadIDSetForRebuild
-
-        let localMediaPairs = locals.map { item in
-            (item, item.toMediaItem())
-        }
 
         let result = await Task.detached(priority: .utility) {
-            var result: [UnifiedLocalMedia] = downloads.map { record in
+            downloads.map { record in
                 UnifiedLocalMedia(
                     id: record.item.id,
                     mediaItem: record.item,
@@ -352,30 +339,9 @@ final class MediaExploreViewModel: ObservableObject {
                     isLocalFile: false
                 )
             }
-
-            let downloadedPaths = Set(downloads.map {
-                (($0.localFilePath as NSString).standardizingPath as String)
-            })
-
-            for (item, mediaItem) in localMediaPairs {
-                guard !downloadedIDs.contains(item.id) else { continue }
-                let itemPath = (item.fileURL.path as NSString).standardizingPath as String
-                guard !downloadedPaths.contains(itemPath) else { continue }
-                guard FileManager.default.fileExists(atPath: item.fileURL.path) else { continue }
-                result.append(UnifiedLocalMedia(
-                    id: item.id,
-                    mediaItem: mediaItem,
-                    localItem: item,
-                    downloadRecord: nil,
-                    fileURL: item.fileURL,
-                    isLocalFile: true
-                ))
-            }
-
-            return result.sorted { a, b in
-                let dateA = a.downloadRecord?.downloadedAt ?? a.localItem?.createdAt.flatMap { parseISO8601Media($0) } ?? Date.distantPast
-                let dateB = b.downloadRecord?.downloadedAt ?? b.localItem?.createdAt.flatMap { parseISO8601Media($0) } ?? Date.distantPast
-                return dateA > dateB
+            .sorted {
+                ($0.downloadRecord?.downloadedAt ?? .distantPast)
+                    > ($1.downloadRecord?.downloadedAt ?? .distantPast)
             }
         }.value
 
@@ -840,7 +806,6 @@ final class MediaExploreViewModel: ObservableObject {
                     case .scene: return .scene
                     case .video: return .video
                     case .web: return .web
-                    case .application: return .application
                     case .all: return nil
                     }
                 }()
@@ -1867,7 +1832,6 @@ final class MediaExploreViewModel: ObservableObject {
             case .scene: return .scene
             case .video: return .video
             case .web: return .web
-            case .application: return .application
             case .all: return nil
             }
         }()
@@ -1919,7 +1883,6 @@ final class MediaExploreViewModel: ObservableObject {
             case .scene: return .scene
             case .video: return .video
             case .web: return .web
-            case .application: return .application
             case .all: return nil
             }
         }()

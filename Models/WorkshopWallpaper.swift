@@ -32,7 +32,6 @@ struct WorkshopWallpaper: Identifiable, Codable {
         case video = "video"
         case scene = "scene"           // Unity WebGL
         case web = "web"               // HTML/JS
-        case application = "application"
         case image = "image"
         case pkg = "pkg"               // 打包格式
         case unknown = "unknown"
@@ -282,8 +281,6 @@ extension WorkshopWallpaper {
             return .web
         } else if lowerTags.contains("scene") {
             return .scene
-        } else if lowerTags.contains("application") {
-            return .application
         } else if lowerTags.contains("image") || lowerTags.contains("wallpaper") {
             // 默认 Wallpaper Engine 的大多数 "Wallpaper" 标签实际上是视频/动态壁纸
             return .video

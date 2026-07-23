@@ -281,7 +281,7 @@ final class VideoThumbnailCache {
         return await generatePosterJPEGFile(from: fileURL, outputURL: outURL)
     }
 
-    /// 为 Scene 烘焙 MP4 生成稳定封面。`forceRegenerate` 为 true 时覆盖同一个 item 的旧抽帧。
+    /// 为 Wallpaper Engine 烘焙 MP4 生成稳定封面。`forceRegenerate` 为 true 时覆盖同一个 item 的旧抽帧。
     func sceneBakePosterJPEGFileURL(
         forLocalVideo videoURL: URL,
         itemID: String,
@@ -300,6 +300,31 @@ final class VideoThumbnailCache {
 
         try? fileManager.removeItem(at: outURL)
         return await generatePosterJPEGFile(from: URL(fileURLWithPath: pathKey), outputURL: outURL)
+    }
+
+    /// 将 Wallpaper Engine Web renderer 的直接截图写入稳定 poster 缓存。
+    ///
+    /// 截图源通常在 `/tmp`，不能直接作为详情页或锁屏长期引用；这里编码为与离线烘焙
+    /// 共用的 item 级 JPEG poster，不创建任何 MP4。
+    func wallpaperEnginePosterJPEGFileURL(
+        forImageFile imageURL: URL,
+        itemID: String,
+        forceRegenerate: Bool = false
+    ) async -> URL? {
+        guard imageURL.isFileURL,
+              fileManager.fileExists(atPath: imageURL.path) else {
+            return nil
+        }
+
+        let outURL = sceneBakePosterCacheURL(itemID: itemID)
+        if !forceRegenerate,
+           let existing = cachedSceneBakePosterFileURLIfExists(itemID: itemID) {
+            scheduleCropExistingPosterIfNeeded(existing)
+            return existing
+        }
+
+        try? fileManager.removeItem(at: outURL)
+        return await generatePosterJPEGFile(fromImageFile: imageURL, outputURL: outURL)
     }
 
     /// 删除 Scene 烘焙稳定封面，并顺手清掉旧的 path-based poster，避免历史重复缓存继续被列表命中。
@@ -416,6 +441,46 @@ final class VideoThumbnailCache {
 
                 print("[VideoThumbnailCache] All poster frame attempts exhausted for \(videoURL.lastPathComponent)")
                 return nil
+            }.value
+        }
+    }
+
+    private func generatePosterJPEGFile(fromImageFile imageURL: URL, outputURL: URL) async -> URL? {
+        await VideoPosterGenerationCoordinator.shared.generate(key: outputURL.path) {
+            await Task.detached(priority: .userInitiated) {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                guard let source = CGImageSourceCreateWithURL(imageURL as CFURL, nil) else {
+                    print("[VideoThumbnailCache] Failed to open Web capture: \(imageURL.lastPathComponent)")
+                    return nil
+                }
+
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 3840,
+                    kCGImageSourceShouldCacheImmediately: false
+                ]
+                guard let image = CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    options as CFDictionary
+                ), let jpeg = Self.encodeJPEG(image, quality: 0.90) else {
+                    print("[VideoThumbnailCache] Failed to encode Web capture: \(imageURL.lastPathComponent)")
+                    return nil
+                }
+
+                do {
+                    try jpeg.write(to: outputURL, options: .atomic)
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+                    print("[VideoThumbnailCache] Web capture poster in \(String(format: "%.0f", elapsed))ms → \(outputURL.lastPathComponent)")
+                    Task.detached(priority: .utility) {
+                        await Self.cropExistingPosterIfNeeded(outputURL)
+                    }
+                    return outputURL
+                } catch {
+                    print("[VideoThumbnailCache] Failed to write Web capture poster: \(error)")
+                    return nil
+                }
             }.value
         }
     }

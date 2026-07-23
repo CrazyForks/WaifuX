@@ -141,7 +141,6 @@ class WallpaperViewModel: ObservableObject {
     private let wallpaperLibrary = WallpaperLibraryService.shared
     private let downloadTaskService = DownloadTaskService.shared
     private let downloadPathManager = DownloadPathManager.shared
-    private let localScanner = LocalWallpaperScanner.shared
     private var cancellables = Set<AnyCancellable>()
 
     /// 收藏/下载库变更时递增；与 `cachedAllLocalWallpapers` 一起驱动依赖 `isFavorite` / 列表的视图刷新。
@@ -279,10 +278,9 @@ class WallpaperViewModel: ObservableObject {
         }
 
         // MARK: - 优化后的 Service 数据变更监听：保护主线程免受 I/O 阻塞
-        Publishers.Merge3(
+        Publishers.Merge(
             wallpaperLibrary.$favoriteRecords.map { _ in () },
-            wallpaperLibrary.$downloadRecords.map { _ in () },
-            localScanner.$scanRevision.map { _ in () }
+            wallpaperLibrary.$downloadRecords.map { _ in () }
         )
         // 1. ⚙️ 不要在主线程接收原始通知，直接在当前的后台或默认管道处理
         .sink { [weak self] _ in
@@ -379,18 +377,13 @@ class WallpaperViewModel: ObservableObject {
         wallpaperLibrary.downloadedWallpapers
     }
 
-    /// 本地扫描的壁纸（用户手动复制到目录的文件）
-    var localWallpapers: [LocalWallpaperItem] {
-        localScanner.getLocalWallpapers()
-    }
-
-    /// 所有可显示的本地壁纸（下载记录 + 扫描到的本地文件）
-    /// 用于库页面显示。现在返回内存缓存，避免重复文件 I/O。
+    /// 所有可显示的本地壁纸。导入和下载都会同步创建持久化记录，
+    /// 因此库页面只读该记录缓存，不再枚举下载目录。
     var allLocalWallpapers: [UnifiedLocalWallpaper] {
         cachedAllLocalWallpapers
     }
 
-    /// 重建本地壁纸缓存（在 downloadRecords / favoriteRecords / scanRevision 变化时自动调用）
+    /// 重建本地壁纸缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalWallpaperCacheRebuild(delayNanoseconds: UInt64) {
         rebuildLocalWallpaperCacheTask?.cancel()
         rebuildLocalWallpaperCacheTask = Task { @MainActor [weak self] in
@@ -402,14 +395,12 @@ class WallpaperViewModel: ObservableObject {
         }
     }
 
-    /// 主线程只取快照和发布结果；路径标准化、文件存在性检查和排序放到后台，避免上千条本地数据卡住 UI。
+    /// 从持久化下载记录重建库页面缓存。此路径不访问文件系统。
     private func rebuildLocalWallpaperCache() async {
         let downloads = wallpaperLibrary.downloadedWallpapers
-        let locals = localScanner.getLocalWallpapers()
-        let downloadedIDs = wallpaperLibrary.downloadIDSetForRebuild
 
         let result = await Task.detached(priority: .utility) {
-            var result: [UnifiedLocalWallpaper] = downloads.map { record in
+            downloads.map { record in
                 UnifiedLocalWallpaper(
                     id: record.wallpaper.id,
                     wallpaper: record.wallpaper,
@@ -419,30 +410,9 @@ class WallpaperViewModel: ObservableObject {
                     isLocalFile: false
                 )
             }
-
-            let downloadedPaths = Set(downloads.map {
-                (($0.localFilePath as NSString).standardizingPath as String)
-            })
-
-            for item in locals {
-                guard !downloadedIDs.contains(item.id) else { continue }
-                let itemPath = (item.fileURL.path as NSString).standardizingPath as String
-                guard !downloadedPaths.contains(itemPath) else { continue }
-                guard FileManager.default.fileExists(atPath: item.fileURL.path) else { continue }
-                result.append(UnifiedLocalWallpaper(
-                    id: item.id,
-                    wallpaper: item.toWallpaper(),
-                    localItem: item,
-                    downloadRecord: nil,
-                    fileURL: item.fileURL,
-                    isLocalFile: true
-                ))
-            }
-
-            return result.sorted { a, b in
-                let dateA = a.downloadRecord?.downloadedAt ?? a.localItem?.createdAt.flatMap { parseISO8601($0) } ?? Date.distantPast
-                let dateB = b.downloadRecord?.downloadedAt ?? b.localItem?.createdAt.flatMap { parseISO8601($0) } ?? Date.distantPast
-                return dateA > dateB
+            .sorted {
+                ($0.downloadRecord?.downloadedAt ?? .distantPast)
+                    > ($1.downloadRecord?.downloadedAt ?? .distantPast)
             }
         }.value
 
@@ -510,8 +480,8 @@ class WallpaperViewModel: ObservableObject {
         wallpaperLibrary.removeWallpaperDownloads(withIDs: ids)
     }
 
-    /// 详情页删除本地壁纸：同时覆盖下载记录与纯本地扫描文件。
-    /// 纯 `local_*` 扫描项没有 download record，仅靠 `removeWallpaperDownloads` 会删不掉。
+    /// 详情页删除本地壁纸。正常导入内容始终存在下载记录；
+    /// 路径兜底保留给旧版本遗留数据。
     @discardableResult
     func deleteLocalWallpaper(_ wallpaper: Wallpaper) -> Bool {
         var idsToRemove = Set<String>()
@@ -557,7 +527,7 @@ class WallpaperViewModel: ObservableObject {
             wallpaperLibrary.removeWallpaperDownloads(withIDs: idsToRemove)
         }
 
-        // 4) 兜底删物理文件（纯 local_* 扫描项 / 记录删完文件仍在）
+        // 4) 兜底删物理文件（旧版本记录删完文件仍在）
         var deletedFile = false
         let derivedWallpapersDirectory = DownloadPathManager.shared.derivedWallpapersFolderURL
         for path in pathsToDelete {
@@ -580,10 +550,7 @@ class WallpaperViewModel: ObservableObject {
 
         let didSomething = !idsToRemove.isEmpty || deletedFile
         if didSomething {
-            Task { @MainActor in
-                await LocalWallpaperScanner.shared.forceRescan()
-                scheduleLocalWallpaperCacheRebuild(delayNanoseconds: 0)
-            }
+            scheduleLocalWallpaperCacheRebuild(delayNanoseconds: 0)
         }
         return didSomething
     }

@@ -519,6 +519,7 @@ enum SceneOfflineBakeService {
 
     /// 实时渲染桌面后配套生成离线 MP4。
     /// 该 MP4 不会反向替换桌面实时渲染；如果动态锁屏开启，则烘焙完成后推送给对应显示器实例。
+    /// 关闭自动烘焙时，缓存未命中会改为临时烘焙 1 秒，仅保留抽出的 poster。
     @MainActor
     static func scheduleRealtimeCompanionBake(path: String, targetScreens: [NSScreen]? = nil, reason: String) {
         guard #available(macOS 26.0, *) else { return }
@@ -544,7 +545,12 @@ enum SceneOfflineBakeService {
                 }
 
                 guard autoBakeEnabled else {
-                    print("[SceneOfflineBake] realtime companion bake skipped (\(reason)): cache miss and auto_bake_scene is disabled")
+                    await generateTransientRealtimePoster(
+                        contentRoot: contentRoot,
+                        record: record,
+                        displayIDs: displayIDs,
+                        reason: reason
+                    )
                     return
                 }
 
@@ -591,6 +597,148 @@ enum SceneOfflineBakeService {
         }
     }
 
+    /// 自动烘焙关闭时的 Scene 静帧兜底。
+    ///
+    /// 临时 MP4 仅用于给 `AVAssetImageGenerator` 提供抽帧源：不会进入 SceneBakes、
+    /// 不写 `sceneBakeArtifact`、不持久化任务，也不会进入视频优化队列。
+    @available(macOS 26.0, *)
+    @MainActor
+    private static func generateTransientRealtimePoster(
+        contentRoot: URL,
+        record: MediaDownloadRecord?,
+        displayIDs: [UInt32],
+        reason: String
+    ) async {
+        let videoManager = VideoWallpaperManager.shared
+        guard videoManager.isLockScreenEnabled || videoManager.isSystemWallpaperSyncEnabled else {
+            print("[SceneOfflineBake] transient poster skipped (\(reason)): no static poster target is enabled")
+            return
+        }
+
+        let itemID = record?.item.id
+        let posterCacheID = itemID ?? stableOrphanCacheItemID(contentRootPath: contentRoot.path)
+        if let cachedPoster = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: posterCacheID) {
+            await syncRealtimeStaticPoster(
+                cachedPoster,
+                displayIDs: displayIDs,
+                reason: "\(reason), cached transient poster"
+            )
+            return
+        }
+
+        let eligibility: SceneBakeEligibilitySnapshot
+        if let existing = record?.sceneBakeEligibility,
+           SceneBakeEligibilityAnalyzer.isSameContentRoot(existing.contentRootPath, contentRoot.path) {
+            eligibility = existing
+        } else {
+            guard SystemMemoryPressure.hasRoomForSceneEligibilityAnalysis() else {
+                print("[SceneOfflineBake] transient poster skipped (\(reason)): insufficient memory for analysis")
+                return
+            }
+            do {
+                eligibility = try await Task.detached(priority: .utility) {
+                    try SceneBakeEligibilityAnalyzer.analyze(
+                        contentRoot: contentRoot,
+                        intent: .desktopLoop,
+                        strict: false
+                    )
+                }.value
+            } catch {
+                print("[SceneOfflineBake] transient poster analysis failed (\(reason)): \(error.localizedDescription)")
+                return
+            }
+
+            if let itemID {
+                MediaLibraryService.shared.attachSceneBakeEligibility(
+                    itemID: itemID,
+                    snapshot: eligibility,
+                    triggerAutoBake: false
+                )
+            }
+        }
+
+        let displaySize = mainDisplayPixelSize()
+        let width = max(64, (displaySize.width / 2) * 2)
+        let height = max(64, (displaySize.height / 2) * 2)
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WaifuX", isDirectory: true)
+            .appendingPathComponent("TransientScenePosters", isDirectory: true)
+        let temporaryVideoURL = temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).mp4")
+        let temporarySidecarURL = temporaryVideoURL
+            .deletingPathExtension()
+            .appendingPathExtension("json")
+        do {
+            try FileManager.default.createDirectory(
+                at: temporaryDirectory,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            print("[SceneOfflineBake] transient poster setup failed (\(reason)): \(error.localizedDescription)")
+            return
+        }
+        defer {
+            try? FileManager.default.removeItem(at: temporaryVideoURL)
+            try? FileManager.default.removeItem(at: temporarySidecarURL)
+        }
+
+        let jobID = UUID()
+        await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
+        let artifact: SceneBakeArtifact
+        do {
+            // 在等待 GPU 队列期间，另一个同场景请求可能已经写好了 poster。
+            if let cachedPoster = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: posterCacheID) {
+                await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
+                await syncRealtimeStaticPoster(
+                    cachedPoster,
+                    displayIDs: displayIDs,
+                    reason: "\(reason), shared transient poster"
+                )
+                return
+            }
+
+            let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
+                userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(for: contentRoot.path),
+                for: contentRoot.path
+            )
+            artifact = try await bakeWithWallpaperWgpu(
+                contentRoot: contentRoot,
+                outURL: temporaryVideoURL,
+                eligibility: eligibility,
+                width: width,
+                height: height,
+                fps: min(resolvedBakeFPS(requestedFPS: nil), 30),
+                durationSeconds: 1,
+                userProperties: userProperties,
+                progress: nil
+            )
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
+        } catch {
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
+            print("[SceneOfflineBake] transient poster bake failed (\(reason)): \(error.localizedDescription)")
+            return
+        }
+
+        guard isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)),
+              let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
+                  forLocalVideo: URL(fileURLWithPath: artifact.videoPath),
+                  itemID: posterCacheID
+              ) else {
+            print("[SceneOfflineBake] transient poster extraction failed (\(reason)): \(temporaryVideoURL.path)")
+            return
+        }
+
+        if let itemID {
+            NotificationCenter.default.post(
+                name: .sceneOfflineBakeThumbnailDidUpdate,
+                object: itemID,
+                userInfo: ["thumbnailURL": posterURL]
+            )
+        }
+        await syncRealtimeStaticPoster(posterURL, displayIDs: displayIDs, reason: "\(reason), temporary 1s bake")
+        print("[SceneOfflineBake] transient poster finished (\(reason)): \(posterURL.path)")
+    }
+
     @available(macOS 26.0, *)
     @MainActor
     private static func syncRealtimeBakeToLockScreen(
@@ -613,12 +761,6 @@ enum SceneOfflineBakeService {
             )
             print("[SceneOfflineBake] realtime companion bake synced lock screen (\(reason)): display=\(displayIDs) video=\(videoID)")
         } else {
-            // 动态锁屏关闭：仅在系统壁纸同步开启时写桌面 poster。
-            // 关闭同步时桌面由实时 scene 渲染，不得偷偷改系统壁纸。
-            guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
-                print("[SceneOfflineBake] 🧊 系统壁纸同步已关闭，跳过 companion bake 桌面 poster (\(reason))")
-                return
-            }
             guard let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(
                 forLocalVideo: videoURL,
                 fallbackPosterURL: nil
@@ -626,44 +768,76 @@ enum SceneOfflineBakeService {
                 print("[SceneOfflineBake] realtime companion bake could not generate desktop poster (\(reason)): \(videoURL.path)")
                 return
             }
-            let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
-                .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
-                .allowClipping: true
-            ]
-            // 只把 poster 推给目标显示器，绝不能写回 NSScreen.screens 全集 ——
-            // 否则用户只在屏幕 N 上启用场景实时渲染时，烘焙完成会把静帧 poster
-            // 顺手贴到其它屏的桌面（其它屏没有 wallpaper-wgpu 叠层挡着，直接可见）。
-            // 入参 displayIDs 已由调用方按 targetScreens 精确指定，这里照单全收。
-            let targetScreens: [NSScreen]
-            if displayIDs.isEmpty {
-                // 调用方未指定 → 退回历史行为（兼容无显示器信息的路径）
-                targetScreens = NSScreen.screens
-            } else {
-                let idSet = Set(displayIDs)
-                targetScreens = NSScreen.screens.filter { screen in
-                    guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
-                        return false
-                    }
-                    return idSet.contains(n.uint32Value)
-                }
-            }
-            guard !targetScreens.isEmpty else {
-                print("[SceneOfflineBake] realtime companion bake has no matching display for desktop poster (\(reason)): display=\(displayIDs)")
+            await syncRealtimeStaticPoster(posterURL, displayIDs: displayIDs, reason: reason)
+        }
+    }
+
+    /// 将已抽出的静帧推送到当前可用的静态承载层。
+    ///
+    /// 动态锁屏开启时使用静态图片源，避免短暂的 1 秒 MP4 被删除后仍被扩展引用。
+    @available(macOS 26.0, *)
+    @MainActor
+    private static func syncRealtimeStaticPoster(
+        _ posterURL: URL,
+        displayIDs: [UInt32],
+        reason: String
+    ) async {
+        if VideoWallpaperManager.shared.isLockScreenEnabled {
+            guard !displayIDs.isEmpty else {
+                print("[SceneOfflineBake] static poster skipped (\(reason)): no lock-screen display IDs")
                 return
             }
-
-            var appliedScreens = 0
-            for screen in targetScreens {
-                do {
-                    try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
-                    DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
-                    appliedScreens += 1
-                } catch {
-                    print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
-                }
+            do {
+                try await LockScreenWallpaperService.shared.cacheStaticImageSource(
+                    imageURL: posterURL,
+                    displayIDs: displayIDs
+                )
+                print("[SceneOfflineBake] set lock-screen static poster (\(reason)): display=\(displayIDs) poster=\(posterURL.path)")
+            } catch {
+                print("[SceneOfflineBake] failed to set lock-screen static poster (\(reason)): \(error.localizedDescription)")
             }
-            print("[SceneOfflineBake] realtime companion bake set desktop poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
+            return
         }
+
+        // 系统壁纸同步关闭时桌面由实时 scene 渲染，不得偷偷改系统壁纸。
+        guard VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled else {
+            print("[SceneOfflineBake] system wallpaper sync disabled; skipped static poster (\(reason))")
+            return
+        }
+
+        let targetScreens: [NSScreen]
+        if displayIDs.isEmpty {
+            // 调用方未指定 → 退回历史行为（兼容无显示器信息的路径）
+            targetScreens = NSScreen.screens
+        } else {
+            let idSet = Set(displayIDs)
+            targetScreens = NSScreen.screens.filter { screen in
+                guard let n = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                    return false
+                }
+                return idSet.contains(n.uint32Value)
+            }
+        }
+        guard !targetScreens.isEmpty else {
+            print("[SceneOfflineBake] static poster has no matching display (\(reason)): display=\(displayIDs)")
+            return
+        }
+
+        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+            .allowClipping: true
+        ]
+        var appliedScreens = 0
+        for screen in targetScreens {
+            do {
+                try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
+                appliedScreens += 1
+            } catch {
+                print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
+            }
+        }
+        print("[SceneOfflineBake] set desktop static poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
     }
 
     @MainActor

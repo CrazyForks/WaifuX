@@ -1,13 +1,26 @@
 import Foundation
 
-/// 本地壁纸扫描服务
-/// 自动检测用户复制到下载目录的壁纸和媒体文件，生成基本元数据
+/// 本地壁纸扫描服务。
+/// 正常运行不主动扫描；仅由“修复数据”和一次性升级迁移枚举受管目录。
 @MainActor
 final class LocalWallpaperScanner {
     static let shared = LocalWallpaperScanner()
+
+    struct ReindexResult {
+        let indexedWallpapers: Int
+        let indexedMedia: Int
+
+        var totalIndexed: Int {
+            indexedWallpapers + indexedMedia
+        }
+    }
     
     private let downloadPathManager = DownloadPathManager.shared
     private let fileManager = FileManager.default
+    /// 旧版本仅把扫描结果留在内存。首次升级到持久化下载记录模型时，
+    /// 用该迁移标记确保用户现有内容会被补登一次，而不是每次启动都扫盘。
+    private static let persistentIndexMigrationKey = "managedLibraryPersistentIndexMigration"
+    private static let persistentIndexMigrationVersion = 1
     
     // 缓存扫描结果
     private var scannedWallpapers: [LocalWallpaperItem] = []
@@ -42,6 +55,83 @@ final class LocalWallpaperScanner {
     /// 强制重新扫描本地文件
     func forceRescan() async {
         await scanLocalFiles(force: true)
+    }
+
+    /// 在持久化下载记录模型首次启用时执行一次索引迁移。
+    /// 该方法只能在 AppDelegate 的延迟恢复阶段调用，此时 UserDefaults 已可安全访问。
+    /// 如果受管根目录暂时不可用（例如外置盘未挂载），不写完成标记，下次启动会重试。
+    func rebuildManagedLibraryIndexForUpgradeIfNeeded() async -> ReindexResult? {
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: Self.persistentIndexMigrationKey)
+            < Self.persistentIndexMigrationVersion else {
+            return nil
+        }
+
+        let rootURL = downloadPathManager.rootFolderURL.standardizedFileURL
+        guard fileManager.fileExists(atPath: rootURL.path),
+              fileManager.isReadableFile(atPath: rootURL.path) else {
+            print("[LocalWallpaperScanner] Deferred persistent-index migration: managed root unavailable")
+            return nil
+        }
+
+        let result = await rebuildManagedLibraryIndex()
+        defaults.set(
+            Self.persistentIndexMigrationVersion,
+            forKey: Self.persistentIndexMigrationKey
+        )
+        print(
+            "[LocalWallpaperScanner] Persistent-index migration completed: "
+                + "indexed=\(result.totalIndexed)"
+        )
+        return result
+    }
+
+    /// 显式扫描受管目录，并把没有持久化下载记录的文件补建为本地记录。
+    /// 仅供“修复数据”和升级迁移调用，不能作为常规列表或轮播的数据源。
+    func rebuildManagedLibraryIndex() async -> ReindexResult {
+        await scanLocalFiles(force: true)
+
+        var knownWallpaperPaths = Set(
+            WallpaperLibraryService.shared.downloadedWallpapers.map(Self.standardizedPath)
+        )
+        var knownMediaPaths = Set(
+            MediaLibraryService.shared.downloadedItems.map(Self.standardizedPath)
+        )
+        var indexedWallpapers = 0
+        var indexedMedia = 0
+
+        for item in scannedWallpapers {
+            let path = Self.standardizedPath(item.fileURL)
+            guard knownWallpaperPaths.insert(path).inserted else { continue }
+            WallpaperLibraryService.shared.recordDownload(
+                item.toWallpaper(),
+                fileURL: item.fileURL
+            )
+            indexedWallpapers += 1
+        }
+
+        for item in scannedMediaItems {
+            let path = Self.standardizedPath(item.fileURL)
+            guard knownMediaPaths.insert(path).inserted else { continue }
+            MediaLibraryService.shared.recordDownload(
+                item: item.toMediaItem(),
+                localFileURL: item.fileURL
+            )
+            indexedMedia += 1
+        }
+
+        if indexedWallpapers > 0 || indexedMedia > 0 {
+            NotificationCenter.default.post(name: .managedLibraryContentsChanged, object: nil)
+            print(
+                "[LocalWallpaperScanner] Rebuilt managed index: "
+                    + "wallpapers=\(indexedWallpapers), media=\(indexedMedia)"
+            )
+        }
+
+        return ReindexResult(
+            indexedWallpapers: indexedWallpapers,
+            indexedMedia: indexedMedia
+        )
     }
 
     /// 主窗口长期隐藏后释放前台库列表缓存；下次打开时按需重新扫描。
@@ -248,6 +338,18 @@ final class LocalWallpaperScanner {
     nonisolated private static func isImageFileStatic(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         return ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "heic"].contains(ext)
+    }
+
+    nonisolated private static func standardizedPath(_ url: URL) -> String {
+        (url.path as NSString).standardizingPath
+    }
+
+    nonisolated private static func standardizedPath(_ record: WallpaperDownloadRecord) -> String {
+        (record.localFilePath as NSString).standardizingPath
+    }
+
+    nonisolated private static func standardizedPath(_ record: MediaDownloadRecord) -> String {
+        (record.localFilePath as NSString).standardizingPath
     }
 
     nonisolated private static func isVideoFileStatic(_ url: URL) -> Bool {

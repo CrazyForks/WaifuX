@@ -117,7 +117,7 @@ private struct LibraryScrollObserver: NSViewRepresentable {
 struct MyLibraryContentView: View {
     // 共享 AppDelegate 持有的全局 ViewModel 实例（与首页/壁纸探索/媒体探索共用）。
     // 之前是 @StateObject 创建独立实例，导致两份 WallpaperViewModel/MediaExploreViewModel
-    // 同时订阅 LocalWallpaperScanner 通知 → 双倍内存 + 双倍响应。
+    // 同时订阅库记录变更 → 双倍内存 + 双倍响应。
     // 改为 @ObservedObject 接收外部实例，仍能响应数据变化（body 内读 favorites/allLocalWallpapers
     // 等需要响应式），但不再有冗余实例。
     @ObservedObject var viewModel: WallpaperViewModel
@@ -206,6 +206,8 @@ struct MyLibraryContentView: View {
     @State private var showRedownloadMediaFolderConfirm = false
     @State private var pendingRedownloadMediaItem: MediaItem?
     @State private var showRedownloadMediaItemConfirm = false
+    @State private var pendingWallpaperDeletion: AnyWallpaperItem?
+    @State private var pendingMediaDeletion: AnyMediaItem?
 
     // 添加壁纸到文件夹
     @State private var showAddToFolderSheet = false
@@ -379,14 +381,6 @@ struct MyLibraryContentView: View {
             updateWallpaperItems()
             updateMediaItems()
             await loadAnimeFavorites()
-            Task(priority: .utility) {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                await LocalWallpaperScanner.shared.forceRescan()
-                await MainActor.run {
-                    updateWallpaperItems()
-                    updateMediaItems()
-                }
-            }
         }
         .onAppear {
             restoreLastLibraryPageIfNeeded()
@@ -542,6 +536,38 @@ struct MyLibraryContentView: View {
             }
         } message: {
             Text(t("library.redownload.item.confirm.message"))
+        }
+        .alert(t("delete"), isPresented: Binding(
+            get: { pendingWallpaperDeletion != nil },
+            set: { if !$0 { pendingWallpaperDeletion = nil } }
+        )) {
+            Button(t("delete"), role: .destructive) {
+                if let item = pendingWallpaperDeletion {
+                    deleteWallpaperItem(item)
+                }
+                pendingWallpaperDeletion = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingWallpaperDeletion = nil
+            }
+        } message: {
+            Text(t("deleteConfirmMessage"))
+        }
+        .alert(t("delete"), isPresented: Binding(
+            get: { pendingMediaDeletion != nil },
+            set: { if !$0 { pendingMediaDeletion = nil } }
+        )) {
+            Button(t("delete"), role: .destructive) {
+                if let item = pendingMediaDeletion {
+                    deleteMediaItem(item)
+                }
+                pendingMediaDeletion = nil
+            }
+            Button(t("cancel"), role: .cancel) {
+                pendingMediaDeletion = nil
+            }
+        } message: {
+            Text(t("deleteConfirmMessage"))
         }
         .sheet(isPresented: $showSyncProfileSheet) {
             syncProfileSheet
@@ -1224,6 +1250,12 @@ struct MyLibraryContentView: View {
                     Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
             }
+            Divider()
+            Button(role: .destructive) {
+                pendingWallpaperDeletion = item
+            } label: {
+                Label(t("delete"), systemImage: "trash")
+            }
         }
         card.draggable(dragPayload(for: item.id))
     }
@@ -1424,6 +1456,12 @@ struct MyLibraryContentView: View {
                 } label: {
                     Label(t("videoOptimizationOptimizeVideo"), systemImage: "sparkles")
                 }
+            }
+            Divider()
+            Button(role: .destructive) {
+                pendingMediaDeletion = item
+            } label: {
+                Label(t("delete"), systemImage: "trash")
             }
         }
         card.draggable(dragPayload(for: item.id))
@@ -2850,6 +2888,26 @@ struct MyLibraryContentView: View {
         updateMediaItems()
     }
 
+    private func deleteWallpaperItem(_ item: AnyWallpaperItem) {
+        if selectedSubTab == .favorites {
+            viewModel.removeWallpaperFavorites(withIDs: [item.id])
+        } else {
+            _ = viewModel.deleteLocalWallpaper(item.wallpaper)
+        }
+        gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
+        updateWallpaperItems()
+    }
+
+    private func deleteMediaItem(_ item: AnyMediaItem) {
+        if selectedSubTab == .favorites {
+            mediaViewModel.removeFavorites(withIDs: [item.id])
+        } else if let localItem = mediaViewModel.allLocalMedia.first(where: { $0.id == item.id }) {
+            deleteLocalMedias([localItem])
+        }
+        gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
+        updateMediaItems()
+    }
+
     /// 删除文件夹及其所有内容（包括子文件夹中的项目）
     private func deleteFolderWithContents(folderID: String, contentType: LibraryFolder.FolderContentType) {
         // 收集该文件夹及所有子文件夹的 ID
@@ -3037,10 +3095,7 @@ struct MyLibraryContentView: View {
             }
         }
 
-        Task {
-            await LocalWallpaperScanner.shared.forceRescan()
-            viewModel.loadFavorites()
-        }
+        viewModel.loadFavorites()
     }
 
     /// 删除本地媒体（含物理文件删除）
@@ -3062,10 +3117,7 @@ struct MyLibraryContentView: View {
             }
         }
 
-        Task {
-            await LocalWallpaperScanner.shared.forceRescan()
-            mediaViewModel.refreshLibraryContent()
-        }
+        mediaViewModel.refreshLibraryContent()
     }
 
     // MARK: - Grid Config

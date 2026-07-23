@@ -74,9 +74,6 @@ final class MediaLibraryService: ObservableObject {
     /// 延迟恢复持久化数据（必须在 AppDelegate.applicationDidFinishLaunching 中调用）
     func restoreSavedData() {
         loadPersistedState()
-        Task { [weak self] in
-            await self?.rebuildManagedMediaLibrary()
-        }
     }
 
     private func rebuildFavoriteIndex() {
@@ -90,9 +87,6 @@ final class MediaLibraryService: ObservableObject {
             uniquingKeysWith: { current, _ in current }
         )
     }
-
-    /// 供 ViewModel 缓存重建时快速排除已下载项目的 ID 集合
-    var downloadIDSetForRebuild: Set<String> { downloadIDSet }
 
     var favoriteItems: [MediaItem] {
         favoriteRecords
@@ -849,6 +843,10 @@ final class MediaLibraryService: ObservableObject {
             deletePhysicalFile(at: filePath)
             // 删除对应的烘焙产物
             deleteSceneBakeArtifacts(for: record)
+            VideoThumbnailCache.shared.removeSceneBakePoster(
+                itemID: record.item.id,
+                videoPath: record.sceneBakeArtifact?.videoPath
+            )
         }
     }
 
@@ -869,6 +867,10 @@ final class MediaLibraryService: ObservableObject {
         for record in recordsToDelete {
             deletePhysicalFile(at: record.localFilePath)
             deleteSceneBakeArtifacts(for: record)
+            VideoThumbnailCache.shared.removeSceneBakePoster(
+                itemID: record.item.id,
+                videoPath: record.sceneBakeArtifact?.videoPath
+            )
         }
     }
 
@@ -1518,9 +1520,6 @@ final class WallpaperLibraryService: ObservableObject {
             uniquingKeysWith: { current, _ in current }
         )
     }
-
-    /// 供 ViewModel 缓存重建时快速排除已下载项目的 ID 集合
-    var downloadIDSetForRebuild: Set<String> { downloadIDSet }
 
     var favoriteWallpapers: [Wallpaper] {
         favoriteRecords

@@ -886,12 +886,19 @@ private struct DownloadSettingsTab: View {
         Task {
             let result = await DirectoryMigrationService.shared.repairBrokenRecords()
             isRepairing = false
-            if result.repairedCount == 0 && result.removedCount == 0 && result.migratedCount == 0 {
+            if result.indexedCount == 0
+                && result.repairedCount == 0
+                && result.removedCount == 0
+                && result.migratedCount == 0 {
                 repairResultMessage = t("repairNoIssues")
             } else {
                 repairResultMessage = String(
                     format: t("repairResult"),
-                    result.repairedCount, result.migratedCount, result.removedCount, result.healthyCount
+                    result.indexedCount,
+                    result.repairedCount,
+                    result.migratedCount,
+                    result.removedCount,
+                    result.healthyCount
                 )
             }
             NotificationCenter.default.post(name: .downloadPathChanged, object: nil)
@@ -1628,7 +1635,7 @@ private struct AboutSettingsTab: View {
                     Divider().background(Color.white.opacity(0.06)).padding(.leading, 16)
 
                     MacLinkRow(title: t("reportProblem"), action: {
-                        if let url = URL(string: "https://github.com/jipika/WaifuX") {
+                        if let url = URL(string: "https://github.com/jipika/WaifuX/issues") {
                             NSWorkspace.shared.open(url)
                         }
                     })
@@ -2681,7 +2688,6 @@ private struct DirectoryMigrationSheet: View {
             self.isMigrating = false
 
             NotificationCenter.default.post(name: .downloadPathChanged, object: nil)
-            await LocalWallpaperScanner.shared.forceRescan()
         }
     }
 }

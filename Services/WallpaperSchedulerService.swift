@@ -54,11 +54,21 @@ class WallpaperSchedulerService: ObservableObject {
     private let deferredRetryDelay: TimeInterval = 5
     /// Retry soon after a failed timed apply instead of waiting a full interval.
     private let failedApplyRetryDelay: TimeInterval = 15
+    /// When a managed library root is unavailable (for example, its external
+    /// volume is disconnected), avoid probing every registered item path.
+    private let unavailableLibraryRetryDelay: TimeInterval = 60
     private let minimumTimerDelay: TimeInterval = 0.25
     private let scheduleLeeway: DispatchTimeInterval = .milliseconds(200)
     private var isScreenLocked = false
     private var lastUnlockSwitchTime: Date?
     private var globalRotationTask: Task<Void, Never>?
+    /// Cached per-root health result. Candidate construction stays memory-only;
+    /// each actual switch forces one root-level check before applying.
+    private var managedLibraryRootAvailability: (path: String, isAvailable: Bool)?
+    private var unavailableLibraryRetryUntil: Date?
+    /// Missing files are removed from this process's candidate pool after the
+    /// real apply path detects them, rather than being stat'ed every rotation.
+    private var unavailableSchedulableItemIDs = Set<String>()
 
     /// Persists screenID → fingerprint mapping so that display configs can be
     /// relinked after sleep/wake when CGDirectDisplayID may change on external monitors.
@@ -92,6 +102,18 @@ class WallpaperSchedulerService: ObservableObject {
             self,
             selector: #selector(handleScreenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleManagedLibraryChanged),
+            name: .managedLibraryContentsChanged,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleManagedLibraryChanged),
+            name: .downloadPathChanged,
             object: nil
         )
         // 监听视频播放完成通知（用于"播完即换"模式）
@@ -152,12 +174,12 @@ class WallpaperSchedulerService: ObservableObject {
     }
 
     func hasSchedulableItems(for screenID: String) -> Bool {
+        guard isManagedLibraryAvailable() else { return false }
         let displayConfig = config.isGlobalDisplaySyncEnabled
             ? config.globalDisplayConfig
             : config.resolvedDisplayConfig(for: screenID)
         return !getSchedulableItems(
-            for: displayConfig,
-            screenID: config.isGlobalDisplaySyncEnabled ? nil : screenID
+            for: displayConfig
         ).isEmpty
     }
 
@@ -242,7 +264,14 @@ class WallpaperSchedulerService: ObservableObject {
             break
         }
 
-        let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+        guard isManagedLibraryAvailable(forceRefresh: true) else {
+            print("\(logTag) Skip next wallpaper for \(screenID): managed library root unavailable")
+            finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
+            recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
+            return
+        }
+
+        let items = getSchedulableItems(for: displayConfig)
         guard !items.isEmpty else {
             print("\(logTag) Screen \(screenID): no schedulable items for next-wallpaper request (includeMedia=\(displayConfig.includeMedia) includeWallpapers=\(displayConfig.includeWallpapers) onEnd=\(displayConfig.isOnEndMode))")
             finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
@@ -335,6 +364,13 @@ class WallpaperSchedulerService: ObservableObject {
            let cooldownUntil = globalOnEndSwitchCooldownUntil,
            Date() < cooldownUntil {
             print("\(logTag) Skip global on-end rotation: within post-switch cooldown")
+            return
+        }
+        guard isManagedLibraryAvailable(forceRefresh: true) else {
+            if case .onEnd? = requiredMode {
+                VideoWallpaperManager.shared.resumeOnEndVideosAfterFailedGlobalSwitch(for: screens)
+            }
+            print("\(logTag) Skip global next wallpaper: managed library root unavailable")
             return
         }
         let items = getSchedulableItems(for: displayConfig)
@@ -462,6 +498,18 @@ class WallpaperSchedulerService: ObservableObject {
             }
             self.pendingCleanupWorkItem = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+        }
+    }
+
+    @objc private func handleManagedLibraryChanged() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.managedLibraryRootAvailability = nil
+            self.unavailableLibraryRetryUntil = nil
+            self.unavailableSchedulableItemIDs.removeAll()
+            if self.isRunning {
+                self.scheduleNextChange()
+            }
         }
     }
 
@@ -1059,6 +1107,11 @@ class WallpaperSchedulerService: ObservableObject {
     private func applyIndependentSelectionsAfterGlobalDisable(
         transitionGeneration: UInt64
     ) async {
+        guard isManagedLibraryAvailable(forceRefresh: true) else {
+            print("\(logTag) Global sync disabled: managed library root unavailable")
+            return
+        }
+
         for screen in NSScreen.screensOrderedForDisplay {
             guard !Task.isCancelled,
                   displayModeTransitionGeneration == transitionGeneration,
@@ -1071,7 +1124,7 @@ class WallpaperSchedulerService: ObservableObject {
                 continue
             }
 
-            let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+            let items = getSchedulableItems(for: displayConfig)
             guard let item = selectNextItem(
                 from: items,
                 lastID: lastChangedItemIDs[screenID],
@@ -1424,9 +1477,39 @@ class WallpaperSchedulerService: ObservableObject {
         return base
     }
 
+    /// The scheduler's source of truth is the managed download library. Checking
+    /// its root once per actual switch is much cheaper than stat'ing every item
+    /// on a removable volume.
+    private func isManagedLibraryAvailable(forceRefresh: Bool = false) -> Bool {
+        let rootURL = DownloadPathManager.shared.rootFolderURL.standardizedFileURL
+        let rootPath = rootURL.path
+        let now = Date()
+
+        if !forceRefresh,
+           let cached = managedLibraryRootAvailability,
+           cached.path == rootPath,
+           (cached.isAvailable || (unavailableLibraryRetryUntil ?? .distantPast) > now) {
+            return cached.isAvailable
+        }
+
+        let isAvailable = FileManager.default.fileExists(atPath: rootPath)
+        managedLibraryRootAvailability = (path: rootPath, isAvailable: isAvailable)
+        if isAvailable {
+            unavailableLibraryRetryUntil = nil
+        } else {
+            unavailableLibraryRetryUntil = Date().addingTimeInterval(unavailableLibraryRetryDelay)
+            print("\(logTag) Managed library root unavailable: \(rootPath); retry in \(Int(unavailableLibraryRetryDelay))s")
+        }
+        return isAvailable
+    }
+
     /// Next one-shot fire: earliest due time among timed displays, or a short
     /// deferred poll when apply is blocked. nil = event-driven only (no timer).
     private func nextTimerFireDate(from now: Date) -> Date? {
+        if let retryUntil = unavailableLibraryRetryUntil, retryUntil > now {
+            return retryUntil
+        }
+
         if WallpaperEngineXBridge.shared.isSettingWallpaper
             || timedRotationTask != nil
             || globalRotationTask != nil {
@@ -1549,6 +1632,10 @@ class WallpaperSchedulerService: ObservableObject {
         if config.isGlobalDisplaySyncEnabled {
             return changeGlobalWallpaperIfNeeded()
         }
+        guard isManagedLibraryAvailable(forceRefresh: true) else {
+            print("\(logTag) Skipping timed rotation: managed library root unavailable")
+            return false
+        }
         let screens = NSScreen.screens
         let now = Date()
 
@@ -1655,6 +1742,10 @@ class WallpaperSchedulerService: ObservableObject {
             applyNextGlobalWallpaper(requiredMode: nil)
             return
         }
+        guard isManagedLibraryAvailable(forceRefresh: true) else {
+            print("\(logTag) Skipping unlock switch: managed library root unavailable")
+            return
+        }
 
         let now = Date()
         if let lastUnlockSwitchTime,
@@ -1671,7 +1762,7 @@ class WallpaperSchedulerService: ObservableObject {
             let displayConfig = resolvedDisplayConfig(for: screen)
             guard displayConfig.isEnabled && displayConfig.isOnUnlockMode else { continue }
 
-            let items = getSchedulableItems(for: displayConfig, screenID: screenID)
+            let items = getSchedulableItems(for: displayConfig)
             if items.isEmpty {
                 print("\(logTag) Screen \(screenID): no schedulable items for unlock mode")
                 continue
@@ -1766,6 +1857,10 @@ class WallpaperSchedulerService: ObservableObject {
                 )
             )
             return ok
+        } catch LocalWallpaperApplyService.ApplyError.missingFile {
+            unavailableSchedulableItemIDs.insert(item.id)
+            print("\(logTag) Removed missing item '\(item.title)' from this session's rotation pool")
+            return false
         } catch {
             print("\(logTag) applyItem failed for '\(item.title)' (\(item.fileURL.lastPathComponent)): \(error)")
             return false
@@ -1826,67 +1921,14 @@ class WallpaperSchedulerService: ObservableObject {
                     reason: "globalScheduler"
                 )
             )
+        } catch LocalWallpaperApplyService.ApplyError.missingFile {
+            unavailableSchedulableItemIDs.insert(item.id)
+            print("\(logTag) Removed missing global item '\(item.title)' from this session's rotation pool")
+            return false
         } catch {
             print("\(logTag) Global apply failed for '\(item.title)': \(error.localizedDescription)")
             return false
         }
-    }
-
-    /// 从 project.json 的 file/background 字段提取视频文件路径
-    private func findVideoFileInProject(projectJSON: [String: Any], root: URL) -> URL? {
-        let fm = FileManager.default
-        let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v"]
-
-        // 1. 优先读 project.json 中明确的 file/background 字段
-        for key in ["file", "background"] {
-            if let path = projectJSON[key] as? String {
-                let candidate = root.appendingPathComponent(path)
-                if videoExts.contains(candidate.pathExtension.lowercased()),
-                   fm.fileExists(atPath: candidate.path) {
-                    return candidate
-                }
-            }
-        }
-
-        // 2. 递归查找目录中的视频文件
-        return findFirstVideoFile(in: root, extensions: videoExts)
-    }
-
-    /// 在目录树中找第一个可播视频（用于 project.json 解析失败时的兜底）。
-    private func findFirstVideoFile(
-        in root: URL,
-        extensions: Set<String> = ["mp4", "mov", "webm", "m4v"]
-    ) -> URL? {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: nil) else {
-            return nil
-        }
-        for case let fileURL as URL in enumerator {
-            if extensions.contains(fileURL.pathExtension.lowercased()),
-               fm.fileExists(atPath: fileURL.path) {
-                return fileURL
-            }
-        }
-        return nil
-    }
-
-    /// Validates a Workshop directory before it enters an event-driven rotation.
-    /// Scene and web projects have no AVPlayer completion event, so selecting either
-    /// after a video ends would leave the finished player paused without a successor.
-    private func workshopDirectoryContainsPlayableVideo(
-        at directory: URL,
-        allowedExtensions: Set<String>
-    ) -> Bool {
-        let root = WorkshopService.resolveWallpaperEngineProjectRoot(startingAt: directory)
-        let projectURL = root.appendingPathComponent("project.json")
-        guard let data = try? Data(contentsOf: projectURL),
-              let project = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (project["type"] as? String)?.lowercased() == "video",
-              let videoURL = findVideoFileInProject(projectJSON: project, root: root) else {
-            return false
-        }
-
-        return allowedExtensions.contains(videoURL.pathExtension.lowercased())
     }
 
     private let videoExtensions: Set<String> = ["mp4", "mov", "webm", "mkv", "avi", "m4v", "flv"]
@@ -2021,7 +2063,10 @@ class WallpaperSchedulerService: ObservableObject {
         }
     }
 
-    private func getSchedulableItems(for displayConfig: DisplaySchedulerConfig, screenID: String? = nil) -> [SchedulableItem] {
+    /// Builds candidates from persisted library records only. Imported content is
+    /// recorded synchronously, so polling the download folders is unnecessary.
+    private func getSchedulableItems(for displayConfig: DisplaySchedulerConfig) -> [SchedulableItem] {
+        guard isManagedLibraryAvailable() else { return [] }
         var items: [SchedulableItem] = []
 
         // "播完即换"模式下只获取视频项（静态图片和 Web/Scene 壁纸不支持播完即换）
@@ -2039,31 +2084,19 @@ class WallpaperSchedulerService: ObservableObject {
         }
 
         if displayConfig.includeWallpapers && (!onEndMode || webSceneSwitchEnabled) {
-            // Downloaded wallpapers（图片或已烘焙的 WE scene 目录）
+            // Persisted wallpaper download records are the authoritative source.
             for record in WallpaperLibraryService.shared.downloadedWallpapers {
                 guard folderFilter(record.folderID) else { continue }
                 let url = URL(fileURLWithPath: record.localFilePath)
-                guard FileManager.default.fileExists(atPath: url.path) else { continue }
+                let itemID = "wp_dl_\(record.id)"
+                guard !unavailableSchedulableItemIDs.contains(itemID) else { continue }
                 items.append(SchedulableItem(
-                    id: "wp_dl_\(record.id)",
+                    id: itemID,
                     fileURL: url,
                     title: url.deletingPathExtension().lastPathComponent,
                     bakedVideoPath: nil,
                     sceneBakeItemID: nil
                 ))
-            }
-            // Scanned local wallpapers（仅未指定文件夹时包含本地扫描文件）
-            if folderIDs == nil {
-                for item in LocalWallpaperScanner.shared.getLocalWallpapers() {
-                    guard FileManager.default.fileExists(atPath: item.fileURL.path) else { continue }
-                    items.append(SchedulableItem(
-                        id: "wp_scan_\(item.id)",
-                        fileURL: item.fileURL,
-                        title: item.title,
-                        bakedVideoPath: nil,
-                        sceneBakeItemID: nil
-                    ))
-                }
             }
         }
 
@@ -2081,10 +2114,11 @@ class WallpaperSchedulerService: ObservableObject {
                 let url = URL(fileURLWithPath: record.localFilePath)
                 let isWorkshop = record.item.id.hasPrefix("workshop_")
                 let isAllowedExt = allowedMediaExts.contains(url.pathExtension.lowercased())
-                let isDirectory = (try? FileManager.default.attributesOfItem(atPath: url.path)[.type] as? FileAttributeType) == .typeDirectory
-                guard FileManager.default.fileExists(atPath: url.path),
-                      (isWorkshop || isAllowedExt || isDirectory) else { continue }
+                // Imports only create direct video files or `workshop_*` project
+                // directories. Do not stat every record just to rediscover that.
+                guard isWorkshop || isAllowedExt else { continue }
                 let itemID = "media_dl_\(record.id)"
+                guard !unavailableSchedulableItemIDs.contains(itemID) else { continue }
                 // 双选时 wallpapers 分支已添加过，跳过避免重复
                 if isWorkshop && displayConfig.includeWallpapers && existingIDs.contains(itemID) {
                     continue
@@ -2128,13 +2162,11 @@ class WallpaperSchedulerService: ObservableObject {
                 if onEndMode && !webSceneSwitchEnabled {
                     if bakedVideoPath != nil {
                         // 有烘焙视频产物，可播放
-                    } else if isAllowedExt && !isDirectory {
+                    } else if isAllowedExt {
                         // 可由 AVFoundation 直接播放的视频文件
-                    } else if isWorkshop && isDirectory && workshopDirectoryContainsPlayableVideo(
-                        at: url,
-                        allowedExtensions: allowedMediaExts
-                    ) {
-                        // 候选阶段已验证，避免结束后选到 scene/web 再黑屏。
+                    } else if isWorkshop && workshopRecordDeclaresVideo(record) {
+                        // 导入/下载时已经保存了 Wallpaper Engine 项目类型，避免在
+                        // 每次播完时递归扫描 project 目录验证视频文件。
                     } else {
                         continue
                     }
@@ -2148,23 +2180,15 @@ class WallpaperSchedulerService: ObservableObject {
                     sceneBakeItemID: sceneBakeItemID
                 ))
             }
-            // Scanned local media（仅未指定文件夹时包含）
-            if folderIDs == nil {
-                for item in LocalWallpaperScanner.shared.getLocalMedia() {
-                    guard FileManager.default.fileExists(atPath: item.fileURL.path),
-                          allowedMediaExts.contains(item.fileURL.pathExtension.lowercased()) else { continue }
-                    items.append(SchedulableItem(
-                        id: "media_scan_\(item.id)",
-                        fileURL: item.fileURL,
-                        title: item.title,
-                        bakedVideoPath: nil,
-                        sceneBakeItemID: nil
-                    ))
-                }
-            }
         }
 
         return items
+    }
+
+    private func workshopRecordDeclaresVideo(_ record: MediaDownloadRecord) -> Bool {
+        record.item.resolutionLabel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("video") == .orderedSame
     }
 
     private func selectSequential(from items: [SchedulableItem], lastID: String?) -> SchedulableItem? {

@@ -329,9 +329,10 @@ final class DirectoryMigrationService {
         var removedCount: Int = 0
         var healthyCount: Int = 0
         var migratedCount: Int = 0
+        var indexedCount: Int = 0
     }
 
-    /// 扫描所有下载记录，修复断裂路径或移除无法恢复的记录
+    /// 修复已有下载记录的断裂路径，并显式扫描受管目录补建未知文件的记录。
     func repairBrokenRecords() async -> RepairResult {
         let fm = FileManager.default
         var result = RepairResult()
@@ -398,7 +399,16 @@ final class DirectoryMigrationService {
         }
         WallpaperLibraryService.shared.persistDownloads()
 
-        print("[Repair] Done: repaired=\(result.repairedCount), migrated=\(result.migratedCount), removed=\(result.removedCount), healthy=\(result.healthyCount)")
+        // 所有内容现在都应经由软件导入；这一步只在用户主动修复时运行，
+        // 用于恢复旧版本、缓存损坏或迁移中断后遗留的未索引文件。
+        let reindexResult = await LocalWallpaperScanner.shared.rebuildManagedLibraryIndex()
+        result.indexedCount = reindexResult.totalIndexed
+
+        print(
+            "[Repair] Done: indexed=\(result.indexedCount), "
+                + "repaired=\(result.repairedCount), migrated=\(result.migratedCount), "
+                + "removed=\(result.removedCount), healthy=\(result.healthyCount)"
+        )
         return result
     }
 

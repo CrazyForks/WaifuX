@@ -539,6 +539,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                     // 壁纸库 + 文件夹 + 媒体库都已就位，清理空字符串 / 孤儿 / 跨集合 folderID
                     LibraryFolderStore.shared.sanitizeLibraryFolderMemberships()
 
+                    // 旧版本的 LocalWallpaperScanner 只把陌生文件放在内存中。
+                    // 本次迁移在两套库记录恢复后补写一次持久化记录；完成后不再常规扫盘。
+                    Task(priority: .utility) {
+                        _ = await LocalWallpaperScanner.shared
+                            .rebuildManagedLibraryIndexForUpgradeIfNeeded()
+                    }
+
                     // 第4帧：动漫数据
                     DispatchQueue.main.async {
                         AnimeFavoriteStore.shared.restoreSavedData()
@@ -849,7 +856,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         LocalImageThumbnailCache.shared.clearMemoryHints()
         WorkshopLibraryPreviewCache.shared.clearAll()
         VideoPreloader.shared.clearCache()
-        LocalWallpaperScanner.shared.clearInMemoryCache()
         WorkshopService.shared.clearForegroundState()
         URLCache.shared.removeAllCachedResponses()
         clearWebKitForegroundCaches()
