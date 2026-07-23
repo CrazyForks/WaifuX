@@ -537,10 +537,7 @@ struct MyLibraryContentView: View {
         } message: {
             Text(t("library.redownload.item.confirm.message"))
         }
-        .alert(t("delete"), isPresented: Binding(
-            get: { pendingWallpaperDeletion != nil },
-            set: { if !$0 { pendingWallpaperDeletion = nil } }
-        )) {
+        .alert(t("delete"), isPresented: wallpaperDeletionAlertPresented) {
             Button(t("delete"), role: .destructive) {
                 if let item = pendingWallpaperDeletion {
                     deleteWallpaperItem(item)
@@ -553,10 +550,7 @@ struct MyLibraryContentView: View {
         } message: {
             Text(t("deleteConfirmMessage"))
         }
-        .alert(t("delete"), isPresented: Binding(
-            get: { pendingMediaDeletion != nil },
-            set: { if !$0 { pendingMediaDeletion = nil } }
-        )) {
+        .alert(t("delete"), isPresented: mediaDeletionAlertPresented) {
             Button(t("delete"), role: .destructive) {
                 if let item = pendingMediaDeletion {
                     deleteMediaItem(item)
@@ -588,6 +582,28 @@ struct MyLibraryContentView: View {
                     }
                 }
         }
+    }
+
+    private var wallpaperDeletionAlertPresented: Binding<Bool> {
+        Binding(
+            get: { pendingWallpaperDeletion != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingWallpaperDeletion = nil
+                }
+            }
+        )
+    }
+
+    private var mediaDeletionAlertPresented: Binding<Bool> {
+        Binding(
+            get: { pendingMediaDeletion != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingMediaDeletion = nil
+                }
+            }
+        )
     }
 
     // MARK: - 加载动漫收藏
