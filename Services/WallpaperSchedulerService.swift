@@ -1307,15 +1307,19 @@ class WallpaperSchedulerService: ObservableObject {
 
         // 如果切换到"播完即换"模式，需要重新应用壁纸以启用非循环播放器
         if !wasOnEndMode && isNowOnEndMode {
+            print("\(logTag) Detected switch to on-end mode for screen \(screenID)")
             if let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
                 Task { @MainActor in
+                    print("\(logTag) On-end mode Task started for screen \(screenID)")
                     // 检查是否是 Web 壁纸（由 WallpaperEngineXBridge 管理）
                     let isWebWallpaper = WallpaperEngineXBridge.shared.isManaging(screen: screen)
                     let hasVideo = VideoWallpaperManager.shared.hasActiveWallpaper(on: screen)
+                    print("\(logTag) Screen \(screenID) state: isWeb=\(isWebWallpaper), hasVideo=\(hasVideo)")
 
                     // 已有本机视频壁纸：重新应用以禁用循环（播完即换非循环模式）
                     if hasVideo, let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                         let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
+                        print("\(logTag) Reapplying video wallpaper with forceRebuild to disable looping: \(videoURL.lastPathComponent)")
                         try? VideoWallpaperManager.shared.applyVideoWallpaper(
                             from: videoURL,
                             posterURL: posterURL,
@@ -1323,7 +1327,7 @@ class WallpaperSchedulerService: ObservableObject {
                             targetScreen: screen,
                             forceRebuild: true
                         )
-                        print("\(logTag) Switched to on-end mode, reapplied wallpaper for screen \(screenID)")
+                        print("\(logTag) ✅ Switched to on-end mode, reapplied wallpaper for screen \(screenID)")
                         return
                     }
 
@@ -1335,6 +1339,8 @@ class WallpaperSchedulerService: ObservableObject {
                     print("\(logTag) On-end mode: no active video, auto-selecting first video wallpaper for screen \(screenID)")
                     self.triggerNextWallpaper(for: screenID)
                 }
+            } else {
+                print("\(logTag) ⚠️ Could not find screen with ID \(screenID) to apply on-end mode")
             }
         } else if wasOnEndMode && !isNowOnEndMode {
             // 如果从"播完即换"模式切换回来，需要重新启用循环播放

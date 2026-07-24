@@ -109,6 +109,7 @@ final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
         config.userContentController = userContentController
 
         let materialView = NSVisualEffectView(frame: NSRect(origin: .zero, size: contentSize))
+        materialView.appearance = NSAppearance(named: .darkAqua)
         materialView.material = .popover
         materialView.blendingMode = .behindWindow
         materialView.state = .active

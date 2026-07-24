@@ -20,8 +20,8 @@ enum LocalWallpaperApplyService {
     }
 
     struct Options {
-        /// 手动/快速切换默认 false（立刻停旧上新）；调度轮播可显式 true 走首帧预热平滑过渡。
-        var animatedTransition: Bool = false
+        /// 所有用户可见的壁纸切换默认启用首帧预热过渡；恢复/回滚路径可显式关闭。
+        var animatedTransition: Bool = true
         /// 播完即换且未开 web/scene 定时：跳过无播放完成事件的类型
         var requirePlaybackEndSupport: Bool = false
         var muted: Bool = true

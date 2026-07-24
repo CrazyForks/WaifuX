@@ -1091,14 +1091,15 @@ enum SceneOfflineBakeService {
         return nil
     }
 
-    /// 新产物落地后清理同 item 目录下其它 bake mp4 / sidecar / optimization 元数据，避免堆出「两组一样」的文件。
+    /// 新产物落地后清理同 item 目录下其它 bake mp4 / bake sidecar，避免堆出「两组一样」的文件。
+    /// 优化履历已迁出媒体目录（Application Support），这里只顺带扫掉历史遗留的
+    /// `.waifux-optimization.json` 旁路文件。
     static func cleanupStaleBakeFiles(
         inDirectory directory: URL,
         keeping keptURL: URL
     ) {
         let fm = FileManager.default
         let keptPath = keptURL.standardizedFileURL.path
-        let keptName = keptURL.lastPathComponent
         let keptStem = keptURL.deletingPathExtension().lastPathComponent
         guard let entries = try? fm.contentsOfDirectory(
             at: directory,
@@ -1113,17 +1114,29 @@ enum SceneOfflineBakeService {
             if path == keptPath { continue }
 
             let name = url.lastPathComponent
-            // 与当前成片配套的 sidecar / optimization 元数据保留
+            // 与当前成片配套的 bake sidecar 保留；optimization 履历不再写在媒体旁
             if name == "\(keptStem).json" { continue }
-            if name == "\(keptName).waifux-optimization.json" { continue }
+
+            // 历史遗留：媒体旁的 optimization 元数据一律清掉（新路径在 App Support）
+            if name.hasSuffix(".waifux-optimization.json") {
+                try? fm.removeItem(at: url)
+                print("[SceneOfflineBake] cleaned legacy optimization sidecar: \(name)")
+                continue
+            }
 
             guard looksLikeBakeProductFilename(name) else { continue }
 
             let ext = url.pathExtension.lowercased()
             let isVideo = ext == "mp4"
-            let isSidecar = ext == "json" && !name.hasSuffix(".waifux-optimization.json")
-            let isOptimization = name.hasSuffix(".waifux-optimization.json")
-            guard isVideo || isSidecar || isOptimization else { continue }
+            let isSidecar = ext == "json"
+            guard isVideo || isSidecar else { continue }
+
+            // 旧 bake 成片被替换时，同步丢掉其 App Support 履历，避免孤儿记录
+            if isVideo {
+                Task { @MainActor in
+                    VideoOptimizationRecordStore.shared.reset(for: url)
+                }
+            }
 
             do {
                 try fm.removeItem(at: url)
@@ -1424,11 +1437,13 @@ enum SceneOfflineBakeService {
                             try? FileManager.default.removeItem(at: newSidecar)
                             try? FileManager.default.moveItem(at: legacySidecar, to: newSidecar)
                         }
-                        let legacyOpt = URL(fileURLWithPath: legacyOutURL.path + ".waifux-optimization.json")
-                        let newOpt = URL(fileURLWithPath: outURL.path + ".waifux-optimization.json")
-                        if FileManager.default.fileExists(atPath: legacyOpt.path) {
-                            try? FileManager.default.removeItem(at: newOpt)
-                            try? FileManager.default.moveItem(at: legacyOpt, to: newOpt)
+                        // 优化履历在 Application Support，按视频路径哈希搬迁；
+                        // 同时清掉历史写在媒体旁的 .waifux-optimization.json。
+                        await MainActor.run {
+                            VideoOptimizationRecordStore.shared.relocateRecord(
+                                from: legacyOutURL,
+                                to: outURL
+                            )
                         }
                         print("[SceneOfflineBake] renamed legacy bake cache → \(outURL.lastPathComponent)")
                         return hit

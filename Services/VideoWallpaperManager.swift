@@ -129,7 +129,7 @@ final class VideoWallpaperManager: ObservableObject {
     private var pendingSharedFollowerScreenIDsByPlayerID: [ObjectIdentifier: Set<String>] = [:]
     private var sharedFollowerAttachmentTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     /// 全局同源视频切换采用双代管线：旧共享 player 保持可见，新共享 player
-    /// 在每屏隐藏 layer 中预热；所有 layer 都有首帧后再统一黑场交接。
+    /// 在每屏隐藏 layer 中预热；所有 layer 都有首帧后再统一交叉淡入。
     private var globalTransitionGeneration: UInt64 = 0
     private var globalTransitionObservers: [NSKeyValueObservation] = []
     private var globalTransitionTimeout: DispatchWorkItem?
@@ -182,6 +182,10 @@ final class VideoWallpaperManager: ObservableObject {
     private var playerItemObserverTokens: [String: UUID] = [:]
     /// 启动淡入超时工作项（key: screenID）
     private var fadeInTimeouts: [String: DispatchWorkItem] = [:]
+
+    /// 菜单栏重采样的桌面暴露闪烁工作项（key: screenID）。
+    /// 新一轮切换会取消上一轮未发射的闪烁，避免打断新内容的过渡动画。
+    private var menuBarFlashWorkItems: [String: [DispatchWorkItem]] = [:]
 
     /// "播完即换"模式下的播放器播放结束观察者（key: screenID）
     private var playbackEndObservers: [String: Any] = [:]
@@ -334,6 +338,9 @@ final class VideoWallpaperManager: ObservableObject {
         CATransaction.flush()
         // 再跑一圈 runloop，让桌面层在后台 timer 触发路径上也能立刻合帧。
         CFRunLoopWakeUp(CFRunLoopGetMain())
+        // 注意：不要在这里 schedule 菜单栏采样刷新。
+        // reveal 会被 forceCommit / 首帧 / 重排频繁调用；采样刷新只应在
+        // poster 真正写入后或 forceCommit 末尾显式触发（见 DesktopWallpaperSyncManager）。
     }
 
     /// 新建窗口首帧就绪后的呈现。
@@ -406,6 +413,9 @@ final class VideoWallpaperManager: ObservableObject {
                 }
             }
             CATransaction.flush()
+            // 桌面窗 settle 后再强制菜单栏按 poster 重采样（交替路径，非同一 URL no-op）。
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: targets, delay: 0.08)
         }
     }
 
@@ -453,7 +463,6 @@ final class VideoWallpaperManager: ObservableObject {
         } else {
             setPosterAsDesktopWallpaper(posterURL, targetScreen: screen)
         }
-        DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen)
         persistState()
     }
 
@@ -1093,15 +1102,22 @@ final class VideoWallpaperManager: ObservableObject {
         )
         DesktopWallpaperSyncManager.shared.captureOriginalSystemWallpaperIfNeeded(for: captureScreens)
 
-        // Scene/Web/独立静态图 → 视频也必须先预热视频首帧。逐屏记录，避免一块
-        // 显示器的切换提前拆掉另一块显示器仍在播放的旧内容。
+        // Scene/Web/独立静态图 → 视频：旧内容保留到新视频首帧就绪后再无黑场提交。
+        // 视频 → 视频不走跨类型标记：由 per-screen replacement / global stage 保留旧 AVPlayer 窗口。
+        // 若误把旧视频标成 cross-type，stage 失败 teardown 后 createWindow 会 alpha=1 露黑窗。
         for screen in captureScreens {
             let screenID = screen.wallpaperScreenIdentifier
             let hasExternalRenderer = WallpaperEngineXBridge.shared.hasLivePresentation(on: screen)
             let hasStaticOverlay = StaticImageWallpaperOverlayManager.shared.hasActiveWallpaper(on: [screen])
             if animatedTransition && (hasExternalRenderer || hasStaticOverlay) {
                 pendingCrossTypeVideoScreenIDs.insert(screenID)
-                StaticImageWallpaperOverlayManager.shared.keepPresentationFront(on: [screen])
+                if hasStaticOverlay {
+                    StaticImageWallpaperOverlayManager.shared.keepPresentationFront(on: [screen])
+                }
+                if windows[screenID] != nil {
+                    // 同屏仍有视频窗时也顶在前，避免新 Scene 窗抢到最前闪一帧。
+                    keepNativeVideoPresentationFront(on: [screen])
+                }
                 continue
             }
 
@@ -1156,6 +1172,7 @@ final class VideoWallpaperManager: ObservableObject {
            videoTargetScreenIDs.isSubset(of: screenIDsNow),
            !targetDisplayConfigurationChanged,
            !playbackModeChanged {
+            print("[VideoWallpaperManager] Taking early-return path (reusing existing players). forceRebuild=\(forceRebuild), playbackModeChanged=\(playbackModeChanged)")
             // 已起播同一视频但每屏各有一路解码时，把多份 AVQueuePlayer 合并成一路。
             // 否则「再设一次同样壁纸」会 early-return，VTDecoderXPCService 仍是多份。
             let coalesced = coalesceDuplicateDecodersForSameVideos()
@@ -1204,6 +1221,11 @@ final class VideoWallpaperManager: ObservableObject {
             if let targetScreenID {
                 scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: coalesced ? "reuseExistingCoalesced" : "reuseExisting")
             }
+            // 早退复用：画面本就在屏上，但上一轮 apply 的采样 poke 可能全部打在
+            // 首帧合成之前（菜单栏仍是旧采样）。内容已在屏，短延迟补一次兜底。
+            let reuseRefreshScreens: [NSScreen] = targetScreen.map { [$0] } ?? NSScreen.screens
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: reuseRefreshScreens, delay: 0.1)
             return
         }
 
@@ -1218,7 +1240,8 @@ final class VideoWallpaperManager: ObservableObject {
             )
         } else if targetScreen == nil,
                   animatedTransition,
-                  usesSharedVideoDecoder,
+                  // 单屏全局切换不会开 shared decoder，同样需要旧画面回滚。
+                  (usesSharedVideoDecoder || NSScreen.screens.count == 1),
                   !windows.isEmpty {
             globalTransitionSourceRollback = GlobalTransitionSourceRollback(
                 currentVideoURL: currentVideoURL,
@@ -1249,11 +1272,17 @@ final class VideoWallpaperManager: ObservableObject {
         if shouldSkipStaticPosterForDynamicLockScreen {
             print("[VideoWallpaperManager] 🔒 动态锁屏已启用，跳过设置静态桌面 poster")
         } else if let posterURL = posterURL {
-            if posterURL.isFileURL {
+            if animatedTransition {
+                // 动画切换：等新视频起播/首帧就绪后再写系统底图，避免加载期
+                // 系统墙纸刷新与 desktop-level 动态窗抢合成、拉长可见黑场。
+                schedulePosterAsDesktopWallpaperAfterPlaybackSettles(
+                    posterURL,
+                    targetScreen: targetScreen,
+                    expectedVideoURL: localFileURL
+                )
+            } else if posterURL.isFileURL {
                 // 与直接设置静态图保持相同顺序：先提交系统桌面底图并发出
                 // com.apple.desktop 刷新，再创建/显示 desktop-level 视频窗口。
-                // 这也适用于调度器动画转场；转场仍由视频窗口负责，不能把
-                // 静态底图提交延后到动态内容出现之后。
                 applyPosterAsDesktopWallpaperSync(posterURL, targetScreen: targetScreen)
             } else {
                 setPosterAsDesktopWallpaper(posterURL, targetScreen: targetScreen)
@@ -1303,6 +1332,21 @@ final class VideoWallpaperManager: ObservableObject {
         wallpaperChangeCount &+= 1
         DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+
+        // 动态视频窗口已创建并提交到 WindowServer 后，强制菜单栏外观重采样。
+        // 主手段是“窗口变化 poke”（与点一下其它 App 同类），不依赖 poster 是否已写入。
+        // 动画路径 poster 稍后 apply 时还会再 schedule 一次（含可选 setDesktop 换路径）。
+        let refreshScreens: [NSScreen]
+        if let targetScreen {
+            refreshScreens = [targetScreen]
+        } else {
+            refreshScreens = NSScreen.screens
+        }
+        DesktopWallpaperSyncManager.shared
+            .scheduleSystemWallpaperRefreshAfterDynamicPresentation(
+                on: refreshScreens,
+                delay: animatedTransition ? 0.28 : 0.12
+            )
 
         // 同步到锁屏镜像实例（macOS 26+）
         if #available(macOS 26.0, *) {
@@ -1477,7 +1521,7 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     /// 跨类型切换在新内容准备期间需要保留旧视频窗口。调用方用这个快照决定
-    /// 是立即 teardown，还是等新内容首帧就绪后再在黑场内提交。
+    /// 是立即 teardown，还是等新内容首帧就绪后再提交。
     func hasNativeVideoWallpaper(on screens: [NSScreen]) -> Bool {
         screens.contains { screen in
             let screenID = screen.wallpaperScreenIdentifier
@@ -1486,7 +1530,7 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     /// Scene/Web 会在旧视频仍播放时创建同级 desktop window。加载窗口默认会被
-    /// WindowServer 放到同层最前，造成“新第一帧闪一下再进黑场”。准备阶段周期性
+    /// WindowServer 放到同层最前，造成“新第一帧提前闪一下”。准备阶段周期性
     /// 把旧视频窗提回最前即可让新内容在后方持续播放、完全不可见地预热。
     func keepNativeVideoPresentationFront(on screens: [NSScreen]) {
         for screen in screens {
@@ -1787,6 +1831,7 @@ final class VideoWallpaperManager: ObservableObject {
         let oldLooper = loopers[screenID]
         let schedulerConfig = WallpaperSchedulerService.shared.config.resolvedDisplayConfig(for: screenID)
         let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
+        print("[VideoWallpaperManager] Screen \(screenID): schedulerConfig.isEnabled=\(schedulerConfig.isEnabled), schedulerConfig.isOnEndMode=\(schedulerConfig.isOnEndMode), computed isOnEndMode=\(isOnEndMode), will set enableLooping=\(!isOnEndMode)")
         // Drop this screen's map entry first so resolve can reuse another screen's player,
         // but not this screen's about-to-be-replaced instance.
         players.removeValue(forKey: screenID)
@@ -1869,6 +1914,9 @@ final class VideoWallpaperManager: ObservableObject {
         for task in videoLetterboxAnalysisTasks.values { task.cancel() }
         videoLetterboxAnalysisTasks.removeAll()
         videoLetterboxContentCrops.removeAll()
+        // 修复：清空持久缓存，防止自动切换时无限累积
+        videoLetterboxCropCache.removeAll()
+        videoLetterboxNoCropCache.removeAll()
     }
 
     private func clearFrameInterpolationState() {
@@ -2619,6 +2667,48 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
+    /// 把视频窗短暂 alpha 闪烁（露出桌面图层），迫使菜单栏按当前系统壁纸重采样。
+    ///
+    /// ## 为什么需要这个（macOS 26 实测结论）
+    /// 菜单栏采样的是**系统壁纸**而非合成画面；视频窗把桌面图层完全盖住时，
+    /// WindowServer 会剔除被遮挡的桌面图层——写 poster / `com.apple.desktop` 通知 /
+    /// 透明 poke 窗 / 状态栏项闪现**全部**不产生 damage，菜单栏永远拿旧缓存，
+    /// 只有「桌面图重新可见」或「App 激活」才会重采样。
+    /// 闪烁时露出的刚好是新 poster（≈ 视频首帧），视觉上近似无缝。
+    ///
+    /// - Parameter delays: 默认两次：0.6s 等 WallpaperAgent 加载新 poster，1.6s 兜底慢加载。
+    private func flashDesktopExposureForMenuBarResample(
+        on screens: [NSScreen],
+        delays: [TimeInterval] = [0.6, 1.6]
+    ) {
+        // 与 poster 写入同一门槛：系统壁纸同步关闭 / 动态锁屏启用时，
+        // 桌面图不是本次切换的 poster——闪烁只会露出无关旧壁纸（可见闪动），
+        // 菜单栏也没有新内容可采，直接跳过。本函数不触碰 setDesktopImageURL。
+        guard isSystemWallpaperSyncEnabled, !shouldSkipStaticPosterForDynamicLockScreen else { return }
+        for screen in screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            menuBarFlashWorkItems[screenID]?.forEach { $0.cancel() }
+            var scheduled: [DispatchWorkItem] = []
+            for delay in delays {
+                let item = DispatchWorkItem { [weak self, weak screen] in
+                    guard let self, let screen,
+                          let entry = self.existingVideoWindowEntry(for: screen) else { return }
+                    let window = entry.window
+                    let previousAlpha = window.alphaValue
+                    window.alphaValue = 0
+                    CATransaction.flush()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
+                        window?.alphaValue = previousAlpha
+                        CATransaction.flush()
+                    }
+                }
+                scheduled.append(item)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+            }
+            menuBarFlashWorkItems[screenID] = scheduled
+        }
+    }
+
     /// 立即写入系统静态底图。动态壁纸开始展示前必须走这里，保证菜单栏采样
     /// 与直接设置静态壁纸使用同一条提交顺序。
     private func applyPosterAsDesktopWallpaperSync(_ posterURL: URL, targetScreen: NSScreen? = nil) {
@@ -2659,8 +2749,18 @@ final class VideoWallpaperManager: ObservableObject {
             ]
             for screen in screensToSet {
                 try workspace.setDesktopImageURLForAllSpaces(persistentURL, for: screen, options: fillOptions)
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(
+                    persistentURL,
+                    for: screen,
+                    options: fillOptions
+                )
             }
             print("[VideoWallpaperManager] [sync] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
+            // 关键：被视频窗盖住时写 poster 不会触发菜单栏重采样（遮挡剔除），
+            // 短暂露出桌面图（= 新 poster）迫使菜单栏按新 poster 重采样。
+            flashDesktopExposureForMenuBarResample(on: screensToSet)
         } catch {
             print("[VideoWallpaperManager] [sync] Failed to set poster: \(error)")
         }
@@ -2723,8 +2823,17 @@ final class VideoWallpaperManager: ObservableObject {
             ]
             for screen in screensToSet {
                 try workspace.setDesktopImageURLForAllSpaces(persistentURL, for: screen, options: fillOptions)
+                DesktopWallpaperSyncManager.shared.registerWallpaperSet(
+                    persistentURL,
+                    for: screen,
+                    options: fillOptions
+                )
             }
             print("[VideoWallpaperManager] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
+            // 同 sync 版：露出桌面图迫使菜单栏按新 poster 重采样（遮挡剔除规避）。
+            flashDesktopExposureForMenuBarResample(on: screensToSet)
             // macOS 锁屏壁纸默认跟随桌面壁纸，无需额外设置
         } catch {
             print("[VideoWallpaperManager] Failed to set poster: \(error)")
@@ -3441,7 +3550,7 @@ final class VideoWallpaperManager: ObservableObject {
                 // Scene/Web -> 全屏视频没有旧的本机视频窗口，不能走 shared-player
                 // staging；但 teardownAllWindows 会清理跨类型标记。先保存目标屏标记，
                 // 否则后面 createWindow 会按普通视频路径提前 reveal，旧 Scene 也不会
-                // 在首帧就绪后的黑场内退出。
+                // 在首帧就绪后退出。
                 let rebuildingScreenIDs = Set(screensToRebuild.map(\.wallpaperScreenIdentifier))
                 let crossTypeScreenIDs = pendingCrossTypeVideoScreenIDs.intersection(rebuildingScreenIDs)
                 let requestedSharedDecoder = usesSharedVideoDecoder
@@ -3567,15 +3676,14 @@ final class VideoWallpaperManager: ObservableObject {
 
                     let readinessToken = UUID()
                     playerItemObserverTokens[targetScreenID] = readinessToken
-                    let incomingLayer = containerView.preparePlayerForBlackTransition(components.player)
+                    let incomingLayer = containerView.preparePlayerForCrossfade(components.player)
 
-                    // Hidden warm-up layer must be attached before playback. Wait for
-                    // an actual displayable frame, not merely AVPlayerItem.status.
+                    // Hidden warm-up layer must be attached before decoding. Do not
+                    // start playback yet: first preroll the Looper's real queue item,
+                    // then start it immediately before the crossfade.
+                    // 提前 play 会让慢视频在切换前抢占主层输出，表现为半截空窗。
                     let screenVolume = volumeByScreen[targetScreenID] ?? volume
                     applyPlayerAudioPolicy(components.player, muted: isMuted, volume: screenVolume)
-                    if !isPaused {
-                        components.player.play()
-                    }
 
                     let beginAnimatedSwap: @MainActor @Sendable (String) -> Void = { [weak self, weak containerView] reason in
                         guard let self, let containerView else { return }
@@ -3593,30 +3701,20 @@ final class VideoWallpaperManager: ObservableObject {
                             components.player.play()
                         }
 
-                        // 后台自动切换：CA completion 可能一直不跑。瞬时 attach + freeze 垫层更稳。
-                        // 前台仍走预热层 + 黑场交接（PR），避免半截空窗。
-                        if !Self.shouldAnimateDesktopPresentation {
-                            CATransaction.begin()
-                            CATransaction.setDisableActions(true)
-                            containerView.cancelPlayerTransitionIfNeeded()
-                            containerView.playerLayer.videoGravity = .resizeAspectFill
-                            containerView.attachPlayer(components.player)
-                            CATransaction.commit()
-                            finalizeReplacement()
-                            if let window = self.windows[targetScreenID] {
-                                Self.revealDesktopWallpaperWindow(window)
-                            }
-                            self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "\(reason)ImmediateBackground")
-                            return
-                        }
-
-                        containerView.blackFadeToPreparedPlayer(
+                        containerView.crossfadePreparedPlayer(
                             components.player,
                             duration: self.automaticSwitchTransitionDuration
                         ) {
                             finalizeReplacement()
                             if let window = self.windows[targetScreenID] {
                                 Self.revealDesktopWallpaperWindow(window)
+                            }
+                            // 交叉淡入完成、新帧已可见，再强制菜单栏重采样（见 createWindow 首帧注释）。
+                            if let swapScreen = NSScreen.screens.first(where: {
+                                $0.wallpaperScreenIdentifier == targetScreenID
+                            }) {
+                                DesktopWallpaperSyncManager.shared
+                                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [swapScreen], delay: 0.15)
                             }
                             self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: reason)
                         }
@@ -3629,6 +3727,31 @@ final class VideoWallpaperManager: ObservableObject {
                         }
                     }
                     playerItemObservers[targetScreenID] = observer
+
+                    // AVPlayerLooper 的 template item 可能一直是 unknown；应等待其
+                    // currentItem 副本 ready 后 preroll。该条件不依赖隐藏 layer 是否
+                    // 被 WindowServer 合成，慢视频只会让旧壁纸多显示一会，不会提前暴露新层。
+                    Task { @MainActor [weak self, weak player = components.player, weak containerView] in
+                        guard let self, let player, containerView != nil else { return }
+                        let deadline = Date().addingTimeInterval(30)
+                        while Date() < deadline {
+                            guard self.playerItemObserverTokens[targetScreenID] == readinessToken else { return }
+                            if let currentItem = player.currentItem {
+                                if currentItem.status == .failed { return }
+                                if currentItem.status == .readyToPlay {
+                                    self.applyPlayerAudioPolicy(player, muted: self.isMuted, volume: screenVolume)
+                                    player.preroll(atRate: 1.0) { success in
+                                        guard success else { return }
+                                        Task { @MainActor in
+                                            beginAnimatedSwap("replacementPrerolled")
+                                        }
+                                    }
+                                    return
+                                }
+                            }
+                            try? await Task.sleep(nanoseconds: 25_000_000)
+                        }
+                    }
 
                     let timeout = DispatchWorkItem { [weak self, weak containerView] in
                         guard let self, let containerView,
@@ -3658,7 +3781,8 @@ final class VideoWallpaperManager: ObservableObject {
                         self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementFirstFrameTimeout")
                     }
                     fadeInTimeouts[targetScreenID] = timeout
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: timeout)
+                    // 与 createWindow 跨类型预热上限对齐；慢视频宁可多显示旧画面也不提前揭黑。
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 30.0, execute: timeout)
                 } else {
                     screenTransitionSourceRollbacks.removeValue(forKey: targetScreenID)
                     containerView.cancelPlayerTransitionIfNeeded()
@@ -3676,6 +3800,10 @@ final class VideoWallpaperManager: ObservableObject {
                     }
                     finalizeReplacement()
                     Self.revealDesktopWallpaperWindow(existingWindow)
+                    // 立即替换路径不等待首帧，attach 时新帧可能尚未解码；
+                    // 用较长延迟补 poke，避免采到旧桌面后无人再触发重采样。
+                    DesktopWallpaperSyncManager.shared
+                        .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [targetScreen], delay: 0.4)
                     scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementImmediate")
                 }
 
@@ -3756,7 +3884,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         // 只先挂 leader 的隐藏预热层；follower 等 leader 真起播后再挂。
-        let leaderLayer = leaderContainer.preparePlayerForBlackTransition(components.player)
+        let leaderLayer = leaderContainer.preparePlayerForCrossfade(components.player)
         let warmupStartedAt = Date()
         globalTransitionReadyScreenIDs.removeAll()
         globalTransitionDidBeginCommit = false
@@ -3835,7 +3963,7 @@ final class VideoWallpaperManager: ObservableObject {
                     guard self.globalTransitionGeneration == generation,
                           !self.globalTransitionDidBeginCommit,
                           let container = containersByScreen[screenID] else { return }
-                    let layer = container.preparePlayerForBlackTransition(player)
+                    let layer = container.preparePlayerForCrossfade(player)
                     let layerDeadline = Date().addingTimeInterval(5.0)
                     while Date() < layerDeadline {
                         guard self.globalTransitionGeneration == generation,
@@ -3921,6 +4049,7 @@ final class VideoWallpaperManager: ObservableObject {
     ) {
         guard globalTransitionGeneration == generation,
               pendingGlobalTransitionPlayer === components.player else { return }
+        let crossfadeCommitStartedAt = Date()
 
         globalTransitionObservers.forEach { $0.invalidate() }
         globalTransitionObservers.removeAll()
@@ -3928,8 +4057,9 @@ final class VideoWallpaperManager: ObservableObject {
         globalTransitionTimeout = nil
         globalTransitionReadyScreenIDs.removeAll()
 
-        // Promote the new generation only after first-frame readiness. Every
-        // screen points at the exact same player/item/looper tuple.
+        // Promote the one warmed decode pipeline only after every screen has joined it.
+        let previousSharedPlayer = sharedVideoPlayer
+        let previousSharedLooper = sharedVideoLooper
         for observer in playbackEndObservers.values {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -3985,11 +4115,21 @@ final class VideoWallpaperManager: ObservableObject {
             for (oldScreenID, oldPlayer) in oldPlayersByScreen where oldPlayer !== components.player {
                 let id = ObjectIdentifier(oldPlayer)
                 guard released.insert(id).inserted else { continue }
-                self.releasePlayerIfUnreferenced(oldPlayer, looper: oldLoopersByScreen[oldScreenID])
+                let oldLooper = oldLoopersByScreen[oldScreenID]
+                    ?? (oldPlayer === previousSharedPlayer ? previousSharedLooper : nil)
+                self.releasePlayerIfUnreferenced(oldPlayer, looper: oldLooper)
             }
-            self.purgeOrphanedVideoPlayers(reason: "globalBlackTransitionComplete")
+            self.purgeOrphanedVideoPlayers(reason: "globalCrossfadeComplete")
             self.persistState()
-            NSLog("[VideoWallpaperManager] Global shared-player black transition completed")
+            AppLogger.debug(.wallpaper, "Global video crossfade completed", metadata: [
+                "screens": screens.map(\.wallpaperScreenIdentifier).sorted().joined(separator: ","),
+                "transitionMS": Int(Date().timeIntervalSince(crossfadeCommitStartedAt) * 1_000)
+            ])
+            NSLog("[VideoWallpaperManager] Global shared-player crossfade completed")
+            // 全局交叉淡入完成、各屏新帧均已可见，统一强制菜单栏重采样
+            // （动画路径 poster 写入常被动态锁屏跳过，此前没有任何首帧后 poke）。
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens, delay: 0.15)
         }
 
         for screen in screens {
@@ -3999,7 +4139,7 @@ final class VideoWallpaperManager: ObservableObject {
                 finishOne(screen)
                 continue
             }
-            container.blackFadeToPreparedPlayer(
+            container.crossfadePreparedPlayer(
                 components.player,
                 duration: automaticSwitchTransitionDuration
             ) {
@@ -4892,12 +5032,31 @@ final class VideoWallpaperManager: ObservableObject {
                     window.orderFrontRegardless()
                 }
                 self.presentedVideoScreenIDs.insert(screenID)
+                // 首帧已提交可见，此刻再强制菜单栏重采样。apply 时 0.12s 的 poke
+                // 常早于首帧合成，采到旧桌面后无人再补，表现为“切视频不刷新，
+                // 点一下其它 App 才好”。
+                DesktopWallpaperSyncManager.shared
+                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [transitionScreen], delay: 0.15)
+                // 跨类型切换 poster 已在 apply 前写入（被旧 Scene/Web 遮挡）；
+                // 新窗 reveal 后露出一次桌面图，菜单栏才能按 poster 重采样。
+                // 第二次闪烁兜底 WallpaperAgent 慢加载（未加载完会采到旧图）。
+                self.flashDesktopExposureForMenuBarResample(on: [transitionScreen], delays: [0.3, 1.2])
                 self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "crossTypeVideoReady")
                 return
             }
 
             self.presentDesktopWallpaperWindow(window, animated: Self.shouldAnimateDesktopPresentation)
             self.presentedVideoScreenIDs.insert(screenID)
+            if let presentedScreen = NSScreen.screens.first(where: {
+                $0.wallpaperScreenIdentifier == screenID
+            }) {
+                DesktopWallpaperSyncManager.shared
+                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [presentedScreen], delay: 0.15)
+                // 非动画路径 poster 在重建窗口前已写入（被旧窗遮挡，菜单栏未重采样）；
+                // 启动恢复时壁纸本就是上次 poster。首帧 reveal 后露出一次桌面图即可。
+                // 第二次闪烁兜底 WallpaperAgent 慢加载（未加载完会采到旧图）。
+                self.flashDesktopExposureForMenuBarResample(on: [presentedScreen], delays: [0.3, 1.2])
+            }
             self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "windowReady")
         }
 
@@ -5423,17 +5582,17 @@ private struct VideoLetterboxCrop {
     }
 }
 
-/// 视频切到照片 / Scene / Web 时的提交遮罩。
+/// 视频切到照片 / Scene / Web 时的提交协调器。
 ///
-/// 新内容必须先在旧视频后方完成准备；这里只负责很短的黑场提交窗口，确保旧视频
-/// teardown 与新内容 reveal 发生在黑场最深处。遮罩永远由本方法负责移除，后台切换
-/// 不依赖 AppKit 动画 completion，避免菜单栏“下一张”时黑层永久滞留。
+/// 新内容必须先在旧视频后方完成准备。提交时使用旧桌面快照覆盖 teardown 空档，
+/// 再淡出快照露出新内容，既避免黑场也保留跨类型转场的连续感。
 @MainActor
 final class WallpaperCrossTypeTransitionCoordinator {
     static let shared = WallpaperCrossTypeTransitionCoordinator()
 
     private var transitionGenerationByScreen: [String: UInt64] = [:]
-    private var blackWindowsByScreen: [String: NSWindow] = [:]
+    private var snapshotWindowsByScreen: [String: NSWindow] = [:]
+    private let crossTypeFadeDuration: TimeInterval = 0.28
 
     private init() {}
 
@@ -5452,103 +5611,47 @@ final class WallpaperCrossTypeTransitionCoordinator {
         }
 
         var generations: [String: UInt64] = [:]
-        var windowsByScreen: [String: NSWindow] = [:]
+        var snapshots: [String: NSWindow] = [:]
         for (screenID, screen) in uniqueScreens {
-            removeBlackWindow(for: screenID)
+            removeSnapshotWindow(for: screenID)
             let generation = (transitionGenerationByScreen[screenID] ?? 0) &+ 1
             transitionGenerationByScreen[screenID] = generation
             generations[screenID] = generation
-            let window = makeBlackWindow(for: screen)
-            blackWindowsByScreen[screenID] = window
-            windowsByScreen[screenID] = window
-            window.alphaValue = 0
-            window.orderFrontRegardless()
-            window.displayIfNeeded()
+            if let snapshot = captureDesktopSnapshot(for: screen) {
+                let window = makeSnapshotWindow(for: screen, image: snapshot)
+                snapshotWindowsByScreen[screenID] = window
+                snapshots[screenID] = window
+                window.orderFrontRegardless()
+                window.displayIfNeeded()
+            }
         }
-        let windows = Array(windowsByScreen.values)
 
-        // 桌面层 NSWindow.animator 在菜单栏/非 key 时经常不推进，不能依赖
-        // “App 是否 active” 分支；统一瞬时提交 + 固定半程，避免要点一下才变。
-        setAlpha(1, for: windows)
-        try? await Task.sleep(nanoseconds: 140_000_000)
-
-        guard isCurrent(generations: generations) else {
-            removeMatchingBlackWindows(windowsByScreen)
-            return
-        }
         let teardownStartedAt = Date()
         await teardownOldContent()
-        // prepared content 的 reveal 可能在相同 desktop level 上调用 orderFront。
-        // 提交后重新把遮罩置顶，确保黑场不会在最深点突然丢失。
-        for window in windows {
-            window.orderFrontRegardless()
-            window.displayIfNeeded()
+
+        guard isCurrent(generations: generations) else {
+            removeMatchingSnapshotWindows(snapshots)
+            return
         }
+        // 新内容已在提交前就绪。快照保持旧画面直到同级 desktop window 完成
+        // orderFront/orderOut，再通过独立 CA 动画淡出。
         CATransaction.flush()
         CFRunLoopWakeUp(CFRunLoopGetMain())
         await Task.yield()
-
-        try? await Task.sleep(nanoseconds: 140_000_000)
-        setAlpha(0, for: windows)
+        fadeOutSnapshotWindows(Array(snapshots.values), duration: crossTypeFadeDuration)
+        try? await Task.sleep(nanoseconds: UInt64(crossTypeFadeDuration * 1_000_000_000))
 
         guard isCurrent(generations: generations) else {
-            removeMatchingBlackWindows(windowsByScreen)
+            removeMatchingSnapshotWindows(snapshots)
             return
         }
-        removeMatchingBlackWindows(windowsByScreen)
-        AppLogger.debug(.wallpaper, "Cross-type black transition completed", metadata: [
+        removeMatchingSnapshotWindows(snapshots)
+        AppLogger.debug(.wallpaper, "Cross-type wallpaper crossfade completed", metadata: [
             "screens": uniqueScreens.keys.sorted().joined(separator: ","),
+            "snapshotScreens": snapshots.keys.sorted().joined(separator: ","),
             "teardownMS": Int(Date().timeIntervalSince(teardownStartedAt) * 1_000),
             "totalMS": Int(Date().timeIntervalSince(transitionStartedAt) * 1_000)
         ])
-    }
-
-    private func makeBlackWindow(for screen: NSScreen) -> NSWindow {
-        let window = NSWindow(
-            contentRect: screen.frame,
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false,
-            screen: screen
-        )
-        // 比实际壁纸窗高一级。两者同级时，新内容 orderFront 会盖住黑层，表现为
-        // 全局黑场过渡“丢了”；仍远低于普通应用窗口，不会遮住用户界面。
-        window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        window.isOpaque = true
-        window.backgroundColor = .black
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.isReleasedWhenClosed = false
-        window.setFrame(screen.frame, display: true)
-        return window
-    }
-
-    private func animate(windows: [NSWindow], alpha: CGFloat, duration: TimeInterval) async {
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = duration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            for window in windows {
-                window.animator().alphaValue = alpha
-            }
-        } completionHandler: {}
-        // NSAnimationContext completion 在菜单栏切换/焦点变化时偶发延迟约
-        // 250ms，两个半程叠加后会把短黑场拖到接近 1 秒。按目标时长等待后
-        // 直接锁定最终 alpha；加载时间完全留在黑场之前，提交时长保持确定。
-        let nanoseconds = UInt64(max(0, duration) * 1_000_000_000)
-        try? await Task.sleep(nanoseconds: nanoseconds)
-        setAlpha(alpha, for: windows)
-    }
-
-    private func setAlpha(_ alpha: CGFloat, for windows: [NSWindow]) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for window in windows {
-            window.alphaValue = alpha
-            window.displayIfNeeded()
-        }
-        CATransaction.commit()
-        CATransaction.flush()
     }
 
     private func isCurrent(generations: [String: UInt64]) -> Bool {
@@ -5557,21 +5660,87 @@ final class WallpaperCrossTypeTransitionCoordinator {
         }
     }
 
-    /// 批量过渡被其中一块屏的新请求取代时，只移除仍属于本批次的窗口。
-    /// 已由新请求接管的屏幕会因为 identity 不匹配而保留新黑层。
-    private func removeMatchingBlackWindows(_ windowsByScreen: [String: NSWindow]) {
-        for (screenID, window) in windowsByScreen {
-            removeBlackWindow(for: screenID, ifMatching: window)
+    /// 仅在已有屏幕录制权限时捕获；不主动请求权限，拿不到快照就降级为无黑场直切。
+    private func captureDesktopSnapshot(for screen: NSScreen) -> NSImage? {
+        guard CGPreflightScreenCaptureAccess(),
+              let number = screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+              ] as? NSNumber else {
+            return nil
+        }
+        let displayBounds = CGDisplayBounds(number.uint32Value)
+        guard let image = CGWindowListCreateImage(
+            displayBounds,
+            .optionOnScreenOnly,
+            kCGNullWindowID,
+            [.boundsIgnoreFraming, .bestResolution]
+        ) else {
+            return nil
+        }
+        return NSImage(cgImage: image, size: screen.frame.size)
+    }
+
+    private func makeSnapshotWindow(for screen: NSScreen, image: NSImage) -> NSWindow {
+        let window = NSWindow(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false,
+            screen: screen
+        )
+        window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
+        window.setFrame(screen.frame, display: false)
+
+        let contentView = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
+        let imageView = NSImageView(frame: contentView.bounds)
+        imageView.image = image
+        imageView.imageScaling = .scaleAxesIndependently
+        imageView.imageAlignment = .alignCenter
+        imageView.autoresizingMask = [.width, .height]
+        contentView.addSubview(imageView)
+        window.contentView = contentView
+        return window
+    }
+
+    private func fadeOutSnapshotWindows(_ windows: [NSWindow], duration: TimeInterval) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for window in windows {
+            guard let layer = window.contentView?.layer else { continue }
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = layer.presentation()?.opacity ?? layer.opacity
+            fade.toValue = 0
+            fade.duration = duration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(fade, forKey: "wallpaperCrossTypeCrossfade")
+            layer.opacity = 0
+        }
+        CATransaction.commit()
+        CATransaction.flush()
+    }
+
+    private func removeMatchingSnapshotWindows(_ windows: [String: NSWindow]) {
+        for (screenID, window) in windows {
+            removeSnapshotWindow(for: screenID, ifMatching: window)
         }
     }
 
-    private func removeBlackWindow(for screenID: String, ifMatching expected: NSWindow? = nil) {
-        guard let window = blackWindowsByScreen[screenID],
+    private func removeSnapshotWindow(for screenID: String, ifMatching expected: NSWindow? = nil) {
+        guard let window = snapshotWindowsByScreen[screenID],
               expected == nil || window === expected else { return }
         window.orderOut(nil)
         window.close()
-        blackWindowsByScreen.removeValue(forKey: screenID)
+        snapshotWindowsByScreen.removeValue(forKey: screenID)
     }
+
 }
 
 private enum VideoLetterboxAnalyzer {
@@ -5767,11 +5936,11 @@ private final class WallpaperVideoContainerView: NSView {
     private var storedPosterLayer: CALayer?
     private var grainOverlayView: NSView?
     private var transitionPlayerLayer: AVPlayerLayer?
-    private var blackTransitionLayer: CALayer?
 
     /// 实际播放视频的 AVPlayerLayer。作为容器 backing layer 的子层，
     /// 通过修改它的 frame 实现 pan/zoom 裁切（容器 backing layer masksToBounds 自然裁剪）。
-    private let avPlayerLayer = AVPlayerLayer()
+    /// 交叉淡入结束时可晋升已预热的 transition layer，故为 var。
+    private var avPlayerLayer = AVPlayerLayer()
     /// 垫在 AVPlayerLayer 下方：当 `isReadyForDisplay == false`（looper 切 item / 解码空帧）
     /// 时用最近一帧挡住 window 纯黑底，避免桌面「暗闪一下」而 UI 窗口不受影响。
     private let freezeFrameLayer = CALayer()
@@ -5996,7 +6165,6 @@ private final class WallpaperVideoContainerView: NSView {
             freezeFrameLayer.frame = viewBounds
             // 过渡层与主视频层同坐标系（父 layer），必须用 frame 而非 bounds。
             transitionPlayerLayer?.frame = avPlayerLayer.frame
-            blackTransitionLayer?.frame = viewBounds
             // 回退：mask 清除，poster/grain 恢复全 bounds
             layer?.mask = nil
             storedPosterLayer?.frame = viewBounds  // 无 crop 时 poster 也铺满
@@ -6052,22 +6220,18 @@ private final class WallpaperVideoContainerView: NSView {
         storedPosterLayer?.frame = computedLayerFrame
         grainOverlayView?.autoresizingMask = []
         grainOverlayView?.frame = viewport
-        blackTransitionLayer?.frame = viewBounds
     }
 
     func cancelPlayerTransitionIfNeeded() {
         transitionPlayerLayer?.player = nil
         transitionPlayerLayer?.removeFromSuperlayer()
         transitionPlayerLayer = nil
-        blackTransitionLayer?.removeAllAnimations()
-        blackTransitionLayer?.removeFromSuperlayer()
-        blackTransitionLayer = nil
     }
 
     /// Attach an incoming shared player to an almost-transparent layer so AVFoundation
     /// actually decodes a presentable frame while the old main layer remains visible.
     @discardableResult
-    func preparePlayerForBlackTransition(_ player: AVQueuePlayer) -> AVPlayerLayer {
+    func preparePlayerForCrossfade(_ player: AVQueuePlayer) -> AVPlayerLayer {
         cancelPlayerTransitionIfNeeded()
         let incoming = AVPlayerLayer(player: player)
         incoming.videoGravity = avPlayerLayer.videoGravity
@@ -6084,14 +6248,11 @@ private final class WallpaperVideoContainerView: NSView {
         transitionPlayerLayer?.player = nil
         transitionPlayerLayer?.removeFromSuperlayer()
         transitionPlayerLayer = nil
-        blackTransitionLayer?.removeAllAnimations()
-        blackTransitionLayer?.removeFromSuperlayer()
-        blackTransitionLayer = nil
     }
 
-    /// Fade to black, swap the already-warm incoming player while fully covered,
-    /// then fade black out. The old player is never detached before black is opaque.
-    func blackFadeToPreparedPlayer(
+    /// 将已经预热的图层淡入旧图层上方。提交时直接晋升同一个
+    /// `AVPlayerLayer`，避免把同一 player 重新挂到新 layer 时重建输出并闪黑。
+    func crossfadePreparedPlayer(
         _ newPlayer: AVQueuePlayer,
         duration: TimeInterval,
         completion: @escaping () -> Void
@@ -6099,80 +6260,139 @@ private final class WallpaperVideoContainerView: NSView {
         guard let incoming = transitionPlayerLayer, incoming.player === newPlayer else {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            // 走 attachPlayer：未就绪时由 freeze 垫层挡住 window 黑底。
             attachPlayer(newPlayer)
             CATransaction.commit()
             completion()
             return
         }
 
-        // 黑场盖住前先尽量抓一帧，揭黑后若主层短暂未 ready 仍有垫层。
+        // 保留旧帧作为 output 重绑期间的最后兜底。正常路径里旧主层会一直留在
+        // incoming 下方，直到淡入结束，因此不会露出 window 的黑色底图。
         captureFreezeFrameIfNeeded(force: true)
 
-        let black = CALayer()
-        black.backgroundColor = NSColor.black.cgColor
-        black.frame = bounds
-        black.opacity = 0
-        layer?.addSublayer(black)
-        blackTransitionLayer = black
-
         var didComplete = false
-        let finish: () -> Void = { [weak self, weak black] in
+        var didPromote = false
+        var didBeginFade = false
+        let finish: () -> Void = {
             guard !didComplete else { return }
             didComplete = true
-            black?.removeAllAnimations()
-            black?.removeFromSuperlayer()
-            if self?.blackTransitionLayer === black {
-                self?.blackTransitionLayer = nil
-            }
             completion()
         }
 
-        let installIncoming: () -> Void = { [weak self, weak incoming] in
+        let promoteIncoming: () -> Bool = { [weak self, weak incoming] in
+            guard !didPromote else { return true }
+            didPromote = true
             guard let self, let incoming else {
                 finish()
-                return
+                return false
             }
+
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            self.avPlayerLayer.videoGravity = incoming.videoGravity
-            // attachPlayer 统一管理主层 + freeze 可见性；不要直接写 avPlayerLayer.player。
-            self.attachPlayer(newPlayer)
-            // 交接瞬间主层可能尚未 isReadyForDisplay，先露 freeze 防揭黑闪一下。
-            self.freezeFrameLayer.isHidden = false
-            incoming.player = nil
-            incoming.removeFromSuperlayer()
+            let outgoing = self.avPlayerLayer
+            self.readyForDisplayObservation?.invalidate()
+            incoming.opacity = 1
+            self.avPlayerLayer = incoming
             if self.transitionPlayerLayer === incoming {
                 self.transitionPlayerLayer = nil
             }
-            CATransaction.commit()
-        }
-
-        let totalDuration = max(0.16, duration)
-        let halfDuration = totalDuration / 2
-        // 桌面层 CA completion 在 App 非 key / 菜单栏切换时经常不跑，表现为
-        // “壁纸已切换但画面要等点一下其它 App 才更新”。统一用固定时序提交。
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        black.opacity = 1
-        CATransaction.commit()
-        CATransaction.flush()
-        DispatchQueue.main.asyncAfter(deadline: .now() + halfDuration) {
-            guard !didComplete else { return }
-            installIncoming()
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            black.opacity = 0
+            outgoing.player = nil
+            outgoing.removeFromSuperlayer()
+            self.startReadyForDisplayObservation()
+            self.refreshFreezeFrameVisibility()
             CATransaction.commit()
             CATransaction.flush()
-            DispatchQueue.main.asyncAfter(deadline: .now() + halfDuration) {
+            return true
+        }
+
+        let beginFade: () -> Void = { [weak self, weak incoming] in
+            guard !didBeginFade, !didComplete, let self, let incoming,
+                  self.transitionPlayerLayer === incoming,
+                  incoming.player === newPlayer else { return }
+            didBeginFade = true
+
+            let fadeDuration = max(0.12, duration)
+            if duration <= 0.01 {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                incoming.opacity = 1
+                CATransaction.commit()
+                _ = promoteIncoming()
+                finish()
+                return
+            }
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = incoming.presentation()?.opacity ?? incoming.opacity
+            fade.toValue = 1
+            fade.duration = fadeDuration
+            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            incoming.add(fade, forKey: "wallpaperCrossfade")
+            incoming.opacity = 1
+            CATransaction.commit()
+            CATransaction.flush()
+
+            // 显式 CA 动画不依赖 App 是否前台；收尾仍使用固定时序而非 completion。
+            // 整个动画期间旧图层仍在下方，所以不会暴露黑底。
+            DispatchQueue.main.asyncAfter(deadline: .now() + fadeDuration) {
+                guard !didComplete else { return }
+                _ = promoteIncoming()
                 finish()
             }
         }
-        // 兜底：即使 runloop 被拖住，也在 totalDuration 后强制完成交接。
-        DispatchQueue.main.asyncAfter(deadline: .now() + totalDuration + 0.35) {
-            installIncoming()
-            finish()
+
+        waitForPreparedPlayerToAdvance(
+            player: newPlayer,
+            layer: incoming,
+            timeout: 1.5,
+            completion: beginFade
+        )
+    }
+
+    /// `AVPlayerItem.readyToPlay` 不代表该 layer 已有可合成帧；仅在预热 layer
+    /// 已显示且播放时间推进后才开始淡入，防止把尚未产出的首帧放到最上层。
+    private func waitForPreparedPlayerToAdvance(
+        player: AVQueuePlayer,
+        layer: AVPlayerLayer,
+        timeout: TimeInterval,
+        completion: @escaping () -> Void
+    ) {
+        let startedAt = CACurrentMediaTime()
+        let initialSeconds = player.currentTime().seconds
+        let expectsPlaybackProgress = player.rate > 0 || player.timeControlStatus != .paused
+        Task { @MainActor [weak self, weak player, weak layer] in
+            guard let self, let player, let layer else { return }
+            let deadline = startedAt + timeout
+            while CACurrentMediaTime() < deadline {
+                guard self.transitionPlayerLayer === layer, layer.player === player else { return }
+                let currentSeconds = player.currentTime().seconds
+                let advanced = !expectsPlaybackProgress
+                    || (initialSeconds.isFinite && currentSeconds.isFinite
+                        && abs(currentSeconds - initialSeconds) >= 1.0 / 30.0)
+                if CACurrentMediaTime() - startedAt >= 0.05,
+                   layer.isReadyForDisplay,
+                   advanced {
+                    completion()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+
+            guard self.transitionPlayerLayer === layer, layer.player === player else { return }
+            AppLogger.warn(
+                .wallpaper,
+                "Prepared video layer did not advance before crossfade timeout",
+                metadata: [
+                    "layerReady": layer.isReadyForDisplay,
+                    "rate": player.rate,
+                    "timeControlStatus": player.timeControlStatus.rawValue,
+                    "currentSeconds": player.currentTime().seconds,
+                    "initialSeconds": initialSeconds
+                ]
+            )
+            completion()
         }
     }
 
@@ -6346,7 +6566,6 @@ private final class WallpaperVideoContainerView: NSView {
             freezeFrameLayer.frame = currentLayerFrame ?? avPlayerLayer.frame
         }
         transitionPlayerLayer?.frame = avPlayerLayer.frame
-        blackTransitionLayer?.frame = bounds
 
         // poster 是 sublayer，和 avPlayerLayer 同级，容器 mask 自动裁剪。
         // poster frame 必须和 avPlayerLayer 一致（含 pan/zoom 偏移），不能用 viewport。

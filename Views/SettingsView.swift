@@ -318,6 +318,10 @@ private struct GeneralSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @State private var showClearLockScreenAlert = false
+    @State private var showDynamicLockScreenAutomationAlert = false
+    @State private var showDynamicLockScreenAutomationFailureAlert = false
+    @State private var dynamicLockScreenAutomationFailure: LockScreenWallpaperService.AutomaticSetupResult?
+    @State private var isConfiguringDynamicLockScreen = false
     @State private var importProfileURL = ""
 
     private var languageBinding: Binding<LocalizationService.Language> {
@@ -334,6 +338,49 @@ private struct GeneralSettingsTab: View {
     private func openAccessibilitySettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private var dynamicLockScreenBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.dynamicLockScreenEnabled },
+            set: { enabled in
+                guard enabled != viewModel.dynamicLockScreenEnabled else { return }
+                viewModel.dynamicLockScreenEnabled = enabled
+                if enabled {
+                    showDynamicLockScreenAutomationAlert = true
+                }
+            }
+        )
+    }
+
+    private func configureDynamicLockScreenAutomatically() {
+        isConfiguringDynamicLockScreen = true
+        Task { @MainActor in
+            let result = await LockScreenWallpaperService.shared.automaticallyConfigureLockScreen()
+            isConfiguringDynamicLockScreen = false
+
+            guard result != .configured else { return }
+            dynamicLockScreenAutomationFailure = result
+            NSApp.activate(ignoringOtherApps: true)
+            showDynamicLockScreenAutomationFailureAlert = true
+        }
+    }
+
+    private var dynamicLockScreenAutomationFailureMessage: String {
+        switch dynamicLockScreenAutomationFailure {
+        case .accessibilityPermissionRequired:
+            return t("dynamicLockScreenAutoSetupAccessibilityMessage")
+        case .ambiguousDisplayNames:
+            return t("dynamicLockScreenAutoSetupAmbiguousDisplaysMessage")
+        case .noDisplayInstances:
+            return t("dynamicLockScreenAutoSetupNoDisplaysMessage")
+        case .unavailable:
+            return t("dynamicLockScreenAutoSetupUnavailableMessage")
+        case .systemSettingsUnavailable, .timedOut:
+            return t("dynamicLockScreenAutoSetupManualMessage")
+        case .configured, .none:
+            return ""
+        }
     }
 
     var body: some View {
@@ -586,7 +633,13 @@ private struct GeneralSettingsTab: View {
                         subtitle: t("dynamicLockScreenDesc"),
                         showDivider: true
                     ) {
-                        MacToggle(isOn: $viewModel.dynamicLockScreenEnabled)
+                        if isConfiguringDynamicLockScreen {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(width: 32, height: 24)
+                        } else {
+                            MacToggle(isOn: dynamicLockScreenBinding)
+                        }
                     }
 
                     MacSettingsRow(
@@ -703,6 +756,30 @@ private struct GeneralSettingsTab: View {
             }
         } message: {
             Text(t("clearLockScreenInstancesConfirm"))
+        }
+        .alert(t("dynamicLockScreenAutoSetupTitle"), isPresented: $showDynamicLockScreenAutomationAlert) {
+            Button(t("dynamicLockScreenAutoSetupLater"), role: .cancel) {}
+            Button(t("dynamicLockScreenAutoSetupAction")) {
+                configureDynamicLockScreenAutomatically()
+            }
+        } message: {
+            Text(t("dynamicLockScreenAutoSetupConfirm"))
+        }
+        .alert(
+            t("dynamicLockScreenAutoSetupFailedTitle"),
+            isPresented: $showDynamicLockScreenAutomationFailureAlert
+        ) {
+            if dynamicLockScreenAutomationFailure == .accessibilityPermissionRequired {
+                Button(t("openAccessibilitySettings")) {
+                    openAccessibilitySettings()
+                }
+            }
+            Button(t("dynamicLockScreenOpenWallpaperSettings")) {
+                LockScreenWallpaperService.shared.openWallpaperSettings()
+            }
+            Button(t("cancel"), role: .cancel) {}
+        } message: {
+            Text(dynamicLockScreenAutomationFailureMessage)
         }
     }
 

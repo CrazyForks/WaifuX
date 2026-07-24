@@ -36,11 +36,16 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         private weak var containerView: LoopingVideoPlayerContainerView?
-        private var currentURL: URL?
+        private var requestedURL: URL?
+        private var playingURL: URL?
         private var player: AVQueuePlayer?
         private var looper: AVPlayerLooper?
         private var onReady: (@MainActor @Sendable () -> Void)?
         private var readyObserver: NSObjectProtocol?
+        private var failedObserver: NSObjectProtocol?
+        private var statusObservation: NSKeyValueObservation?
+        private var resolveTask: Task<Void, Never>?
+        private var didSignalReady = false
 
         init(onReady: (@MainActor @Sendable () -> Void)?) {
             self.onReady = onReady
@@ -53,7 +58,7 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
         func update(url: URL, isMuted: Bool, in view: LoopingVideoPlayerContainerView) {
             attach(to: view)
 
-            if currentURL != url {
+            if requestedURL != url {
                 configurePlayer(with: url, in: view)
             }
 
@@ -63,22 +68,105 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
         }
 
         func teardown() {
+            resolveTask?.cancel()
+            resolveTask = nil
             if let observer = readyObserver {
                 NotificationCenter.default.removeObserver(observer)
                 readyObserver = nil
             }
+            if let observer = failedObserver {
+                NotificationCenter.default.removeObserver(observer)
+                failedObserver = nil
+            }
+            statusObservation?.invalidate()
+            statusObservation = nil
             looper?.disableLooping()
             looper = nil
             player?.pause()
             player = nil
-            currentURL = nil
+            requestedURL = nil
+            playingURL = nil
+            didSignalReady = false
             containerView?.playerLayer.player = nil
+        }
+
+        private func signalReadyOnce() {
+            guard !didSignalReady else { return }
+            didSignalReady = true
+            onReady?()
         }
 
         private func configurePlayer(with url: URL, in view: LoopingVideoPlayerContainerView) {
             teardown()
+            requestedURL = url
+            didSignalReady = false
 
-            let item = AVPlayerItem(url: url)
+            // 本地文件：直接播
+            if url.isFileURL {
+                startPlayback(with: url, in: view)
+                return
+            }
+
+            // Wallsflow 等：CDN 假 Range，必须先整文件落地再播，否则 -11850 黑屏
+            if WallsflowService.isProtectedMediaURL(url) {
+                resolveTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        let playable = try await VideoPreloader.shared.resolvePlayableURL(for: url)
+                        guard !Task.isCancelled, self.requestedURL == url else { return }
+                        guard let container = self.containerView else { return }
+                        self.startPlayback(with: playable, in: container)
+                    } catch {
+                        print("[LoopingVideoBackground] resolve/download failed: \(url.lastPathComponent) \(error)")
+                        self.signalReadyOnce()
+                    }
+                }
+                // 下载期间先结束 loading 遮罩，由底层封面顶着
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.signalReadyOnce()
+                }
+                return
+            }
+
+            // 其他远程：带可选自定义头直接播
+            startPlayback(with: url, in: view, remoteHeaders: nil)
+        }
+
+        private func startPlayback(
+            with url: URL,
+            in view: LoopingVideoPlayerContainerView,
+            remoteHeaders: [String: String]? = nil
+        ) {
+            // 清理上一次播放器，但保留 requestedURL / resolveTask 语义
+            if let observer = readyObserver {
+                NotificationCenter.default.removeObserver(observer)
+                readyObserver = nil
+            }
+            if let observer = failedObserver {
+                NotificationCenter.default.removeObserver(observer)
+                failedObserver = nil
+            }
+            statusObservation?.invalidate()
+            statusObservation = nil
+            looper?.disableLooping()
+            looper = nil
+            player?.pause()
+            player = nil
+
+            let item: AVPlayerItem = {
+                if url.isFileURL {
+                    return AVPlayerItem(url: url)
+                }
+                var options: [String: Any] = [
+                    AVURLAssetPreferPreciseDurationAndTimingKey: false
+                ]
+                let headers = remoteHeaders ?? WallsflowService.mediaRequestHeaders(for: url)
+                if let headers {
+                    options["AVURLAssetHTTPHeaderFieldsKey"] = headers
+                }
+                return AVPlayerItem(asset: AVURLAsset(url: url, options: options))
+            }()
+
             if #available(macOS 10.15, *) {
                 item.seekingWaitsForVideoCompositionRendering = true
             }
@@ -96,18 +184,38 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
                 object: item,
                 queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.onReady?() }
+                MainActor.assumeIsolated { self?.signalReadyOnce() }
+            }
+
+            failedObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemFailedToPlayToEndTime,
+                object: item,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.signalReadyOnce() }
+            }
+
+            statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] observed, _ in
+                let status = observed.status
+                DispatchQueue.main.async {
+                    if status == .readyToPlay || status == .failed {
+                        if status == .failed {
+                            print("[LoopingVideoBackground] item failed: \(observed.error?.localizedDescription ?? "?")")
+                        }
+                        self?.signalReadyOnce()
+                    }
+                }
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.onReady?()
+                self?.signalReadyOnce()
             }
 
             queuePlayer.play()
 
             self.player = queuePlayer
             self.looper = looper
-            self.currentURL = url
+            self.playingURL = url
         }
     }
 }
@@ -136,9 +244,7 @@ final class LoopingVideoPlayerContainerView: NSView {
     }
 
     var playerLayer: AVPlayerLayer {
-        // makeBackingLayer 确保 backing layer 始终是 AVPlayerLayer
         guard let avLayer = layer as? AVPlayerLayer else {
-            // 防御性兜底：理论上不会触发，但防止极端情况下的崩溃
             let fallback = AVPlayerLayer()
             fallback.videoGravity = contentMode == .fill ? .resizeAspectFill : .resizeAspect
             fallback.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
@@ -151,7 +257,6 @@ final class LoopingVideoPlayerContainerView: NSView {
 
     override func layout() {
         super.layout()
-        // 确保 layer 尺寸与 view 同步（macOS < 26 的补充保障）
         if playerLayer.frame != bounds {
             playerLayer.frame = bounds
         }
@@ -159,8 +264,6 @@ final class LoopingVideoPlayerContainerView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        // macOS < 26：加入 window 时确保 layer 尺寸正确
-        // 解决 NSViewRepresentable 在 GeometryReader 中尺寸传递的时序问题
         if window != nil {
             playerLayer.frame = bounds
         }

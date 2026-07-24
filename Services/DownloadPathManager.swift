@@ -260,6 +260,13 @@ final class DownloadPathManager {
                 ok = false
             }
         }
+
+        // Optimization records no longer live next to media; lift any historical
+        // adjacent sidecars out of Media / SceneBakes when the library root is ready.
+        let migrated = VideoOptimizationRecordStore.shared.migrateLegacyAdjacentSidecarsInLibraryRootsIfNeeded()
+        if migrated > 0 {
+            print("[DownloadPathManager] Migrated \(migrated) video optimization sidecars out of media folders")
+        }
         return ok
     }
 

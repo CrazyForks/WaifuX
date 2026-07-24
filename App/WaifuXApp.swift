@@ -280,6 +280,10 @@ struct WaifuXApp {
         if host.contains("motionbgs.com") {
             request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
             request.setValue("https://motionbgs.com/", forHTTPHeaderField: "Referer")
+        } else if host.contains("wallsflow.com") {
+            // cloud.wallsflow.com 封面/视频热链保护
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+            request.setValue(WallsflowService.siteOrigin, forHTTPHeaderField: "Referer")
         } else if host.contains("wallhaven.cc") {
             request.setValue("https://wallhaven.cc/", forHTTPHeaderField: "Referer")
         } else if host.contains("pximg.net") {

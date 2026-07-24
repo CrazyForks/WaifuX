@@ -94,19 +94,59 @@ actor WallsflowService {
     private var listCache: [String: WallsflowListPage] = [:]
     private var detailCache: [String: MediaItem] = [:]
 
-    private let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    static let siteOrigin = "https://wallsflow.com/"
+    static let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+
+    private let userAgent = WallsflowService.browserUserAgent
 
     private var defaultHeaders: [String: String] {
         [
             "User-Agent": userAgent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://wallsflow.com/",
+            "Referer": Self.siteOrigin,
             "Cache-Control": "no-cache",
         ]
     }
 
     private init() {}
+
+    /// `cloud.wallsflow.com` 的 mp4 热链保护：无 Referer 会 302 到首页 HTML。
+    nonisolated static func isProtectedMediaURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host.contains("wallsflow.com")
+    }
+
+    /// 下载 / AVPlayer 请求 `cloud.wallsflow.com` 时必须带上的头。
+    nonisolated static func mediaRequestHeaders(for url: URL, pageURL: URL? = nil) -> [String: String]? {
+        guard isProtectedMediaURL(url) else { return nil }
+        let referer: String = {
+            if let pageURL,
+               let host = pageURL.host?.lowercased(),
+               host.contains("wallsflow.com") {
+                return pageURL.absoluteString
+            }
+            return siteOrigin
+        }()
+        return [
+            "User-Agent": browserUserAgent,
+            "Referer": referer,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://wallsflow.com",
+        ]
+    }
+
+    /// 是否为 Wallsflow 媒体项（slug / source / page host）。
+    nonisolated static func isWallsflowItem(_ item: MediaItem) -> Bool {
+        if item.slug.hasPrefix("wf_") || item.id.hasPrefix("wf_") {
+            return true
+        }
+        if let host = item.pageURL.host?.lowercased(), host.contains("wallsflow.com") {
+            return true
+        }
+        return item.sourceName.lowercased().contains("wallsflow")
+    }
 
     // MARK: - 列表页获取
 
@@ -463,7 +503,8 @@ private extension WallsflowService {
 
         let headline = article["headline"] as? String ?? article["name"] as? String ?? ""
         let description = article["description"] as? String
-        let imageURL = (article["image"] as? String).flatMap(URL.init)
+        // JSON-LD 的 image 可能是 String / [String] / [{url: ...}]
+        let imageURL = Self.parseJSONLDImageURL(article["image"])
 
         // 作者
         let authorName: String? = {
@@ -492,7 +533,7 @@ private extension WallsflowService {
         }()
 
         // 从页面 DOM 补充视频 URL、标签等（JSON-LD 不包含这些）
-        let (videoURL, tags, resolution, fileSizeText, _, _, _) = parseDetailSupplemental(document: document)
+        let (videoURL, tags, resolution, fileSizeText, _, _, downloadURL) = parseDetailSupplemental(document: document)
 
         // 从 URL 提取 ID
         let id = extractID(from: pageURL.absoluteString) ?? pageURL.lastPathComponent.replacingOccurrences(of: ".html", with: "")
@@ -517,16 +558,13 @@ private extension WallsflowService {
 
         let sourceNameValue = t("wallsflow")
 
-        var detailDownloadOptions: [MediaDownloadOption] = []
-        if let videoURL {
-            let option = MediaDownloadOption(
-                label: "Original",
-                fileSizeLabel: fileSizeText ?? "",
-                detailText: resolution ?? "Original MP4",
-                remoteURL: videoURL
-            )
-            detailDownloadOptions = [option]
-        }
+        // 优先直链 mp4（cloud.wallsflow.com）；download.php 常回 HTML，不适合当媒体直链。
+        let detailDownloadOptions = Self.makeDownloadOptions(
+            videoURL: videoURL,
+            downloadURL: downloadURL,
+            fileSizeText: fileSizeText,
+            resolution: resolution
+        )
 
         let mediaItem = MediaItem(
             slug: "wf_\(id)",
@@ -588,7 +626,7 @@ private extension WallsflowService {
         }()
 
         // 补充字段
-        let (videoURL, tags, resolution, fileSizeText, _, _, _) = parseDetailSupplemental(document: document)
+        let (videoURL, tags, resolution, fileSizeText, _, _, downloadURL) = parseDetailSupplemental(document: document)
 
         let id = extractID(from: pageURL.absoluteString) ?? pageURL.lastPathComponent.replacingOccurrences(of: ".html", with: "")
         let sourceNameValue = t("wallsflow")
@@ -596,16 +634,12 @@ private extension WallsflowService {
         let (exactResolution, _, _) = parseResolution(resolution)
         let fileSizeBytes = parseFileSize(fileSizeText)
 
-        var detailDownloadOptions: [MediaDownloadOption] = []
-        if let videoURL {
-            let option = MediaDownloadOption(
-                label: "Original",
-                fileSizeLabel: fileSizeText ?? "",
-                detailText: resolution ?? "Original MP4",
-                remoteURL: videoURL
-            )
-            detailDownloadOptions = [option]
-        }
+        let detailDownloadOptions = Self.makeDownloadOptions(
+            videoURL: videoURL,
+            downloadURL: downloadURL,
+            fileSizeText: fileSizeText,
+            resolution: resolution
+        )
 
         return MediaItem(
             slug: "wf_\(id)",
@@ -742,6 +776,62 @@ private extension WallsflowService {
     }
 
     // MARK: - 辅助方法
+
+    /// JSON-LD `image` 兼容 String / [String] / [{url}] 三种形态。
+    nonisolated static func parseJSONLDImageURL(_ value: Any?) -> URL? {
+        if let s = value as? String, let url = URL(string: s), !s.isEmpty {
+            return url
+        }
+        if let arr = value as? [String] {
+            for s in arr where !s.isEmpty {
+                if let url = URL(string: s) { return url }
+            }
+        }
+        if let arr = value as? [Any] {
+            for entry in arr {
+                if let s = entry as? String, let url = URL(string: s), !s.isEmpty {
+                    return url
+                }
+                if let dict = entry as? [String: Any] {
+                    if let s = dict["url"] as? String, let url = URL(string: s) {
+                        return url
+                    }
+                    if let s = dict["contentUrl"] as? String, let url = URL(string: s) {
+                        return url
+                    }
+                }
+            }
+        }
+        if let dict = value as? [String: Any] {
+            if let s = dict["url"] as? String, let url = URL(string: s) {
+                return url
+            }
+            if let s = dict["contentUrl"] as? String, let url = URL(string: s) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// 构建下载选项：始终优先 `cloud.wallsflow.com` 直链 mp4。
+    nonisolated static func makeDownloadOptions(
+        videoURL: URL?,
+        downloadURL: URL?,
+        fileSizeText: String?,
+        resolution: String?
+    ) -> [MediaDownloadOption] {
+        // download.php 往往回 HTML 页面，不能当媒体文件直链；仅作最后兜底。
+        let preferred = videoURL ?? downloadURL
+        guard let preferred else { return [] }
+        return [
+            MediaDownloadOption(
+                label: "Original",
+                fileSizeLabel: fileSizeText ?? "",
+                detailText: resolution ?? "Original MP4",
+                remoteURL: preferred
+            )
+        ]
+    }
 
     /// 从 URL 或 HTML 属性中提取数字 ID
     func extractID(from urlString: String) -> String? {

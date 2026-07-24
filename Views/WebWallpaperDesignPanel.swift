@@ -27,6 +27,7 @@ final class WebWallpaperDesignPanelController {
             defer: false
         )
         window.title = "设计壁纸"
+        window.appearance = NSAppearance(named: .darkAqua)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
@@ -42,6 +43,7 @@ final class WebWallpaperDesignPanelController {
 
         let rootView = WebWallpaperDesignPanel(viewModel: viewModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .preferredColorScheme(.dark)
 
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.wantsLayer = true

@@ -38,6 +38,7 @@ final class SceneWallpaperDesignPanelController {
             defer: false
         )
         window.title = "设计壁纸"
+        window.appearance = NSAppearance(named: .darkAqua)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = true
@@ -53,6 +54,7 @@ final class SceneWallpaperDesignPanelController {
 
         let rootView = SceneWallpaperDesignPanel(viewModel: viewModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .preferredColorScheme(.dark)
         let hostingView = NSHostingView(rootView: rootView)
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = NSColor.clear.cgColor

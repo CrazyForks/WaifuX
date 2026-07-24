@@ -1,9 +1,11 @@
+import CryptoKit
 import Foundation
 
-/// Persists durable terminal optimization state adjacent to the media file.
+/// Persists durable terminal optimization state outside the media library folder.
 ///
-/// The queue remains responsible for scheduling and UI state. This store only
-/// records lifecycle events and source provenance so a library rebuild,
+/// Records live under Application Support so download / Media directories stay
+/// clean. The queue remains responsible for scheduling and UI state. This store
+/// only records lifecycle events and source provenance so a library rebuild,
 /// re-download, or application restart cannot make a replaced file look
 /// untouched or inherit a previous file's terminal outcomes.
 @MainActor
@@ -27,7 +29,7 @@ final class VideoOptimizationRecordStore {
         case frameBlacklisted
     }
 
-    /// How this exact video file came to exist. Stored beside the file rather
+    /// How this exact video file came to exist. Stored with the record rather
     /// than inferred from a library cache entry.
     enum SourceKind: String, Codable, Equatable {
         case download
@@ -86,13 +88,13 @@ final class VideoOptimizationRecordStore {
     }
 
     struct Record: Codable, Equatable {
-        /// Provenance first so the human-readable sidecar is easy to inspect.
+        /// Provenance first so the human-readable record is easy to inspect.
         /// Older schema v1 sidecars decode because these fields are optional.
         var source: SourceInfo?
         var download: DownloadInfo?
         var bake: BakeInfo?
         let schemaVersion: Int
-        let videoPath: String
+        var videoPath: String
         let createdAt: Date
         var updatedAt: Date
         var events: [Event]
@@ -143,21 +145,63 @@ final class VideoOptimizationRecordStore {
         "mp4", "mov", "m4v", "mkv", "webm", "avi", "flv", "wmv"
     ]
 
+    private let fileManager = FileManager.default
+    private var didMigrateLibraryRoots = false
+
     private init() {}
 
+    /// Canonical record path under Application Support (never next to the media file).
     func sidecarURL(for videoURL: URL) -> URL {
+        recordsDirectoryURL
+            .appendingPathComponent(recordFileName(for: videoURL), isDirectory: false)
+    }
+
+    /// Pre-relocation path written beside the media file. Kept only for migration / cleanup.
+    func legacyAdjacentSidecarURL(for videoURL: URL) -> URL {
         URL(fileURLWithPath: videoURL.standardizedFileURL.path + ".waifux-optimization.json")
     }
 
     func record(for videoURL: URL) -> Record? {
-        guard isVideoFile(videoURL),
-              let data = try? Data(contentsOf: sidecarURL(for: videoURL)) else {
+        guard isVideoFile(videoURL) else { return nil }
+        migrateLegacyAdjacentSidecarIfNeeded(for: videoURL)
+
+        guard let data = try? Data(contentsOf: sidecarURL(for: videoURL)) else {
             return nil
         }
+        return decodeRecord(from: data)
+    }
 
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(Record.self, from: data)
+    /// Moves durable state when a bake/cache video path is renamed.
+    func relocateRecord(from oldVideoURL: URL, to newVideoURL: URL) {
+        guard isVideoFile(oldVideoURL), isVideoFile(newVideoURL) else { return }
+        let oldPath = oldVideoURL.standardizedFileURL.path
+        let newPath = newVideoURL.standardizedFileURL.path
+        guard oldPath != newPath else { return }
+
+        migrateLegacyAdjacentSidecarIfNeeded(for: oldVideoURL)
+        migrateLegacyAdjacentSidecarIfNeeded(for: newVideoURL)
+
+        if var existing = loadRecordIgnoringMigration(for: oldVideoURL) {
+            existing.videoPath = newPath
+            if var bake = existing.bake, bake.artifactPath == oldPath {
+                bake.artifactPath = newPath
+                existing.bake = bake
+            }
+            existing.updatedAt = Date()
+            _ = write(existing, for: newVideoURL)
+            try? fileManager.removeItem(at: sidecarURL(for: oldVideoURL))
+        } else if fileManager.fileExists(atPath: sidecarURL(for: oldVideoURL).path) {
+            let destination = sidecarURL(for: newVideoURL)
+            try? fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? fileManager.removeItem(at: destination)
+            try? fileManager.moveItem(at: sidecarURL(for: oldVideoURL), to: destination)
+        }
+
+        removeLegacyAdjacentSidecar(for: oldVideoURL)
+        removeLegacyAdjacentSidecar(for: newVideoURL)
     }
 
     @discardableResult
@@ -176,7 +220,7 @@ final class VideoOptimizationRecordStore {
     }
 
     /// Registers a completed download as the source of this exact video.
-    /// Callers that need a clean lifecycle should reset the old sidecar first.
+    /// Callers that need a clean lifecycle should reset the old record first.
     func recordDownloadedSource(for videoURL: URL, sourceURL: URL?) {
         guard isVideoFile(videoURL) else { return }
 
@@ -331,7 +375,7 @@ final class VideoOptimizationRecordStore {
         }
     }
 
-    /// Derives the whole-pipeline result from the durable sidecar events.
+    /// Derives the whole-pipeline result from the durable record events.
     /// Scene bake provenance satisfies the loop stage by design; ordinary videos
     /// require a terminal loop judgment before the overall result is complete.
     func optimizationState(for videoURL: URL, targetFPS: Int) -> OptimizationState {
@@ -393,14 +437,91 @@ final class VideoOptimizationRecordStore {
 
     @discardableResult
     func reset(for videoURL: URL) -> Bool {
+        migrateLegacyAdjacentSidecarIfNeeded(for: videoURL)
         let sidecarURL = sidecarURL(for: videoURL)
-        guard FileManager.default.fileExists(atPath: sidecarURL.path) else { return true }
+        removeLegacyAdjacentSidecar(for: videoURL)
+        guard fileManager.fileExists(atPath: sidecarURL.path) else { return true }
         do {
-            try FileManager.default.removeItem(at: sidecarURL)
+            try fileManager.removeItem(at: sidecarURL)
             return true
         } catch {
             return false
         }
+    }
+
+    /// Scans the current library Media / SceneBakes roots once per process.
+    @discardableResult
+    func migrateLegacyAdjacentSidecarsInLibraryRootsIfNeeded() -> Int {
+        guard !didMigrateLibraryRoots else { return 0 }
+        didMigrateLibraryRoots = true
+        return migrateLegacyAdjacentSidecars(
+            under: [
+                DownloadPathManager.shared.mediaFolderURL,
+                DownloadPathManager.shared.sceneBakesFolderURL
+            ]
+        )
+    }
+
+    /// Scans library roots and lifts every adjacent
+    /// `*.waifux-optimization.json` into Application Support, then deletes the
+    /// media-side leftovers so Media / SceneBakes stay clean.
+    @discardableResult
+    func migrateLegacyAdjacentSidecars(under rootDirectories: [URL]) -> Int {
+        var migrated = 0
+        for root in rootDirectories {
+            let rootPath = root.standardizedFileURL.path
+            guard fileManager.fileExists(atPath: rootPath),
+                  let enumerator = fileManager.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: [.isRegularFileKey],
+                    options: [.skipsHiddenFiles]
+                  ) else {
+                continue
+            }
+
+            for case let fileURL as URL in enumerator {
+                let name = fileURL.lastPathComponent
+                guard name.hasSuffix(".waifux-optimization.json") else { continue }
+
+                // `<videoPath>.waifux-optimization.json` → strip the sidecar suffix.
+                let videoPath = String(fileURL.path.dropLast(".waifux-optimization.json".count))
+                let videoURL = URL(fileURLWithPath: videoPath)
+                guard isVideoFile(videoURL) else {
+                    // Orphan sidecar without a recognized video extension — just remove.
+                    try? fileManager.removeItem(at: fileURL)
+                    continue
+                }
+
+                let before = fileManager.fileExists(atPath: sidecarURL(for: videoURL).path)
+                migrateLegacyAdjacentSidecarIfNeeded(for: videoURL)
+                let after = fileManager.fileExists(atPath: sidecarURL(for: videoURL).path)
+                // Count only successful lifts / cleanups that no longer leave adjacent files.
+                if after || before || !fileManager.fileExists(atPath: fileURL.path) {
+                    migrated += 1
+                }
+            }
+        }
+        return migrated
+    }
+
+    // MARK: - Storage location
+
+    private var recordsDirectoryURL: URL {
+        let applicationSupport = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? fileManager.temporaryDirectory
+        return applicationSupport
+            .appendingPathComponent("WaifuX", isDirectory: true)
+            .appendingPathComponent("VideoOptimization", isDirectory: true)
+            .appendingPathComponent("Records", isDirectory: true)
+    }
+
+    private func recordFileName(for videoURL: URL) -> String {
+        let path = videoURL.standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(path.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "\(hex).json"
     }
 
     private func isVideoFile(_ url: URL) -> Bool {
@@ -415,14 +536,79 @@ final class VideoOptimizationRecordStore {
         }
     }
 
+    private func loadRecordIgnoringMigration(for videoURL: URL) -> Record? {
+        guard let data = try? Data(contentsOf: sidecarURL(for: videoURL)) else {
+            return nil
+        }
+        return decodeRecord(from: data)
+    }
+
+    /// One-shot lift of legacy `<video>.waifux-optimization.json` beside media into App Support.
+    private func migrateLegacyAdjacentSidecarIfNeeded(for videoURL: URL) {
+        let legacyURL = legacyAdjacentSidecarURL(for: videoURL)
+        guard fileManager.fileExists(atPath: legacyURL.path) else { return }
+
+        let destination = sidecarURL(for: videoURL)
+        if fileManager.fileExists(atPath: destination.path) {
+            // Canonical copy already present — drop the adjacent leftover.
+            removeLegacyAdjacentSidecar(for: videoURL)
+            return
+        }
+
+        var migrated = false
+        if let data = try? Data(contentsOf: legacyURL),
+           let decoded = decodeRecord(from: data) {
+            var record = decoded
+            record.videoPath = videoURL.standardizedFileURL.path
+            record.updatedAt = Date()
+            migrated = write(record, for: videoURL)
+        } else {
+            do {
+                try fileManager.createDirectory(
+                    at: destination.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try fileManager.copyItem(at: legacyURL, to: destination)
+                migrated = fileManager.fileExists(atPath: destination.path)
+            } catch {
+                migrated = false
+            }
+        }
+
+        // Only delete the adjacent file after a successful lift, so a failed write
+        // cannot destroy the only remaining optimization history.
+        if migrated {
+            removeLegacyAdjacentSidecar(for: videoURL)
+        }
+    }
+
+    private func decodeRecord(from data: Data) -> Record? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Record.self, from: data)
+    }
+
+    private func removeLegacyAdjacentSidecar(for videoURL: URL) {
+        let legacyURL = legacyAdjacentSidecarURL(for: videoURL)
+        guard fileManager.fileExists(atPath: legacyURL.path) else { return }
+        try? fileManager.removeItem(at: legacyURL)
+    }
+
     private func write(_ record: Record, for videoURL: URL) -> Bool {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(record) else { return false }
 
+        let destination = sidecarURL(for: videoURL)
         do {
-            try data.write(to: sidecarURL(for: videoURL), options: .atomic)
+            try fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: destination, options: .atomic)
+            // Never leave a stale adjacent sidecar behind after writing.
+            removeLegacyAdjacentSidecar(for: videoURL)
             return true
         } catch {
             return false

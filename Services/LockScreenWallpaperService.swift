@@ -10,6 +10,7 @@ import AVFoundation
 import Combine
 import Foundation
 import AppKit
+import ApplicationServices
 import ImageIO
 import UniformTypeIdentifiers
 import notify
@@ -29,6 +30,16 @@ final class LockScreenWallpaperService: ObservableObject {
         let displayID: UInt32
         let name: String
         let thumbnailPath: String?
+    }
+
+    enum AutomaticSetupResult: Equatable {
+        case configured
+        case accessibilityPermissionRequired
+        case unavailable
+        case noDisplayInstances
+        case ambiguousDisplayNames
+        case systemSettingsUnavailable
+        case timedOut
     }
 
     /// 功能是否可用（macOS 26.0+ 且已配置 App Group）
@@ -653,6 +664,87 @@ final class LockScreenWallpaperService: ObservableObject {
         print("[LockScreenWallpaper] 🖥️ 已同步 \(instances.count) 个显示器实例到 Socket 服务端")
     }
 
+    /// 打开系统设置的「墙纸」页面。链接无法工作时，退回为打开系统设置 App。
+    func openWallpaperSettings() {
+        if let wallpaperSettingsURL = URL(
+            string: "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension"
+        ), NSWorkspace.shared.open(wallpaperSettingsURL) {
+            return
+        }
+
+        let systemSettingsURL = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        Task {
+            try? await NSWorkspace.shared.openApplication(
+                at: systemSettingsURL,
+                configuration: configuration
+            )
+        }
+    }
+
+    /// 尽力在系统设置的 WaifuX 分组中选择每个显示器实例。
+    ///
+    /// 这是一个有意保守的辅助功能自动化：仅在显示器名称唯一、并且能够找到 WaifuX
+    /// 分组时执行。系统设置的内部 UI 发生变化时会超时并让用户手动完成，绝不点击
+    /// 页面中名称相同的其它显示器控件。
+    func automaticallyConfigureLockScreen() async -> AutomaticSetupResult {
+        guard #available(macOS 26.0, *), isAvailable else {
+            return .unavailable
+        }
+
+        let instances = currentDisplayInstances()
+        guard !instances.isEmpty else {
+            return .noDisplayInstances
+        }
+
+        let names = instances.map(\.name)
+        guard Set(names).count == names.count else {
+            openWallpaperSettings()
+            return .ambiguousDisplayNames
+        }
+
+        guard requestAccessibilityPermission() else {
+            return .accessibilityPermissionRequired
+        }
+
+        // 先持久化并通知扩展，再打开系统设置，确保墙纸页面能读到最新实例。
+        syncDisplayInstancesToSocketServer()
+        openWallpaperSettings()
+
+        guard let systemSettingsPID = await waitForSystemSettingsProcess() else {
+            return .systemSettingsUnavailable
+        }
+
+        let systemSettings = AXUIElementCreateApplication(systemSettingsPID)
+        let deadline = Date().addingTimeInterval(16)
+        var pendingInstances = instances
+
+        while !pendingInstances.isEmpty, Date() < deadline {
+            if let nextInstance = pendingInstances.first,
+               let target = findWaifuXInstanceControl(
+                    in: systemSettings,
+                    instance: nextInstance
+               ),
+               AXUIElementPerformAction(target, kAXPressAction as CFString) == .success {
+                print("[LockScreenWallpaper] 🤖 已自动选择实例: \(nextInstance.name)")
+                pendingInstances.removeFirst()
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                continue
+            }
+
+            try? await Task.sleep(nanoseconds: 350_000_000)
+        }
+
+        if pendingInstances.isEmpty {
+            print("[LockScreenWallpaper] ✅ 已完成锁屏实例自动配置")
+            return .configured
+        }
+
+        print("[LockScreenWallpaper] ⚠️ 自动配置超时，待选择实例: \(pendingInstances.map(\.name))")
+        return .timedOut
+    }
+
     func loadDisplayInstances() -> [DisplayInstance] {
         guard let url = displayInstancesURL,
               let data = try? Data(contentsOf: url),
@@ -698,6 +790,178 @@ final class LockScreenWallpaperService: ObservableObject {
             return
         }
         try? data.write(to: url, options: .atomic)
+    }
+
+    private func requestAccessibilityPermission() -> Bool {
+        if AXIsProcessTrusted() {
+            return true
+        }
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func waitForSystemSettingsProcess() async -> pid_t? {
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline {
+            if let process = NSWorkspace.shared.runningApplications.first(
+                where: { $0.bundleIdentifier == "com.apple.systempreferences" }
+            ) {
+                return process.processIdentifier
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return nil
+    }
+
+    private func findWaifuXInstanceControl(
+        in root: AXUIElement,
+        instance: DisplayInstance
+    ) -> AXUIElement? {
+        let groupMarkers = findElements(
+            in: root,
+            matching: { labels in
+                labels.contains { $0.localizedCaseInsensitiveContains("WaifuX") }
+            }
+        )
+
+        for marker in groupMarkers {
+            var scope: AXUIElement? = marker
+            for _ in 0..<3 {
+                guard let currentScope = scope else { break }
+                if let control = findPressableControl(
+                    in: currentScope,
+                    matching: instance
+                ) {
+                    return control
+                }
+                scope = parent(of: currentScope)
+            }
+        }
+        return nil
+    }
+
+    private func findPressableControl(
+        in root: AXUIElement,
+        matching instance: DisplayInstance
+    ) -> AXUIElement? {
+        var remainingVisits = 1_000
+
+        func visit(
+            _ element: AXUIElement,
+            depth: Int,
+            pressableAncestor: AXUIElement?
+        ) -> AXUIElement? {
+            guard remainingVisits > 0, depth <= 12 else { return nil }
+            remainingVisits -= 1
+
+            let currentPressable = isPressable(element) ? element : pressableAncestor
+            let labels = accessibleStrings(for: element)
+            if labels.contains(where: { labelMatchesInstance($0, instance: instance) }),
+               let currentPressable {
+                return currentPressable
+            }
+
+            for child in children(of: element) {
+                if let control = visit(
+                    child,
+                    depth: depth + 1,
+                    pressableAncestor: currentPressable
+                ) {
+                    return control
+                }
+            }
+            return nil
+        }
+
+        return visit(root, depth: 0, pressableAncestor: nil)
+    }
+
+    private func findElements(
+        in root: AXUIElement,
+        matching predicate: ([String]) -> Bool
+    ) -> [AXUIElement] {
+        var matches = [AXUIElement]()
+        var remainingVisits = 1_500
+
+        func visit(_ element: AXUIElement, depth: Int) {
+            guard remainingVisits > 0, depth <= 12 else { return }
+            remainingVisits -= 1
+
+            if predicate(accessibleStrings(for: element)) {
+                matches.append(element)
+            }
+            for child in children(of: element) {
+                visit(child, depth: depth + 1)
+            }
+        }
+
+        visit(root, depth: 0)
+        return matches
+    }
+
+    private func labelMatchesInstance(_ label: String, instance: DisplayInstance) -> Bool {
+        let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized == instance.name || normalized == instance.id
+    }
+
+    private func accessibleStrings(for element: AXUIElement) -> [String] {
+        [
+            kAXTitleAttribute as CFString,
+            kAXDescriptionAttribute as CFString,
+            kAXHelpAttribute as CFString,
+            kAXValueAttribute as CFString,
+            kAXIdentifierAttribute as CFString
+        ]
+        .compactMap { attribute in
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+                return nil
+            }
+            return value as? String
+        }
+    }
+
+    private func children(of element: AXUIElement) -> [AXUIElement] {
+        let attributes: [CFString] = [
+            kAXChildrenAttribute as CFString,
+            kAXVisibleChildrenAttribute as CFString,
+            kAXRowsAttribute as CFString,
+            kAXContentsAttribute as CFString
+        ]
+
+        var children = [AXUIElement]()
+        for attribute in attributes {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+                continue
+            }
+            if let values = value as? [AXUIElement] {
+                children.append(contentsOf: values)
+            }
+        }
+        return children
+    }
+
+    private func parent(of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXParentAttribute as CFString,
+            &value
+        ) == .success,
+              let value else {
+            return nil
+        }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    private func isPressable(_ element: AXUIElement) -> Bool {
+        var actions: CFArray?
+        guard AXUIElementCopyActionNames(element, &actions) == .success,
+              let actionNames = actions as? [String] else {
+            return false
+        }
+        return actionNames.contains(kAXPressAction as String)
     }
 
     private func posterThumbnailPath(for screen: NSScreen) -> String? {

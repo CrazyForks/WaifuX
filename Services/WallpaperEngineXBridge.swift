@@ -252,6 +252,8 @@ final class WallpaperEngineXBridge: ObservableObject {
     }
     /// 每个进程的终止 watchdog（key = pid）
     private var screenWatchdogs: [pid_t: DispatchWorkItem] = [:]
+    /// crop 等待 Task（key = screenID），新的 setWallpaper 开始前先 cancel 旧的
+    private var cropWaitTasks: [String: Task<Void, Never>] = [:]
     /// 非隔离存储所有活跃 PID，供 deinit 中安全清理
     private nonisolated(unsafe) var _deinitPIDs: Set<pid_t> = []
     /// 启动批次号，防止旧进程的 terminationHandler 污染新进程状态
@@ -623,6 +625,9 @@ final class WallpaperEngineXBridge: ObservableObject {
             DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             ensureAudioRelayMatchesActiveWallpaper(projectRoot: resolvedPath)
+            // Web 壁纸窗口已提交后，刷新系统静态底图确保状态栏重新采样
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: effectiveScreens)
             return
         }
         // 切到非 web 壁纸：根据其它屏剩余 web 壁纸重新评估是否仍需音频中继
@@ -780,10 +785,14 @@ final class WallpaperEngineXBridge: ObservableObject {
                     let screenW_c = screenW
                     let screenH_c = screenH
                     let screenIDCopy = screenID
-                    Task { @MainActor [weak self] in
+                    // 修复：取消上一次同屏的等待 Task，防止快速切换时 Task 叠加
+                    cropWaitTasks[screenIDCopy]?.cancel()
+                    cropWaitTasks[screenIDCopy] = Task { @MainActor [weak self] in
+                        defer { self?.cropWaitTasks.removeValue(forKey: screenIDCopy) }
                         let deadline = Date().addingTimeInterval(5.0)
                         while Date() < deadline {
                             try? await Task.sleep(nanoseconds: 100_000_000)
+                            if Task.isCancelled { return }
                             guard let self else { return }
                             guard self.screenProcesses[screenIDCopy]?.pid == existingInfo.pid else { return }
                             if let realSize = self.readCanvasSize(url: canvasSizeURLCopy) {
@@ -932,10 +941,14 @@ final class WallpaperEngineXBridge: ObservableObject {
                     let screenH_c = screenH
                     let genCopy = self.launchGeneration
                     let screenIDCopy = screenID
-                    Task { @MainActor [weak self] in
+                    // 修复：取消上一次同屏的等待 Task，防止快速切换时 Task 叠加
+                    cropWaitTasks[screenIDCopy]?.cancel()
+                    cropWaitTasks[screenIDCopy] = Task { @MainActor [weak self] in
+                        defer { self?.cropWaitTasks.removeValue(forKey: screenIDCopy) }
                         let deadline = Date().addingTimeInterval(5.0)
                         while Date() < deadline {
                             try? await Task.sleep(nanoseconds: 100_000_000)
+                            if Task.isCancelled { return }
                             guard let self else { return }
                             guard self.launchGeneration == genCopy,
                                   self.screenProcesses[screenIDCopy]?.generation == genCopy else { return }
@@ -1023,6 +1036,8 @@ final class WallpaperEngineXBridge: ObservableObject {
             path: resolvedPath,
             targetScreens: bakedStaticScreens
         )
+        DesktopWallpaperSyncManager.shared
+            .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: bakedStaticScreens)
 
         // 强制恢复之前的焦点应用（wallpaper-wgpu 启动会抢占焦点）
         // 多次延迟尝试确保焦点恢复
@@ -3085,6 +3100,10 @@ final class WallpaperEngineXBridge: ObservableObject {
             if let canvasSizeURL = info.canvasSizeURL {
                 try? FileManager.default.removeItem(at: canvasSizeURL)
             }
+            // 修复：清理 wallpaperControlURL 临时文件，防止磁盘/FD 泄漏
+            if let wallpaperControlURL = info.wallpaperControlURL {
+                try? FileManager.default.removeItem(at: wallpaperControlURL)
+            }
         }
     }
 
@@ -3870,6 +3889,10 @@ final class WallpaperEngineXBridge: ObservableObject {
             } catch {
                 print("[WallpaperEngineXBridge] ⚠️ 设置静态壁纸失败 (screen: \(screen.localizedName)): \(error.localizedDescription)")
             }
+        }
+        if didApply {
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens)
         }
         return didApply
     }

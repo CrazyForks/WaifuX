@@ -1962,6 +1962,15 @@ final class VideoOptimizationQueueService: ObservableObject {
         guard !didRestoreQueueCheckpoint else { return }
         didRestoreQueueCheckpoint = true
 
+        // Keep Media / SceneBakes free of optimization sidecars: lift any historical
+        // adjacent `*.waifux-optimization.json` into Application Support once per launch.
+        let migrated = VideoOptimizationRecordStore.shared.migrateLegacyAdjacentSidecarsInLibraryRootsIfNeeded()
+        if migrated > 0 {
+            frameInterpolationDebugPrint(
+                "视频优化：已将 \(migrated) 个媒体旁履历迁移到 Application Support。"
+            )
+        }
+
         let restoredState = VideoOptimizationQueueCheckpointStore.shared.loadState()
         let restoredItems = restoredState.items
         for request in restoredState.sourceRestoreRequests {

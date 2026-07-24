@@ -1,57 +1,206 @@
 import AVFoundation
 import Foundation
+import CryptoKit
 
-/// 视频预加载器 - 使用 AVAsset 预加载视频元数据，加快视频播放启动速度
+/// 视频预加载器
+///
+/// Wallsflow 等 CDN 会声明 `Accept-Ranges: bytes`，但对 Range 请求仍返回整文件 200，
+/// AVFoundation 探测 duration/tracks 时会报 byte range length mismatch (-11850)。
+/// 因此对受保护远程视频：整文件下载到本地缓存后再用 file URL 交给 AVPlayer。
 actor VideoPreloaderActor {
     static let shared = VideoPreloaderActor()
 
-    /// 缓存的 AVAsset 实例
+    /// 缓存的 AVAsset 实例（本地 file URL 或可流式远程）
     private var cachedAssets: [URL: AVAsset] = [:]
-    private let maxCacheCount = 3
+    /// 远程 URL → 本地缓存文件
+    private var localFileByRemote: [URL: URL] = [:]
+    /// 正在进行的整文件下载（避免并发重复下同一 URL）
+    private var inflightDownloads: [URL: Task<URL, Error>] = [:]
 
-    /// 预加载视频
-    /// - Parameter url: 视频 URL
+    private let maxCacheCount = 4
+    private let fileManager = FileManager.default
+
+    private var previewCacheDirectory: URL {
+        let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
+        let dir = base.appendingPathComponent("WaifuX/WallsflowPreview", isDirectory: true)
+        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 预加载视频（失败只打日志，不抛出）
     func preload(url: URL) {
         Task {
-            // 如果已经缓存，直接返回
-            guard cachedAssets[url] == nil else { return }
-
-            let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-
             do {
-                // 预加载 duration 和 tracks
-                let duration = try await asset.load(.duration)
-                let tracks = try await asset.load(.tracks)
-
-                // 如果有视频轨道，预加载自然尺寸
-                if let videoTrack = tracks.first(where: { $0.mediaType == .video }) {
-                    _ = try await videoTrack.load(.naturalSize)
-                }
-
-                // 缓存 asset
-                // 清理旧缓存
-                if self.cachedAssets.count >= self.maxCacheCount {
-                    self.cachedAssets.removeAll()
-                }
-                self.cachedAssets[url] = asset
-
-                print("[VideoPreloader] 预加载完成: \(url.lastPathComponent), duration: \(duration.seconds)s, tracks: \(tracks.count)")
+                _ = try await resolvePlayableURL(for: url)
             } catch {
                 print("[VideoPreloader] 预加载失败: \(url.lastPathComponent), error: \(error)")
             }
         }
     }
 
-    /// 获取缓存的 AVAsset
-    /// - Parameter url: 视频 URL
-    /// - Returns: 缓存的 AVAsset（如果存在）
-    func getCachedAsset(for url: URL) -> AVAsset? {
-        return cachedAssets[url]
+    /// 解析可交给 AVPlayer 的 URL：本地直通；Wallsflow 等整文件落地后返回 file URL。
+    func resolvePlayableURL(for url: URL) async throws -> URL {
+        if url.isFileURL {
+            return url
+        }
+
+        // 非 Wallsflow 受保护源：仍可尝试远程 asset（多数 CDN Range 正常）
+        guard WallsflowService.isProtectedMediaURL(url) else {
+            return url
+        }
+
+        if let existing = localFileByRemote[url],
+           fileManager.fileExists(atPath: existing.path),
+           !Self.looksCorrupt(at: existing) {
+            return existing
+        }
+
+        if let inflight = inflightDownloads[url] {
+            return try await inflight.value
+        }
+
+        let task = Task<URL, Error> {
+            try await self.downloadProtectedMediaToCache(url)
+        }
+        inflightDownloads[url] = task
+        defer { inflightDownloads[url] = nil }
+
+        let local = try await task.value
+        localFileByRemote[url] = local
+        trimLocalCacheIfNeeded()
+        return local
     }
 
-    /// 清除所有缓存
+    /// 获取缓存的 AVAsset（若有）
+    func getCachedAsset(for url: URL) -> AVAsset? {
+        if let asset = cachedAssets[url] { return asset }
+        if let local = localFileByRemote[url] {
+            return cachedAssets[local]
+        }
+        return nil
+    }
+
     func clearCache() {
         cachedAssets.removeAll()
+        // 不删磁盘预览缓存，避免反复下 70MB+；仅清内存索引
+        localFileByRemote.removeAll()
+        for (_, task) in inflightDownloads {
+            task.cancel()
+        }
+        inflightDownloads.removeAll()
+    }
+
+    // MARK: - Private
+
+    private func downloadProtectedMediaToCache(_ remoteURL: URL) async throws -> URL {
+        let dest = localCacheURL(for: remoteURL)
+        if fileManager.fileExists(atPath: dest.path), !Self.looksCorrupt(at: dest) {
+            await rememberAsset(for: dest)
+            print("[VideoPreloader] 命中预览缓存: \(dest.lastPathComponent)")
+            return dest
+        }
+
+        let headers = WallsflowService.mediaRequestHeaders(for: remoteURL) ?? [:]
+        print("[VideoPreloader] 整文件下载预览: \(remoteURL.lastPathComponent)")
+        let data = try await NetworkService.shared.fetchData(from: remoteURL, headers: headers)
+
+        if Self.looksLikeHTML(data) {
+            throw NetworkError.invalidResponse
+        }
+        // 正常 live wallpaper 远大于 64KB；过小几乎一定是坏响应
+        guard data.count > 64_000 else {
+            throw NetworkError.invalidResponse
+        }
+
+        // 写到临时文件再 atomic replace
+        let tmp = dest.appendingPathExtension("download")
+        try? fileManager.removeItem(at: tmp)
+        try data.write(to: tmp, options: .atomic)
+        if fileManager.fileExists(atPath: dest.path) {
+            try? fileManager.removeItem(at: dest)
+        }
+        try fileManager.moveItem(at: tmp, to: dest)
+
+        await rememberAsset(for: dest)
+        print("[VideoPreloader] 预览落地完成: \(dest.lastPathComponent), size=\(data.count)")
+        return dest
+    }
+
+    private func rememberAsset(for fileURL: URL) async {
+        let asset = AVURLAsset(url: fileURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        do {
+            let duration = try await asset.load(.duration)
+            let tracks = try await asset.load(.tracks)
+            if let videoTrack = tracks.first(where: { $0.mediaType == .video }) {
+                _ = try await videoTrack.load(.naturalSize)
+            }
+            if cachedAssets.count >= maxCacheCount {
+                cachedAssets.removeAll()
+            }
+            cachedAssets[fileURL] = asset
+            print("[VideoPreloader] 预加载完成: \(fileURL.lastPathComponent), duration: \(duration.seconds)s, tracks: \(tracks.count)")
+        } catch {
+            // 文件已可用，asset 元数据失败不阻塞播放
+            print("[VideoPreloader] asset 元数据加载失败(可仍播放): \(error)")
+            cachedAssets[fileURL] = asset
+        }
+    }
+
+    private func localCacheURL(for remoteURL: URL) -> URL {
+        let digest = SHA256.hash(data: Data(remoteURL.absoluteString.utf8))
+        let hex = digest.compactMap { String(format: "%02x", $0) }.joined()
+        let prefix = String(hex.prefix(24))
+        let ext = remoteURL.pathExtension.isEmpty ? "mp4" : remoteURL.pathExtension
+        return previewCacheDirectory.appendingPathComponent("\(prefix).\(ext)")
+    }
+
+    private func trimLocalCacheIfNeeded() {
+        // 最多保留 6 个预览文件，按修改时间淘汰
+        let dir = previewCacheDirectory
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let mp4s = files.filter { !$0.pathExtension.lowercased().contains("download") }
+        guard mp4s.count > 6 else { return }
+
+        let ranked = mp4s.compactMap { url -> (URL, Date)? in
+            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return (url, date)
+        }
+        .sorted { $0.1 > $1.1 }
+
+        for stale in ranked.dropFirst(6) {
+            try? fileManager.removeItem(at: stale.0)
+            localFileByRemote = localFileByRemote.filter { $0.value != stale.0 }
+            cachedAssets[stale.0] = nil
+        }
+    }
+
+    private static func looksLikeHTML(_ data: Data) -> Bool {
+        guard let head = String(data: data.prefix(256), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else { return false }
+        return head.hasPrefix("<!doctype html")
+            || head.hasPrefix("<html")
+            || head.contains("<head")
+    }
+
+    private static func looksCorrupt(at url: URL) -> Bool {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        if size < 64_000 { return true }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return true }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 12)
+        // ftyp box
+        if head.count >= 8, head[4..<8] == Data("ftyp".utf8) {
+            return false
+        }
+        return looksLikeHTML(head)
     }
 }
 
@@ -63,22 +212,23 @@ final class VideoPreloader: ObservableObject {
     private init() {}
 
     /// 预加载视频
-    /// - Parameter url: 视频 URL
     func preload(url: URL) {
-        Task { @MainActor in
+        Task {
             await VideoPreloaderActor.shared.preload(url: url)
         }
     }
 
-    /// 获取缓存的 AVAsset
-    /// - Parameter url: 视频 URL
-    /// - Returns: 缓存的 AVAsset（如果存在）
-    func getCachedAsset(for url: URL) -> AVAsset? {
-        // 同步获取需要存储副本
-        return nil
+    /// 解析可播放 URL（Wallsflow 会先整文件缓存）
+    func resolvePlayableURL(for url: URL) async throws -> URL {
+        try await VideoPreloaderActor.shared.resolvePlayableURL(for: url)
     }
 
-    /// 清除所有缓存
+    /// 获取缓存的 AVAsset
+    func getCachedAsset(for url: URL) -> AVAsset? {
+        nil
+    }
+
+    /// 清除内存缓存
     func clearCache() {
         Task {
             await VideoPreloaderActor.shared.clearCache()

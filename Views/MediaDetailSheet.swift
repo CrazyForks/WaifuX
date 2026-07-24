@@ -75,6 +75,7 @@ struct MediaDetailSheet: View {
     @State private var copyToastMessage = "链接已复制"
     @State private var showMoreOptionsPopover = false
     @State private var showDeleteBakeConfirm = false
+    @State private var showRedownloadConfirm = false
     @State private var showRemoveFrameInterpolationBlacklistConfirm = false
     @State private var pendingRemoveFrameInterpolationBlacklistURL: URL?
     @State private var isDeletingBake = false
@@ -138,6 +139,13 @@ struct MediaDetailSheet: View {
             && !isLocalFile
             && resolvedItem.id.hasPrefix("workshop_")
             && hasWorkshopUpdateAvailable
+    }
+
+    /// 与库右键一致：已下载且有远端源时才可重新下载（本地导入除外）
+    private var canRedownloadItem: Bool {
+        guard !isLocalFile else { return false }
+        return mediaLibrary.downloadRecord(for: resolvedItem.id)?.isActive == true
+            || viewModel.isDownloaded(resolvedItem)
     }
 
     private var downloadActionSystemName: String {
@@ -388,6 +396,14 @@ struct MediaDetailSheet: View {
         } message: {
             Text(t("deleteConfirmMessage"))
         }
+        .alert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadConfirm) {
+            Button(t("library.redownload.item"), role: .destructive) {
+                redownloadCurrentItem()
+            }
+            Button(t("cancel"), role: .cancel) {}
+        } message: {
+            Text(t("library.redownload.item.confirm.message"))
+        }
         .alert("删除烘焙产物?", isPresented: $showDeleteBakeConfirm) {
             Button("删除", role: .destructive) {
                 Task { await performDeleteSceneBakeKeepingPoster() }
@@ -544,15 +560,14 @@ struct MediaDetailSheet: View {
         return localWorkshopPreviewImageURL(for: resolvedItem)
     }
 
-    /// 列表/探索未下载时常用的封面：thumbnail 优先，再 poster，最后 initialItem。
+    /// 列表/探索未下载时常用的封面：thumbnail 优先，再 poster。
+    /// 必须只读当前 `resolvedItem`：作者列表/键盘切换会原地替换详情，
+    /// 若仍优先 `initialItem`，背景会继续显示打开详情页时那张旧 GIF/封面。
     private var undownloadedStylePreviewImageURL: URL {
         // 远程/原始 thumbnail 最接近「未下载」详情观感
         let candidates: [URL?] = [
-            initialItem.thumbnailURL,
             resolvedItem.thumbnailURL,
-            initialItem.posterURL,
             resolvedItem.posterURL,
-            initialItem.coverImageURL,
             resolvedItem.coverImageURL
         ]
 
@@ -725,6 +740,34 @@ struct MediaDetailSheet: View {
     @ViewBuilder
     private func fixedMediaBackground(width: CGFloat, height viewH: CGFloat) -> some View {
         ZStack {
+            // 远程视频失败（如 CDN 鉴权）时仍有封面垫底，避免纯黑详情背景。
+            let heroLayoutSize = CGSize(width: width, height: viewH)
+            let heroDownsampleSize = CGSize(
+                width: min(max(width * 2, 1), 2400),
+                height: min(max(viewH * 2, 1), 2400)
+            )
+            let showPosterUnderVideo = previewVideoURL != nil && !(previewVideoURL?.isFileURL ?? true)
+
+            if previewVideoURL == nil || showPosterUnderVideo {
+                KFMediaCoverImage(
+                    url: heroImageURL,
+                    animated: resolvedItem.shouldRenderThumbnailAsAnimatedImage,
+                    downsampleSize: heroDownsampleSize,
+                    fadeDuration: 0.3,
+                    loadFinished: {
+                        // 仅在没有视频、或视频尚未 ready 时由封面结束 loading
+                        if previewVideoURL == nil {
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                isMediaLoaded = true
+                            }
+                        }
+                    },
+                    layoutSize: heroLayoutSize,
+                    playAnimatedImage: previewVideoURL == nil
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
             if let previewVideoURL {
                 LoopingVideoBackgroundView(
                     url: previewVideoURL,
@@ -735,26 +778,6 @@ struct MediaDetailSheet: View {
                         }
                     }
                 )
-            } else {
-                let heroLayoutSize = CGSize(width: width, height: viewH)
-                let heroDownsampleSize = CGSize(
-                    width: min(max(width * 2, 1), 2400),
-                    height: min(max(viewH * 2, 1), 2400)
-                )
-                KFMediaCoverImage(
-                    url: heroImageURL,
-                    animated: resolvedItem.shouldRenderThumbnailAsAnimatedImage,
-                    downsampleSize: heroDownsampleSize,
-                    fadeDuration: 0.3,
-                    loadFinished: {
-                        withAnimation(.easeInOut(duration: 0.3)) {
-                            isMediaLoaded = true
-                        }
-                    },
-                    layoutSize: heroLayoutSize,
-                    playAnimatedImage: true
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             LinearGradient(
@@ -1598,7 +1621,7 @@ struct MediaDetailSheet: View {
                         ? NSScreen.screens
                         : selectedScreen.map { [$0] }
                     var options = LocalWallpaperApplyService.Options(
-                        animatedTransition: false,
+                        animatedTransition: true,
                         requirePlaybackEndSupport: false,
                         muted: isMuted,
                         fallbackPosterURL: preferredWorkshopPosterForVideo,
@@ -1817,6 +1840,23 @@ struct MediaDetailSheet: View {
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
+            }
+
+            if canRedownloadItem {
+                Button {
+                    showMoreOptionsPopover = false
+                    showRedownloadConfirm = true
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.clockwise.circle")
+                        Text(t("library.redownload.item"))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                .disabled(isDownloading || isResettingVideoOptimization || isWorkshopUpdateFlow)
             }
 
             copySourceLinkButton
@@ -2222,18 +2262,40 @@ struct MediaDetailSheet: View {
     /// Clears durable optimization state, removes library files, then re-downloads source.
     /// 先清队列/sidecar，再 `removeDownloads`（含物理文件 + 烘焙产物），最后重下。
     private func deleteAndRedownloadCurrentItem() {
-        guard !isResettingVideoOptimization, !isLocalFile else { return }
+        redownloadCurrentItem(fromOptimizationReset: true)
+    }
+
+    /// 与库右键「重新下载」一致：先持久化下载队列，再清优化状态与旧文件，最后启动传输。
+    /// `fromOptimizationReset` 时沿用原优化重置的 loading / toast 行为。
+    private func redownloadCurrentItem(fromOptimizationReset: Bool = false) {
+        guard canRedownloadItem, !isResettingVideoOptimization else { return }
 
         let downloadingItem = resolvedItem
         let itemID = downloadingItem.id
+        let folderID = mediaLibrary.downloadRecord(for: itemID)?.folderID
         let videoURLs = [
             currentOptimizationVideoURL,
-            cachedSceneBakeVideoURL
+            cachedSceneBakeVideoURL,
+            currentDownloadRecord?.resolvedVideoFileURL
         ].compactMap { $0 }
 
-        isResettingVideoOptimization = true
+        // 先落盘 Job，失败则不删旧文件（与 MyLibrary 行为一致）
+        guard PersistentDownloadQueueService.shared.stage(
+            [downloadingItem],
+            folderID: folderID
+        ) else {
+            errorMessage = "无法保存下载队列，已取消删除旧文件"
+            showError = true
+            return
+        }
+
+        if fromOptimizationReset {
+            isResettingVideoOptimization = true
+            downloadActivity.start(itemID: itemID)
+        }
         errorMessage = ""
-        downloadActivity.start(itemID: itemID)
+
+        stopPlayingWallpaperIfNeeded(for: downloadingItem)
 
         for videoURL in Set(videoURLs.map(\.standardizedFileURL)) {
             frameInterpolationQueue.cancelSourceRestoreRequest(videoURL: videoURL)
@@ -2243,16 +2305,21 @@ struct MediaDetailSheet: View {
         // removeDownloads 会删下载记录 + 物理文件 + 烘焙产物，必须在 re-download 之前。
         viewModel.removeDownloads(withIDs: [itemID])
 
-        Task { @MainActor in
-            defer {
-                isResettingVideoOptimization = false
-                downloadActivity.finish(itemID: itemID)
-            }
-            do {
-                if itemID.hasPrefix("workshop_") {
-                    try await viewModel.downloadWorkshopWallpaper(downloadingItem)
-                } else {
-                    try await viewModel.download(downloadingItem)
+        PersistentDownloadQueueService.shared.start(using: viewModel)
+
+        if fromOptimizationReset {
+            Task { @MainActor in
+                defer {
+                    isResettingVideoOptimization = false
+                    downloadActivity.finish(itemID: itemID)
+                }
+                // 等待队列任务结束（成功或失败）后再刷新详情
+                // TODO: jobs/waitForCompletionIfPossible 尚未在 PersistentDownloadQueueService
+                // 实现（另一会话 WIP），先走轮询兜底保证可编译。
+                // 无 job 句柄时兜底：短轮询下载记录恢复
+                for _ in 0..<120 {
+                    if mediaLibrary.downloadRecord(for: itemID)?.isActive == true { break }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                 }
                 refreshResolvedItemAfterLocalDownload()
                 if let videoURL = videoURLs.first {
@@ -2260,10 +2327,17 @@ struct MediaDetailSheet: View {
                 }
                 sceneBakeStatusFlash = "已重新下载原文件"
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                sceneBakeStatusFlash = nil
-            } catch {
-                errorMessage = Self.truncateErrorMessage(error.localizedDescription)
-                showError = true
+                if sceneBakeStatusFlash == "已重新下载原文件" {
+                    sceneBakeStatusFlash = nil
+                }
+            }
+        } else {
+            sceneBakeStatusFlash = t("library.redownload.item")
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if sceneBakeStatusFlash == t("library.redownload.item") {
+                    sceneBakeStatusFlash = nil
+                }
             }
         }
     }
@@ -2528,12 +2602,18 @@ struct MediaDetailSheet: View {
 
     @MainActor
     private func loadDetailIfNeeded() async {
-        let detail = await viewModel.ensureDetail(for: initialItem)
-        let merged = mediaItemByMergingAuthorMetadata(detail, fallback: initialItem)
+        // 仅加载「当前」详情；作者面板切换后 resolvedItem 会变，
+        // 不可再用已过期的 initialItem 覆盖背景。
+        let target = resolvedItem
+        let targetID = target.id
+        let detail = await viewModel.ensureDetail(for: target)
+        guard resolvedItem.id == targetID else { return }
+        let merged = mediaItemByMergingAuthorMetadata(detail, fallback: target)
         var item = itemWithLocalWorkshopVideo(merged)
         // 修复历史脏数据：早期导入未读 project.json 的 workshopid，可能把本地 hash/UUID
         // 伪造成了打不开的 Steam 链接。这里从本地 project.json 重新提取真实 ID 并修正 pageURL。
         item = itemWithCorrectedWorkshopPageURL(item)
+        guard resolvedItem.id == targetID else { return }
         resolvedItem = item
         viewModel.recordViewed(resolvedItem)
 
@@ -2694,8 +2774,8 @@ struct MediaDetailSheet: View {
 
     private func setupNextItemDataSource() {
         let items = navigationItems
-        // 找到当前媒体项在列表中的索引
-        if let index = items.firstIndex(where: { $0.id == initialItem.id }) {
+        // 找到当前媒体项在列表中的索引（用 resolvedItem，兼容作者面板原地切换）
+        if let index = items.firstIndex(where: { $0.id == resolvedItem.id }) {
             currentItemIndex = index
         }
 
@@ -2843,11 +2923,16 @@ struct MediaDetailSheet: View {
 
     @MainActor
     private func loadDetailIfNeededFor(_ item: MediaItem) async {
+        let targetID = item.id
         let detail = await viewModel.ensureDetail(for: item)
+        // 快速连续切换时丢弃过期响应，避免旧项封面/GIF 回写到当前详情
+        guard resolvedItem.id == targetID else { return }
         let updated = itemWithLocalWorkshopVideo(mediaItemByMergingAuthorMetadata(detail, fallback: item))
+        guard resolvedItem.id == targetID else { return }
         resolvedItem = updated
         viewModel.recordViewed(resolvedItem)
         await checkWorkshopUpdateIfNeeded()
+        guard resolvedItem.id == targetID else { return }
         withAnimation(.easeInOut(duration: 0.3)) {
             isSourcesReady = true
         }
@@ -3288,7 +3373,7 @@ struct MediaDetailSheet: View {
                         ? NSScreen.screens
                         : selectedScreen.map { [$0] }
                     var options = LocalWallpaperApplyService.Options(
-                        animatedTransition: false,
+                        animatedTransition: true,
                         requirePlaybackEndSupport: false,
                         muted: isMuted,
                         fallbackPosterURL: preferredWorkshopPosterForVideo,
@@ -4558,13 +4643,17 @@ struct MediaDetailSheet: View {
     private func navigateToAuthorMedia(_ item: MediaItem) {
         // 作者列表所有项目同属一个作者，按字段补齐作者信息，避免只因 authorName 已存在就漏掉头像。
         let patchedItem = mediaItemByMergingAuthorMetadata(item, fallback: resolvedItem)
+        guard patchedItem.id != resolvedItem.id else { return }
 
         // 始终原地替换 resolvedItem，不走 onNavigateToItem push 路径
         // 这样作者面板保持打开，详情页数据无缝切换
         isAuthorPanelFade = true
         isNavigating = true
+        // 强制详情背景按新项重建，避免 Kingfisher/AVPlayer 残留上一张 GIF/视频
+        isMediaLoaded = false
+        mediaBackgroundEpoch &+= 1
 
-        if let index = viewModel.items.firstIndex(where: { $0.id == patchedItem.id }) {
+        if let index = navigationItems.firstIndex(where: { $0.id == patchedItem.id }) {
             navigateToIndex(index)
         } else {
             reloadMedia(patchedItem)

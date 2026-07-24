@@ -94,6 +94,9 @@ final class MediaExploreViewModel: ObservableObject {
 
     /// 本地媒体缓存重建任务（带防抖）
     private var rebuildLocalMediaCacheTask: Task<Void, Never>?
+    private var localMediaCacheRebuildID: UUID?
+    /// 仅在主窗口释放前台资源后置为 true；空数组本身仍可能是一个有效的库快照。
+    private var localMediaCacheNeedsRestore = false
 
     // MARK: - Workshop 分页状态
     private var workshopCurrentPage = 1
@@ -312,24 +315,40 @@ final class MediaExploreViewModel: ObservableObject {
         cachedAllLocalMedia
     }
 
-    /// 主窗口从状态栏重新挂载后，立即从持久化记录恢复本地库索引。
-    /// 隐藏窗口会主动清空该内存缓存，不能等待下一次下载记录变更才重建。
-    func restoreLocalLibraryCache() async {
-        rebuildLocalMediaCacheTask?.cancel()
-        rebuildLocalMediaCacheTask = nil
-        await rebuildLocalMediaCache()
+    /// 确保本地媒体索引可供库页面使用。
+    /// 缓存失效时会合并并发请求，避免多个视图重复从持久化记录重建同一份快照。
+    func ensureLocalMediaIndex() async {
+        guard localMediaCacheNeedsRestore else { return }
+        if let task = rebuildLocalMediaCacheTask {
+            await task.value
+            return
+        }
+        await startLocalMediaCacheRebuild(delayNanoseconds: 0).value
     }
 
     /// 重建本地媒体缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalMediaCacheRebuild(delayNanoseconds: UInt64) {
+        _ = startLocalMediaCacheRebuild(delayNanoseconds: delayNanoseconds)
+    }
+
+    @discardableResult
+    private func startLocalMediaCacheRebuild(delayNanoseconds: UInt64) -> Task<Void, Never> {
         rebuildLocalMediaCacheTask?.cancel()
-        rebuildLocalMediaCacheTask = Task { @MainActor [weak self] in
+        let rebuildID = UUID()
+        localMediaCacheRebuildID = rebuildID
+
+        let task = Task { @MainActor [weak self] in
             if delayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: delayNanoseconds)
             }
             guard let self, !Task.isCancelled else { return }
             await self.rebuildLocalMediaCache()
+            guard self.localMediaCacheRebuildID == rebuildID else { return }
+            self.rebuildLocalMediaCacheTask = nil
+            self.localMediaCacheRebuildID = nil
         }
+        rebuildLocalMediaCacheTask = task
+        return task
     }
 
     /// 从持久化下载记录重建库页面缓存。此路径不访问文件系统。
@@ -355,6 +374,7 @@ final class MediaExploreViewModel: ObservableObject {
 
         guard !Task.isCancelled else { return }
         cachedAllLocalMedia = result
+        localMediaCacheNeedsRestore = false
         // 缓存重建完成后递增版本号，触发 MyLibraryContentView 的
         // .onChange → debouncedUpdateMediaItems()，让依赖缓存的
         // 标签页（如「下载」）在拖拽入库等操作后能读到新鲜数据。
@@ -976,6 +996,28 @@ final class MediaExploreViewModel: ObservableObject {
             return resolvedItem
         }
 
+        // Wallsflow：列表页已有 video/download 时仍可能缺 poster/标签，
+        // 且绝不能走 MotionBG 的 mediaService.fetchDetail(slug:)。
+        if WallsflowService.isWallsflowItem(item) {
+            let alreadyHasPlaybackDetail = !item.downloadOptions.isEmpty || item.previewVideoURL != nil
+            if alreadyHasPlaybackDetail, item.posterURL != nil {
+                mediaLibrary.upsert(item)
+                return item
+            }
+
+            let task = Task<MediaItem, Error> {
+                let detail = try await self.wallsflowService.enrichListItem(item)
+                return detail.preservingPersistedMetadata(from: item)
+            }
+            detailTasks[item.id] = task
+            defer { detailTasks[item.id] = nil }
+
+            let resolvedItem = try await task.value
+            replaceItem(with: resolvedItem)
+            mediaLibrary.upsert(resolvedItem)
+            return resolvedItem
+        }
+
         let alreadyHasPlaybackDetail = !item.downloadOptions.isEmpty || item.previewVideoURL != nil
         if alreadyHasPlaybackDetail, item.posterURL != nil {
             mediaLibrary.upsert(item)
@@ -1140,12 +1182,13 @@ final class MediaExploreViewModel: ObservableObject {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
             mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
+            // 用户可见切换：首帧预热 + 短黑场交接，避免视频/跨类型切换露黑。
             try videoWallpaperManager.applyVideoWallpaper(
                 from: localVideoURL,
                 posterURL: posterURL,
                 muted: muted,
                 targetScreens: resolvedTargetScreens,
-                animatedTransition: false,
+                animatedTransition: true,
                 usesSharedVideoDecoder: usesSharedVideoDecoder
             )
             return
@@ -1163,7 +1206,7 @@ final class MediaExploreViewModel: ObservableObject {
                     posterURL: posterURL,
                     muted: muted,
                     targetScreens: resolvedTargetScreens,
-                    animatedTransition: false,
+                    animatedTransition: true,
                     usesSharedVideoDecoder: usesSharedVideoDecoder
                 )
                 return
@@ -1184,7 +1227,7 @@ final class MediaExploreViewModel: ObservableObject {
             posterURL: posterURL,
             muted: muted,
             targetScreens: resolvedTargetScreens,
-            animatedTransition: false,
+            animatedTransition: true,
             usesSharedVideoDecoder: usesSharedVideoDecoder
         )
     }
@@ -1466,20 +1509,27 @@ final class MediaExploreViewModel: ObservableObject {
 
         // 如果文件已存在（在新位置或旧位置），直接返回
         if fileLocation.foundIn != .notFound {
-            print("[MediaExploreViewModel] File found at: \(fileLocation.url.path) (location: \(fileLocation.foundIn))")
-            if let taskID {
-                updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
-            }
+            // 历史坏下载：Wallsflow 无 Referer 时会把 HTML 当 mp4 落盘，需作废重下。
+            if Self.localMediaFileLooksCorrupt(fileLocation.url) {
+                print("[MediaExploreViewModel] Corrupt media file detected, re-downloading: \(fileLocation.url.path)")
+                try? FileManager.default.removeItem(at: fileLocation.url)
+                FileExistenceCache.shared.invalidate(atPath: fileLocation.url.path)
+            } else {
+                print("[MediaExploreViewModel] File found at: \(fileLocation.url.path) (location: \(fileLocation.foundIn))")
+                if let taskID {
+                    updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
+                }
 
-            if saveToDownloads {
-                mediaLibrary.ensureDownloadRecord(
-                    item: resolvedItem,
-                    localFileURL: fileLocation.url,
-                    folderID: folderID
-                )
-            }
+                if saveToDownloads {
+                    mediaLibrary.ensureDownloadRecord(
+                        item: resolvedItem,
+                        localFileURL: fileLocation.url,
+                        folderID: folderID
+                    )
+                }
 
-            return fileLocation.url
+                return fileLocation.url
+            }
         }
 
         // 文件不存在，需要下载
@@ -1491,16 +1541,34 @@ final class MediaExploreViewModel: ObservableObject {
         }
 
         let cachedURL: URL
-        if let existingCachedURL = await cacheService.cachedFileURL(named: fileURL.lastPathComponent, in: "Media") {
+        if let existingCachedURL = await cacheService.cachedFileURL(named: fileURL.lastPathComponent, in: "Media"),
+           !Self.localMediaFileLooksCorrupt(existingCachedURL) {
             cachedURL = existingCachedURL
             if let taskID {
                 updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
             }
         } else {
-            let data = try await networkService.fetchData(from: downloadOption.remoteURL) { progress in
+            if let stale = await cacheService.cachedFileURL(named: fileURL.lastPathComponent, in: "Media") {
+                try? FileManager.default.removeItem(at: stale)
+            }
+            // Wallsflow cloud CDN 无 Referer 会 302 成 HTML；且 Range 不可用，必须整文件 GET。
+            let wallsflowHeaders = WallsflowService.mediaRequestHeaders(
+                for: downloadOption.remoteURL,
+                pageURL: resolvedItem.pageURL
+            ) ?? [:]
+            let data = try await networkService.fetchData(
+                from: downloadOption.remoteURL,
+                headers: wallsflowHeaders
+            ) { progress in
                 guard let taskID else { return }
                 Task { @MainActor in
                     DownloadTaskService.shared.updateProgress(id: taskID, progress: min(progress * 0.86, 0.86))
+                }
+            }
+            // 防御：若仍拿到 HTML（鉴权/跳转失败），勿落盘污染缓存。
+            if WallsflowService.isProtectedMediaURL(downloadOption.remoteURL) {
+                if Self.looksLikeHTMLPayload(data) || data.count < 64_000 {
+                    throw NetworkError.invalidResponse
                 }
             }
             cachedURL = try await cacheService.cacheFile(data, named: fileURL.lastPathComponent, in: "Media")
@@ -1625,7 +1693,7 @@ final class MediaExploreViewModel: ObservableObject {
         detailTasks.removeAll()
     }
 
-    /// 释放前台浏览态内存：取消当前前台任务并清空列表/本地列表快照，保留持久化库数据与设置状态。
+    /// 释放前台浏览态内存：取消前台任务并使本地库索引失效，持久化库数据与设置状态保持不变。
     func releaseForegroundMemory() {
         networkRecoveryTask?.cancel()
         sourceSwitchTask?.cancel()
@@ -1645,7 +1713,11 @@ final class MediaExploreViewModel: ObservableObject {
 
         items.removeAll()
         homeItems.removeAll()
+        rebuildLocalMediaCacheTask?.cancel()
+        rebuildLocalMediaCacheTask = nil
+        localMediaCacheRebuildID = nil
         cachedAllLocalMedia.removeAll()
+        localMediaCacheNeedsRestore = true
         errorMessage = nil
         isLoading = false
         isLoadingMore = false
@@ -2565,6 +2637,49 @@ final class MediaExploreViewModel: ObservableObject {
         let item = try await wallsflowService.fetchDetail(url: url)
         print("[MediaExploreViewModel] resolveWallsflowItemByURL success: \(item.id) - \(item.title)")
         return item
+    }
+
+    /// 检测 CDN 鉴权失败时返回的 HTML 伪装响应（避免落盘坏文件）。
+    private static func looksLikeHTMLPayload(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return false }
+        let prefixCount = min(data.count, 256)
+        guard let head = String(data: data.prefix(prefixCount), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return false
+        }
+        return head.hasPrefix("<!doctype html")
+            || head.hasPrefix("<html")
+            || head.contains("<head")
+            || head.contains("utm_source=redirect")
+    }
+
+    /// 本地“媒体”文件是否其实是 HTML 或过小的坏文件。
+    private static func localMediaFileLooksCorrupt(_ url: URL) -> Bool {
+        let path = url.path
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        // 正常 live wallpaper 远大于 8KB；HTML 跳转页通常很小。
+        if size > 0, size < 8_192 {
+            if let handle = try? FileHandle(forReadingFrom: url) {
+                defer { try? handle.close() }
+                let head = handle.readData(ofLength: 256)
+                if looksLikeHTMLPayload(head) { return true }
+            }
+            // 极小且扩展名是视频 → 大概率坏文件
+            let ext = url.pathExtension.lowercased()
+            if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+                return true
+            }
+        } else if size >= 8_192, size < 64_000 {
+            if let handle = try? FileHandle(forReadingFrom: url) {
+                defer { try? handle.close() }
+                let head = handle.readData(ofLength: 256)
+                if looksLikeHTMLPayload(head) { return true }
+            }
+        }
+        return false
     }
 
     // MARK: - 同步 Steam 订阅

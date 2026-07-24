@@ -83,6 +83,8 @@ struct LibraryFolderCard: View {
     let onRedownloadAll: (() -> Void)?
 
     @State private var isHovered = false
+    /// 指针是否在卡片内（滚动中也更新；滚停时用来恢复 isHovered）
+    @State private var isPointerInside = false
     @State private var isDropTarget = false
 
     private var thumbnailHeight: CGFloat {
@@ -118,7 +120,7 @@ struct LibraryFolderCard: View {
                         relockButton(onRelock: onRelock)
                     }
 
-                    // 收纳 drop 仅覆盖卡片缩略图中央 60%，
+                    // 收纳 drop 覆盖卡片缩略图中央 60%（浏览态也要能拖入文件夹）。
                     // 卡片其他区域（左侧间隙、底部信息栏、外缘）让给 grid 的排序插入条 drop zone。
                     Color.clear
                         .frame(width: cardWidth * 0.6, height: thumbnailHeight * 0.6)
@@ -179,7 +181,19 @@ struct LibraryFolderCard: View {
         .animation(.easeOut(duration: 0.16), value: isHovered)
         .animation(.easeInOut(duration: 0.15), value: isDropTarget)
         .throttledHover(interval: 0.05) { hovering in
+            isPointerInside = hovering
+            if hovering, LibraryScrollHoverGate.shared.suppressesAnimatedHover {
+                return
+            }
             isHovered = hovering
+        }
+        .libraryScrollIdleHoverProbe { inside in
+            isPointerInside = inside
+            if inside {
+                isHovered = true
+            } else if isHovered {
+                isHovered = false
+            }
         }
         .contextMenu {
             Button(action: onRename) {

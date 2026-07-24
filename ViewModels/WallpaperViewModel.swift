@@ -36,6 +36,9 @@ class WallpaperViewModel: ObservableObject {
 
     /// 本地壁纸缓存重建任务（带防抖）
     private var rebuildLocalWallpaperCacheTask: Task<Void, Never>?
+    private var localWallpaperCacheRebuildID: UUID?
+    /// 仅在主窗口释放前台资源后置为 true；空数组本身仍可能是一个有效的库快照。
+    private var localWallpaperCacheNeedsRestore = false
     private var currentRandomSeed: String?
 
 
@@ -383,24 +386,40 @@ class WallpaperViewModel: ObservableObject {
         cachedAllLocalWallpapers
     }
 
-    /// 主窗口从状态栏重新挂载后，立即从持久化记录恢复本地库索引。
-    /// 隐藏窗口会主动清空该内存缓存，不能等待下一次下载记录变更才重建。
-    func restoreLocalLibraryCache() async {
-        rebuildLocalWallpaperCacheTask?.cancel()
-        rebuildLocalWallpaperCacheTask = nil
-        await rebuildLocalWallpaperCache()
+    /// 确保本地壁纸索引可供库页面使用。
+    /// 缓存失效时会合并并发请求，避免多个视图重复从持久化记录重建同一份快照。
+    func ensureLocalWallpaperIndex() async {
+        guard localWallpaperCacheNeedsRestore else { return }
+        if let task = rebuildLocalWallpaperCacheTask {
+            await task.value
+            return
+        }
+        await startLocalWallpaperCacheRebuild(delayNanoseconds: 0).value
     }
 
     /// 重建本地壁纸缓存（在 downloadRecords / favoriteRecords 变化时自动调用）
     private func scheduleLocalWallpaperCacheRebuild(delayNanoseconds: UInt64) {
+        _ = startLocalWallpaperCacheRebuild(delayNanoseconds: delayNanoseconds)
+    }
+
+    @discardableResult
+    private func startLocalWallpaperCacheRebuild(delayNanoseconds: UInt64) -> Task<Void, Never> {
         rebuildLocalWallpaperCacheTask?.cancel()
-        rebuildLocalWallpaperCacheTask = Task { @MainActor [weak self] in
+        let rebuildID = UUID()
+        localWallpaperCacheRebuildID = rebuildID
+
+        let task = Task { @MainActor [weak self] in
             if delayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: delayNanoseconds)
             }
             guard let self, !Task.isCancelled else { return }
             await self.rebuildLocalWallpaperCache()
+            guard self.localWallpaperCacheRebuildID == rebuildID else { return }
+            self.rebuildLocalWallpaperCacheTask = nil
+            self.localWallpaperCacheRebuildID = nil
         }
+        rebuildLocalWallpaperCacheTask = task
+        return task
     }
 
     /// 从持久化下载记录重建库页面缓存。此路径不访问文件系统。
@@ -426,6 +445,7 @@ class WallpaperViewModel: ObservableObject {
 
         guard !Task.isCancelled else { return }
         cachedAllLocalWallpapers = result
+        localWallpaperCacheNeedsRestore = false
         // 缓存重建完成后递增版本号，触发 MyLibraryContentView 的
         // .onChange → debouncedUpdateWallpaperItems()，让依赖缓存的
         // 标签页（如「下载」）在拖拽入库等操作后能读到新鲜数据。
@@ -1154,7 +1174,7 @@ class WallpaperViewModel: ObservableObject {
         loadMoreTask?.cancel()
     }
 
-    /// 释放前台浏览态内存：取消任务并清空当前列表/本地列表快照，保留持久化库数据。
+    /// 释放前台浏览态内存：取消任务并使本地库索引失效，持久化库数据保持不变。
     func releaseForegroundMemory() {
         searchTask?.cancel()
         loadMoreTask?.cancel()
@@ -1172,7 +1192,11 @@ class WallpaperViewModel: ObservableObject {
         topWallpapers.removeAll()
         latestWallpapers.removeAll()
         availableTags.removeAll()
+        rebuildLocalWallpaperCacheTask?.cancel()
+        rebuildLocalWallpaperCacheTask = nil
+        localWallpaperCacheRebuildID = nil
         cachedAllLocalWallpapers.removeAll()
+        localWallpaperCacheNeedsRestore = true
         errorMessage = nil
         isLoading = false
         hasMorePages = true

@@ -116,21 +116,22 @@ private struct LibraryScrollObserver: NSViewRepresentable {
 
 struct MyLibraryContentView: View {
     // 共享 AppDelegate 持有的全局 ViewModel 实例（与首页/壁纸探索/媒体探索共用）。
-    // 之前是 @StateObject 创建独立实例，导致两份 WallpaperViewModel/MediaExploreViewModel
-    // 同时订阅库记录变更 → 双倍内存 + 双倍响应。
-    // 改为 @ObservedObject 接收外部实例，仍能响应数据变化（body 内读 favorites/allLocalWallpapers
-    // 等需要响应式），但不再有冗余实例。
-    @ObservedObject var viewModel: WallpaperViewModel
-    @ObservedObject var mediaViewModel: MediaExploreViewModel
-    @StateObject private var downloadTaskViewModel = DownloadTaskViewModel()
-    @ObservedObject private var animeFavoriteStore = AnimeFavoriteStore.shared
-    @ObservedObject private var folderStore = LibraryFolderStore.shared
-    @ObservedObject private var gridOrderStore = LibraryGridOrderStore.shared
-    @ObservedObject private var folderLockService = FolderLockService.shared
-    // 注意：ArcBackgroundSettings 不在顶层观察。它有多个 @Published（dotGridOpacity /
-    // useNoiseTexture / grainIntensity 等），顶层观察会导致任意外观设置变化触发整个库视图
-    // body 重算。背景渲染已下沉到 LibraryAtmosphereBackground 子视图自行观察。
-    @ObservedObject private var workshopSourceManager = WorkshopSourceManager.shared
+    // ⚠️ 不用 @ObservedObject：WallpaperViewModel / MediaExploreViewModel 各有大量
+    // @Published（探索页 searchQuery/isLoading 等），任一变化都会刷整页库 body。
+    // 库内容变更只听 libraryContentRevision（onReceive），数据用 viewModel.xxx 命令式读取。
+    let viewModel: WallpaperViewModel
+    let mediaViewModel: MediaExploreViewModel
+    // 注意：ArcBackgroundSettings / CurrentWallpaperService / WorkshopSourceManager /
+    // FolderLockService / AnimeFavoriteStore 均不在顶层 @ObservedObject。
+    // - 背景 → LibraryAtmosphereBackground 自行观察
+    // - 当前壁纸标记 → activeWallpaperRevision 快照 + 卡片布尔
+    // - 文件夹解锁 → folderUnlockRevision 快照
+    // - 动漫收藏 / Steam 配置 → 事件驱动写 @State，不订阅整对象
+    // 命令式访问共享单例（不订阅 objectWillChange）
+    private let folderStore = LibraryFolderStore.shared
+    private let gridOrderStore = LibraryGridOrderStore.shared
+    private let workshopSourceManager = WorkshopSourceManager.shared
+    private let animeFavoriteStore = AnimeFavoriteStore.shared
     @Environment(\.mainTopBarContentPadding) private var mainTopBarContentPadding
 
     // 分类筛选
@@ -158,8 +159,12 @@ struct MyLibraryContentView: View {
 
     // MARK: - Scroll 恢复
     @StateObject private var libraryScrollRuntimeState = LibraryScrollRuntimeState()
-    @ObservedObject private var currentWallpaperService = CurrentWallpaperService.shared
-    @State private var isLibraryHeaderContentVisible = true
+    /// 当前活跃壁纸路径快照（仅路径集合变化时递增，驱动卡片 isCurrent 布尔刷新）
+    @State private var activeWallpaperFilePaths: Set<String> = []
+    @State private var activeWallpaperURLStrings: Set<String> = []
+    @State private var activeWallpaperRevision: UInt = 0
+    /// 文件夹解锁集合变化时递增，驱动文件夹卡锁态刷新（不观察 FolderLockService 全对象）
+    @State private var folderUnlockRevision: UInt = 0
     /// 详情页导航前保存的滚动位置（>=0 表示需要恢复）
     @State private var savedLibraryScrollOffset: CGFloat = -1
     /// 恢复成功后自增，驱动 LibraryScrollRestorer 重新触发
@@ -307,10 +312,6 @@ struct MyLibraryContentView: View {
         !trimmedLibrarySearchQuery.isEmpty
     }
 
-    private var libraryHeaderHeight: CGFloat {
-        118
-    }
-
     var body: some View {
         // 性能测量：开启 PERF_TRACE 编译标记后，会在控制台打印触发本 body 的属性来源
         #if PERF_TRACE
@@ -378,10 +379,16 @@ struct MyLibraryContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .environmentObject(CurrentWallpaperService.shared)
         .task {
-            await viewModel.initialLoad()
+            async let wallpaperIndex: Void = viewModel.ensureLocalWallpaperIndex()
+            async let mediaIndex: Void = mediaViewModel.ensureLocalMediaIndex()
+            _ = await (wallpaperIndex, mediaIndex)
+
             updateWallpaperItems()
             updateMediaItems()
-            await loadAnimeFavorites()
+
+            async let initialLoad: Void = viewModel.initialLoad()
+            async let animeFavoritesLoad: Void = loadAnimeFavorites()
+            _ = await (initialLoad, animeFavoritesLoad)
         }
         .onAppear {
             restoreLastLibraryPageIfNeeded()
@@ -392,6 +399,7 @@ struct MyLibraryContentView: View {
             // 注册触摸板双指右滑返回手势（文件夹内）。
             registerFolderBackSwipeHandler()
             registerFolderBackKeyboardHandler()
+            syncActiveWallpaperSnapshot()
         }
         .onDisappear {
             unregisterFolderBackSwipeHandler()
@@ -413,12 +421,15 @@ struct MyLibraryContentView: View {
                 persistLastLibraryPage()
             } else {
                 restoreLastLibraryPageIfNeeded()
+                // 回到库页时同步一次当前壁纸快照（可能在其他页被切换）
+                syncActiveWallpaperSnapshot()
             }
         }
-        .onChange(of: viewModel.libraryContentRevision) { _, _ in
+        // ViewModel 不再 @ObservedObject：用 publisher 只听库内容 revision
+        .onReceive(viewModel.$libraryContentRevision) { _ in
             debouncedUpdateWallpaperItems()
         }
-        .onChange(of: mediaViewModel.libraryContentRevision) { _, _ in
+        .onReceive(mediaViewModel.$libraryContentRevision) { _ in
             debouncedUpdateMediaItems()
         }
         .onChange(of: selectedSubTab) { _, _ in
@@ -449,6 +460,20 @@ struct MyLibraryContentView: View {
         .onReceive(gridOrderStore.$revision) { _ in
             debouncedUpdateWallpaperItems()
             debouncedUpdateMediaItems()
+        }
+        // 当前壁纸 / 文件夹解锁：只在集合真变化时写 @State，避免无关 @Published 刷整页
+        .onReceive(CurrentWallpaperService.shared.$activeFilePaths) { paths in
+            guard paths != activeWallpaperFilePaths else { return }
+            activeWallpaperFilePaths = paths
+            activeWallpaperRevision &+= 1
+        }
+        .onReceive(CurrentWallpaperService.shared.$activeURLStrings) { urls in
+            guard urls != activeWallpaperURLStrings else { return }
+            activeWallpaperURLStrings = urls
+            activeWallpaperRevision &+= 1
+        }
+        .onReceive(FolderLockService.shared.$unlockedFolderIDs) { _ in
+            folderUnlockRevision &+= 1
         }
         .onReceive(NotificationCenter.default.publisher(for: .appShouldReleaseForegroundMemory)) { _ in
             releaseForegroundMemory()
@@ -723,40 +748,17 @@ struct MyLibraryContentView: View {
     }
 
     private func handleLibraryScroll(_ offset: CGFloat) {
+        // 只写运行时 offset + 滚动门控；不触发任何 @State，避免滚动帧刷整页 body
         libraryScrollRuntimeState.currentOffset = offset
-        // 滚动中抑制媒体卡 hover/GIF 叠加，避免滚过时反复挂载 KFAnimatedImage
+        // 滚动中抑制媒体卡 hover/GIF 叠加，并暂停缩略图生成/预取
+        let wasScrolling = LibraryScrollHoverGate.shared.isScrolling
         LibraryScrollHoverGate.shared.noteScrollActivity()
-
-        let hideThreshold = libraryHeaderHeight + 24
-        let showThreshold = libraryHeaderHeight - 24
-        let shouldBeVisible = isLibraryHeaderContentVisible
-            ? offset < hideThreshold
-            : offset < showThreshold
-        guard shouldBeVisible != isLibraryHeaderContentVisible else { return }
-
-        DispatchQueue.main.async {
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                isLibraryHeaderContentVisible = shouldBeVisible
-            }
+        // 刚进入滚动：立刻停掉正在进行的 Kingfisher 预取（不写 @State）
+        if !wasScrolling {
+            ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
+            ForegroundPrefetchManager.shared.stop(namespace: mediaPrefetchNamespace)
+            ForegroundPrefetchManager.shared.stop(namespace: animePrefetchNamespace)
         }
-    }
-
-    // MARK: - Hero
-    private var libraryHeaderPlaceholder: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if isLibraryHeaderContentVisible {
-                VStack(alignment: .leading, spacing: 0) {
-                    mediaHero
-                    libraryControlPanel
-                        .padding(.top, 36)
-                }
-                .frame(height: libraryHeaderHeight, alignment: .bottom)
-            }
-        }
-        .frame(height: libraryHeaderHeight, alignment: .bottom)
-        .clipped()
     }
 
     private var mediaHero: some View {
@@ -883,12 +885,17 @@ struct MyLibraryContentView: View {
         case .folder(let folder):
             wallpaperFolderCard(folder: folder, config: config)
                 .overlay(alignment: .leading) {
-                    insertionDropZone(before: entry.id)
+                    // 排序插入条仅编辑态挂载，减少非编辑滚动时每卡 hit-test 层
+                    if isEditing {
+                        insertionDropZone(before: entry.id)
+                    }
                 }
         case .item(let item):
             wallpaperGridItem(item: item, config: config)
                 .overlay(alignment: .leading) {
-                    insertionDropZone(before: entry.id)
+                    if isEditing {
+                        insertionDropZone(before: entry.id)
+                    }
                 }
                 .onAppear {
                     preloadNearbyWallpapers(around: item, config: config)
@@ -898,6 +905,8 @@ struct MyLibraryContentView: View {
 
     private func wallpaperFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = wallpaperFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
+        // 依赖 folderUnlockRevision，解锁集合变化时刷新锁态，无需观察 FolderLockService 全对象
+        _ = folderUnlockRevision
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
         return LibraryFolderCard(
             folder: folder,
@@ -922,7 +931,7 @@ struct MyLibraryContentView: View {
                 folderStore.toggleFolderLock(id: folder.id, contentType: .wallpaper)
             },
             onRelock: {
-                folderLockService.lockFolder(folder.id)
+                FolderLockService.shared.lockFolder(folder.id)
             },
             onOptimizeVideos: {
                 _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
@@ -1083,6 +1092,43 @@ struct MyLibraryContentView: View {
         }
         updateMediaDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
+    // MARK: - 当前壁纸快照（不订阅 CurrentWallpaperService 全对象）
+
+    private func syncActiveWallpaperSnapshot() {
+        let service = CurrentWallpaperService.shared
+        let paths = service.activeFilePaths
+        let urls = service.activeURLStrings
+        if paths != activeWallpaperFilePaths {
+            activeWallpaperFilePaths = paths
+        }
+        if urls != activeWallpaperURLStrings {
+            activeWallpaperURLStrings = urls
+        }
+    }
+
+    /// 与 `CurrentWallpaperService.isCurrentWallpaper` 等价，但只读本地快照，
+    /// 避免顶层 @ObservedObject 在任意活跃路径重建时刷整页 body。
+    private func isActiveWallpaperURL(_ url: URL?) -> Bool {
+        // 引用 revision，确保路径/URL 集合变化时 SwiftUI 会重算依赖该布尔的卡片
+        _ = activeWallpaperRevision
+        guard let url else { return false }
+        if activeWallpaperURLStrings.contains(url.absoluteString) {
+            return true
+        }
+        guard url.isFileURL else { return false }
+        guard !activeWallpaperFilePaths.isEmpty else { return false }
+        let candidate = url.standardizedFileURL.path
+        if activeWallpaperFilePaths.contains(candidate) {
+            return true
+        }
+        for activePath in activeWallpaperFilePaths {
+            if candidate.hasPrefix(activePath + "/") || activePath.hasPrefix(candidate + "/") {
+                return true
+            }
+        }
+        return false
     }
 
     private func updateWallpaperItems() {
@@ -1290,8 +1336,8 @@ struct MyLibraryContentView: View {
             isSelected: selectedItems.contains(item.id),
             downloadDate: item.downloadDate,
             cardWidth: config.cardWidth,
-            isCurrentWallpaper: currentWallpaperService.isCurrentWallpaper(localFileURL: item.localFileURL)
-                || currentWallpaperService.isCurrentWallpaper(localFileURL: item.wallpaper.fullImageURL)
+            isCurrentWallpaper: isActiveWallpaperURL(item.localFileURL)
+                || isActiveWallpaperURL(item.wallpaper.fullImageURL)
         ) {
             handleWallpaperTap(item.wallpaper)
         }
@@ -1330,6 +1376,7 @@ struct MyLibraryContentView: View {
                 Label(t("delete"), systemImage: "trash")
             }
         }
+        // 始终可拖入文件夹（浏览态也需要）；排序插入条仍仅编辑态挂载
         card.draggable(dragPayload(for: item.id))
     }
 
@@ -1370,12 +1417,16 @@ struct MyLibraryContentView: View {
         case .folder(let folder):
             mediaFolderCard(folder: folder, config: config)
                 .overlay(alignment: .leading) {
-                    insertionDropZone(before: entry.id)
+                    if isEditing {
+                        insertionDropZone(before: entry.id)
+                    }
                 }
         case .item(let item):
             mediaGridItem(item: item, config: config)
                 .overlay(alignment: .leading) {
-                    insertionDropZone(before: entry.id)
+                    if isEditing {
+                        insertionDropZone(before: entry.id)
+                    }
                 }
                 .onAppear {
                     preloadNearbyMedia(around: item, config: config)
@@ -1385,6 +1436,7 @@ struct MyLibraryContentView: View {
 
     private func mediaFolderCard(folder: LibraryFolder, config: LibraryGridConfig) -> some View {
         let display = mediaFolderDisplay[folder.id] ?? FolderDisplayInfo(previewURLs: [], itemCount: 0)
+        _ = folderUnlockRevision
         let isUnlocked = FolderLockService.shared.isFolderUnlocked(folder.id)
         return LibraryFolderCard(
             folder: folder,
@@ -1409,7 +1461,7 @@ struct MyLibraryContentView: View {
                 folderStore.toggleFolderLock(id: folder.id, contentType: .media)
             },
             onRelock: {
-                folderLockService.lockFolder(folder.id)
+                FolderLockService.shared.lockFolder(folder.id)
             },
             onOptimizeVideos: {
                 _ = VideoOptimizationQueueService.shared.enqueueLibraryFolder(folder)
@@ -1485,8 +1537,8 @@ struct MyLibraryContentView: View {
             shouldProbeAnimatedThumbnail: item.shouldProbeAnimatedThumbnail,
             resolvedVideoFileURL: item.resolvedVideoFileURL,
             isVisible: isVisible,
-            isCurrentWallpaper: currentWallpaperService.isCurrentWallpaper(localFileURL: item.localFileURL)
-                || currentWallpaperService.isCurrentWallpaper(localFileURL: item.resolvedVideoFileURL)
+            isCurrentWallpaper: isActiveWallpaperURL(item.localFileURL)
+                || isActiveWallpaperURL(item.resolvedVideoFileURL)
         ) {
             handleMediaTap(item.mediaItem)
         }
@@ -1537,6 +1589,7 @@ struct MyLibraryContentView: View {
                 Label(t("delete"), systemImage: "trash")
             }
         }
+        // 始终可拖入文件夹（浏览态也需要）；排序插入条仍仅编辑态挂载
         card.draggable(dragPayload(for: item.id))
     }
 
@@ -1631,6 +1684,8 @@ struct MyLibraryContentView: View {
     // 全表扫描。改用 ID→Index 字典做 O(1) 查找。
 
     private func preloadNearbyWallpapers(around item: AnyWallpaperItem, config: LibraryGridConfig) {
+        // 快速滚动时跳过预取/SSD 生成，避免与滚动抢 I/O 与主线程
+        if LibraryScrollHoverGate.shared.isScrolling { return }
         guard let index = wallpaperIDIndexCache[item.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastWallpaperPrefetchBucket != bucket else { return }
@@ -1658,12 +1713,14 @@ struct MyLibraryContentView: View {
             namespace: wallpaperPrefetchNamespace
         )
 
-        // 后台为附近静图生成 SSD 缩略图，后续滚动直接命中
+        // 后台为附近静图生成 SSD 缩略图；滚动中不启动，滚停后由卡片 ensure 补齐
         let nearbyLocals = range.compactMap { wallpaperItems[$0].localFileURL }
             .filter { LocalImageThumbnailCache.isRasterImageFile($0) }
         if !nearbyLocals.isEmpty {
             Task { @MainActor in
-                for url in nearbyLocals.prefix(12) {
+                guard !LibraryScrollHoverGate.shared.isScrolling else { return }
+                for url in nearbyLocals.prefix(8) {
+                    if LibraryScrollHoverGate.shared.isScrolling { return }
                     _ = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: url)
                 }
             }
@@ -1671,6 +1728,7 @@ struct MyLibraryContentView: View {
     }
 
     private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
+        if LibraryScrollHoverGate.shared.isScrolling { return }
         guard let index = mediaIDIndexCache[item.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastMediaPrefetchBucket != bucket else { return }
@@ -1692,6 +1750,7 @@ struct MyLibraryContentView: View {
     }
 
     private func preloadNearbyAnime(around anime: AnimeSearchResult, config: AnimeGridConfig) {
+        if LibraryScrollHoverGate.shared.isScrolling { return }
         guard let index = animeIDIndexCache[anime.id] else { return }
         let bucket = prefetchBucket(for: index)
         guard lastAnimePrefetchBucket != bucket else { return }
@@ -1712,11 +1771,13 @@ struct MyLibraryContentView: View {
     }
 
     private func prefetchBucket(for index: Int) -> Int {
-        index / 6
+        // 更粗的 bucket：减少滚动时 stop/start prefetcher 频率
+        index / 8
     }
 
     private func prefetchRange(around index: Int, totalCount: Int) -> Range<Int> {
-        max(0, index - 8)..<min(totalCount, index + 9)
+        // 收窄窗口：±5，降低 Kingfisher 与磁盘压力
+        max(0, index - 5)..<min(totalCount, index + 6)
     }
 
     private func refreshWallpaperFolderDisplay() {

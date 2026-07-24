@@ -341,33 +341,130 @@ public enum LibraryCardMetrics {
 
 // MARK: - Scroll Hover Gate
 
-/// 我的库滚动期间抑制 hover（尤其 GIF 叠加层挂载）。
+/// 我的库滚动期间抑制 hover（尤其 GIF 叠加层挂载），并门控缩略图生成/预热。
 /// 仅在 suppress 边沿发一次通知，避免滚动帧驱动整树重绘。
 @MainActor
 final class LibraryScrollHoverGate {
     static let shared = LibraryScrollHoverGate()
 
     private(set) var suppressesAnimatedHover = false
+    /// 滚动中（含惯性尾段）为 true；滚停 idleDelay 后变 false。
+    private(set) var isScrolling = false
     private var idleWorkItem: DispatchWorkItem?
+    private var idleCallbacks: [UUID: () -> Void] = [:]
     /// 滚停后稍等再恢复，避免惯性滚动尾段反复开关
-    private let idleDelay: TimeInterval = 0.18
+    private let idleDelay: TimeInterval = 0.22
 
     func noteScrollActivity() {
         idleWorkItem?.cancel()
+        isScrolling = true
         if !suppressesAnimatedHover {
             suppressesAnimatedHover = true
             NotificationCenter.default.post(name: .libraryScrollDidSuppressHover, object: nil)
         }
         let work = DispatchWorkItem { [weak self] in
-            self?.suppressesAnimatedHover = false
+            guard let self else { return }
+            self.isScrolling = false
+            self.suppressesAnimatedHover = false
+            let callbacks = Array(self.idleCallbacks.values)
+            self.idleCallbacks.removeAll()
+            for callback in callbacks {
+                callback()
+            }
+            NotificationCenter.default.post(name: .libraryScrollDidBecomeIdle, object: nil)
         }
         idleWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + idleDelay, execute: work)
+    }
+
+    /// 滚动中排队，滚停后只执行一次（同 token 会覆盖）。
+    @discardableResult
+    func runWhenIdle(token: UUID = UUID(), _ work: @escaping () -> Void) -> UUID {
+        if !isScrolling {
+            work()
+            return token
+        }
+        idleCallbacks[token] = work
+        return token
+    }
+
+    func cancelIdleWork(token: UUID) {
+        idleCallbacks.removeValue(forKey: token)
     }
 }
 
 extension Notification.Name {
     static let libraryScrollDidSuppressHover = Notification.Name("libraryScrollDidSuppressHover")
+    static let libraryScrollDidBecomeIdle = Notification.Name("libraryScrollDidBecomeIdle")
+}
+
+// MARK: - 滚停后命中恢复 hover
+//
+// macOS 上内容从静止指针下划过时，SwiftUI onHover 往往不会对“新到指针下的卡”重发 enter。
+// 滚停后用 AppKit 窗口坐标对卡片 bounds 做一次 hit-test，指针仍在卡上则立刻恢复 isHovered。
+
+private struct LibraryScrollIdleHoverProbe: NSViewRepresentable {
+    let onProbe: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onProbe = onProbe
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        nsView.onProbe = onProbe
+    }
+
+    final class ProbeView: NSView {
+        var onProbe: ((Bool) -> Void)?
+        private var idleObserver: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeIdleObserver()
+            guard window != nil else { return }
+            idleObserver = NotificationCenter.default.addObserver(
+                forName: .libraryScrollDidBecomeIdle,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.probeMouse()
+            }
+        }
+
+        override func removeFromSuperview() {
+            removeIdleObserver()
+            super.removeFromSuperview()
+        }
+
+        private func removeIdleObserver() {
+            if let idleObserver {
+                NotificationCenter.default.removeObserver(idleObserver)
+                self.idleObserver = nil
+            }
+        }
+
+        private func probeMouse() {
+            guard let window, !isHiddenOrHasHiddenAncestor else { return }
+            // 不可见/零尺寸时跳过（Lazy 离屏卡）
+            guard bounds.width > 1, bounds.height > 1 else { return }
+            let mouseInWindow = window.mouseLocationOutsideOfEventStream
+            let local = convert(mouseInWindow, from: nil)
+            onProbe?(bounds.contains(local))
+        }
+    }
+}
+
+extension View {
+    /// 滚停后若指针仍在本视图上，回调 true（用于恢复 hover，不依赖 onHover 重发）
+    func libraryScrollIdleHoverProbe(_ onProbe: @escaping (Bool) -> Void) -> some View {
+        background {
+            LibraryScrollIdleHoverProbe(onProbe: onProbe)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+        }
+    }
 }
 
 // MARK: - Media Video Card
@@ -393,6 +490,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
     let action: () -> Void
 
     @State private var isHovered = false
+    /// 指针是否在卡片内（滚动中也更新；滚停时用来恢复 isHovered）
+    @State private var isPointerInside = false
     /// 异步生成抽帧后更新的本地封面 URL
     @State private var resolvedThumbnailURL: URL?
     /// GIF 动画检测
@@ -403,6 +502,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
     @State private var cachedListThumbnailURL: URL?
     /// GIF 探测 debounce 任务
     @State private var gifProbeTask: Task<Void, Never>?
+    /// 滚停后再做抽帧/SSD 缩略图生成的排队 token
+    @State private var pendingThumbnailIdleToken: UUID?
     private let maxAnimatedGIFBytes: Int64 = 18 * 1024 * 1024
 
     private static let videoExtensions: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
@@ -480,15 +581,30 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .throttledHover(interval: 0.05) { hovering in
             guard !isEditing else { return }
+            // 始终记录指针位置；滚动中仅抑制 isHovered，不丢 enter 信息
+            isPointerInside = hovering
             if hovering, LibraryScrollHoverGate.shared.suppressesAnimatedHover {
                 // 滚动中忽略 enter，保持静态封面
                 return
             }
             isHovered = hovering
         }
-        .onReceive(NotificationCenter.default.publisher(for: .libraryScrollDidSuppressHover)) { _ in
-            // 滚过时立刻收起 hover / GIF，避免已 hover 的卡片在滚动中继续切层
+        // 仅已 hover 的卡才订阅 suppress 通知：避免每张可见卡都挂 Combine sink。
+        .background {
             if isHovered {
+                Color.clear
+                    .onReceive(NotificationCenter.default.publisher(for: .libraryScrollDidSuppressHover)) { _ in
+                        isHovered = false
+                    }
+            }
+        }
+        // 内容从指针下划过时 onHover 不重发 enter；滚停 hit-test 恢复
+        .libraryScrollIdleHoverProbe { inside in
+            guard !isEditing else { return }
+            isPointerInside = inside
+            if inside {
+                isHovered = true
+            } else if isHovered {
                 isHovered = false
             }
         }
@@ -503,10 +619,16 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 detectedGIF = false
                 return
             }
+            // 滚动中不启动 GIF probe（读文件头会抖）；滚停后再探测
+            if LibraryScrollHoverGate.shared.isScrolling {
+                detectedGIF = false
+                return
+            }
             detectedGIF = false
             gifProbeTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
+                if LibraryScrollHoverGate.shared.isScrolling { return }
                 let probeURL = animatedGIFSourceURL
                 // 静态列表缓存路径不可能是动图
                 let path = probeURL.standardizedFileURL.path
@@ -536,22 +658,25 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             } else {
                 // 清除产物 / 无新帧：重新解析（可能回退站点封面）
                 resolveThumbnailURL()
-                triggerThumbnailIfNeeded()
+                scheduleThumbnailWork()
             }
         }
-        // ⚡ 内存压力下的 detectedGIF 重置已不在每张卡注册：滚动期间数百张卡片各自挂
-        // 两个 Combine sink 会拖慢滚动；下次内存压力时由 ViewModel/Bridge 通过统一通道
-        // 推送即可。`detectedGIF` 是几字节布尔，留着无碍。
         .onAppear {
             resolveThumbnailURL()
-            triggerThumbnailIfNeeded()
+            scheduleThumbnailWork()
+        }
+        .onDisappear {
+            if let token = pendingThumbnailIdleToken {
+                LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+                pendingThumbnailIdleToken = nil
+            }
         }
         .onChange(of: localMediaFileURL) { _, _ in
             thumbnailRefreshID &+= 1
             resolvedThumbnailURL = nil
             cachedListThumbnailURL = nil
             resolveThumbnailURL()
-            triggerThumbnailIfNeeded()
+            scheduleThumbnailWork()
         }
         .onChange(of: thumbnailURL) { _, _ in
             cachedListThumbnailURL = nil
@@ -712,8 +837,41 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         .background(Color(hex: "1A1D24"))
     }
 
+    /// 滚动中排队；滚停后只做一次抽帧/SSD 生成。
+    @MainActor
+    private func scheduleThumbnailWork() {
+        if let token = pendingThumbnailIdleToken {
+            LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+        }
+        // 已停滚：直接生成
+        if !LibraryScrollHoverGate.shared.isScrolling {
+            pendingThumbnailIdleToken = nil
+            triggerThumbnailIfNeeded()
+            return
+        }
+        let token = UUID()
+        pendingThumbnailIdleToken = token
+        // 用 Task 轮询 idle，避免把 @State 写入塞进非 View 闭包导致不刷新
+        Task { @MainActor in
+            while LibraryScrollHoverGate.shared.isScrolling {
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                if Task.isCancelled { return }
+                guard pendingThumbnailIdleToken == token else { return }
+            }
+            guard pendingThumbnailIdleToken == token else { return }
+            pendingThumbnailIdleToken = nil
+            triggerThumbnailIfNeeded()
+        }
+    }
+
     @MainActor
     private func triggerThumbnailIfNeeded() {
+        // 滚动中绝不启动生成/目录解析，避免与滚动抢主线程与磁盘
+        if LibraryScrollHoverGate.shared.isScrolling {
+            scheduleThumbnailWork()
+            return
+        }
+
         // Scene 烘焙：优先列表小图；有 poster 先占位再后台补完整画幅帧
         if let bakedPath = MediaLibraryService.shared.downloadRecord(for: item.id)?.sceneBakeArtifact?.videoPath,
            !bakedPath.isEmpty {
@@ -735,6 +893,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 return
             }
             Task { @MainActor in
+                guard !LibraryScrollHoverGate.shared.isScrolling else { return }
                 // 不在主线程 isUsableBakedVideo（外置卡 stat 很慢）；生成侧会自己检查文件
                 if let listThumb = await VideoThumbnailCache.shared.listThumbnailJPEGFileURL(forLocalVideo: bakedVideo) {
                     resolvedThumbnailURL = listThumb
@@ -781,20 +940,22 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             return
         }
 
-        // 静图
+        // 静图：只读已有 SSD 缓存；缺失时后台生成
         if LocalImageThumbnailCache.isRasterImageFile(local) {
             if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
                 resolvedThumbnailURL = cached
                 cachedListThumbnailURL = cached
                 return
             }
+            if cachedListThumbnailURL == nil {
+                cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
+            }
             Task { @MainActor in
+                guard !LibraryScrollHoverGate.shared.isScrolling else { return }
                 if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: local) {
                     resolvedThumbnailURL = thumb
                     cachedListThumbnailURL = thumb
                     fileCache.markExisting(atPath: local.path)
-                } else if cachedListThumbnailURL == nil {
-                    cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
                 }
             }
             return
@@ -815,6 +976,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
 
         // Workshop 目录：有内部视频则必须抽帧；preview 仅占位，不能「有 preview 就永久 return」
         Task { @MainActor in
+            guard !LibraryScrollHoverGate.shared.isScrolling else { return }
             let exists = await local.fileExistsAsync()
             if exists {
                 fileCache.markExisting(atPath: local.path)
@@ -825,6 +987,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                 }
                 return
             }
+            guard !LibraryScrollHoverGate.shared.isScrolling else { return }
 
             // 1) 先找可抽帧视频（结果有 WorkshopLibraryPreviewCache）
             if let resolved = MediaItem.resolveLocalVideoFile(from: local),
@@ -861,6 +1024,9 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
                         cachedListThumbnailURL = cached
                         return
                     }
+                    if cachedListThumbnailURL == nil {
+                        cachedListThumbnailURL = localPreview
+                    }
                     if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: localPreview) {
                         resolvedThumbnailURL = thumb
                         cachedListThumbnailURL = thumb
@@ -894,6 +1060,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             cachedListThumbnailURL = thumbnailURL ?? item.coverImageURL
         }
         Task { @MainActor in
+            guard !LibraryScrollHoverGate.shared.isScrolling else { return }
             if let listThumb = await VideoThumbnailCache.shared.listThumbnailJPEGFileURL(forLocalVideo: videoURL) {
                 resolvedThumbnailURL = listThumb
                 cachedListThumbnailURL = listThumb
@@ -909,6 +1076,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         }
     }
 
+    /// 滚动热路径：只读父视图预计算 / 已有 state，绝不触发 `libraryGridThumbnailURL` 的磁盘扫描。
     @MainActor
     private func resolveThumbnailURL() {
         guard cachedListThumbnailURL == nil else { return }
@@ -921,7 +1089,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             cachedListThumbnailURL = thumbnailURL
             return
         }
-        cachedListThumbnailURL = item.libraryGridThumbnailURL(localFileURL: localMediaFileURL)
+        // 无预计算时用站点封面占位；缺失缓存的生成由 scheduleThumbnailWork 滚停后补
+        cachedListThumbnailURL = item.coverImageURL
     }
 }
 
@@ -947,6 +1116,8 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
     let action: () -> Void
 
     @State private var isHovered = false
+    /// 指针是否在卡片内（滚动中也更新；滚停时用来恢复 isHovered）
+    @State private var isPointerInside = false
     /// SSD 列表缩略图（生成后刷新，避免 KFImage 一直读 TF 上的全尺寸文件）
     @State private var cachedListThumbURL: URL?
 
@@ -968,7 +1139,7 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
         wallpaper.thumbURL ?? wallpaper.smallThumbURL
     }
 
-    /// 封面 URL：SSD 列表缩略图 > 站点 thumb > 绝不默认返回外置原图
+    /// 封面 URL：SSD 列表缩略图 > 站点 thumb > 绝不把外置/全尺寸原图喂给 KFImage。
     private var resolvedThumbURL: URL? {
         if let cachedListThumbURL {
             return cachedListThumbURL
@@ -982,13 +1153,8 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
         if let remote = remoteThumbURL {
             return remote
         }
-        // 仅当无远程 thumb（本地导入）且本地已有 SSD 缓存时才用本地；
-        // 无缓存时仍返回 local 路径但由 onAppear 异步生成并切换。
-        if let local = localFileURL,
-           local.isFileURL,
-           FileExistenceCache.shared.fileExists(atPath: local.path) {
-            return local
-        }
+        // 无远程 thumb 且 SSD 缓存未就绪：返回 nil → Skeleton 占位，
+        // 由 ensureLocalListThumbnail 在滚停后生成并切换。
         return nil
     }
 
@@ -1114,7 +1280,20 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
         .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .throttledHover(interval: 0.05) { hovering in
             if !isEditing {
+                isPointerInside = hovering
+                if hovering, LibraryScrollHoverGate.shared.suppressesAnimatedHover {
+                    return
+                }
                 isHovered = hovering
+            }
+        }
+        .libraryScrollIdleHoverProbe { inside in
+            guard !isEditing else { return }
+            isPointerInside = inside
+            if inside {
+                isHovered = true
+            } else if isHovered {
+                isHovered = false
             }
         }
         .onAppear {
@@ -1126,7 +1305,7 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
         }
     }
 
-    /// 外置原图 → 本机 SSD 512 列表缩略图；有远程 thumb 时列表先显示远程，后台补本地缓存。
+    /// 外置原图 → 本机 SSD 512 列表缩略图；有远程 thumb 时列表先显示远程，滚停后再补本地缓存。
     @MainActor
     private func ensureLocalListThumbnail() {
         guard let local = localFileURL,
@@ -1138,7 +1317,25 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
             return
         }
 
+        // 滚动中不生成：先靠远程 thumb / skeleton，滚停后再写 SSD
+        if LibraryScrollHoverGate.shared.isScrolling {
+            Task { @MainActor in
+                while LibraryScrollHoverGate.shared.isScrolling {
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    if Task.isCancelled { return }
+                }
+                guard let stillLocal = localFileURL,
+                      stillLocal == local,
+                      cachedListThumbURL == nil else { return }
+                if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: stillLocal) {
+                    cachedListThumbURL = thumb
+                }
+            }
+            return
+        }
+
         Task { @MainActor in
+            guard !LibraryScrollHoverGate.shared.isScrolling else { return }
             if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: local) {
                 cachedListThumbURL = thumb
             }
