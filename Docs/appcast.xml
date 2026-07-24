@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.138</title>
-      <sparkle:version>38.0.138</sparkle:version>
-      <sparkle:shortVersionString>38.0.138</sparkle:shortVersionString>
-      <pubDate>Wed, 22 Jul 2026 18:49:21 +0800</pubDate>
+      <title>Version 38.0.139</title>
+      <sparkle:version>38.0.139</sparkle:version>
+      <sparkle:shortVersionString>38.0.139</sparkle:shortVersionString>
+      <pubDate>Fri, 24 Jul 2026 19:54:11 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.138</h3><ul><li>build: 修复部分场景壁纸显示异常 (9425add)</li><li><strong>refactor(services): 统一视频壁纸抽帧逻辑，修复静帧缺失问题 (5ddd17b)</strong><ul><li>将全局同步、调度服务的generatePosterFromVideoIfNeeded默认值改为true</li><li>补充复用壁纸路径下的静帧缓存更新逻辑</li><li>重构高清海报缓存检查逻辑，避免误将预览图当作有效缓存</li><li>调整注释说明后台抽帧不阻塞热路径，统一各服务的行为逻辑</li></ul></li><li><strong>feat: 新增单个壁纸重新下载功能与Wallhaven设置页 (909ee15)</strong><ul><li>主要变更：</li><li>为单张壁纸添加右键重新下载选项，支持自定义目标文件夹</li><li>新增Wallhaven设置标签页，支持配置API密钥</li><li>完善本地化多语言文本</li><li>优化视频优化检测逻辑，支持Scene烘焙视频路径</li><li>调整下载队列服务参数，支持空文件夹ID自动使用根目录</li></ul></li><li>fix: stabilize offline bake optimization (d4bca9d)</li><li>fix: refine video wallpaper transitions (0136276)</li><li>refactor: unify download task management (7e118ce)</li><li>fix: preserve media detail playback state (6053be5)</li><li>fix: stabilize global wallpaper scheduling (e558de3)</li><li>feat: improve download task recovery (e40c0bf)</li><li>feat: add download path management controls (2bf4cc7)</li><li>feat: improve library folder actions (014a223)</li><li>refactor: streamline video optimization pipeline (c5501a6)</li><li>fix: smooth shared video wallpaper transitions (3fc1f3a)</li></ul>
+<h3>WaifuX 38.0.139</h3><ul><li><strong>refactor(Library): optimize scroll idle handling and preload logic (595b740)</strong><ul><li>为 LibraryScrollHoverGate 添加 generation 机制避免旧回调误触发</li><li>重构滚动 idle 后执行的缩略图加载逻辑，替换原轮询方案</li><li>拆分预加载方法，新增滚动结束后恢复预载的逻辑</li><li>记录当前可见itemID，滚动停滞后精准触发附近内容预加载</li></ul></li><li><strong>fix(ExploreGrid): 修复可见单元格刷新的越界和崩溃问题 (5f617c5)</strong><ul><li>给targetVisibleIndexPaths增加数据源数量校验，过滤过期indexPath</li><li>添加canSafelyMutateVisibleItems判断，避免在数据未对齐时调用reloadItems</li><li>刷新前增加双重安全校验，防止AppKit内部断言崩溃</li><li>局部reload时禁用隐式动画，避免布局冲突</li></ul></li><li><strong>fix: 修复多种坏文件误判、下载超时与菜单栏重采样问题 (c7435c6)</strong><ul><li>修复热链失败的大体积HTML被误判为有效视频文件的问题，新增全类型媒体文件头校验</li><li>增大网络请求超时时间，避免大文件下载中途失败</li><li>重构下载任务为下载文件后再读取，优化大文件下载体验与进度回调</li><li>优化重新下载逻辑，保留删除前的文件夹归属</li><li>改进菜单栏重采样逻辑，改为仅露出菜单栏条带，避免全屏闪烁</li><li>新增多种坏文件检测场景，包括伪装扩展名的非媒体文件</li></ul></li><li><strong>feat: 优化动态壁纸切换过渡并修复菜单栏采样与库体验 (781b982)</strong><ul><li>动态壁纸提交后强制菜单栏重采样（窗口 poke / 交替路径 poster / 桌面闪露）</li><li>视频切换改为预热后交叉淡入，延后写系统底图，避免黑场与跨类型闪帧</li><li>优化履历迁入 Application Support，并补充锁屏自动配置、Wallsflow 与库滚动体验</li></ul></li><li><strong>fix: 修复多场景下壁纸显示异常与恢复问题 (4efa49d)</strong><ul><li>本次提交修复了多个壁纸相关的问题：</li><li>主窗口从菜单栏/状态栏重新打开时，恢复本地壁纸与媒体库缓存，避免列表为空</li><li>修复静态壁纸窗口无法及时刷新的问题，改用orderFrontRegardless并强制合帧</li><li>优化壁纸切换逻辑，保留旧壁纸直到新渲染就绪，避免黑场闪烁</li><li>修复状态栏切换壁纸时的桌面合帧延迟问题</li><li>优化离线烘焙的窗口遮挡逻辑，避免录制时桌面画面异常</li><li>修复Web渲染器的帧率控制与时间戳问题，避免视频卡顿</li><li>完善跨类型壁纸切换的状态管理与资源清理逻辑</li></ul></li><li><strong>feat: 完成多项功能优化与 bug 修复 (a3f8a33)</strong><ul><li>更新本地壁纸烘焙逻辑，支持无产物时临时烘焙1秒仅保留高清poster</li><li>新增本地媒体高清poster更新通知，优化媒体详情页背景加载</li><li>移除状态栏菜单中Web壁纸不支持裁切的提示逻辑</li><li>新增Esc键返回文件夹功能，完善库页面键盘交互</li><li>更新多语言本地化文案，修正动态元素与实时渲染的互斥说明</li><li>重构CLI与Web渲染桥接，支持Web壁纸裁切参数同步</li><li>移除桌面静态截图缓存逻辑，改用Host统一同步静态壁纸源</li></ul></li><li><strong>refactor(MyLibraryContentView): 提取删除弹窗的绑定逻辑 (77c1278)</strong><ul><li>将重复的Binding创建代码抽为私有计算属性，简化视图代码结构，提升可读性和可维护性</li></ul></li><li><strong>refactor: 重构本地壁纸库管理逻辑，移除本地扫描依赖 (b63948a)</strong><ul><li>移除application类型壁纸支持，清理相关枚举和本地化</li><li>改用持久化下载记录作为唯一数据源，不再依赖LocalWallpaperScanner实时扫盘</li><li>新增受管库索引重建能力，支持升级迁移和手动修复</li><li>优化导入和修复流程，改用通知触发UI更新</li><li>修复详情页和锁屏的Web壁纸海报生成逻辑</li><li>简化缓存重建和库刷新流程，移除冗余的扫描调用</li></ul></li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.138/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.139/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
