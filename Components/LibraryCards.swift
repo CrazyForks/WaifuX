@@ -351,12 +351,16 @@ final class LibraryScrollHoverGate {
     /// 滚动中（含惯性尾段）为 true；滚停 idleDelay 后变 false。
     private(set) var isScrolling = false
     private var idleWorkItem: DispatchWorkItem?
+    /// 只允许最新一次滚动活动结束后解除门控。
+    private var idleGeneration = 0
     private var idleCallbacks: [UUID: () -> Void] = [:]
     /// 滚停后稍等再恢复，避免惯性滚动尾段反复开关
     private let idleDelay: TimeInterval = 0.22
 
     func noteScrollActivity() {
         idleWorkItem?.cancel()
+        idleGeneration &+= 1
+        let generation = idleGeneration
         isScrolling = true
         if !suppressesAnimatedHover {
             suppressesAnimatedHover = true
@@ -364,6 +368,8 @@ final class LibraryScrollHoverGate {
         }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            guard self.idleGeneration == generation else { return }
+            self.idleWorkItem = nil
             self.isScrolling = false
             self.suppressesAnimatedHover = false
             let callbacks = Array(self.idleCallbacks.values)
@@ -666,6 +672,8 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
             scheduleThumbnailWork()
         }
         .onDisappear {
+            gifProbeTask?.cancel()
+            gifProbeTask = nil
             if let token = pendingThumbnailIdleToken {
                 LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
                 pendingThumbnailIdleToken = nil
@@ -851,13 +859,7 @@ public struct MediaVideoCard: View, @preconcurrency Equatable {
         }
         let token = UUID()
         pendingThumbnailIdleToken = token
-        // 用 Task 轮询 idle，避免把 @State 写入塞进非 View 闭包导致不刷新
-        Task { @MainActor in
-            while LibraryScrollHoverGate.shared.isScrolling {
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                if Task.isCancelled { return }
-                guard pendingThumbnailIdleToken == token else { return }
-            }
+        LibraryScrollHoverGate.shared.runWhenIdle(token: token) {
             guard pendingThumbnailIdleToken == token else { return }
             pendingThumbnailIdleToken = nil
             triggerThumbnailIfNeeded()
@@ -1120,6 +1122,8 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
     @State private var isPointerInside = false
     /// SSD 列表缩略图（生成后刷新，避免 KFImage 一直读 TF 上的全尺寸文件）
     @State private var cachedListThumbURL: URL?
+    /// 滚动中延后的本地静图缩略图任务。
+    @State private var pendingLocalThumbnailIdleToken: UUID?
 
     public static func == (lhs: WallpaperEditCard, rhs: WallpaperEditCard) -> Bool {
         lhs.wallpaper.id == rhs.wallpaper.id &&
@@ -1303,6 +1307,12 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
             cachedListThumbURL = nil
             ensureLocalListThumbnail()
         }
+        .onDisappear {
+            if let token = pendingLocalThumbnailIdleToken {
+                LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+                pendingLocalThumbnailIdleToken = nil
+            }
+        }
     }
 
     /// 外置原图 → 本机 SSD 512 列表缩略图；有远程 thumb 时列表先显示远程，滚停后再补本地缓存。
@@ -1312,6 +1322,11 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
               local.isFileURL,
               LocalImageThumbnailCache.isRasterImageFile(local) else { return }
 
+        if let token = pendingLocalThumbnailIdleToken {
+            LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+            pendingLocalThumbnailIdleToken = nil
+        }
+
         if let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
             cachedListThumbURL = cached
             return
@@ -1319,16 +1334,22 @@ public struct WallpaperEditCard: View, @preconcurrency Equatable {
 
         // 滚动中不生成：先靠远程 thumb / skeleton，滚停后再写 SSD
         if LibraryScrollHoverGate.shared.isScrolling {
-            Task { @MainActor in
-                while LibraryScrollHoverGate.shared.isScrolling {
-                    try? await Task.sleep(nanoseconds: 80_000_000)
-                    if Task.isCancelled { return }
-                }
+            let token = UUID()
+            pendingLocalThumbnailIdleToken = token
+            LibraryScrollHoverGate.shared.runWhenIdle(token: token) {
+                guard pendingLocalThumbnailIdleToken == token else { return }
+                pendingLocalThumbnailIdleToken = nil
                 guard let stillLocal = localFileURL,
                       stillLocal == local,
                       cachedListThumbURL == nil else { return }
-                if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: stillLocal) {
-                    cachedListThumbURL = thumb
+                Task { @MainActor in
+                    if LibraryScrollHoverGate.shared.isScrolling {
+                        ensureLocalListThumbnail()
+                        return
+                    }
+                    if let thumb = await LocalImageThumbnailCache.shared.ensureThumbnail(forLocalFile: stillLocal) {
+                        cachedListThumbURL = thumb
+                    }
                 }
             }
             return

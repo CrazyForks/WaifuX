@@ -6,6 +6,10 @@ import AVFoundation
 // MARK: - Scroll State
 private final class LibraryScrollRuntimeState: ObservableObject {
     var currentOffset: CGFloat = 0
+    /// 不发布到 SwiftUI，仅记录滚停时应从哪张可见卡继续预取。
+    var lastWallpaperItemID: String?
+    var lastMediaItemID: String?
+    var lastAnimeItemID: String?
 }
 
 // MARK: - Scroll 观察与恢复辅助组件
@@ -409,6 +413,10 @@ struct MyLibraryContentView: View {
             Task {
                 await loadAnimeFavorites()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .libraryScrollDidBecomeIdle)) { _ in
+            guard isVisible else { return }
+            resumeLibraryPrefetchAfterScroll()
         }
         .onChange(of: librarySearchQuery) { _, _ in
             updateWallpaperItems()
@@ -898,7 +906,8 @@ struct MyLibraryContentView: View {
                     }
                 }
                 .onAppear {
-                    preloadNearbyWallpapers(around: item, config: config)
+                    libraryScrollRuntimeState.lastWallpaperItemID = item.id
+                    preloadNearbyWallpapers(around: item)
                 }
         }
     }
@@ -1429,7 +1438,8 @@ struct MyLibraryContentView: View {
                     }
                 }
                 .onAppear {
-                    preloadNearbyMedia(around: item, config: config)
+                    libraryScrollRuntimeState.lastMediaItemID = item.id
+                    preloadNearbyMedia(around: item)
                 }
         }
     }
@@ -1683,10 +1693,32 @@ struct MyLibraryContentView: View {
     // `firstIndex(where:)` 是 O(N)，大库（数千项）时每次滚动 mount 几十张就会做几十次
     // 全表扫描。改用 ID→Index 字典做 O(1) 查找。
 
-    private func preloadNearbyWallpapers(around item: AnyWallpaperItem, config: LibraryGridConfig) {
-        // 快速滚动时跳过预取/SSD 生成，避免与滚动抢 I/O 与主线程
-        if LibraryScrollHoverGate.shared.isScrolling { return }
+    private func resumeLibraryPrefetchAfterScroll() {
+        switch selectedContentType {
+        case .wallpaper:
+            guard let id = libraryScrollRuntimeState.lastWallpaperItemID,
+                  let index = wallpaperIDIndexCache[id] else { return }
+            preloadNearbyWallpapers(at: index)
+        case .video:
+            guard let id = libraryScrollRuntimeState.lastMediaItemID,
+                  let index = mediaIDIndexCache[id] else { return }
+            preloadNearbyMedia(at: index)
+        case .anime:
+            guard let id = libraryScrollRuntimeState.lastAnimeItemID,
+                  let index = animeIDIndexCache[id] else { return }
+            preloadNearbyAnime(at: index)
+        }
+    }
+
+    private func preloadNearbyWallpapers(around item: AnyWallpaperItem) {
         guard let index = wallpaperIDIndexCache[item.id] else { return }
+        preloadNearbyWallpapers(at: index)
+    }
+
+    private func preloadNearbyWallpapers(at index: Int) {
+        // 快速滚动时跳过预取/SSD 生成，避免与滚动抢 I/O 与主线程
+        guard !LibraryScrollHoverGate.shared.isScrolling,
+              wallpaperItems.indices.contains(index) else { return }
         let bucket = prefetchBucket(for: index)
         guard lastWallpaperPrefetchBucket != bucket else { return }
         lastWallpaperPrefetchBucket = bucket
@@ -1727,9 +1759,14 @@ struct MyLibraryContentView: View {
         }
     }
 
-    private func preloadNearbyMedia(around item: AnyMediaItem, config: LibraryGridConfig) {
-        if LibraryScrollHoverGate.shared.isScrolling { return }
+    private func preloadNearbyMedia(around item: AnyMediaItem) {
         guard let index = mediaIDIndexCache[item.id] else { return }
+        preloadNearbyMedia(at: index)
+    }
+
+    private func preloadNearbyMedia(at index: Int) {
+        guard !LibraryScrollHoverGate.shared.isScrolling,
+              currentMediaItems.indices.contains(index) else { return }
         let bucket = prefetchBucket(for: index)
         guard lastMediaPrefetchBucket != bucket else { return }
         lastMediaPrefetchBucket = bucket
@@ -1749,9 +1786,14 @@ struct MyLibraryContentView: View {
         )
     }
 
-    private func preloadNearbyAnime(around anime: AnimeSearchResult, config: AnimeGridConfig) {
-        if LibraryScrollHoverGate.shared.isScrolling { return }
+    private func preloadNearbyAnime(around anime: AnimeSearchResult) {
         guard let index = animeIDIndexCache[anime.id] else { return }
+        preloadNearbyAnime(at: index)
+    }
+
+    private func preloadNearbyAnime(at index: Int) {
+        guard !LibraryScrollHoverGate.shared.isScrolling,
+              currentAnimeItems.indices.contains(index) else { return }
         let bucket = prefetchBucket(for: index)
         guard lastAnimePrefetchBucket != bucket else { return }
         lastAnimePrefetchBucket = bucket
@@ -2079,7 +2121,8 @@ struct MyLibraryContentView: View {
                             handleAnimeTap(anime)
                         }
                         .onAppear {
-                            preloadNearbyAnime(around: anime, config: config)
+                            libraryScrollRuntimeState.lastAnimeItemID = anime.id
+                            preloadNearbyAnime(around: anime)
                         }
                         .frame(height: animeCardHeight)
                     }
