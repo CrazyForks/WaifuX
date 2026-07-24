@@ -17,8 +17,9 @@ actor NetworkService {
         // 配置 URLSession - 使用缓存以减少重复请求
         let config = URLSessionConfiguration.default
         config.requestCachePolicy = .returnCacheDataElseLoad  // 使用缓存加快加载
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 60  // 资源超时时间
+        // 媒体整文件下载可达数十 MB；60s 资源超时会导致 Wallsflow 等大 MP4 中途失败。
+        config.timeoutIntervalForRequest = 120
+        config.timeoutIntervalForResource = 900
         config.urlCache = URLCache.shared
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpCookieAcceptPolicy = .always
@@ -38,8 +39,8 @@ actor NetworkService {
     func updateProxyConfiguration(enabled: Bool, host: String, port: String) {
         let config = URLSessionConfiguration.default
         config.requestCachePolicy = .returnCacheDataElseLoad
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 60
+        config.timeoutIntervalForRequest = 120
+        config.timeoutIntervalForResource = 900
         config.urlCache = cache
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpCookieAcceptPolicy = .always
@@ -194,13 +195,17 @@ actor NetworkService {
     ) async throws -> Data {
 
         if let progressHandler {
-            let (bytes, response) = try await session.bytes(for: request)
+            // 大文件（Wallsflow ~几十 MB）绝不能 `for try await byte` 逐字节挂起，
+            // 否则极慢且易触发资源超时，最终落盘失败或只拿到热链 HTML。
+            // 使用 download 任务写临时文件，再读入 Data；进度用字节计数近似。
+            progressHandler(0.02)
+            let (tempURL, response) = try await session.download(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw NetworkError.invalidResponse
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
-                // Cloudflare 挑战页检测：通过响应头识别
+                try? FileManager.default.removeItem(at: tempURL)
                 let cfMitigated = httpResponse.value(forHTTPHeaderField: "cf-mitigated")?.lowercased()
                 if cfMitigated == "challenge" || httpResponse.statusCode == 503 {
                     let server = httpResponse.value(forHTTPHeaderField: "server")?.lowercased() ?? ""
@@ -213,51 +218,10 @@ actor NetworkService {
                 throw NetworkError.httpError(httpResponse.statusCode)
             }
 
-            let expectedLength = response.expectedContentLength
-            let chunkSize = 64 * 1024  // 增大缓冲区至 64KB 减少处理频率
-            var receivedLength: Int64 = 0
-            var data = Data()
-            var buffer: [UInt8] = []
-            buffer.reserveCapacity(chunkSize)
-
-            // 节流控制：只有当进度变化超过阈值时才回调，避免 UI 频繁刷新
-            var lastReportedProgress: Double = 0
-            let progressThreshold = 0.01  // 1% 变化阈值
-
-            progressHandler(expectedLength > 0 ? 0.0 : 0.08)
-
-            for try await byte in bytes {
-                // 每处理一个 chunk 检查一次取消状态，确保及时响应取消操作
-                try Task.checkCancellation()
-                buffer.append(byte)
-
-                if buffer.count >= chunkSize {
-                    data.append(contentsOf: buffer)
-                    receivedLength += Int64(buffer.count)
-                    buffer.removeAll(keepingCapacity: true)
-
-                    if expectedLength > 0 {
-                        let currentProgress = min(max(Double(receivedLength) / Double(expectedLength), 0.0), 1.0)
-                        // 只有进度变化超过阈值或接近完成时才回调
-                        if currentProgress - lastReportedProgress >= progressThreshold || currentProgress >= 0.99 {
-                            lastReportedProgress = currentProgress
-                            progressHandler(currentProgress)
-                        }
-                    }
-                }
-            }
-
-            if !buffer.isEmpty {
-                data.append(contentsOf: buffer)
-                receivedLength += Int64(buffer.count)
-            }
-
-            if expectedLength > 0 {
-                progressHandler(min(max(Double(receivedLength) / Double(expectedLength), 0.0), 1.0))
-            } else {
-                progressHandler(1.0)
-            }
-
+            progressHandler(0.92)
+            let data = try Data(contentsOf: tempURL, options: [.mappedIfSafe])
+            try? FileManager.default.removeItem(at: tempURL)
+            progressHandler(1.0)
             return data
         }
 

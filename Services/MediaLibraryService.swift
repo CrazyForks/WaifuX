@@ -194,8 +194,46 @@ final class MediaLibraryService: ObservableObject {
         let fileExists = fileCache.fileExists(atPath: record.localFilePath)
         if !fileExists {
             print("[MediaLibraryService] File not found for downloaded item: \(item.id) at \(record.localFilePath)")
+            return false
         }
-        return fileExists
+        // Wallsflow 等热链失败会把 HTML 落成 .mp4；存在≠可播放。
+        // 仅对常见视频扩展名做轻量文件头探测，避免把坏文件当成“已下载”。
+        let path = record.localFilePath
+        let ext = (path as NSString).pathExtension.lowercased()
+        let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
+        if videoExts.contains(ext), Self.localVideoFileLooksUnplayable(atPath: path) {
+            print("[MediaLibraryService] Corrupt/unplayable media treated as not downloaded: \(item.id) at \(path)")
+            return false
+        }
+        return true
+    }
+
+    /// 轻量检测：HTML 伪装页 / 无 ftyp 的 mp4 等（任意体积，含 ~200KB 热链失败页）。
+    private static func localVideoFileLooksUnplayable(atPath path: String) -> Bool {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        if size < 64_000 { return true }
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return true
+        }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 256)
+        if let text = String(data: head, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() {
+            if text.hasPrefix("<!doctype") || text.hasPrefix("<html") || text.contains("<head") {
+                return true
+            }
+        }
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ext == "webm" || ext == "mkv" {
+            return !(head.count >= 4 && head[0] == 0x1A && head[1] == 0x45 && head[2] == 0xDF && head[3] == 0xA3)
+        }
+        // mp4/mov/m4v：ISO BMFF 应为 ....ftyp
+        if head.count >= 8, head[4..<8] == Data("ftyp".utf8) {
+            return false
+        }
+        return true
     }
 
     /// 已下载媒体在磁盘上的文件 URL（存在且可读时）
@@ -219,19 +257,29 @@ final class MediaLibraryService: ObservableObject {
     }
 
     /// 登记下载记录。
-    /// - Parameter folderID: 可选目标文件夹。传入时写入/覆盖归属；
-    ///   不传时保留已有 folderID（避免二次 record 把作者批量下载归夹冲掉）。
+    /// - Parameter folderID: 可选目标文件夹。
+    ///   - 活跃记录：非 nil 时写入/覆盖归属；nil 表示调用方不关心，保留现有 folderID
+    ///     （避免二次 record 把作者批量下载归夹冲掉）。
+    ///   - 软删除复活（重新下载）：以本次传入的 folderID 为权威归属（含 nil=根目录），
+    ///     并清掉已随物理文件删除的烘焙/循环状态，避免脏 sidecar。
     func recordDownload(item: MediaItem, localFileURL: URL, folderID: String? = nil) {
         let targetFolderID = Self.normalizedFolderID(folderID)
         var persistedItem = item
         if let index = downloadRecords.firstIndex(where: { $0.item.id == item.id }) {
+            let wasDeleted = downloadRecords[index].metadata.isDeleted
             persistedItem = item.preservingPersistedMetadata(from: downloadRecords[index].item)
             downloadRecords[index].item = persistedItem
             downloadRecords[index].localFilePath = localFileURL.path
             downloadRecords[index].downloadedAt = .now
             downloadRecords[index].metadata.markLocalMutation(deleted: false)
-            // 仅在显式指定时改归属；nil 表示调用方不关心，保留现有 folderID
-            if let targetFolderID {
+            if wasDeleted {
+                // 重新下载：队列 Job 上的 folderID 是删前捕获的权威归属
+                downloadRecords[index].folderID = targetFolderID
+                downloadRecords[index].sceneBakeArtifact = nil
+                downloadRecords[index].sceneBakeEligibility = nil
+                downloadRecords[index].isLooped = nil
+            } else if let targetFolderID {
+                // 活跃记录仅在显式指定时改归属
                 downloadRecords[index].folderID = targetFolderID
             }
         } else {

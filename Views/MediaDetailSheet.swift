@@ -2266,23 +2266,28 @@ struct MediaDetailSheet: View {
     }
 
     /// 与库右键「重新下载」一致：先持久化下载队列，再清优化状态与旧文件，最后启动传输。
+    /// 删前捕获 folderID 写入 Job，落盘复活时按 Job 归属恢复原文件夹（含根目录）。
     /// `fromOptimizationReset` 时沿用原优化重置的 loading / toast 行为。
     private func redownloadCurrentItem(fromOptimizationReset: Bool = false) {
         guard canRedownloadItem, !isResettingVideoOptimization else { return }
 
         let downloadingItem = resolvedItem
         let itemID = downloadingItem.id
-        let folderID = mediaLibrary.downloadRecord(for: itemID)?.folderID
+        // 优先读活跃记录；删前必须捕获，removeDownloads 后 isActive 会变 false
+        let preservedFolderID = MediaLibraryService.normalizedFolderID(
+            currentDownloadRecord?.folderID
+                ?? mediaLibrary.downloadRecord(for: itemID)?.folderID
+        )
         let videoURLs = [
             currentOptimizationVideoURL,
             cachedSceneBakeVideoURL,
             currentDownloadRecord?.resolvedVideoFileURL
         ].compactMap { $0 }
 
-        // 先落盘 Job，失败则不删旧文件（与 MyLibrary 行为一致）
+        // 先落盘 Job（带 folderID），失败则不删旧文件（与 MyLibrary 行为一致）
         guard PersistentDownloadQueueService.shared.stage(
             [downloadingItem],
-            folderID: folderID
+            folderID: preservedFolderID
         ) else {
             errorMessage = "无法保存下载队列，已取消删除旧文件"
             showError = true
@@ -2302,7 +2307,7 @@ struct MediaDetailSheet: View {
             frameInterpolationQueue.resetOptimizationState(videoURL: videoURL)
         }
 
-        // removeDownloads 会删下载记录 + 物理文件 + 烘焙产物，必须在 re-download 之前。
+        // removeDownloads 会软删下载记录 + 物理文件 + 烘焙产物，必须在 re-download 之前。
         viewModel.removeDownloads(withIDs: [itemID])
 
         PersistentDownloadQueueService.shared.start(using: viewModel)
@@ -2313,14 +2318,16 @@ struct MediaDetailSheet: View {
                     isResettingVideoOptimization = false
                     downloadActivity.finish(itemID: itemID)
                 }
-                // 等待队列任务结束（成功或失败）后再刷新详情
-                // TODO: jobs/waitForCompletionIfPossible 尚未在 PersistentDownloadQueueService
-                // 实现（另一会话 WIP），先走轮询兜底保证可编译。
-                // 无 job 句柄时兜底：短轮询下载记录恢复
+                // 短轮询等待下载记录复活
                 for _ in 0..<120 {
                     if mediaLibrary.downloadRecord(for: itemID)?.isActive == true { break }
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
+                // 双保险：若队列路径未写回归属，按删前 folderID 强制恢复
+                restoreDownloadFolderMembershipIfNeeded(
+                    itemID: itemID,
+                    folderID: preservedFolderID
+                )
                 refreshResolvedItemAfterLocalDownload()
                 if let videoURL = videoURLs.first {
                     VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
@@ -2334,12 +2341,36 @@ struct MediaDetailSheet: View {
         } else {
             sceneBakeStatusFlash = t("library.redownload.item")
             Task { @MainActor in
+                // 下载完成后兜底一次文件夹归属（根目录则保持 nil）
+                for _ in 0..<120 {
+                    if mediaLibrary.downloadRecord(for: itemID)?.isActive == true {
+                        restoreDownloadFolderMembershipIfNeeded(
+                            itemID: itemID,
+                            folderID: preservedFolderID
+                        )
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if sceneBakeStatusFlash == t("library.redownload.item") {
                     sceneBakeStatusFlash = nil
                 }
             }
         }
+    }
+
+    /// 重新下载完成后，确保下载记录仍在删前的库文件夹内。
+    private func restoreDownloadFolderMembershipIfNeeded(itemID: String, folderID: String?) {
+        guard let record = mediaLibrary.downloadRecord(for: itemID), record.isActive else { return }
+        let expected = MediaLibraryService.normalizedFolderID(folderID)
+        let actual = MediaLibraryService.normalizedFolderID(record.folderID)
+        guard expected != actual else { return }
+        mediaLibrary.moveMediaToFolder(
+            mediaID: itemID,
+            folderID: expected,
+            scope: .downloads
+        )
     }
 
     private func detailInfoBubble(width: CGFloat) -> some View {

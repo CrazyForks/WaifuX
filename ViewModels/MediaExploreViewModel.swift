@@ -1514,6 +1514,10 @@ final class MediaExploreViewModel: ObservableObject {
                 print("[MediaExploreViewModel] Corrupt media file detected, re-downloading: \(fileLocation.url.path)")
                 try? FileManager.default.removeItem(at: fileLocation.url)
                 FileExistenceCache.shared.invalidate(atPath: fileLocation.url.path)
+                // 同步清掉“已下载”假阳性记录，避免 UI 显示勾选但文件是 HTML
+                if mediaLibrary.downloadRecord(for: resolvedItem.id) != nil {
+                    mediaLibrary.removeDownloadRecord(withID: resolvedItem.id)
+                }
             } else {
                 print("[MediaExploreViewModel] File found at: \(fileLocation.url.path) (location: \(fileLocation.foundIn))")
                 if let taskID {
@@ -1550,6 +1554,7 @@ final class MediaExploreViewModel: ObservableObject {
         } else {
             if let stale = await cacheService.cachedFileURL(named: fileURL.lastPathComponent, in: "Media") {
                 try? FileManager.default.removeItem(at: stale)
+                FileExistenceCache.shared.invalidate(atPath: stale.path)
             }
             // Wallsflow cloud CDN 无 Referer 会 302 成 HTML；且 Range 不可用，必须整文件 GET。
             let wallsflowHeaders = WallsflowService.mediaRequestHeaders(
@@ -1565,11 +1570,16 @@ final class MediaExploreViewModel: ObservableObject {
                     DownloadTaskService.shared.updateProgress(id: taskID, progress: min(progress * 0.86, 0.86))
                 }
             }
-            // 防御：若仍拿到 HTML（鉴权/跳转失败），勿落盘污染缓存。
+            // 防御：若仍拿到 HTML（鉴权/跳转失败）或非媒体载荷，勿落盘污染缓存。
             if WallsflowService.isProtectedMediaURL(downloadOption.remoteURL) {
-                if Self.looksLikeHTMLPayload(data) || data.count < 64_000 {
+                if Self.looksLikeHTMLPayload(data)
+                    || data.count < 64_000
+                    || !Self.looksLikeISOBMFF(data) {
+                    print("[MediaExploreViewModel] Rejected Wallsflow payload: size=\(data.count) html=\(Self.looksLikeHTMLPayload(data)) ftyp=\(Self.looksLikeISOBMFF(data))")
                     throw NetworkError.invalidResponse
                 }
+            } else if Self.looksLikeHTMLPayload(data) {
+                throw NetworkError.invalidResponse
             }
             cachedURL = try await cacheService.cacheFile(data, named: fileURL.lastPathComponent, in: "Media")
             if let taskID {
@@ -1578,31 +1588,46 @@ final class MediaExploreViewModel: ObservableObject {
         }
 
         if saveToDownloads {
-            // 复制到应用内媒体库目录（Application Support 下 WaifuX/Media）
-            if !FileManager.default.fileExists(atPath: fileURL.path) {
-                do {
-                    // 确保目标目录存在
-                    let directory = fileURL.deletingLastPathComponent()
-                    if !FileManager.default.fileExists(atPath: directory.path) {
-                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                        print("[MediaExploreViewModel] Created directory: \(directory.path)")
-                    }
+            // 复制到应用内媒体库目录（含自定义根目录下的 WaifuX/Media）
+            do {
+                let directory = fileURL.deletingLastPathComponent()
+                if !FileManager.default.fileExists(atPath: directory.path) {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    print("[MediaExploreViewModel] Created directory: \(directory.path)")
+                }
 
-                    // 后台读取缓存文件 + 后台写入目标文件，避免 MainActor 阻塞
+                // 目标若仍是旧坏文件，必须覆盖，不能 early-return
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    if Self.localMediaFileLooksCorrupt(fileURL)
+                        || (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value
+                            != (try? FileManager.default.attributesOfItem(atPath: cachedURL.path)[.size] as? NSNumber)?.int64Value {
+                        try? FileManager.default.removeItem(at: fileURL)
+                        FileExistenceCache.shared.invalidate(atPath: fileURL.path)
+                    }
+                }
+
+                if !FileManager.default.fileExists(atPath: fileURL.path) {
                     let cachedData = try await cachedURL.readDataAsync()
                     try await cachedData.writeAsync(to: fileURL, options: .atomic)
-
-                    // 验证文件是否成功写入
-                    if FileManager.default.fileExists(atPath: fileURL.path) {
-                        print("[MediaExploreViewModel] ✅ File saved successfully: \(fileURL.path)")
-                    } else {
-                        print("[MediaExploreViewModel] ❌ File write appeared to succeed but file not found: \(fileURL.path)")
-                        throw DownloadError.writeFailed(NSError(domain: "WaifuX", code: -1, userInfo: [NSLocalizedDescriptionKey: "File not found after write"]))
-                    }
-                } catch {
-                    print("[MediaExploreViewModel] ❌ Failed to write file to app media library: \(error)")
-                    throw DownloadError.writeFailed(error)
                 }
+
+                guard FileManager.default.fileExists(atPath: fileURL.path),
+                      !Self.localMediaFileLooksCorrupt(fileURL) else {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    FileExistenceCache.shared.invalidate(atPath: fileURL.path)
+                    print("[MediaExploreViewModel] ❌ Library file missing or corrupt after write: \(fileURL.path)")
+                    throw DownloadError.writeFailed(NSError(
+                        domain: "WaifuX",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "File missing or corrupt after write"]
+                    ))
+                }
+                print("[MediaExploreViewModel] ✅ File saved successfully: \(fileURL.path)")
+            } catch let error as DownloadError {
+                throw error
+            } catch {
+                print("[MediaExploreViewModel] ❌ Failed to write file to app media library: \(error)")
+                throw DownloadError.writeFailed(error)
             }
 
             if let taskID {
@@ -2640,45 +2665,81 @@ final class MediaExploreViewModel: ObservableObject {
     }
 
     /// 检测 CDN 鉴权失败时返回的 HTML 伪装响应（避免落盘坏文件）。
+    /// 注意：wallsflow 热链失败页可达 ~200KB+，绝不能只按体积阈值扫描。
     private static func looksLikeHTMLPayload(_ data: Data) -> Bool {
         guard !data.isEmpty else { return false }
-        let prefixCount = min(data.count, 256)
-        guard let head = String(data: data.prefix(prefixCount), encoding: .utf8)?
+        let prefixCount = min(data.count, 512)
+        let raw = data.prefix(prefixCount)
+        // BOM / 前导空白后的 HTML
+        if let head = String(data: raw, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() else {
-            return false
+            .lowercased() {
+            if head.hasPrefix("<!doctype html")
+                || head.hasPrefix("<html")
+                || head.hasPrefix("<head")
+                || head.contains("<head")
+                || head.contains("utm_source=redirect")
+                || head.contains("just a moment") {
+                return true
+            }
         }
-        return head.hasPrefix("<!doctype html")
-            || head.hasPrefix("<html")
-            || head.contains("<head")
-            || head.contains("utm_source=redirect")
+        // 非 UTF-8 时仍可能以 ASCII 标签开头
+        let lower = raw.map { ($0 >= 65 && $0 <= 90) ? $0 + 32 : $0 }
+        if let s = String(bytes: lower.prefix(64), encoding: .ascii) {
+            if s.hasPrefix("<!doctype") || s.hasPrefix("<html") {
+                return true
+            }
+        }
+        return false
     }
 
-    /// 本地“媒体”文件是否其实是 HTML 或过小的坏文件。
+    /// 是否像 ISO BMFF / MP4（`....ftyp`）。
+    private static func looksLikeISOBMFF(_ data: Data) -> Bool {
+        guard data.count >= 8 else { return false }
+        return data[4..<8] == Data("ftyp".utf8)
+    }
+
+    /// 本地“媒体”文件是否其实是 HTML 或无法播放的坏文件。
+    /// 任意体积都读文件头：历史坏文件常为 200KB+ HTML，旧逻辑（仅 <64KB）会漏检。
     private static func localMediaFileLooksCorrupt(_ url: URL) -> Bool {
         let path = url.path
         guard FileManager.default.fileExists(atPath: path) else { return false }
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-        // 正常 live wallpaper 远大于 8KB；HTML 跳转页通常很小。
-        if size > 0, size < 8_192 {
-            if let handle = try? FileHandle(forReadingFrom: url) {
-                defer { try? handle.close() }
-                let head = handle.readData(ofLength: 256)
-                if looksLikeHTMLPayload(head) { return true }
-            }
-            // 极小且扩展名是视频 → 大概率坏文件
-            let ext = url.pathExtension.lowercased()
-            if ["mp4", "mov", "webm", "m4v", "mkv"].contains(ext) {
+        let ext = url.pathExtension.lowercased()
+        let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv"]
+
+        if size <= 0 { return true }
+
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return true }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 512)
+
+        if looksLikeHTMLPayload(head) {
+            return true
+        }
+
+        // 过小的“视频”几乎一定是坏文件（热链 HTML 也常 < 512KB）
+        if videoExts.contains(ext), size < 64_000 {
+            return true
+        }
+
+        if videoExts.contains(ext) {
+            // webm/mkv 为 EBML (0x1A45DFA3)；mp4/mov/m4v 为 ISO BMFF `ftyp`
+            if ext == "webm" || ext == "mkv" {
+                if head.count >= 4,
+                   head[0] == 0x1A, head[1] == 0x45, head[2] == 0xDF, head[3] == 0xA3 {
+                    return false
+                }
                 return true
             }
-        } else if size >= 8_192, size < 64_000 {
-            if let handle = try? FileHandle(forReadingFrom: url) {
-                defer { try? handle.close() }
-                let head = handle.readData(ofLength: 256)
-                if looksLikeHTMLPayload(head) { return true }
+            if looksLikeISOBMFF(head) {
+                return false
             }
+            // 非 ftyp 且非 HTML 的伪装扩展名 → 仍视为损坏，强制重下
+            return true
         }
+
         return false
     }
 

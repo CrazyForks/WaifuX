@@ -186,6 +186,8 @@ final class VideoWallpaperManager: ObservableObject {
     /// 菜单栏重采样的桌面暴露闪烁工作项（key: screenID）。
     /// 新一轮切换会取消上一轮未发射的闪烁，避免打断新内容的过渡动画。
     private var menuBarFlashWorkItems: [String: [DispatchWorkItem]] = [:]
+    /// 菜单栏条带暴露进行中的屏：期间禁止 synchronizeWindow 把 frame 拉回全屏。
+    private var menuBarFlashInProgressScreenIDs = Set<String>()
 
     /// "播完即换"模式下的播放器播放结束观察者（key: screenID）
     private var playbackEndObservers: [String: Any] = [:]
@@ -2667,22 +2669,29 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
-    /// 把视频窗短暂 alpha 闪烁（露出桌面图层），迫使菜单栏按当前系统壁纸重采样。
+    /// 短暂只露出菜单栏条带下的系统壁纸，迫使菜单栏按当前 poster 重采样。
     ///
     /// ## 为什么需要这个（macOS 26 实测结论）
     /// 菜单栏采样的是**系统壁纸**而非合成画面；视频窗把桌面图层完全盖住时，
     /// WindowServer 会剔除被遮挡的桌面图层——写 poster / `com.apple.desktop` 通知 /
     /// 透明 poke 窗 / 状态栏项闪现**全部**不产生 damage，菜单栏永远拿旧缓存，
     /// 只有「桌面图重新可见」或「App 激活」才会重采样。
-    /// 闪烁时露出的刚好是新 poster（≈ 视频首帧），视觉上近似无缝。
     ///
-    /// - Parameter delays: 默认两次：0.6s 等 WallpaperAgent 加载新 poster，1.6s 兜底慢加载。
+    /// ## 丝滑策略（MBLab Phase B）
+    /// 整窗 `alpha=0` 与「缩掉菜单栏条带」都能触发重采样；后者桌面主体始终被视频盖住，
+    /// 用户几乎只看到菜单栏毛玻璃颜色跟着新 poster 更新，而不是整屏闪一下。
+    /// 缩框时冻结 contentView 尺寸，避免 AVPlayerLayer 跟着 reflow 产生可见缩放跳变。
+    ///
+    /// - Parameter delays: 默认单次 0.12s（本地 poster 写入后 WallpaperAgent 多数已就绪）。
+    ///   交叉淡入完成 / 首帧 reveal 等「poster 早已写完」的路径应传接近 0 的 delays，
+    ///   让菜单栏尽量跟视频切换同步；Dock 侧 IconAppearance 仍有约 1–2 帧系统延迟，无法再压。
+    ///   每次切换只闪一次：过渡中反复露出会有"来回卡"的跳变感。
     private func flashDesktopExposureForMenuBarResample(
         on screens: [NSScreen],
-        delays: [TimeInterval] = [0.6, 1.6]
+        delays: [TimeInterval] = [0.12]
     ) {
         // 与 poster 写入同一门槛：系统壁纸同步关闭 / 动态锁屏启用时，
-        // 桌面图不是本次切换的 poster——闪烁只会露出无关旧壁纸（可见闪动），
+        // 桌面图不是本次切换的 poster——暴露只会露出无关旧壁纸，
         // 菜单栏也没有新内容可采，直接跳过。本函数不触碰 setDesktopImageURL。
         guard isSystemWallpaperSyncEnabled, !shouldSkipStaticPosterForDynamicLockScreen else { return }
         for screen in screens {
@@ -2693,19 +2702,80 @@ final class VideoWallpaperManager: ObservableObject {
                 let item = DispatchWorkItem { [weak self, weak screen] in
                     guard let self, let screen,
                           let entry = self.existingVideoWindowEntry(for: screen) else { return }
-                    let window = entry.window
-                    let previousAlpha = window.alphaValue
-                    window.alphaValue = 0
-                    CATransaction.flush()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
-                        window?.alphaValue = previousAlpha
-                        CATransaction.flush()
-                    }
+                    // 过渡/预热仍在进行时跳过：交叉淡入被中途打断会产生
+                    // "旧→新→旧→新"的来回跳变。过渡完成点会自行调度。
+                    guard self.playerItemObserverTokens[screenID] == nil,
+                          self.pendingGlobalTransitionPlayer == nil,
+                          self.globalTransitionPendingCompletionScreenIDs.isEmpty else { return }
+                    if let container = entry.window.contentView as? WallpaperVideoContainerView,
+                       container.hasPreparedPlayerTransitionInFlight { return }
+                    self.performMenuBarStripExposureFlash(
+                        window: entry.window,
+                        screen: screen,
+                        screenID: entry.screenID
+                    )
                 }
                 scheduled.append(item)
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
             }
             menuBarFlashWorkItems[screenID] = scheduled
+        }
+    }
+
+    /// 只缩掉菜单栏高度：桌面主体仍盖着视频，菜单栏 backdrop 能采到新 poster。
+    /// 约 2–3 帧后恢复全屏；contentView 保持全尺寸以免视频被压扁/上跳。
+    private func performMenuBarStripExposureFlash(
+        window: NSWindow,
+        screen: NSScreen,
+        screenID: String
+    ) {
+        guard !menuBarFlashInProgressScreenIDs.contains(screenID) else { return }
+        // 非全屏/已异常 frame 时不冒险缩框，避免把窗口弄丢。
+        guard framesApproximatelyEqual(window.frame, screen.frame, tolerance: 4) else { return }
+
+        menuBarFlashInProgressScreenIDs.insert(screenID)
+
+        let fullFrame = screen.frame
+        let barHeight = max(24, fullFrame.maxY - screen.visibleFrame.maxY)
+        // +2pt：确保与菜单栏采样矩形相交（Notch / 菜单栏底缘）。
+        let strip = barHeight + 2
+        var exposedFrame = fullFrame
+        exposedFrame.size.height = max(1, fullFrame.height - strip)
+        // origin.y 不变 → 只把上沿下移，露出顶部条带下的系统壁纸。
+
+        let contentView = window.contentView
+        let previousMask = contentView?.autoresizingMask ?? [.width, .height]
+        let fullContentFrame = NSRect(origin: .zero, size: fullFrame.size)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentView?.autoresizingMask = []
+        window.setFrame(exposedFrame, display: true)
+        // 窗口变矮后 contentView 仍铺满「原全屏」高度：顶端被窗裁掉，
+        // 菜单栏以下像素与缩框前一致，不会出现整屏内容上移/缩放。
+        if let contentView {
+            contentView.frame = fullContentFrame
+        }
+        CATransaction.commit()
+        CATransaction.flush()
+
+        // ~2 帧@60Hz：够 WindowServer 把桌面条带纳入合成；再长只会拖慢菜单栏体感，
+        // 不会让 Dock 更快算完 IconAppearance。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.034) { [weak self, weak window, weak screen] in
+            guard let self else { return }
+            defer { self.menuBarFlashInProgressScreenIDs.remove(screenID) }
+            guard let window else { return }
+
+            let restoreFrame = screen?.frame ?? fullFrame
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.setFrame(restoreFrame, display: true)
+            if let contentView = window.contentView {
+                contentView.frame = NSRect(origin: .zero, size: restoreFrame.size)
+                contentView.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
+            }
+            CATransaction.commit()
+            CATransaction.flush()
         }
     }
 
@@ -2759,7 +2829,7 @@ final class VideoWallpaperManager: ObservableObject {
             DesktopWallpaperSyncManager.shared
                 .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
             // 关键：被视频窗盖住时写 poster 不会触发菜单栏重采样（遮挡剔除），
-            // 短暂露出桌面图（= 新 poster）迫使菜单栏按新 poster 重采样。
+            // 只露出菜单栏条带下的新 poster，迫使菜单栏重采样且桌面主体不闪。
             flashDesktopExposureForMenuBarResample(on: screensToSet)
         } catch {
             print("[VideoWallpaperManager] [sync] Failed to set poster: \(error)")
@@ -2832,7 +2902,7 @@ final class VideoWallpaperManager: ObservableObject {
             print("[VideoWallpaperManager] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
             DesktopWallpaperSyncManager.shared
                 .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
-            // 同 sync 版：露出桌面图迫使菜单栏按新 poster 重采样（遮挡剔除规避）。
+            // 同 sync 版：只缩菜单栏条带触发重采样（遮挡剔除规避，桌面主体不闪）。
             flashDesktopExposureForMenuBarResample(on: screensToSet)
             // macOS 锁屏壁纸默认跟随桌面壁纸，无需额外设置
         } catch {
@@ -3456,6 +3526,11 @@ final class VideoWallpaperManager: ObservableObject {
 
     @discardableResult
     private func synchronizeWindow(_ window: WallpaperVideoWindow, to screen: NSScreen) -> Bool {
+        // 菜单栏条带暴露期间 frame 故意不是全屏；此处拉回会抵消重采样触发。
+        if menuBarFlashInProgressScreenIDs.contains(screen.wallpaperScreenIdentifier) {
+            return false
+        }
+
         let targetFrame = screen.frame
         var didAdjust = false
 
@@ -3713,8 +3788,11 @@ final class VideoWallpaperManager: ObservableObject {
                             if let swapScreen = NSScreen.screens.first(where: {
                                 $0.wallpaperScreenIdentifier == targetScreenID
                             }) {
+                                // poster 在 apply 开头已写入；淡入期间 WallpaperAgent 通常已就绪，
+                                // 完成后立刻缩条带，避免再白等 150ms。
                                 DesktopWallpaperSyncManager.shared
-                                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [swapScreen], delay: 0.15)
+                                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [swapScreen], delay: 0.02)
+                                self.flashDesktopExposureForMenuBarResample(on: [swapScreen], delays: [0])
                             }
                             self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: reason)
                         }
@@ -4128,8 +4206,10 @@ final class VideoWallpaperManager: ObservableObject {
             NSLog("[VideoWallpaperManager] Global shared-player crossfade completed")
             // 全局交叉淡入完成、各屏新帧均已可见，统一强制菜单栏重采样
             // （动画路径 poster 写入常被动态锁屏跳过，此前没有任何首帧后 poke）。
+            // poster 早已写入；全局淡入完成即触发，不再额外拖延。
             DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens, delay: 0.15)
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens, delay: 0.02)
+            self.flashDesktopExposureForMenuBarResample(on: screens, delays: [0])
         }
 
         for screen in screens {
@@ -5035,12 +5115,10 @@ final class VideoWallpaperManager: ObservableObject {
                 // 首帧已提交可见，此刻再强制菜单栏重采样。apply 时 0.12s 的 poke
                 // 常早于首帧合成，采到旧桌面后无人再补，表现为“切视频不刷新，
                 // 点一下其它 App 才好”。
+                // poster 在 apply 前已写入；首帧 reveal 后立刻触发，仅保留极短 WS 合成余量。
                 DesktopWallpaperSyncManager.shared
-                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [transitionScreen], delay: 0.15)
-                // 跨类型切换 poster 已在 apply 前写入（被旧 Scene/Web 遮挡）；
-                // 新窗 reveal 后露出一次桌面图，菜单栏才能按 poster 重采样。
-                // 第二次闪烁兜底 WallpaperAgent 慢加载（未加载完会采到旧图）。
-                self.flashDesktopExposureForMenuBarResample(on: [transitionScreen], delays: [0.3, 1.2])
+                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [transitionScreen], delay: 0.02)
+                self.flashDesktopExposureForMenuBarResample(on: [transitionScreen], delays: [0.04])
                 self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "crossTypeVideoReady")
                 return
             }
@@ -5050,12 +5128,10 @@ final class VideoWallpaperManager: ObservableObject {
             if let presentedScreen = NSScreen.screens.first(where: {
                 $0.wallpaperScreenIdentifier == screenID
             }) {
+                // poster 在重建前已写入；首帧 reveal 后立刻触发。
                 DesktopWallpaperSyncManager.shared
-                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [presentedScreen], delay: 0.15)
-                // 非动画路径 poster 在重建窗口前已写入（被旧窗遮挡，菜单栏未重采样）；
-                // 启动恢复时壁纸本就是上次 poster。首帧 reveal 后露出一次桌面图即可。
-                // 第二次闪烁兜底 WallpaperAgent 慢加载（未加载完会采到旧图）。
-                self.flashDesktopExposureForMenuBarResample(on: [presentedScreen], delays: [0.3, 1.2])
+                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [presentedScreen], delay: 0.02)
+                self.flashDesktopExposureForMenuBarResample(on: [presentedScreen], delays: [0.04])
             }
             self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "windowReady")
         }
@@ -5936,6 +6012,10 @@ private final class WallpaperVideoContainerView: NSView {
     private var storedPosterLayer: CALayer?
     private var grainOverlayView: NSView?
     private var transitionPlayerLayer: AVPlayerLayer?
+
+    /// 是否有已预热的过渡层（交叉淡入准备中/进行中）。
+    /// 菜单栏重采样的桌面暴露闪烁据此避开过渡窗口，防止"旧→新→旧→新"跳变。
+    var hasPreparedPlayerTransitionInFlight: Bool { transitionPlayerLayer != nil }
 
     /// 实际播放视频的 AVPlayerLayer。作为容器 backing layer 的子层，
     /// 通过修改它的 frame 实现 pan/zoom 裁切（容器 backing layer masksToBounds 自然裁剪）。

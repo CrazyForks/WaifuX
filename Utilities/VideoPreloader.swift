@@ -195,12 +195,13 @@ actor VideoPreloaderActor {
         if size < 64_000 { return true }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return true }
         defer { try? handle.close() }
-        let head = handle.readData(ofLength: 12)
-        // ftyp box
+        let head = handle.readData(ofLength: 256)
+        if looksLikeHTML(head) { return true }
+        // ftyp box（任意体积 HTML 也可能非 ftyp）
         if head.count >= 8, head[4..<8] == Data("ftyp".utf8) {
             return false
         }
-        return looksLikeHTML(head)
+        return true
     }
 }
 
