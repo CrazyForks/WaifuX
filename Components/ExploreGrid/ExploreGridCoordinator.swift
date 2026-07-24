@@ -606,26 +606,47 @@ final class ExploreGridCoordinator: NSObject {
         applyRestoredScrollOffset(targetOffset)
     }
 
-    private func targetVisibleIndexPaths() -> Set<IndexPath> {
-        var targetIndexPaths = Set(collectionView.indexPathsForVisibleItems())
-        guard let layout = collectionView.collectionViewLayout else { return targetIndexPaths }
+    /// 当前数据源范围内的可见 indexPath。
+    /// 布局缓存 / 已挂载 item 都可能短暂持有过期路径；这里统一裁剪到合法区间。
+    private func targetVisibleIndexPaths(itemCount: Int) -> Set<IndexPath> {
+        guard itemCount > 0 else { return [] }
 
-        // 切换 tab 返回时，NSCollectionView 偶尔只保留下半部分现存 item，
-        // 这时 indexPathsForVisibleItems() 会变成“不完整但非空”的脏状态。
-        // 不能只信任当前已挂载的 item，必须结合当前 viewport 的 layout attributes
-        // 重新推导整块可见区应当存在的 indexPath，才能把顶部缺失的 cell 补回来。
-        let visibleRectInCollection = collectionView.convert(
-            scrollView.contentView.bounds.insetBy(dx: 0, dy: -160),
-            from: scrollView.contentView
-        )
-        let layoutIndexPaths = layout.layoutAttributesForElements(in: visibleRectInCollection)
-            .compactMap(\.indexPath)
-        targetIndexPaths.formUnion(layoutIndexPaths)
-        return targetIndexPaths
+        var targetIndexPaths = Set(collectionView.indexPathsForVisibleItems())
+        if let layout = collectionView.collectionViewLayout {
+            // 切换 tab 返回时，NSCollectionView 偶尔只保留下半部分现存 item，
+            // 这时 indexPathsForVisibleItems() 会变成“不完整但非空”的脏状态。
+            // 不能只信任当前已挂载的 item，必须结合当前 viewport 的 layout attributes
+            // 重新推导整块可见区应当存在的 indexPath，才能把顶部缺失的 cell 补回来。
+            let visibleRectInCollection = collectionView.convert(
+                scrollView.contentView.bounds.insetBy(dx: 0, dy: -160),
+                from: scrollView.contentView
+            )
+            let layoutIndexPaths = layout.layoutAttributesForElements(in: visibleRectInCollection)
+                .compactMap(\.indexPath)
+            targetIndexPaths.formUnion(layoutIndexPaths)
+        }
+
+        return Set(targetIndexPaths.filter { indexPath in
+            indexPath.section == 0 && indexPath.item >= 0 && indexPath.item < itemCount
+        })
+    }
+
+    /// 数据源与 collection view 是否已对齐，且没有尚未落地的整表/批量更新。
+    /// 未对齐时调用 `reloadItems(at:)` 极易触发 AppKit 内部断言/SIGSEGV。
+    private var canSafelyMutateVisibleItems: Bool {
+        guard pendingReload == nil, pendingBatchUpdate == nil else { return false }
+        let dataCount = parent.itemCount()
+        guard dataCount == lastItemCount else { return false }
+        // numberOfItems 在 section 尚未建立时可能不可用；单 section 网格且 dataCount==0 时直接视为安全对齐。
+        if dataCount == 0 { return true }
+        return collectionView.numberOfItems(inSection: 0) == dataCount
     }
 
     private func reconfigureVisibleItems() {
-        let visibleIndexPaths = targetVisibleIndexPaths()
+        guard canSafelyMutateVisibleItems else { return }
+
+        let itemCount = parent.itemCount()
+        let visibleIndexPaths = targetVisibleIndexPaths(itemCount: itemCount)
         guard !visibleIndexPaths.isEmpty else { return }
 
         var missingIndexPaths = Set<IndexPath>()
@@ -640,8 +661,23 @@ final class ExploreGridCoordinator: NSObject {
             parent.configureCell(item, indexPath.item)
         }
 
-        if !missingIndexPaths.isEmpty {
-            collectionView.reloadItems(at: missingIndexPaths)
+        guard !missingIndexPaths.isEmpty else { return }
+        // 二次校验：reload 前再确认路径仍在当前数据源范围内，且未插入新的批量更新。
+        guard canSafelyMutateVisibleItems else { return }
+        let latestCount = parent.itemCount()
+        let safeMissing = Set(missingIndexPaths.filter {
+            $0.section == 0 && $0.item >= 0 && $0.item < latestCount
+        })
+        guard !safeMissing.isEmpty else { return }
+
+        // 局部 reload 期间禁用隐式动画，避免与布局恢复叠在一起。
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            collectionView.reloadItems(at: safeMissing)
+            CATransaction.commit()
         }
     }
 
