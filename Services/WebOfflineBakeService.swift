@@ -8,8 +8,8 @@ import Foundation
 /// The renderer runs in a dedicated CLI process with an offscreen WKWebView, so
 /// baking neither replaces nor pauses the user's currently applied wallpaper.
 ///
-/// Cache naming matches scene bake, but Web exports use a renderer-selected frame rate:
-/// `{analysisId}_{renderer}_{w}x{h}_autofps-v3_{duration}s[_props-{hash}].mp4`
+/// Cache naming matches scene bake:
+/// `{analysisId}_{title}_{w}x{h}_{duration}s.mp4`
 enum WebOfflineBakeService {
     private struct VideoInspection {
         let duration: TimeInterval
@@ -20,7 +20,6 @@ enum WebOfflineBakeService {
 
     /// Web projects own their animation cadence. The CLI records their actual compositor
     /// stream, so this deliberately ignores `scene_bake_fps`.
-    private static let automaticFrameRateCacheLabel = "autofps-v3"
     private static let automaticFrameRateJobSentinel: Int32 = 0
 
     static func isWebProject(at localURL: URL) -> Bool {
@@ -79,10 +78,52 @@ enum WebOfflineBakeService {
                 analysisId: analysisId,
                 width: targetSize.width,
                 height: targetSize.height,
-                frameRateLabel: automaticFrameRateCacheLabel,
+                duration: effectiveDuration,
+                displayTitle: displayTitle
+            )
+        }
+        let legacyCacheURL = await MainActor.run {
+            makeRendererCacheURL(
+                root: DownloadPathManager.shared.sceneBakesFolderURL,
+                itemID: record.id,
+                analysisId: analysisId,
+                width: targetSize.width,
+                height: targetSize.height,
                 duration: effectiveDuration,
                 userPropertiesJSON: effectiveUserProperties,
                 displayTitle: displayTitle
+            )
+        }
+        let legacyUntitledCacheURL = await MainActor.run {
+            makeRendererCacheURL(
+                root: DownloadPathManager.shared.sceneBakesFolderURL,
+                itemID: record.id,
+                analysisId: analysisId,
+                width: targetSize.width,
+                height: targetSize.height,
+                duration: effectiveDuration,
+                userPropertiesJSON: effectiveUserProperties
+            )
+        }
+        let legacyPropertiesCacheURL = await MainActor.run {
+            makePropertiesCacheURL(
+                root: DownloadPathManager.shared.sceneBakesFolderURL,
+                itemID: record.id,
+                analysisId: analysisId,
+                width: targetSize.width,
+                height: targetSize.height,
+                duration: effectiveDuration,
+                userPropertiesJSON: effectiveUserProperties
+            )
+        }
+        let legacyFinalUntitledCacheURL = await MainActor.run {
+            makeCacheURL(
+                root: DownloadPathManager.shared.sceneBakesFolderURL,
+                itemID: record.id,
+                analysisId: analysisId,
+                width: targetSize.width,
+                height: targetSize.height,
+                duration: effectiveDuration
             )
         }
 
@@ -138,6 +179,20 @@ enum WebOfflineBakeService {
                 withIntermediateDirectories: true
             )
 
+            if !FileManager.default.fileExists(atPath: cacheURL.path) {
+                for legacyURL in [
+                    legacyCacheURL,
+                    legacyUntitledCacheURL,
+                    legacyPropertiesCacheURL,
+                    legacyFinalUntitledCacheURL
+                ]
+                where legacyURL != cacheURL {
+                    guard SceneOfflineBakeService.isUsableBakedVideo(at: legacyURL) else { continue }
+                    try? FileManager.default.moveItem(at: legacyURL, to: cacheURL)
+                    break
+                }
+            }
+
             if let inspection = await inspectVideo(
                 at: cacheURL,
                 expectedWidth: targetSize.width,
@@ -167,7 +222,7 @@ enum WebOfflineBakeService {
 
             try? FileManager.default.removeItem(at: cacheURL)
             let temporaryURL = cacheURL.deletingLastPathComponent()
-                .appendingPathComponent(".\(cacheURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).tmp.mp4")
+                .appendingPathComponent(".web-bake-\(UUID().uuidString).tmp.mp4")
             try? FileManager.default.removeItem(at: temporaryURL)
 
             var arguments = [
@@ -332,15 +387,48 @@ enum WebOfflineBakeService {
         return (width - (width % 2), height - (height % 2))
     }
 
-    /// Web 仍保留 `wallpaperEngineWeb` 段以区分 Scene 成片；帧率标签用于缓存失效。
-    /// 格式：`{UUID}[_title]_wallpaperEngineWeb_{WxH}_{frameRateLabel}_{duration}s[_props].mp4`
+    /// 格式：`{UUID}[_title]_{WxH}_{duration}s.mp4`
     private static func makeCacheURL(
         root: URL,
         itemID: String,
         analysisId: UUID,
         width: Int,
         height: Int,
-        frameRateLabel: String,
+        duration: Double,
+        displayTitle: String? = nil
+    ) -> URL {
+        let safeItemID = itemID.replacingOccurrences(of: "/", with: "_")
+        let dir = root.appendingPathComponent(safeItemID, isDirectory: true)
+        let titleSegment = SceneOfflineBakeService.sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
+        let name = "\(analysisId.uuidString)\(titleSegment)_\(width)x\(height)_\(Int(duration.rounded()))s.mp4"
+        return dir.appendingPathComponent(name)
+    }
+
+    /// 上一版无 renderer/title、但仍携带属性哈希的缓存格式。
+    private static func makePropertiesCacheURL(
+        root: URL,
+        itemID: String,
+        analysisId: UUID,
+        width: Int,
+        height: Int,
+        duration: Double,
+        userPropertiesJSON: String?
+    ) -> URL {
+        let safeItemID = itemID.replacingOccurrences(of: "/", with: "_")
+        let dir = root.appendingPathComponent(safeItemID, isDirectory: true)
+        let propertiesSuffix = propertiesCacheKey(for: userPropertiesJSON).map { "_props-\($0)" } ?? ""
+        let name =
+            "\(analysisId.uuidString)_\(width)x\(height)_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
+        return dir.appendingPathComponent(name)
+    }
+
+    /// v3 Web 旧缓存格式，保留用于无重烘迁移。
+    private static func makeRendererCacheURL(
+        root: URL,
+        itemID: String,
+        analysisId: UUID,
+        width: Int,
+        height: Int,
         duration: Double,
         userPropertiesJSON: String?,
         displayTitle: String? = nil
@@ -350,7 +438,7 @@ enum WebOfflineBakeService {
         let propertiesSuffix = propertiesCacheKey(for: userPropertiesJSON).map { "_props-\($0)" } ?? ""
         let titleSegment = SceneOfflineBakeService.sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
         let name =
-            "\(analysisId.uuidString)\(titleSegment)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_\(frameRateLabel)_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
+            "\(analysisId.uuidString)\(titleSegment)_\(SceneBakeRenderer.wallpaperEngineWeb.rawValue)_\(width)x\(height)_autofps-v3_\(Int(duration.rounded()))s\(propertiesSuffix).mp4"
         return dir.appendingPathComponent(name)
     }
 

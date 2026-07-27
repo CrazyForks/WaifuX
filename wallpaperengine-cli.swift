@@ -4033,7 +4033,7 @@ private final class WebOfflineBakeRunner {
         writtenFrameCount = 0
         captureStartedAt = nil
         let temporaryURL = options.outputURL.deletingLastPathComponent()
-            .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).stream.mp4")
+            .appendingPathComponent(".web-bake-\(UUID().uuidString).stream.mp4")
         try? FileManager.default.removeItem(at: temporaryURL)
         temporaryOutputURL = temporaryURL
         emitProgress(phase: "准备", progress: 0)
@@ -4131,7 +4131,7 @@ private final class WebOfflineBakeRunner {
                 withIntermediateDirectories: true
             )
             let temporaryURL = options.outputURL.deletingLastPathComponent()
-                .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).tmp.mp4")
+                .appendingPathComponent(".web-bake-\(UUID().uuidString).tmp.mp4")
             try? FileManager.default.removeItem(at: temporaryURL)
             temporaryOutputURL = temporaryURL
 
@@ -4428,7 +4428,7 @@ private final class WebOfflineBakeRunner {
         }
 
         let muxedURL = videoURL.deletingLastPathComponent().appendingPathComponent(
-            ".\(videoURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).audio.mp4"
+            ".web-bake-\(UUID().uuidString).audio.mp4"
         )
         try? FileManager.default.removeItem(at: muxedURL)
 

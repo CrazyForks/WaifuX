@@ -926,7 +926,7 @@ enum SceneOfflineBakeService {
     ///（根目录为 `DownloadPathManager.sceneBakesFolderURL`）。
     ///
     /// **当前 Scene 格式（无 renderer 段）：**
-    /// `{UUID}[_title]_{WxH}_{fps}fps_{duration}s[_props-hash].mp4`
+    /// `{UUID}[_title]_{WxH}_{fps}fps_{duration}s.mp4`
     ///
     /// 历史格式仍可通过 `legacyCacheCandidateURLs` 命中并迁移：
     /// - `{UUID}_wallpaperWgpu_{WxH}_…`
@@ -940,21 +940,19 @@ enum SceneOfflineBakeService {
         height: Int,
         fps: Int,
         durationSeconds: Double,
-        propertiesCacheKey: String?,
         displayTitle: String?
     ) -> URL {
         let dir = bakeDirectory(baseDir: baseDir, itemID: itemID)
-        let propertiesSuffix = propertiesCacheKey.map { "_props-\($0)" } ?? ""
         let titleSegment = sanitizedBakeFileTitle(displayTitle).map { "_\($0)" } ?? ""
         // Scene 成片不再写入 wallpaperWgpu 段；Web 走 WebOfflineBakeService 自己的命名。
         let name: String
         switch renderer {
         case .wallpaperWgpu:
             name =
-                "\(analysisId.uuidString)\(titleSegment)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+                "\(analysisId.uuidString)\(titleSegment)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s.mp4"
         case .wallpaperEngineWeb:
             name =
-                "\(analysisId.uuidString)\(titleSegment)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+                "\(analysisId.uuidString)\(titleSegment)_\(renderer.rawValue)_\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s.mp4"
         }
         return dir.appendingPathComponent(name)
     }
@@ -964,7 +962,7 @@ enum SceneOfflineBakeService {
         return baseDir.appendingPathComponent(safeID, isDirectory: true)
     }
 
-    /// 历史 Scene 文件名候选（仍含 `_wallpaperWgpu_` 或无标题段），用于 cache hit / 迁移。
+    /// 历史 Scene 文件名候选（含 renderer 段、属性哈希或无标题段），用于 cache hit / 迁移。
     private static func legacyCacheCandidateURLs(
         baseDir: URL,
         itemID: String,
@@ -980,18 +978,22 @@ enum SceneOfflineBakeService {
         guard renderer == .wallpaperWgpu else { return [] }
         let dir = bakeDirectory(baseDir: baseDir, itemID: itemID)
         let propertiesSuffix = propertiesCacheKey.map { "_props-\($0)" } ?? ""
-        let dims = "\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
+        let legacyDims = "\(width)x\(height)_\(fps)fps_\(Int(durationSeconds))s\(propertiesSuffix).mp4"
         let uuid = analysisId.uuidString
         let title = sanitizedBakeFileTitle(displayTitle)
         var names: [String] = []
+        // 上一版当前格式：带标题、无 renderer、带属性哈希。
+        if let title {
+            names.append("\(uuid)_\(title)_\(legacyDims)")
+        }
         // 上一版：带标题 + wallpaperWgpu
         if let title {
-            names.append("\(uuid)_\(title)_wallpaperWgpu_\(dims)")
+            names.append("\(uuid)_\(title)_wallpaperWgpu_\(legacyDims)")
         }
         // 最早：无标题 + wallpaperWgpu
-        names.append("\(uuid)_wallpaperWgpu_\(dims)")
-        // 无标题的新格式（仅 UUID + 参数）
-        names.append("\(uuid)_\(dims)")
+        names.append("\(uuid)_wallpaperWgpu_\(legacyDims)")
+        // 无标题、无 renderer、带属性哈希。
+        names.append("\(uuid)_\(legacyDims)")
         // 带标题但无 wallpaperWgpu 已是当前 canonical，不在 legacy 列表里
 
         var seen = Set<String>()
@@ -1396,7 +1398,6 @@ enum SceneOfflineBakeService {
             height: evenH,
             fps: Int(fps),
             durationSeconds: cacheDurationSeconds,
-            propertiesCacheKey: propertiesCacheKey(for: effectiveUserProperties),
             displayTitle: titleForName
         )
 
