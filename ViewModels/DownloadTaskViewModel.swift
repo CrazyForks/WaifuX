@@ -23,7 +23,7 @@ struct DownloadToastSnapshot: Equatable, Identifiable {
     }
 
     var isRunning: Bool {
-        status == .pending || status == .downloading
+        status == .pending || status == .downloading || status == .waitingForSteamLogin
     }
 
     var isActionable: Bool {
@@ -81,7 +81,12 @@ class DownloadTaskViewModel: ObservableObject {
     // MARK: - Computed Properties
 
     var activeTasks: [DownloadTask] {
-        tasks.filter { $0.status == .pending || $0.status == .downloading || $0.status == .paused }
+        tasks.filter {
+            $0.status == .pending
+                || $0.status == .downloading
+                || $0.status == .waitingForSteamLogin
+                || $0.status == .paused
+        }
     }
 
     var libraryVisibleTasks: [DownloadTask] {

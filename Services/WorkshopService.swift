@@ -56,6 +56,44 @@ private actor SteamCMDDownloadLimiter {
     func currentActiveCount() -> Int { activeCount }
 }
 
+enum SteamCMDNetworkRoute: String, Sendable {
+    case configured
+    case direct
+}
+
+enum SteamSessionProbeResult: Sendable {
+    case valid
+    case guardCodeRequired
+    case mobileConfirmationRequired
+    case reauthenticationRequired
+    case networkUnavailable(String)
+    case unknown(String)
+}
+
+private struct SteamCMDProbeProcessResult: Sendable {
+    let output: String
+    let exitCode: Int32
+    let timedOut: Bool
+}
+
+private final class SteamCMDProbeOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func string() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
 // MARK: - Workshop Service
 ///
 /// 处理 Wallpaper Engine Steam 创意工坊的搜索和下载
@@ -1605,7 +1643,6 @@ class WorkshopService: ObservableObject {
 
     func downloadWorkshopItem(
         workshopID: String,
-        guardCode: String? = nil,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         // 获取并发下载槽位（超出上限则排队等待）
@@ -1622,86 +1659,125 @@ class WorkshopService: ObservableObject {
             }
         }
 
-        // 先尝试不带密码的 login，复用已保存的 session token
-        // 如果 session 已失效，再 fallback 到带密码的登录
+        if WorkshopSourceManager.shared.steamIdentity == nil {
+            WorkshopSourceManager.shared.refreshStoredSteamIdentity()
+        }
+        guard let username = WorkshopSourceManager.shared.storedSteamUsername else {
+            throw WorkshopError.credentialsRequired
+        }
+
         do {
             return try await downloadWorkshopItemOnce(
                 workshopID: workshopID,
-                guardCode: guardCode,
-                attempt: 0,
-                usePassword: false,
+                username: username,
+                route: .configured,
                 progressHandler: progressHandler
             )
         } catch let error as WorkshopError {
-            switch error {
-            case .sessionExpired, .confirmationRequired, .guardCodeRequired, .invalidCredentials:
-                // session 已失效或需要重新认证，使用密码重试一次
-                AppLogger.info(.download, "Workshop 无密码登录失败，尝试使用密码", metadata:
-                    ["workshopID": workshopID, "error": error.localizedDescription])
-                return try await downloadWorkshopItemWithRetry(
-                    workshopID: workshopID,
-                    guardCode: guardCode,
-                    progressHandler: progressHandler
-                )
-            default:
-                throw error
-            }
+            return try await recoverWorkshopDownloadFailure(
+                error,
+                workshopID: workshopID,
+                username: username,
+                progressHandler: progressHandler
+            )
         }
     }
 
-    private func downloadWorkshopItemWithRetry(
+    private func recoverWorkshopDownloadFailure(
+        _ error: WorkshopError,
         workshopID: String,
-        guardCode: String? = nil,
+        username: String,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
-        // 最多重试 2 次（共 3 次尝试），仅对可恢复的网络/下载错误重试
-        let maxRetries = 2
-        var lastError: Error?
-
-        for attempt in 0...maxRetries {
+        if case .downloadIncomplete = error {
+            AppLogger.info(.download, "Workshop 内容不完整，使用当前会话重试一次", metadata: [
+                "workshopID": workshopID
+            ])
             do {
                 return try await downloadWorkshopItemOnce(
                     workshopID: workshopID,
-                    guardCode: guardCode,
-                    attempt: attempt,
-                    usePassword: true,
+                    username: username,
+                    route: .configured,
                     progressHandler: progressHandler
                 )
-            } catch let error as WorkshopError {
-                lastError = error
-                // 仅对超时、网络错误和下载不完整重试，其他错误直接抛出
-                switch error {
-                case .timeout, .loginTimeout, .downloadIncomplete:
-                    if attempt < maxRetries {
-                        AppLogger.info(.download, "Workshop 下载失败，正在重试", metadata:
-                            ["workshopID": workshopID, "attempt": attempt + 1, "error": error.localizedDescription])
-                        continue
-                    }
-                default:
-                    throw error
-                }
+            } catch let retryError as WorkshopError {
+                return try await diagnoseWorkshopDownloadFailure(
+                    retryError,
+                    workshopID: workshopID,
+                    username: username,
+                    route: .configured,
+                    allowDirectFallback: true,
+                    progressHandler: progressHandler
+                )
             }
         }
-        throw lastError ?? WorkshopError.downloadFailed("未知错误")
+
+        return try await diagnoseWorkshopDownloadFailure(
+            error,
+            workshopID: workshopID,
+            username: username,
+            route: .configured,
+            allowDirectFallback: true,
+            progressHandler: progressHandler
+        )
+    }
+
+    private func diagnoseWorkshopDownloadFailure(
+        _ error: WorkshopError,
+        workshopID: String,
+        username: String,
+        route: SteamCMDNetworkRoute,
+        allowDirectFallback: Bool,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) async throws -> URL {
+        if allowDirectFallback,
+           route == .configured,
+           Self.isSteamCMDNetworkFailure(error),
+           Self.configuredSteamCMDEnvironmentUsesProxy() {
+            let directProbe = await probeSteamSession(username: username, route: .direct)
+            switch directProbe {
+            case .valid:
+                AppLogger.info(.download, "当前代理连接失败，已切换 SteamCMD 直连并重试", metadata: [
+                    "workshopID": workshopID
+                ])
+                do {
+                    return try await downloadWorkshopItemOnce(
+                        workshopID: workshopID,
+                        username: username,
+                        route: .direct,
+                        progressHandler: progressHandler
+                    )
+                } catch let directError as WorkshopError {
+                    return try await diagnoseWorkshopDownloadFailure(
+                        directError,
+                        workshopID: workshopID,
+                        username: username,
+                        route: .direct,
+                        allowDirectFallback: false,
+                        progressHandler: progressHandler
+                    )
+                }
+            default:
+                throw Self.workshopError(for: directProbe, fallback: error)
+            }
+        }
+
+        guard Self.shouldProbeSteamSession(after: error) else {
+            throw error
+        }
+
+        let probe = await probeSteamSession(username: username, route: route)
+        throw Self.workshopError(for: probe, fallback: error)
     }
 
     private func downloadWorkshopItemOnce(
         workshopID: String,
-        guardCode: String? = nil,
-        attempt: Int,
-        usePassword: Bool = false,
+        username: String,
+        route: SteamCMDNetworkRoute,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         guard let steamcmdPath = WorkshopSourceManager.shared.steamCMDExecutableURL() else {
             throw WorkshopError.steamcmdNotFound
-        }
-
-        if WorkshopSourceManager.shared.steamCredentials == nil {
-            WorkshopSourceManager.shared.refreshStoredSteamCredentials()
-        }
-
-        guard let credentials = WorkshopSourceManager.shared.steamCredentials else {
-            throw WorkshopError.credentialsRequired
         }
 
         let downloadDir = DownloadPathManager.shared.mediaFolderURL
@@ -1724,37 +1800,21 @@ class WorkshopService: ObservableObject {
             totalSize = 0
         }
 
-        // 优先尝试不带密码的 login，复用已保存的 session token
-        // 如果传密码，steamcmd 会执行 SetLoginInformation 清除内存 token 并强制重新认证
-        let loginLineNoPassword = [
+        let loginLine = [
             "login",
-            Self.steamCMDScriptArgument(credentials.username)
-        ].joined(separator: " ")
-        let loginLineWithPassword = [
-            "login",
-            Self.steamCMDScriptArgument(credentials.username),
-            Self.steamCMDScriptArgument(credentials.password)
+            Self.steamCMDScriptArgument(username)
         ].joined(separator: " ")
 
-        let scriptContentNoPassword = [
+        let scriptContent = [
             "@NoPromptForPassword 1",
             "force_install_dir \(Self.steamCMDScriptArgument(downloadDir.path))",
-            loginLineNoPassword,
-            "workshop_download_item \(wallpaperEngineAppID) \(workshopID)",
-            "quit"
-        ].joined(separator: "\n")
-        let scriptContentWithPassword = [
-            "@NoPromptForPassword 1",
-            "force_install_dir \(Self.steamCMDScriptArgument(downloadDir.path))",
-            loginLineWithPassword,
-            "workshop_download_item \(wallpaperEngineAppID) \(workshopID)",
+            loginLine,
+            "workshop_download_item \(wallpaperEngineAppID) \(workshopID) validate",
             "quit"
         ].joined(separator: "\n")
 
         let contentPath = downloadDir
             .appendingPathComponent("steamapps/workshop/content/\(wallpaperEngineAppID)/\(workshopID)")
-
-        let activeScriptContent = usePassword ? scriptContentWithPassword : scriptContentNoPassword
 
         return try await withCheckedThrowingContinuation { continuation in
             let task = Process()
@@ -1764,12 +1824,15 @@ class WorkshopService: ObservableObject {
             task.executableURL = steamcmdBinURL
             task.arguments = []
             task.currentDirectoryURL = steamcmdPath.deletingLastPathComponent()
-            let environment = Self.steamCMDEnvironment(steamcmdDirectory: steamcmdPath.deletingLastPathComponent())
+            let environment = Self.steamCMDEnvironment(
+                steamcmdDirectory: steamcmdPath.deletingLastPathComponent(),
+                route: route
+            )
             task.environment = environment
 
             let inputPipe = Pipe()
             task.standardInput = inputPipe
-            if let data = activeScriptContent.data(using: .utf8) {
+            if let data = scriptContent.data(using: .utf8) {
                 inputPipe.fileHandleForWriting.write(data)
                 inputPipe.fileHandleForWriting.closeFile()
             }
@@ -1799,7 +1862,7 @@ class WorkshopService: ObservableObject {
             )
             let pollingTask = Task.detached(priority: .utility) {
                 while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                     guard let progress = progressMonitor.currentProgress() else { continue }
                     if progressBox.shouldReport(progress) {
                         progressHandler?(progress)
@@ -1834,13 +1897,23 @@ class WorkshopService: ObservableObject {
 
             // steamcmd 创意工坊下载不输出可用百分比；stdout 同时用于错误判断与下载开始标记。
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
-                if let str = String(data: handle.availableData, encoding: .utf8) {
+                let data = handle.availableData
+                guard !data.isEmpty else {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let str = String(data: data, encoding: .utf8) {
                     outputBox.appendOutput(str)
                     progressMonitor.consumeSteamCMDOutput(str)
                 }
             }
             errorPipe.fileHandleForReading.readabilityHandler = { handle in
-                if let str = String(data: handle.availableData, encoding: .utf8) {
+                let data = handle.availableData
+                guard !data.isEmpty else {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let str = String(data: data, encoding: .utf8) {
                     outputBox.appendError(str)
                 }
             }
@@ -1956,13 +2029,12 @@ class WorkshopService: ObservableObject {
                             return
                         }
 
-                        // 需要邮箱验证码但没有提供 → 登录会话无效，清理本地账号
+                        // 缓存会话要求 Guard 验证时，下载阶段不尝试补密码或验证码。
                         let guardCodeMissing = needsGuardCode
                         if guardCodeMissing {
-                            Task { @MainActor in
-                                WorkshopSourceManager.shared.clearSteamCredentials()
-                            }
-                            resumeBox.resume(throwing: WorkshopError.sessionExpired)
+                            resumeBox.resume(throwing: WorkshopError.guardCodeRequired(
+                                "Steam 要求 Guard 验证。请在设置中重新登录；验证码仅用于本次登录，不会保存。"
+                            ))
                             return
                         }
                     }
@@ -1988,16 +2060,16 @@ class WorkshopService: ObservableObject {
                         return
                     }
 
-                    // 真实登录/会话错误：清理本地账号，要求重新登录
+                    // 登录/会话错误只交给后续 session probe 复核，不清除账号名。
                     let sessionExpiredKeywords = [
                         "ERROR! Not logged on",
                         "Not logged on",
-                        "No login session, exiting"
+                        "No login session, exiting",
+                        "Cached credentials not found",
+                        "No cached credentials",
+                        "password required"
                     ]
                     if sessionExpiredKeywords.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) }) {
-                        Task { @MainActor in
-                            WorkshopSourceManager.shared.clearSteamCredentials()
-                        }
                         resumeBox.resume(throwing: WorkshopError.sessionExpired)
                         return
                     }
@@ -2024,9 +2096,6 @@ class WorkshopService: ObservableObject {
                         "Two-factor code mismatch"
                     ]
                     if authFailureKeywords.contains(where: { combinedOutput.localizedCaseInsensitiveContains($0) }) {
-                        Task { @MainActor in
-                            WorkshopSourceManager.shared.clearSteamCredentials()
-                        }
                         resumeBox.resume(throwing: WorkshopError.invalidCredentials)
                         return
                     }
@@ -2051,7 +2120,7 @@ class WorkshopService: ObservableObject {
                         return
                     }
 
-                    if FileManager.default.fileExists(atPath: contentPath.path) {
+                    if Self.isValidWorkshopDownload(at: contentPath) {
                         resumeBox.resume(returning: contentPath)
                         return
                     }
@@ -2066,7 +2135,7 @@ class WorkshopService: ObservableObject {
                                 if elapsed % 10 == 0 || elapsed == 1 {
                                     AppLogger.info(.media, "Polling SteamCMD", metadata: ["elapsed": elapsed])
                                 }
-                                if FileManager.default.fileExists(atPath: contentPath.path) {
+                                if Self.isValidWorkshopDownload(at: contentPath) {
                                     AppLogger.info(.media, "Workshop content detected", metadata: ["elapsed": elapsed])
                                     resumeBox.resume(returning: contentPath)
                                     return
@@ -2337,12 +2406,347 @@ class WorkshopService: ObservableObject {
         return "\"\(escaped)\""
     }
 
-    nonisolated private static func steamCMDEnvironment(steamcmdDirectory: URL) -> [String: String] {
+    private func probeSteamSession(
+        username: String,
+        route: SteamCMDNetworkRoute
+    ) async -> SteamSessionProbeResult {
+        guard let steamcmdPath = WorkshopSourceManager.shared.steamCMDExecutableURL() else {
+            return .unknown("SteamCMD 组件不可用，无法验证当前会话。")
+        }
+
+        let steamcmdDirectory = steamcmdPath.deletingLastPathComponent()
+        let executableURL = steamcmdDirectory.appendingPathComponent("steamcmd")
+        guard FileManager.default.fileExists(atPath: executableURL.path) else {
+            return .unknown("SteamCMD 可执行文件不存在，无法验证当前会话。")
+        }
+
+        let script = [
+            "@NoPromptForPassword 1",
+            "login \(Self.steamCMDScriptArgument(username))",
+            "quit"
+        ].joined(separator: "\n")
+        let environment = Self.steamCMDEnvironment(
+            steamcmdDirectory: steamcmdDirectory,
+            route: route
+        )
+
+        var processResult = await Task.detached(priority: .utility) {
+            Self.runSteamCMDProbe(
+                executableURL: executableURL,
+                currentDirectoryURL: steamcmdDirectory,
+                environment: environment,
+                script: script,
+                timeoutSeconds: 45
+            )
+        }.value
+
+        if !processResult.timedOut,
+           processResult.output.localizedCaseInsensitiveContains("Update complete, launching") {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            processResult = await Task.detached(priority: .utility) {
+                Self.runSteamCMDProbe(
+                    executableURL: executableURL,
+                    currentDirectoryURL: steamcmdDirectory,
+                    environment: environment,
+                    script: script,
+                    timeoutSeconds: 45
+                )
+            }.value
+        }
+
+        let result = Self.parseSteamSessionProbe(processResult)
+        AppLogger.info(.download, "SteamCMD session probe", metadata: [
+            "route": route.rawValue,
+            "result": Self.steamSessionProbeLabel(result),
+            "exitCode": "\(processResult.exitCode)",
+            "timedOut": "\(processResult.timedOut)"
+        ])
+        return result
+    }
+
+    nonisolated private static func runSteamCMDProbe(
+        executableURL: URL,
+        currentDirectoryURL: URL,
+        environment: [String: String],
+        script: String,
+        timeoutSeconds: TimeInterval
+    ) -> SteamCMDProbeProcessResult {
+        let process = Process()
+        process.executableURL = executableURL
+        process.currentDirectoryURL = currentDirectoryURL
+        process.environment = environment
+
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        let outputBuffer = SteamCMDProbeOutputBuffer()
+        let errorBuffer = SteamCMDProbeOutputBuffer()
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            outputBuffer.append(handle.availableData)
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            errorBuffer.append(handle.availableData)
+        }
+
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+
+        do {
+            try process.run()
+            if let data = script.data(using: .utf8) {
+                inputPipe.fileHandleForWriting.write(data)
+            }
+            inputPipe.fileHandleForWriting.closeFile()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            return SteamCMDProbeProcessResult(
+                output: error.localizedDescription,
+                exitCode: -1,
+                timedOut: false
+            )
+        }
+
+        let timedOut = finished.wait(timeout: .now() + timeoutSeconds) == .timedOut
+        if timedOut {
+            process.terminate()
+            _ = finished.wait(timeout: .now() + 5)
+        }
+
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        if !process.isRunning {
+            outputBuffer.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+            errorBuffer.append(errorPipe.fileHandleForReading.readDataToEndOfFile())
+        }
+
+        let combined = [outputBuffer.string(), errorBuffer.string()]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        return SteamCMDProbeProcessResult(
+            output: combined,
+            exitCode: process.isRunning ? -1 : process.terminationStatus,
+            timedOut: timedOut
+        )
+    }
+
+    nonisolated private static func parseSteamSessionProbe(
+        _ result: SteamCMDProbeProcessResult
+    ) -> SteamSessionProbeResult {
+        let output = result.output
+        if isSteamLoginSuccessful(output) {
+            return .valid
+        }
+
+        let guardIndicators = [
+            "Steam Guard code:",
+            "Enter your two-factor authentication code",
+            "Two-factor code mismatch"
+        ]
+        if guardIndicators.contains(where: { output.localizedCaseInsensitiveContains($0) }) {
+            return .guardCodeRequired
+        }
+
+        let mobileConfirmationIndicators = [
+            "Please confirm the login",
+            "Waiting for confirmation",
+            "Wait for confirmation timed out",
+            "Timed out waiting for confirmation"
+        ]
+        if mobileConfirmationIndicators.contains(where: { output.localizedCaseInsensitiveContains($0) }) {
+            return .mobileConfirmationRequired
+        }
+
+        if result.timedOut {
+            return .networkUnavailable("Steam 会话探测超时。")
+        }
+
+        let networkIndicators = [
+            "ERROR (Timeout)",
+            "Connection timed out",
+            "Could not connect to Steam network",
+            "Operation timed out",
+            "Network is unreachable",
+            "No route to host",
+            "Connection refused",
+            "Unable to connect to Steam",
+            "Failed to connect to Steam",
+            "No Connection"
+        ]
+        if networkIndicators.contains(where: { output.localizedCaseInsensitiveContains($0) }) {
+            let detail = cleanSteamCMDError(output)
+            return .networkUnavailable(detail.isEmpty ? "当前网络无法连接 Steam。" : detail)
+        }
+
+        let reauthenticationIndicators = [
+            "ERROR! Not logged on",
+            "Not logged on",
+            "No login session, exiting",
+            "No cached credentials",
+            "Invalid Password",
+            "Login Failure",
+            "FAILED (Account",
+            "Account Logon Denied",
+            "password required"
+        ]
+        if reauthenticationIndicators.contains(where: { output.localizedCaseInsensitiveContains($0) }) {
+            return .reauthenticationRequired
+        }
+
+        let detail = cleanSteamCMDError(output)
+        if detail.isEmpty {
+            return .unknown("SteamCMD 未返回可用于判断会话状态的信息。")
+        }
+        return .unknown(detail)
+    }
+
+    nonisolated private static func steamSessionProbeLabel(_ result: SteamSessionProbeResult) -> String {
+        switch result {
+        case .valid: return "valid"
+        case .guardCodeRequired: return "guardCodeRequired"
+        case .mobileConfirmationRequired: return "mobileConfirmationRequired"
+        case .reauthenticationRequired: return "reauthenticationRequired"
+        case .networkUnavailable: return "networkUnavailable"
+        case .unknown: return "unknown"
+        }
+    }
+
+    nonisolated private static func shouldProbeSteamSession(after error: WorkshopError) -> Bool {
+        switch error {
+        case .credentialsRequired,
+             .invalidCredentials,
+             .sessionExpired,
+             .loginTimeout,
+             .guardCodeRequired,
+             .confirmationRequired,
+             .timeout,
+             .downloadIncomplete:
+            return true
+        case .downloadFailed(let message):
+            return isSteamCMDNetworkFailureMessage(message)
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isSteamCMDNetworkFailure(_ error: WorkshopError) -> Bool {
+        switch error {
+        case .loginTimeout, .timeout:
+            return true
+        case .downloadIncomplete(let message), .downloadFailed(let message):
+            return isSteamCMDNetworkFailureMessage(message)
+        default:
+            return false
+        }
+    }
+
+    nonisolated private static func isSteamCMDNetworkFailureMessage(_ message: String) -> Bool {
+        let indicators = [
+            "Timeout",
+            "timed out",
+            "Could not connect",
+            "No Connection",
+            "Network is unreachable",
+            "No route to host",
+            "Connection refused",
+            "Unable to connect",
+            "Failed to connect",
+            "网络",
+            "连接 Steam"
+        ]
+        return indicators.contains { message.localizedCaseInsensitiveContains($0) }
+    }
+
+    nonisolated private static func workshopError(
+        for probe: SteamSessionProbeResult,
+        fallback: WorkshopError
+    ) -> WorkshopError {
+        switch probe {
+        case .valid:
+            switch fallback {
+            case .loginTimeout, .timeout:
+                return .downloadFailed(
+                    "Steam 登录状态正常，本次失败不是登录过期。当前网络未能完成 Workshop 下载，请稍后重试或切换网络。账号信息不会被清除。"
+                )
+            default:
+                return .downloadFailed(
+                    "Steam 登录状态正常，本次失败不是登录过期。\n\n\(fallback.localizedDescription)"
+                )
+            }
+        case .guardCodeRequired:
+            return .guardCodeRequired(
+                "Steam 要求 Guard 验证。请在设置中重新登录；验证码仅用于本次登录，不会保存。下载任务已保留，登录成功后将自动继续。"
+            )
+        case .mobileConfirmationRequired:
+            return .confirmationRequired(
+                "Steam 要求手机确认。请在设置中重新登录，并在 Steam App 中确认登录请求。下载任务已保留，登录成功后将自动继续。"
+            )
+        case .reauthenticationRequired:
+            return .sessionExpired
+        case .networkUnavailable(let detail):
+            return .downloadFailed(
+                "当前网络无法连接 Steam。账号信息不会被清除。\n\n\(detail)"
+            )
+        case .unknown(let detail):
+            return .downloadFailed(
+                "无法确认 Steam 会话是否失效，因此没有清除账号信息。请检查网络后重试；若仍失败，再到设置中重新登录。\n\nSteamCMD 会话探测信息：\n\(detail)"
+            )
+        }
+    }
+
+    nonisolated private static func configuredSteamCMDEnvironmentUsesProxy() -> Bool {
+        let proxyKeys = [
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy"
+        ]
+        if proxyKeys.contains(where: {
+            !(ProcessInfo.processInfo.environment[$0] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        }) {
+            return true
+        }
+
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: "proxy_enabled"),
+           let host = defaults.string(forKey: "proxy_host"), !host.isEmpty,
+           let port = Int(defaults.string(forKey: "proxy_port") ?? ""), port > 0 {
+            return true
+        }
+
+        return systemProxyEnvironmentForSteamCMD() != nil
+    }
+
+    nonisolated private static func steamCMDEnvironment(
+        steamcmdDirectory: URL,
+        route: SteamCMDNetworkRoute = .configured
+    ) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment["DYLD_LIBRARY_PATH"] = steamcmdDirectory.path
         environment["DYLD_FRAMEWORK_PATH"] = steamcmdDirectory.path
-        applySteamCMDProxyEnvironment(to: &environment)
+        switch route {
+        case .configured:
+            applySteamCMDProxyEnvironment(to: &environment)
+        case .direct:
+            removeSteamCMDProxyEnvironment(from: &environment)
+        }
         return environment
+    }
+
+    nonisolated private static func removeSteamCMDProxyEnvironment(
+        from environment: inout [String: String]
+    ) {
+        let keys = [
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "ftp_proxy"
+        ]
+        for key in keys {
+            environment.removeValue(forKey: key)
+        }
     }
 
     nonisolated private static func applySteamCMDProxyEnvironment(to environment: inout [String: String]) {
@@ -2511,12 +2915,22 @@ class WorkshopService: ObservableObject {
             let outputBox = VerifyOutputBox()
 
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
-                if let str = String(data: handle.availableData, encoding: .utf8) {
+                let data = handle.availableData
+                guard !data.isEmpty else {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let str = String(data: data, encoding: .utf8) {
                     outputBox.appendOutput(str)
                 }
             }
             errorPipe.fileHandleForReading.readabilityHandler = { handle in
-                if let str = String(data: handle.availableData, encoding: .utf8) {
+                let data = handle.availableData
+                guard !data.isEmpty else {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let str = String(data: data, encoding: .utf8) {
                     outputBox.appendError(str)
                 }
             }
@@ -2658,7 +3072,38 @@ class WorkshopService: ObservableObject {
                     }
 
                     if Self.isSteamLoginSuccessful(combinedOutput) {
-                        resumeBox.resume(returning: ())
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            let cachedSession = await self.probeSteamSession(
+                                username: username,
+                                route: .configured
+                            )
+                            switch cachedSession {
+                            case .valid:
+                                resumeBox.resume(returning: ())
+                            case .guardCodeRequired:
+                                resumeBox.resume(throwing: WorkshopError.guardCodeRequired(
+                                    "Steam 登录已完成，但缓存会话仍要求 Guard 验证。请重新输入最新验证码；验证码不会保存。"
+                                ))
+                            case .mobileConfirmationRequired:
+                                resumeBox.resume(throwing: WorkshopError.confirmationRequired(
+                                    "Steam 登录已完成，但缓存会话仍等待手机确认。请在 Steam App 中确认后重试。"
+                                ))
+                            case .reauthenticationRequired:
+                                resumeBox.resume(throwing: WorkshopError.steamLoginFailed(
+                                    "Steam 账号登录成功，但 SteamCMD 未能保存可复用的本地会话。请重试登录；密码不会保存。"
+                                ))
+                            case .networkUnavailable(let detail):
+                                resumeBox.resume(throwing: WorkshopError.loginTimeout)
+                                AppLogger.error(.download, "SteamCMD 缓存会话复核网络失败", metadata: [
+                                    "detail": detail
+                                ])
+                            case .unknown(let detail):
+                                resumeBox.resume(throwing: WorkshopError.steamLoginFailed(
+                                    "Steam 账号登录成功，但无法确认缓存会话是否可复用。\n\n\(detail)"
+                                ))
+                            }
+                        }
                         return
                     }
 
@@ -2704,6 +3149,36 @@ class WorkshopService: ObservableObject {
             return .notInstalled
         }
         return .ready
+    }
+
+    /// SteamCMD 会提前创建目标目录，但未完成时内容目录为空。
+    /// 因此只需确认目录中已经出现任意非隐藏、非空普通文件；
+    /// 不限制扩展名，以兼容 Web 壁纸的 HTML、JS、CSS 和图片资源。
+    nonisolated private static func isValidWorkshopDownload(at contentURL: URL) -> Bool {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: contentURL.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return false
+        }
+
+        guard let enumerator = fm.enumerator(
+            at: contentURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true,
+                  (values.fileSize ?? 0) > 0 else {
+                continue
+            }
+            return true
+        }
+        return false
     }
 
     /// 扫描并清理下载失败产生的空文件夹
@@ -2914,7 +3389,7 @@ private final class SteamWorkshopNetworkProgressMonitor: @unchecked Sendable {
               !isStopped,
               !isSampleInFlight,
               let processID = monitoredProcessID,
-              Date().timeIntervalSince(lastSampleRequestDate) >= 0.25 else {
+              Date().timeIntervalSince(lastSampleRequestDate) >= 1.0 else {
             lock.unlock()
             return
         }
@@ -3202,15 +3677,31 @@ enum WorkshopError: LocalizedError {
     case executionFailed(String)
     case workshopNotSupported
 
+    var requiresSteamLoginRecovery: Bool {
+        switch self {
+        case .credentialsRequired,
+             .invalidCredentials,
+             .sessionExpired,
+             .guardCodeRequired,
+             .confirmationRequired:
+            return true
+        default:
+            return false
+        }
+    }
+
     var errorDescription: String? {
         switch self {
         case .invalidURL: return "无效的链接"
         case .apiError(let msg): return msg
         case .steamcmdNotFound: return "SteamCMD 组件缺失，请重新安装应用"
-        case .credentialsRequired: return "需要登录 Steam 账号，请在设置中登录 SteamCMD"
-        case .invalidCredentials: return "Steam 账号或密码错误，或需要 Steam Guard 验证码"
+        case .credentialsRequired:
+            return "需要登录 Steam 账号。下载任务已保留，请在设置中登录；成功后将自动继续。"
+        case .invalidCredentials:
+            return "Steam 会话需要重新验证。下载任务已保留，请在设置中重新登录；密码和验证码不会保存。"
         case .steamLoginFailed(let msg): return msg
-        case .sessionExpired: return "Steam 登录已过期，请在设置中重新登录"
+        case .sessionExpired:
+            return "Steam 会话需要重新登录。下载任务已保留，登录成功后将自动继续；账号名不会被清除。"
         case .loginTimeout: return "Steam 登录超时，可能是网络不稳定或 Steam 服务器繁忙，请检查网络后重试"
         case .guardCodeRequired(let msg): return msg
         case .confirmationRequired(let msg): return msg

@@ -1502,6 +1502,11 @@ struct WallpaperExploreContentView: View {
             viewModel.puritySFW = true
             viewModel.puritySketchy = false
             viewModel.purityNSFW = false
+        } else if viewModel.currentSourceRequiresAPIKeyForNSFW && !viewModel.apiKeyConfigured {
+            viewModel.purityNSFW = false
+            if !viewModel.puritySFW && !viewModel.puritySketchy {
+                viewModel.puritySFW = true
+            }
         }
         fourKCategory = nil
         // 切换源时保留用户持久化过的各源排序，仅同步 UI 绑定
@@ -2190,7 +2195,10 @@ private enum PurityFilter: String, CaseIterable, Identifiable {
 private extension WallpaperExploreContentView {
     var visiblePurityFilters: [PurityFilter] {
         if !viewModel.currentSourceSupportsNSFW { return [.sfw] }
-        return viewModel.apiKeyConfigured ? Array(PurityFilter.allCases) : [.sfw, .sketchy]
+        if viewModel.currentSourceRequiresAPIKeyForNSFW && !viewModel.apiKeyConfigured {
+            return [.sfw, .sketchy]
+        }
+        return Array(PurityFilter.allCases)
     }
 
     var quickColorPresets: [WallhavenAPI.ColorPreset] {
@@ -2238,8 +2246,10 @@ private extension WallpaperExploreContentView {
     }
 
     func togglePurity(_ filter: PurityFilter) {
-        // Sketchy 和 NSFW 需要 API Key
-        if filter.requiresAPIKey && !viewModel.apiKeyConfigured {
+        // Wallhaven 的 NSFW 需要 API Key；Konachan 使用自己的分级与会话。
+        if filter.requiresAPIKey
+            && viewModel.currentSourceRequiresAPIKeyForNSFW
+            && !viewModel.apiKeyConfigured {
             // 使用异步触发 alert，避免阻塞当前点击事件处理
             DispatchQueue.main.async {
                 showAPIKeyAlert = true

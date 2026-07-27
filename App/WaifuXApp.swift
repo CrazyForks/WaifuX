@@ -289,7 +289,10 @@ struct WaifuXApp {
         } else if host.contains("pximg.net") {
             request.setValue("https://www.pixiv.net/", forHTTPHeaderField: "Referer")
         } else if isKonachan {
-            request.setValue("\(KonachanRequestConfiguration.siteURL.absoluteString)/", forHTTPHeaderField: "Referer")
+            request.setValue(
+                KonachanRequestConfiguration.referer(for: request.url),
+                forHTTPHeaderField: "Referer"
+            )
         }
     }
 }
@@ -532,7 +535,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             // 第2帧：权限和库数据
             DispatchQueue.main.async {
                 DownloadPathManager.shared.migrateLegacyCustomFolderPreferenceIfNeeded()
-                WorkshopSourceManager.shared.refreshStoredSteamCredentials()
+                WorkshopSourceManager.shared.refreshStoredSteamIdentity()
                 WorkshopSourceManager.shared.loadSteamProfileID()
                 WallpaperLibraryService.shared.restoreSavedData()
                 LibraryFolderStore.shared.restoreSavedData()

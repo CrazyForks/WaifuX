@@ -1201,6 +1201,8 @@ private struct DownloadProgressToast: View {
             return Color.white.opacity(0.7)
         case .downloading:
             return Color.white.opacity(0.85)
+        case .waitingForSteamLogin:
+            return Color.orange.opacity(0.9)
         case .paused:
             return Color.white.opacity(0.6)
         case .completed:
@@ -1227,6 +1229,7 @@ private struct DownloadProgressToast: View {
         switch snapshot.status {
         case .pending:   return t("status.pending")
         case .downloading: return t("status.downloading")
+        case .waitingForSteamLogin: return t("status.waitingForSteamLogin")
         case .paused:     return t("status.paused")
         case .completed:   return t("status.completed")
         case .failed:      return t("status.failed")
@@ -1255,7 +1258,9 @@ private struct DownloadProgressToast: View {
         snapshot.status == .failed || snapshot.status == .cancelled || snapshot.status == .paused
     }
     private var showsCancel: Bool {
-        snapshot.status == .pending || snapshot.status == .downloading
+        snapshot.status == .pending
+            || snapshot.status == .downloading
+            || snapshot.status == .waitingForSteamLogin
     }
 
     /// 进度条动画：平滑跟随（优化：更长的响应时间减少重绘频率）

@@ -1,12 +1,23 @@
 import Foundation
 import AppKit
 import Combine
+import ImageIO
 
 private let legacyCLIWebCapturePath = "/tmp/wallpaperengine-cli-capture.png"
 
 /// CLI daemon 的 per-screen 截图路径（与 wallpaperengine-cli.swift 中 primaryCapturePath(for:) 保持一致）
 private func legacyCLICapturePath(for screen: Int) -> String {
     return "/tmp/wallpaperengine-cli-capture-s\(screen).png"
+}
+
+/// Web 实时壁纸预热期间采集的海报候选。
+///
+/// 分数只用于避开全黑、过曝开场和低信息量转场帧；它不影响实时渲染本身。
+private struct WebPosterCaptureCandidate: Sendable {
+    let url: URL
+    let score: Double
+    let meanLuma: Double
+    let lumaVariance: Double
 }
 
 /// 与 wallpaperengine-cli daemon IPC 的音频控制消息
@@ -2033,9 +2044,9 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    /// Web daemon 可直接通过其 WKWebView 截图，无需生成临时 MP4。
+    /// Web daemon 可直接通过其 WKWebView 截图，无需生成临时 MP4 或音轨。
     ///
-    /// 仅在没有可播放离线烘焙视频时，等待 Web 页面完成异步资源加载后截取 canonical poster。
+    /// 仅在没有可播放离线烘焙视频时，先预热页面并采样多张无声截图，避开开场/转场帧后写入 canonical poster。
     private func scheduleWebPosterCapture(path: String, targetScreens: [NSScreen]) {
         let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
             startingAt: URL(fileURLWithPath: path)
@@ -2118,21 +2129,21 @@ final class WallpaperEngineXBridge: ObservableObject {
             return
         }
 
-        // 仅首次缺少 canonical poster 时，待页面完成异步资源加载后再截一帧。
-        // 所有静态消费方都只使用该 poster，绝不把 /tmp 中的 raw capture 直接设为系统壁纸。
-        let captureDelay: UInt64 = 6_000_000_000
+        // 不复用短 MP4 烘焙：海报不需要音频，直接向正在运行的 daemon 截图即可。
+        // 某些 Web 壁纸前数秒是白场/黑场/片头，预热后连续采样并选信息量最佳的一张。
+        let captureWarmup: UInt64 = 7_000_000_000
+        let sampleInterval: UInt64 = 1_500_000_000
+        let sampleCount = 4
+        let targetScreenIDs = Set(targetScreens.map(\.wallpaperScreenIdentifier))
         Task(priority: .utility) { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: captureDelay)
+                try await Task.sleep(nanoseconds: captureWarmup)
             } catch {
                 return
             }
 
             guard let self,
-                  self.activeRenderKind == .web,
-                  self.screenRenderStates.values.contains(where: {
-                      $0.renderKind == .web && $0.path == path
-                  }) else {
+                  self.isCurrentWebWallpaper(path: path, on: targetScreenIDs) else {
                 return
             }
 
@@ -2141,41 +2152,183 @@ final class WallpaperEngineXBridge: ObservableObject {
                 return
             }
 
-            do {
-                let status = try await Self.runLegacyCLIClientCommand(["capture", String(screenIndex)])
-                guard status == 0 else {
-                    print("[WallpaperEngineXBridge] Web poster capture command failed screen=\(screenIndex) exit=\(status)")
-                    return
+            let fileManager = FileManager.default
+            let sampleDirectory = fileManager.temporaryDirectory
+                .appendingPathComponent("WaifuX/WebPosterSamples", isDirectory: true)
+            let samplePrefix = "web-poster-\(UUID().uuidString)"
+            var sampleURLs: [URL] = []
+            defer {
+                for url in sampleURLs {
+                    try? fileManager.removeItem(at: url)
                 }
-
-                let captureURL = URL(fileURLWithPath: legacyCLICapturePath(for: screenIndex))
-                guard FileManager.default.fileExists(atPath: captureURL.path),
-                      let posterURL = await VideoThumbnailCache.shared.wallpaperEnginePosterJPEGFileURL(
-                          forImageFile: captureURL,
-                          itemID: cacheItemID,
-                          forceRegenerate: true
-                      ) else {
-                    print("[WallpaperEngineXBridge] Web poster capture output missing screen=\(screenIndex)")
-                    return
-                }
-
-                if let itemID = currentRecord?.item.id ?? record?.item.id {
-                    NotificationCenter.default.post(
-                        name: .sceneOfflineBakeThumbnailDidUpdate,
-                        object: itemID,
-                        userInfo: ["thumbnailURL": posterURL]
-                    )
-                }
-                await self.syncWebPosterToStaticTargets(
-                    posterURL,
-                    path: path,
-                    targetScreens: targetScreens
-                )
-                print("[WallpaperEngineXBridge] Web poster cached screen=\(screenIndex): \(posterURL.path)")
-            } catch {
-                print("[WallpaperEngineXBridge] Web poster capture failed screen=\(screenIndex): \(error.localizedDescription)")
             }
+
+            do {
+                try fileManager.createDirectory(at: sampleDirectory, withIntermediateDirectories: true)
+            } catch {
+                print("[WallpaperEngineXBridge] Web poster sample directory failed: \(error.localizedDescription)")
+                return
+            }
+
+            var bestCandidate: WebPosterCaptureCandidate?
+            for sampleIndex in 0..<sampleCount {
+                guard self.isCurrentWebWallpaper(path: path, on: targetScreenIDs),
+                      SceneOfflineBakeService.usableArtifact(
+                          from: self.webPosterRecord(for: contentRoot)
+                      ) == nil else {
+                    return
+                }
+
+                do {
+                    let status = try await Self.runLegacyCLIClientCommand(["capture", String(screenIndex)])
+                    guard status == 0 else {
+                        print("[WallpaperEngineXBridge] Web poster sample failed screen=\(screenIndex) exit=\(status)")
+                        continue
+                    }
+
+                    let captureURL = URL(fileURLWithPath: legacyCLICapturePath(for: screenIndex))
+                    guard fileManager.fileExists(atPath: captureURL.path) else {
+                        print("[WallpaperEngineXBridge] Web poster sample missing screen=\(screenIndex)")
+                        continue
+                    }
+
+                    let sampleURL = sampleDirectory.appendingPathComponent(
+                        "\(samplePrefix)-\(sampleIndex).png"
+                    )
+                    try? fileManager.removeItem(at: sampleURL)
+                    try fileManager.copyItem(at: captureURL, to: sampleURL)
+                    sampleURLs.append(sampleURL)
+
+                    let candidate = await Task.detached(priority: .utility) {
+                        Self.webPosterCaptureCandidate(for: sampleURL)
+                    }.value ?? WebPosterCaptureCandidate(
+                        url: sampleURL,
+                        score: 0,
+                        meanLuma: 0,
+                        lumaVariance: 0
+                    )
+                    if bestCandidate == nil || candidate.score > bestCandidate!.score {
+                        bestCandidate = candidate
+                    }
+                    print(
+                        "[WallpaperEngineXBridge] Web poster sample \(sampleIndex + 1)/\(sampleCount) "
+                            + "luma=\(String(format: "%.1f", candidate.meanLuma)) "
+                            + "variance=\(String(format: "%.1f", candidate.lumaVariance)) "
+                            + "score=\(String(format: "%.3f", candidate.score))"
+                    )
+                } catch {
+                    print("[WallpaperEngineXBridge] Web poster sample failed: \(error.localizedDescription)")
+                }
+
+                if sampleIndex + 1 < sampleCount {
+                    do {
+                        try await Task.sleep(nanoseconds: sampleInterval)
+                    } catch {
+                        return
+                    }
+                }
+            }
+
+            let finalRecord = self.webPosterRecord(for: contentRoot)
+            guard self.isCurrentWebWallpaper(path: path, on: targetScreenIDs),
+                  SceneOfflineBakeService.usableArtifact(from: finalRecord) == nil,
+                  let bestCandidate,
+                  let posterURL = await VideoThumbnailCache.shared.wallpaperEnginePosterJPEGFileURL(
+                      forImageFile: bestCandidate.url,
+                      itemID: cacheItemID,
+                      forceRegenerate: true
+                  ) else {
+                print("[WallpaperEngineXBridge] Web poster capture exhausted without a usable frame")
+                return
+            }
+
+            if let itemID = finalRecord?.item.id ?? currentRecord?.item.id ?? record?.item.id {
+                NotificationCenter.default.post(
+                    name: .sceneOfflineBakeThumbnailDidUpdate,
+                    object: itemID,
+                    userInfo: ["thumbnailURL": posterURL]
+                )
+            }
+            await self.syncWebPosterToStaticTargets(
+                posterURL,
+                path: path,
+                targetScreens: targetScreens
+            )
+            print(
+                "[WallpaperEngineXBridge] Web poster cached screen=\(screenIndex) "
+                    + "score=\(String(format: "%.3f", bestCandidate.score)): \(posterURL.path)"
+            )
         }
+    }
+
+    /// 对低分辨率副本计算亮度与方差。分数会惩罚几乎纯黑/纯白的片头、闪白和转场帧。
+    private nonisolated static func webPosterCaptureCandidate(for url: URL) -> WebPosterCaptureCandidate? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return nil
+        }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 160,
+            kCGImageSourceShouldCacheImmediately: false
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary
+        ) else {
+            return nil
+        }
+
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let didRender = pixels.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let context = CGContext(
+                      data: baseAddress,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                          | CGBitmapInfo.byteOrder32Big.rawValue
+                  ) else {
+                return false
+            }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard didRender else { return nil }
+
+        var lumaTotal = 0.0
+        var lumaSquaredTotal = 0.0
+        let pixelCount = width * height
+        for index in stride(from: 0, to: pixels.count, by: 4) {
+            let luma = 0.299 * Double(pixels[index])
+                + 0.587 * Double(pixels[index + 1])
+                + 0.114 * Double(pixels[index + 2])
+            lumaTotal += luma
+            lumaSquaredTotal += luma * luma
+        }
+
+        let meanLuma = lumaTotal / Double(pixelCount)
+        let lumaVariance = max(0, lumaSquaredTotal / Double(pixelCount) - meanLuma * meanLuma)
+        let contrastScore = min(1, sqrt(lumaVariance) / 56)
+        let darknessPenalty = min(1, max(0, (18 - meanLuma) / 18))
+        let brightnessPenalty = min(1, max(0, (meanLuma - 242) / 13))
+        let score = contrastScore * (1 - darknessPenalty) * (1 - brightnessPenalty)
+
+        return WebPosterCaptureCandidate(
+            url: url,
+            score: score,
+            meanLuma: meanLuma,
+            lumaVariance: lumaVariance
+        )
     }
 
     private func webPosterRecord(for contentRoot: URL) -> MediaDownloadRecord? {

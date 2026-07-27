@@ -84,13 +84,29 @@ struct KonachanPuritySelection: OptionSet, Sendable {
     static let all: KonachanPuritySelection = [.safe, .questionable, .explicit]
     static let safeOnly: KonachanPuritySelection = [.safe]
 
-    /// 转换为请求 tags 中的 rating 筛选标签数组
+    /// 转换为请求 tags 中的 rating 筛选标签数组。
+    ///
+    /// Konachan 的普通标签是 AND 语义，多个 `rating:` 不能直接并列。
+    /// 选中两个分级时排除第三个；全选或不筛选时不附加 rating 标签。
     var ratingTags: [String] {
-        var tags: [String] = []
-        if contains(.safe) { tags.append("rating:s") }
-        if contains(.questionable) { tags.append("rating:q") }
-        if contains(.explicit) { tags.append("rating:e") }
-        return tags
+        let ratings: [(selection: KonachanPuritySelection, value: String)] = [
+            (.safe, "s"),
+            (.questionable, "q"),
+            (.explicit, "e"),
+        ]
+        let selected = ratings.filter { contains($0.selection) }
+
+        switch selected.count {
+        case 1:
+            return ["rating:\(selected[0].value)"]
+        case 2:
+            guard let excluded = ratings.first(where: { !contains($0.selection) }) else {
+                return []
+            }
+            return ["-rating:\(excluded.value)"]
+        default:
+            return []
+        }
     }
 }
 
@@ -197,10 +213,12 @@ extension KonachanPost {
             small: normalizeURL(previewPath)
         )
 
+        let detailHost = rating.lowercased() == "e" ? "konachan.com" : "konachan.net"
+
         return Wallpaper(
             id: "konachan-\(id)",
             title: nil,
-            url: "https://konachan.net/post/show/\(id)",
+            url: "https://\(detailHost)/post/show/\(id)",
             shortUrl: nil,
             views: 0,
             favorites: score ?? 0,

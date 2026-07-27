@@ -15,8 +15,8 @@ actor KonachanService {
     private let networkService = NetworkService.shared
 
     /// 基础 URL
-    private let primaryBaseURL = "https://konachan.net"
-    private let fallbackBaseURL = "https://konachan.com"
+    private let safeBaseURL = "https://konachan.net"
+    private let matureBaseURL = "https://konachan.com"
 
     /// 请求限速：两次请求之间至少间隔的时间
     private let minimumRequestInterval: TimeInterval = 0.5
@@ -47,21 +47,18 @@ actor KonachanService {
             tags.append(query)
         }
 
-        // 添加 purity 筛选
-        let purityTags = purity.ratingTags
-        if purityTags.count == 1 {
-            // 单个 rating 直接添加
-            tags.append(contentsOf: purityTags)
-        } else if purityTags.count > 1 {
-            // 多个 rating: Moebooru 标签是 AND 语义，rating:s rating:q 可能无结果
-            // 保守策略：取第一个 rating 或使用默认 safe
-            tags.append("rating:s")
-        }
+        // 添加 purity 筛选。多选由 KonachanPuritySelection 转成排除标签。
+        tags.append(contentsOf: purity.ratingTags)
 
         // 添加排序
         if sorting.requiresOrderTag {
             tags.append(sorting.orderTag)
         }
+
+        // konachan.net 是安全版，不提供 explicit 帖子；只要允许 NSFW 就必须走 .com。
+        let includesExplicit = purity.contains(.explicit)
+        let primaryBaseURL = includesExplicit ? matureBaseURL : safeBaseURL
+        let fallbackBaseURL: String? = includesExplicit ? nil : matureBaseURL
 
         guard let primaryURL = buildURL(
             baseURL: primaryBaseURL,
@@ -71,16 +68,19 @@ actor KonachanService {
                 URLQueryItem(name: "page", value: "\(page)"),
                 URLQueryItem(name: "tags", value: tags.joined(separator: " "))
             ]
-        ), let fallbackURL = buildURL(
-            baseURL: fallbackBaseURL,
-            path: "/post.json",
-            queryItems: [
-                URLQueryItem(name: "limit", value: "\(perPage)"),
-                URLQueryItem(name: "page", value: "\(page)"),
-                URLQueryItem(name: "tags", value: tags.joined(separator: " "))
-            ]
         ) else {
             throw NetworkError.invalidResponse
+        }
+        let fallbackURL = fallbackBaseURL.flatMap {
+            buildURL(
+                baseURL: $0,
+                path: "/post.json",
+                queryItems: [
+                    URLQueryItem(name: "limit", value: "\(perPage)"),
+                    URLQueryItem(name: "page", value: "\(page)"),
+                    URLQueryItem(name: "tags", value: tags.joined(separator: " "))
+                ]
+            )
         }
 
         // 限速
@@ -157,7 +157,7 @@ actor KonachanService {
         }
 
         guard let primaryURL = buildURL(
-            baseURL: primaryBaseURL,
+            baseURL: safeBaseURL,
             path: "/tag.json",
             queryItems: [
                 URLQueryItem(name: "limit", value: "\(limit)"),
@@ -165,7 +165,7 @@ actor KonachanService {
                 URLQueryItem(name: "name", value: query)
             ]
         ), let fallbackURL = buildURL(
-            baseURL: fallbackBaseURL,
+            baseURL: matureBaseURL,
             path: "/tag.json",
             queryItems: [
                 URLQueryItem(name: "limit", value: "\(limit)"),
@@ -192,7 +192,7 @@ actor KonachanService {
     /// - Parameter limit: 返回数量，默认 6
     func fetchHotTags(limit: Int = 6) async throws -> [KonachanTag] {
         guard let primaryURL = buildURL(
-            baseURL: primaryBaseURL,
+            baseURL: safeBaseURL,
             path: "/tag.json",
             queryItems: [
                 URLQueryItem(name: "limit", value: "\(limit)"),
@@ -201,7 +201,7 @@ actor KonachanService {
                 URLQueryItem(name: "type", value: "0")
             ]
         ), let fallbackURL = buildURL(
-            baseURL: fallbackBaseURL,
+            baseURL: matureBaseURL,
             path: "/tag.json",
             queryItems: [
                 URLQueryItem(name: "limit", value: "\(limit)"),
@@ -220,14 +220,6 @@ actor KonachanService {
         )
     }
     // MARK: - Private
-
-    /// 默认请求头与 Konachan 登录 WebView 共享同一个 User-Agent。
-    ///
-    /// Cloudflare 的 `cf_clearance` 会绑定浏览器标识；两端不一致会导致
-    /// 用户完成验证后 API 仍被 challenge。
-    private var defaultHeaders: [String: String] {
-        KonachanRequestConfiguration.apiHeaders
-    }
 
     /// 限速控制：保证两次请求之间至少有 minimumRequestInterval 间隔
     private func enforceRateLimit() async {
@@ -248,35 +240,43 @@ actor KonachanService {
         return components.url
     }
 
-    /// 带域名回退的请求方法：优先使用 konachan.net，失败时再尝试 konachan.com。
+    /// 带可选域名回退的请求方法；explicit 查询只允许访问 konachan.com。
     private func fetchWithFallback<T: Decodable & Sendable>(
         _ type: T.Type,
         primaryURL: URL,
-        fallbackURL: URL
+        fallbackURL: URL?
     ) async throws -> T {
         do {
             return try await networkService.fetch(
                 T.self,
                 from: primaryURL,
-                headers: defaultHeaders
+                headers: KonachanRequestConfiguration.apiHeaders(for: primaryURL)
             )
         } catch {
+            guard let fallbackURL else {
+                throw translatedAccessError(error)
+            }
             print("[KonachanService] Primary API failed (\(primaryURL.host ?? "unknown")): \(error). Retrying fallback...")
             do {
                 return try await networkService.fetch(
                     T.self,
                     from: fallbackURL,
-                    headers: defaultHeaders
+                    headers: KonachanRequestConfiguration.apiHeaders(for: fallbackURL)
                 )
-            } catch let fallbackError as NetworkError {
-                if case .loginRequired = fallbackError {
-                    throw NetworkError.loginRequired(
-                        message: "Konachan 请求被 Cloudflare 拦截。请在「设置 → Konachan」完成登录或人机验证后重试。"
-                    )
-                }
-                throw fallbackError
+            } catch {
+                throw translatedAccessError(error)
             }
         }
+    }
+
+    private func translatedAccessError(_ error: Error) -> Error {
+        if let networkError = error as? NetworkError,
+           case .loginRequired = networkError {
+            return NetworkError.loginRequired(
+                message: "Konachan 请求被 Cloudflare 拦截。请在「设置 → Konachan」完成登录或人机验证后重试。"
+            )
+        }
+        return error
     }
 }
 

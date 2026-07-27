@@ -797,12 +797,12 @@ class WallpaperViewModel: ObservableObject {
 
     /// 通过 Konachan post ID 获取壁纸
     private func resolveKonachanWallpaperByID(_ id: String) async throws -> Wallpaper {
-        // purity rawValue=0：不附加 rating 标签，避免 id 精确查询被分级筛选误杀
+        // .all 不附加 rating 标签，并让服务从包含 explicit 帖子的 .com 查询。
         let response = try await KonachanService.shared.search(
             query: "id:\(id)",
             page: 1,
             perPage: 1,
-            purity: KonachanPuritySelection(rawValue: 0),
+            purity: .all,
             sorting: .dateAdded
         )
         if let wallpaper = response.data.first {
@@ -1494,6 +1494,11 @@ class WallpaperViewModel: ObservableObject {
         return sourceManager.currentSourceSupportsNSFW
     }
 
+    /// 只有 Wallhaven 的 NSFW 开关依赖 Wallhaven API Key。
+    var currentSourceRequiresAPIKeyForNSFW: Bool {
+        sourceManager.activeSource == .wallhaven
+    }
+
     /// 当前数据源是否支持 WallHaven 风格排序
     var currentSourceSupportsWallhavenSorting: Bool {
         sourceManager.currentSourceSupportsWallhavenSorting
@@ -1529,7 +1534,8 @@ class WallpaperViewModel: ObservableObject {
         // 第一位=SFW, 第二位=Sketchy, 第三位=NSFW
         let sfw = puritySFW ? 1 : 0
         let sketchy = puritySketchy ? 1 : 0
-        let nsfw = (apiKeyConfigured && purityNSFW) ? 1 : 0
+        let canIncludeNSFW = !currentSourceRequiresAPIKeyForNSFW || apiKeyConfigured
+        let nsfw = (canIncludeNSFW && purityNSFW) ? 1 : 0
 
         // 确保至少选择一个
         if sfw == 0 && sketchy == 0 && nsfw == 0 {
@@ -1669,7 +1675,7 @@ class WallpaperViewModel: ObservableObject {
         }
 
         let headers = wallpaper.source == "konachan"
-            ? KonachanRequestConfiguration.imageHeaders
+            ? KonachanRequestConfiguration.imageHeaders(for: downloadURL)
             : [:]
 
         return try await networkService.fetchImage(from: downloadURL, headers: headers) { progress in

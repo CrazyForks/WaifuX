@@ -495,7 +495,7 @@ struct SteamLoginSheet: View {
                     onLoginSuccess: { id in
                         // 到达订阅页面后保存 SteamID
                         workshopSourceManager.steamProfileID = id
-                        workshopSourceManager.refreshStoredSteamCredentials()
+                        workshopSourceManager.refreshStoredSteamIdentity()
                         isOnSubscriptionPage = true
                     }
                 )
@@ -554,7 +554,7 @@ struct SteamLoginSheet: View {
                             await transferSteamCookiesToSharedStorage()
                             if !steamID.isEmpty {
                                 workshopSourceManager.steamProfileID = steamID
-                                workshopSourceManager.refreshStoredSteamCredentials()
+                                workshopSourceManager.refreshStoredSteamIdentity()
                             }
                             isPresented = false
                         }

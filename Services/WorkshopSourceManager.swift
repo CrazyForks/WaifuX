@@ -135,9 +135,13 @@ class WorkshopSourceManager: ObservableObject {
         }
     }
 
-    // MARK: - SteamCMD 凭证（本地明文存储）
+    // MARK: - SteamCMD 账号标识
 
-    struct SteamCredentials: Codable {
+    struct SteamIdentity: Codable, Equatable {
+        let username: String
+    }
+
+    private struct LegacySteamCredentials: Codable {
         let username: String
         let password: String
         let guardCode: String?
@@ -150,46 +154,48 @@ class WorkshopSourceManager: ObservableObject {
         case failure(String)
     }
 
-    // 本地明文存储 key
-    private let localCredentialsKey = "workshop_steam_credentials_plaintext"
+    private let localIdentityKey = "workshop_steam_identity_v1"
+    private let legacyCredentialsKey = "workshop_steam_credentials_plaintext"
 
-    @Published private(set) var steamCredentials: SteamCredentials?
+    @Published private(set) var steamIdentity: SteamIdentity?
     @Published private(set) var steamCredentialState: SteamCredentialState = .unknown
     @Published private(set) var steamCMDLastSetupError: String?
 
-    /// 仅检查本地是否存有凭据，不验证 SteamCMD 会话是否仍然有效
-    var hasStoredSteamCredentials: Bool {
-        steamCredentials != nil
+    /// 仅检查本地是否保存过账号名，不代表 SteamCMD 会话仍然有效。
+    var hasStoredSteamIdentity: Bool {
+        steamIdentity != nil
     }
 
-    func setSteamCredentials(username: String, password: String, guardCode: String? = nil) {
-        let credentials = SteamCredentials(username: username, password: password, guardCode: guardCode)
-        persistCredentialsLocally(credentials)
+    var storedSteamUsername: String? {
+        steamIdentity?.username
     }
 
-    /// 更新 guardCode（手机确认登录后 guardCode 为 nil，此方法此时为空操作）
-    func updateGuardCode(_ guardCode: String?) {
-        guard let current = steamCredentials else { return }
-        let updated = SteamCredentials(username: current.username, password: current.password, guardCode: guardCode)
-        persistCredentialsLocally(updated)
+    func setSteamIdentity(username: String) {
+        let normalized = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            steamCredentialState = .failure("Steam 用户名不能为空。")
+            return
+        }
+        persistIdentityLocally(SteamIdentity(username: normalized))
     }
 
-    func clearSteamCredentials() {
-        UserDefaults.standard.removeObject(forKey: localCredentialsKey)
-        steamCredentials = nil
+    func clearSteamIdentity() {
+        UserDefaults.standard.removeObject(forKey: localIdentityKey)
+        UserDefaults.standard.removeObject(forKey: legacyCredentialsKey)
+        steamIdentity = nil
         steamCredentialState = .missing
     }
 
-    func refreshStoredSteamCredentials() {
-        switch loadStoredCredentials() {
-        case .success(let credentials):
-            steamCredentials = credentials
-            steamCredentialState = .available(username: credentials.username)
+    func refreshStoredSteamIdentity() {
+        switch loadStoredIdentity() {
+        case .success(let identity):
+            steamIdentity = identity
+            steamCredentialState = .available(username: identity.username)
         case .missing:
-            steamCredentials = nil
+            steamIdentity = nil
             steamCredentialState = .missing
         case .failure(let message):
-            steamCredentials = nil
+            steamIdentity = nil
             steamCredentialState = .failure(message)
         }
     }
@@ -352,30 +358,44 @@ class WorkshopSourceManager: ObservableObject {
 
     // MARK: - 本地存储操作
 
-    private enum LocalCredentialLoadResult {
-        case success(SteamCredentials)
+    private enum LocalIdentityLoadResult {
+        case success(SteamIdentity)
         case missing
         case failure(String)
     }
 
-    private func loadStoredCredentials() -> LocalCredentialLoadResult {
-        guard let data = UserDefaults.standard.data(forKey: localCredentialsKey) else {
+    private func loadStoredIdentity() -> LocalIdentityLoadResult {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: localIdentityKey) {
+            guard let identity = try? JSONDecoder().decode(SteamIdentity.self, from: data) else {
+                return .failure("本地 Steam 账号信息已损坏，请重新登录。")
+            }
+            return .success(identity)
+        }
+
+        guard let legacyData = defaults.data(forKey: legacyCredentialsKey) else {
             return .missing
         }
-        guard let creds = try? JSONDecoder().decode(SteamCredentials.self, from: data) else {
-            return .failure("本地账号数据已损坏，请重新保存账号。")
+        guard let legacy = try? JSONDecoder().decode(LegacySteamCredentials.self, from: legacyData) else {
+            defaults.removeObject(forKey: legacyCredentialsKey)
+            return .failure("旧版 Steam 账号数据已损坏，请重新登录。")
         }
-        return .success(creds)
+
+        let identity = SteamIdentity(username: legacy.username)
+        persistIdentityLocally(identity)
+        defaults.removeObject(forKey: legacyCredentialsKey)
+        AppLogger.info(.media, "已迁移 SteamCMD 账号并删除旧版明文密码")
+        return .success(identity)
     }
 
-    private func persistCredentialsLocally(_ credentials: SteamCredentials) {
-        guard let data = try? JSONEncoder().encode(credentials) else {
+    private func persistIdentityLocally(_ identity: SteamIdentity) {
+        guard let data = try? JSONEncoder().encode(identity) else {
             steamCredentialState = .failure("账号数据编码失败，请重试。")
             return
         }
-        UserDefaults.standard.set(data, forKey: localCredentialsKey)
-        steamCredentials = credentials
-        steamCredentialState = .available(username: credentials.username)
+        UserDefaults.standard.set(data, forKey: localIdentityKey)
+        steamIdentity = identity
+        steamCredentialState = .available(username: identity.username)
     }
 
     // MARK: - SteamCMD 路径管理
@@ -689,6 +709,7 @@ class WorkshopSourceManager: ObservableObject {
     private init() {
         activeSource = .motionBG
         restoreState()
+        refreshStoredSteamIdentity()
     }
 
     /// 恢复持久化状态
@@ -747,9 +768,9 @@ class WorkshopSourceManager: ObservableObject {
         return FileManager.default.fileExists(atPath: dir.appendingPathComponent("steamcmd.sh").path)
     }
 
-    /// 是否已通过 SteamCMD 凭证配置
+    /// 是否已保存 SteamCMD 用户名。真实会话状态由 session probe 判断。
     var isSteamAuthenticated: Bool {
-        hasStoredSteamCredentials
+        hasStoredSteamIdentity
     }
 }
 
@@ -757,4 +778,5 @@ class WorkshopSourceManager: ObservableObject {
 
 extension Notification.Name {
     static let workshopSourceChanged = Notification.Name("workshopSourceChanged")
+    static let steamWorkshopLoginRequired = Notification.Name("steamWorkshopLoginRequired")
 }

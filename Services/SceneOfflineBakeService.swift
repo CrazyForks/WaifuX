@@ -1903,7 +1903,8 @@ enum SceneOfflineBakeService {
         return true
     }
 
-    /// 与 `MediaDownloadRecord.sceneBakeEligibility` 配套；默认主屏逻辑分辨率 × scale。
+    /// 优先使用 `MediaDownloadRecord.sceneBakeEligibility`；缺失时在实际烘焙前现场分析。
+    /// 默认主屏逻辑分辨率 × scale。
     /// FPS 默认值取自用户设置 `scene_bake_fps`（回退 30），且不超过显示器最高刷新率。
     static func bake(
         record: MediaDownloadRecord,
@@ -1920,10 +1921,41 @@ enum SceneOfflineBakeService {
             let saved = UserDefaults.standard.double(forKey: "scene_bake_duration")
             effectiveDuration = saved >= 5 ? min(max(saved, 5), 60) : 15
         }
-        guard let eligibility = record.sceneBakeEligibility else {
-            throw SceneOfflineBakeError.ineligible
+        let eligibility: SceneBakeEligibilitySnapshot
+        let contentRoot: URL
+        if let existing = record.sceneBakeEligibility {
+            eligibility = existing
+            contentRoot = URL(fileURLWithPath: existing.contentRootPath)
+        } else {
+            let resolvedRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
+                startingAt: record.localFileURL
+            )
+            guard SceneBakeEligibilityAnalyzer.sceneContentRootIfEligibleForAnalysis(
+                localFileURL: resolvedRoot
+            ) != nil else {
+                throw SceneOfflineBakeError.ineligible
+            }
+            guard SystemMemoryPressure.hasRoomForSceneOfflineBake() else {
+                throw SceneOfflineBakeError.insufficientMemory
+            }
+
+            eligibility = try await Task.detached(priority: .userInitiated) {
+                try SceneBakeEligibilityAnalyzer.analyze(
+                    contentRoot: resolvedRoot,
+                    intent: .desktopLoop,
+                    strict: false
+                )
+            }.value
+            contentRoot = resolvedRoot
+
+            await MainActor.run {
+                MediaLibraryService.shared.attachSceneBakeEligibility(
+                    itemID: record.item.id,
+                    snapshot: eligibility,
+                    triggerAutoBake: false
+                )
+            }
         }
-        let contentRoot = URL(fileURLWithPath: eligibility.contentRootPath)
         return try await bake(
             eligibility: eligibility,
             contentRoot: contentRoot,

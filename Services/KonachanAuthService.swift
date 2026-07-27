@@ -9,29 +9,43 @@ enum KonachanRequestConfiguration {
     static let browserUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
 
-    static let siteURL = URL(string: "https://konachan.net")!
-    static let loginURL = URL(string: "https://konachan.net/user/login")!
+    static let safeSiteURL = URL(string: "https://konachan.net")!
+    static let matureSiteURL = URL(string: "https://konachan.com")!
+    static let siteURL = safeSiteURL
+    // 成人内容只存在于 .com；默认在该域完成登录 / Cloudflare 验证。
+    static let loginURL = URL(string: "https://konachan.com/user/login")!
     static let cookieDomains = ["konachan.net", "konachan.com"]
 
-    static var apiHeaders: [String: String] {
-        [
+    static func siteURL(for requestURL: URL?) -> URL {
+        requestURL?.host?.lowercased().contains("konachan.com") == true
+            ? matureSiteURL
+            : safeSiteURL
+    }
+
+    static func referer(for requestURL: URL?) -> String {
+        "\(siteURL(for: requestURL).absoluteString)/"
+    }
+
+    static func apiHeaders(for requestURL: URL) -> [String: String] {
+        let requestSiteURL = siteURL(for: requestURL)
+        return [
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,ja;q=0.6",
             "User-Agent": browserUserAgent,
-            "Referer": "\(siteURL.absoluteString)/",
-            "Origin": siteURL.absoluteString,
+            "Referer": "\(requestSiteURL.absoluteString)/",
+            "Origin": requestSiteURL.absoluteString,
             "Connection": "keep-alive",
             "DNT": "1"
         ]
     }
 
-    static var imageHeaders: [String: String] {
+    static func imageHeaders(for requestURL: URL) -> [String: String] {
         [
             "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7,ja;q=0.6",
             "User-Agent": browserUserAgent,
-            "Referer": "\(siteURL.absoluteString)/"
+            "Referer": referer(for: requestURL)
         ]
     }
 

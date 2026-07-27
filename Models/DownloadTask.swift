@@ -3,6 +3,7 @@ import Foundation
 enum DownloadStatus: String, Codable {
     case pending
     case downloading
+    case waitingForSteamLogin
     case paused
     case completed
     case failed
@@ -23,7 +24,7 @@ struct DownloadTask: Identifiable, Codable {
     var workshopItem: MediaItem?  // Workshop 转换后的 MediaItem
     var workshopID: String?        // 原始 Workshop ID
     var progress: Double           // 0.0 - 1.0
-    var status: DownloadStatus     // pending, downloading, paused, completed, failed, cancelled
+    var status: DownloadStatus     // pending, downloading, waitingForSteamLogin, paused, completed, failed, cancelled
     let createdAt: Date
     var completedAt: Date?
     var lastUpdatedAt: Date
@@ -133,11 +134,11 @@ struct DownloadTask: Identifiable, Codable {
     }
 
     var isRunning: Bool {
-        status == .pending || status == .downloading
+        status == .pending || status == .downloading || status == .waitingForSteamLogin
     }
 
     var shouldAppearInLibrary: Bool {
-        status == .pending || status == .downloading || status == .paused
+        status == .pending || status == .downloading || status == .waitingForSteamLogin || status == .paused
     }
 
     var isTerminal: Bool {

@@ -1318,6 +1318,409 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         forMainFrameOnly: false
     )
 
+    /// Offline bake must never route Web audio to the user's output device. The companion
+    /// capture script taps media-element PCM before the zero-output processor branch.
+    private static let offlineBakeAudioSilenceStateScript = WKUserScript(
+        source: """
+        (function() {
+          window.__waifuxAudioMuted = true;
+          window.__waifuxAudioVolume = 1.0;
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
+    /// Records media-element audio into a Web Audio stream that has no hardware output.
+    /// After bake, WebKit decodes the recorded Blob back to PCM for the native AAC writer.
+    /// MediaRecorder pause/resume excludes the slow snapshot intervals from the audio timeline.
+    private static let offlineBakeAudioCaptureScript = WKUserScript(
+        source: """
+        (function() {
+          'use strict';
+          if (window.__wxBakeAudio) return;
+
+          var context = null;
+          var streamDestination = null;
+          var recorder = null;
+          var recorderChunks = [];
+          var captureEnabled = false;
+          var observer = null;
+          var installed = false;
+          var originalPlay = null;
+          var originalPause = null;
+          var attachedMediaCount = 0;
+          var failedMediaCount = 0;
+          var realSetTimeout = window.setTimeout.bind(window);
+
+          function post(message) {
+            try {
+              var bridge = window.webkit && window.webkit.messageHandlers
+                && window.webkit.messageHandlers.waifuxOfflineBakeAudio;
+              if (bridge && typeof bridge.postMessage === 'function') bridge.postMessage(message);
+            } catch (e) {}
+          }
+
+          function postPCM(buffer) {
+            try {
+              var frames = buffer.length | 0;
+              if (frames <= 0) return;
+              var left = buffer.getChannelData(0);
+              var right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+              var packetFrames = 16384;
+              for (var start = 0; start < frames; start += packetFrames) {
+                var count = Math.min(packetFrames, frames - start);
+                var bytes = new Uint8Array(count * 4);
+                var view = new DataView(bytes.buffer);
+                for (var i = 0; i < count; i++) {
+                  var l = Math.max(-1, Math.min(1, Number(left[start + i]) || 0));
+                  var r = Math.max(-1, Math.min(1, Number(right[start + i]) || 0));
+                  view.setInt16(i * 4, l < 0 ? Math.round(l * 32768) : Math.round(l * 32767), true);
+                  view.setInt16(i * 4 + 2, r < 0 ? Math.round(r * 32768) : Math.round(r * 32767), true);
+                }
+                var binary = '';
+                var stringChunk = 0x8000;
+                for (var offset = 0; offset < bytes.length; offset += stringChunk) {
+                  binary += String.fromCharCode.apply(
+                    null,
+                    bytes.subarray(offset, Math.min(bytes.length, offset + stringChunk))
+                  );
+                }
+                post({
+                  type: 'pcm',
+                  sampleRate: Number(buffer.sampleRate) || 48000,
+                  channels: 2,
+                  data: btoa(binary)
+                });
+              }
+            } catch (e) {}
+          }
+
+          function ensureContext() {
+            if (context) return context;
+            var Ctor = window.__waifuxOriginalAudioContext
+              || window.AudioContext || window.webkitAudioContext;
+            if (!Ctor) return null;
+            try {
+              context = new Ctor({ sampleRate: 48000 });
+            } catch (e) {
+              try { context = new Ctor(); } catch (e2) { context = null; }
+            }
+            if (!context) return null;
+
+            try {
+              streamDestination = context.createMediaStreamDestination();
+            } catch (e) {
+              context = null;
+              streamDestination = null;
+              return null;
+            }
+            return context;
+          }
+
+          function ensureRecorder() {
+            var ctx = ensureContext();
+            if (!ctx || !streamDestination || typeof MediaRecorder !== 'function') return null;
+            if (recorder) return recorder;
+            try {
+              recorder = new MediaRecorder(streamDestination.stream);
+              recorder.addEventListener('dataavailable', function(event) {
+                if (event.data && event.data.size > 0) recorderChunks.push(event.data);
+              });
+              recorder.addEventListener('stop', function() {
+                var blob = new Blob(recorderChunks, {
+                  type: recorder.mimeType || 'audio/webm'
+                });
+                recorderChunks = [];
+                if (!blob || blob.size <= 0) {
+                  post({ type: 'end', sampleRate: Number(ctx.sampleRate) || 48000, channels: 2 });
+                  return;
+                }
+                blob.arrayBuffer()
+                  .then(function(bytes) {
+                    var DecodeCtor = window.__waifuxOriginalAudioContext
+                      || window.AudioContext || window.webkitAudioContext;
+                    var decoder = new DecodeCtor({ sampleRate: 48000 });
+                    return decoder.decodeAudioData(bytes).then(function(buffer) {
+                      try { if (decoder && decoder.close) decoder.close(); } catch (e) {}
+                      return buffer;
+                    }, function(error) {
+                      try { if (decoder && decoder.close) decoder.close(); } catch (e) {}
+                      throw error;
+                    });
+                  })
+                  .then(function(buffer) {
+                    postPCM(buffer);
+                    post({
+                      type: 'end',
+                      sampleRate: Number(buffer.sampleRate) || 48000,
+                      channels: 2
+                    });
+                  })
+                  .catch(function() {
+                    post({ type: 'end', sampleRate: Number(ctx.sampleRate) || 48000, channels: 2 });
+                  });
+              });
+            } catch (e) {
+              recorder = null;
+            }
+            return recorder;
+          }
+
+          function anyMediaPlaying() {
+            try {
+              return Array.prototype.some.call(
+                document.querySelectorAll('video,audio'),
+                function(el) { return !!el.__wxBakeAudioSource && !el.paused; }
+              );
+            } catch (e) {
+              return false;
+            }
+          }
+
+          function updateRecorderState() {
+            if (!captureEnabled) return;
+            var activeRecorder = ensureRecorder();
+            if (!activeRecorder) return;
+            var shouldRecord = anyMediaPlaying();
+            try {
+              if (shouldRecord && activeRecorder.state === 'inactive') {
+                activeRecorder.start();
+              } else if (shouldRecord && activeRecorder.state === 'paused') {
+                activeRecorder.resume();
+              } else if (!shouldRecord && activeRecorder.state === 'recording') {
+                activeRecorder.pause();
+              }
+            } catch (e) {}
+          }
+
+          function attachMediaElement(el) {
+            if (!el || el.__wxBakeAudioSource) return;
+            var ctx = ensureContext();
+            if (!ctx || !streamDestination) {
+              try { el.muted = true; } catch (e) {}
+              return;
+            }
+            try {
+              var source = ctx.createMediaElementSource(el);
+              source.connect(streamDestination);
+              Object.defineProperty(el, '__wxBakeAudioSource', {
+                value: source, configurable: false
+              });
+              attachedMediaCount += 1;
+              el.addEventListener('play', function() { realSetTimeout(updateRecorderState, 0); });
+              el.addEventListener('pause', function() { realSetTimeout(updateRecorderState, 0); });
+              el.addEventListener('ended', function() { realSetTimeout(updateRecorderState, 0); });
+            } catch (e) {
+              // A page may already own this media element's source node. Silence it rather
+              // than risking speaker leakage; the bake remains valid but has no PCM for it.
+              try { el.muted = true; } catch (e2) {}
+              failedMediaCount += 1;
+            }
+          }
+
+          function attachTree(root) {
+            try {
+              if (root && root instanceof HTMLMediaElement) attachMediaElement(root);
+              var nodes = root && root.querySelectorAll
+                ? root.querySelectorAll('video,audio') : document.querySelectorAll('video,audio');
+              for (var i = 0; nodes && i < nodes.length; i++) attachMediaElement(nodes[i]);
+            } catch (e) {}
+          }
+
+          function install() {
+            if (installed) return;
+            installed = true;
+            originalPlay = HTMLMediaElement.prototype.play;
+            originalPause = HTMLMediaElement.prototype.pause;
+            HTMLMediaElement.prototype.play = function() {
+              attachMediaElement(this);
+              var ctx = ensureContext();
+              try {
+                if (ctx && ctx.state === 'suspended') {
+                  var p = ctx.resume();
+                  if (p && typeof p.catch === 'function') p.catch(function(){});
+                }
+              } catch (e) {}
+              var result = originalPlay.apply(this, arguments);
+              realSetTimeout(updateRecorderState, 0);
+              return result;
+            };
+            HTMLMediaElement.prototype.pause = function() {
+              var result = originalPause.apply(this, arguments);
+              realSetTimeout(updateRecorderState, 0);
+              return result;
+            };
+
+            var srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+            if (srcDesc && srcDesc.set) {
+              Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                get: srcDesc.get,
+                set: function(value) {
+                  srcDesc.set.call(this, value);
+                  attachMediaElement(this);
+                },
+                configurable: true
+              });
+            }
+
+            var originalSetAttribute = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+              var result = originalSetAttribute.apply(this, arguments);
+              if (this instanceof HTMLMediaElement && String(name).toLowerCase() === 'src') {
+                attachMediaElement(this);
+              }
+              return result;
+            };
+
+            function beginObservation() {
+              attachTree(document);
+              try {
+                observer = new MutationObserver(function(records) {
+                  for (var i = 0; i < records.length; i++) {
+                    for (var j = 0; j < records[i].addedNodes.length; j++) {
+                      attachTree(records[i].addedNodes[j]);
+                    }
+                  }
+                });
+                observer.observe(document.documentElement || document, { childList: true, subtree: true });
+              } catch (e) {}
+            }
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', beginObservation, { once: true });
+            } else {
+              beginObservation();
+            }
+          }
+
+          window.__wxBakeAudio = {
+            isOfflineBake: true,
+            prepare: function() {
+              install();
+              attachTree(document);
+              var ctx = ensureContext();
+              try {
+                if (ctx && ctx.state === 'suspended') {
+                  var p = ctx.resume();
+                  if (p && typeof p.catch === 'function') p.catch(function(){});
+                }
+              } catch (e) {}
+              return ctx ? (Number(ctx.sampleRate) || 48000) : 48000;
+            },
+            start: function() {
+              var rate = this.prepare();
+              captureEnabled = true;
+              updateRecorderState();
+              post({ type: 'start', sampleRate: rate, channels: 2 });
+              try {
+                var media = Array.prototype.slice.call(document.querySelectorAll('video,audio')).map(function(el) {
+                  return {
+                    id: String(el.id || ''),
+                    muted: !!el.muted,
+                    volume: Number(el.volume || 0),
+                    readyState: Number(el.readyState || 0),
+                    attached: !!el.__wxBakeAudioSource
+                  };
+                });
+                post({
+                  type: 'debug',
+                  attachedMediaCount: attachedMediaCount,
+                  failedMediaCount: failedMediaCount,
+                  mediaJSON: JSON.stringify(media)
+                });
+              } catch (e) {}
+              return rate;
+            },
+            stop: function() {
+              captureEnabled = false;
+              try {
+                if (recorder && recorder.state !== 'inactive') {
+                  recorder.stop();
+                } else {
+                  post({
+                    type: 'end',
+                    sampleRate: context ? (Number(context.sampleRate) || 48000) : 48000,
+                    channels: 2
+                  });
+                }
+              } catch (e) {
+                post({
+                  type: 'end',
+                  sampleRate: context ? (Number(context.sampleRate) || 48000) : 48000,
+                  channels: 2
+                });
+              }
+              return true;
+            }
+          };
+
+          install();
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
+    /// Silences physical HTML media output from document start, while preserving the media
+    /// element's original muted state and volume for native-side audio mux planning.
+    private static let offlineBakeSilentMediaScript = WKUserScript(
+        source: """
+        (function() {
+          'use strict';
+          if (window.__wxBakeSilentMediaInstalled) return;
+          window.__wxBakeSilentMediaInstalled = true;
+
+          function silence(el) {
+            try {
+              if (typeof el.__wxBakeOriginalMuted !== 'boolean') {
+                el.__wxBakeOriginalMuted = !!el.muted;
+              }
+              el.defaultMuted = true;
+              el.muted = true;
+            } catch (e) {}
+          }
+
+          function silenceAll() {
+            try { document.querySelectorAll('video,audio').forEach(silence); } catch (e) {}
+          }
+
+          var originalPlay = HTMLMediaElement.prototype.play;
+          HTMLMediaElement.prototype.play = function() {
+            silence(this);
+            return originalPlay.apply(this, arguments);
+          };
+
+          var srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+          if (srcDesc && srcDesc.set) {
+            Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+              get: srcDesc.get,
+              set: function(value) {
+                srcDesc.set.call(this, value);
+                silence(this);
+              },
+              configurable: true
+            });
+          }
+
+          function observe() {
+            silenceAll();
+            try {
+              var observer = new MutationObserver(silenceAll);
+              observer.observe(document.documentElement || document, { childList: true, subtree: true });
+            } catch (e) {}
+          }
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', observe, { once: true });
+          } else {
+            observe();
+          }
+          window.__wxBakeSilenceAllMedia = silenceAll;
+        })();
+        """,
+        injectionTime: .atDocumentStart,
+        forMainFrameOnly: false
+    )
+
     /// documentStart 注入：包装 AudioContext / webkitAudioContext，把 ctx.destination 路由到一个
     /// master GainNode；同时维护 window.__waifuxAudioMuted / __waifuxAudioVolume 状态，
     /// 暴露 window.__waifuxSetAudio({muted?, volume?}) 供 native 通过 evaluateJavaScript 调用。
@@ -1329,6 +1732,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             'use strict';
             var ACtor = window.AudioContext || window.webkitAudioContext;
             if (!ACtor) return;
+            try {
+                if (!window.__waifuxOriginalAudioContext) {
+                    window.__waifuxOriginalAudioContext = ACtor;
+                }
+            } catch (_) {}
 
             if (typeof window.__waifuxAudioVolume !== 'number') {
                 window.__waifuxAudioVolume = 1.0;
@@ -1339,6 +1747,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             var wrappedRefs = [];
 
             function effectiveVolume() {
+                if (window.__wxBakeAudio && window.__wxBakeAudio.isOfflineBake) {
+                    return 0;
+                }
                 return window.__waifuxAudioMuted ? 0 : window.__waifuxAudioVolume;
             }
 
@@ -1481,9 +1892,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     /// 每个屏幕独立的 Web 渲染状态
     private struct ScreenState {
         var window: NSWindow?
-        /// 离线烘焙期间覆盖在渲染窗口之上的桌面静帧。
-        /// 底层窗口仍保持 WindowServer 合成，SCStream 仅抓取底层窗口。
-        var bakeShieldWindow: NSWindow?
         /// 仅裁切容器裁掉超出 viewport 的区域，WebView 本身始终保留完整逻辑尺寸。
         var cropContainer: NSView?
         var webView: WKWebView?
@@ -1493,6 +1901,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         var pendingCompletion: ((Bool) -> Void)?
         var extractedPKGDir: URL?
         var mergedDependencyDir: URL?
+        var projectContentDir: URL?
         var injectedPropertiesJSON: String?
         /// 每次 load/stop 递增。离线烘焙 settle 与 30s 超时回调必须比对 generation，
         /// 否则旧 load 的 asyncAfter 会误杀后续 set 的 pendingCompletion（exit=1 竞态）。
@@ -1519,54 +1928,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         /// 连续多少次「近似」后认为加载动画结束
         static let stablePassesRequired: Int = 2
         static let thumbDimension: Int = 48
-    }
-
-    /// WebKit 会在窗口未参与合成时节流视频解码。离线烘焙因此必须把渲染窗口
-    /// 保持在桌面层，但用系统桌面壁纸盖住它。不要截取整块显示器，否则窗口移动、
-    /// 桌面图标或通知会留下旧画面的残影，看起来像用户桌面被冻住。
-    private func makeOfflineBakeShield(for screen: NSScreen) -> NSWindow? {
-        let desktopImage: NSImage?
-        if let desktopURL = NSWorkspace.shared.desktopImageURL(for: screen),
-           let image = NSImage(contentsOf: desktopURL) {
-            desktopImage = image
-        } else if let screenNumber = screen.deviceDescription[
-            NSDeviceDescriptionKey("NSScreenNumber")
-        ] as? NSNumber,
-        let image = CGDisplayCreateImage(CGDirectDisplayID(screenNumber.uint32Value)) {
-            // Fallback only for unusual desktop providers without a readable image URL.
-            desktopImage = NSImage(cgImage: image, size: screen.frame.size)
-        } else {
-            dlog("[WebRendererBridge] Failed to resolve desktop image for offline bake shield")
-            return nil
-        }
-
-        let shield = NSWindow(
-            contentRect: screen.frame,
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false
-        )
-        let desktopLevel = CGWindowLevelForKey(.desktopWindow)
-        shield.level = .init(rawValue: Int(desktopLevel) + 2)
-        shield.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        shield.isOpaque = true
-        shield.backgroundColor = .black
-        shield.hasShadow = false
-        shield.ignoresMouseEvents = true
-        shield.isReleasedWhenClosed = false
-        shield.setFrame(screen.frame, display: false)
-
-        guard let contentView = shield.contentView else {
-            shield.close()
-            return nil
-        }
-        let imageView = NSImageView(frame: contentView.bounds)
-        imageView.image = desktopImage
-        imageView.imageScaling = .scaleAxesIndependently
-        imageView.imageAlignment = .alignCenter
-        imageView.autoresizingMask = [.width, .height]
-        contentView.addSubview(imageView)
-        return shield
     }
 
     func loadWallpaper(
@@ -1640,6 +2001,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
         screenStates[screenIdx]?.injectedPropertiesJSON = userPropertiesJSON
             ?? readWebWallpaperUserPropertiesJSON(contentDir: baseURL)
+        screenStates[screenIdx]?.projectContentDir = baseURL
         if screenStates[screenIdx]?.injectedPropertiesJSON != nil {
             dlog("[WebRendererBridge] Loaded user properties for injection")
         }
@@ -1669,16 +2031,60 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             defer: false
         )
         let desktopLevel = CGWindowLevelForKey(.desktopWindow)
-        w.level = .init(rawValue: Int(desktopLevel) + (offscreen ? 1 : 0))
+        w.level = offscreen ? .normal : .init(rawValue: Int(desktopLevel))
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         w.isOpaque = false
         w.backgroundColor = .clear
         w.hasShadow = false
         if offscreen {
-            // SCStream captures the WindowServer-composited surface. A transparent window
-            // produces a transparent/static stream, so the bake surface remains opaque and
-            // desktop-composited while `bakeShieldWindow` preserves the visible desktop.
-            w.setFrame(targetScreen.frame, display: false)
+            // `orderOut`, transparent, and fully occluded windows make WebKit throttle
+            // media decode. Leave one physical pixel on-screen so the surface remains
+            // compositor-participating; ScreenCaptureKit ignores the global clip and
+            // captures the complete window.
+            let scale = max(1, targetScreen.backingScaleFactor)
+            let logicalSize = NSSize(
+                width: max(2, (CGFloat(width) / scale).rounded(.up)),
+                height: max(2, (CGFloat(height) / scale).rounded(.up))
+            )
+            let visibleEdge = 1.0 / scale
+            let candidates = [
+                NSRect(
+                    x: targetScreen.frame.maxX - visibleEdge,
+                    y: targetScreen.frame.maxY - visibleEdge,
+                    width: logicalSize.width,
+                    height: logicalSize.height
+                ),
+                NSRect(
+                    x: targetScreen.frame.minX - logicalSize.width + visibleEdge,
+                    y: targetScreen.frame.maxY - visibleEdge,
+                    width: logicalSize.width,
+                    height: logicalSize.height
+                ),
+                NSRect(
+                    x: targetScreen.frame.maxX - visibleEdge,
+                    y: targetScreen.frame.minY - logicalSize.height + visibleEdge,
+                    width: logicalSize.width,
+                    height: logicalSize.height
+                ),
+                NSRect(
+                    x: targetScreen.frame.minX - logicalSize.width + visibleEdge,
+                    y: targetScreen.frame.minY - logicalSize.height + visibleEdge,
+                    width: logicalSize.width,
+                    height: logicalSize.height
+                )
+            ]
+            // A neighbouring display may sit directly outside one edge. Choose the
+            // corner whose bake window overlaps the least visible desktop area.
+            let frame = candidates.min { lhs, rhs in
+                let lhsArea = screens.reduce(CGFloat.zero) { partial, screen in
+                    partial + lhs.intersection(screen.frame).width * lhs.intersection(screen.frame).height
+                }
+                let rhsArea = screens.reduce(CGFloat.zero) { partial, screen in
+                    partial + rhs.intersection(screen.frame).width * rhs.intersection(screen.frame).height
+                }
+                return lhsArea < rhsArea
+            } ?? candidates[0]
+            w.setFrame(frame, display: false)
             w.alphaValue = 1
         } else {
             w.setFrame(targetScreen.frame, display: true)
@@ -1710,11 +2116,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         ucc.addUserScript(Self.wallpaperEngineWebAPIShim)
         ucc.addUserScript(Self.localFileCompatScript)
         ucc.addUserScript(Self.mouseEventBridgeScript)
-        ucc.addUserScript(Self.audioWrapperScript)
-        // Offline bake: virtual content clock so sparse wall-clock snapshots still yield dense animation frames.
         if offscreen {
-            ucc.addUserScript(Self.offlineBakeClockScript)
+            ucc.addUserScript(Self.offlineBakeAudioSilenceStateScript)
+            ucc.addUserScript(Self.offlineBakeSilentMediaScript)
         }
+        ucc.addUserScript(Self.audioWrapperScript)
         config.userContentController = ucc
         if #available(macOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -1732,9 +2138,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         contentView.addSubview(cropContainer)
 
         screenStates[screenIdx]?.window = w
-        if offscreen {
-            screenStates[screenIdx]?.bakeShieldWindow = makeOfflineBakeShield(for: targetScreen)
-        }
         screenStates[screenIdx]?.cropContainer = cropContainer
         screenStates[screenIdx]?.webView = web
         applyCropLayout(for: screenIdx)
@@ -1747,10 +2150,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         autoFixSpineConfigIfNeeded(projectContentDir: baseURL)
         web.loadFileURL(fileURL, allowingReadAccessTo: readAccessURL)
         if offscreen {
-            // `orderBack` makes the WebKit surface occluded, which throttles video decode.
-            // The bake window remains desktop-composited. The static shield is higher in the
-            // desktop level, so the user keeps seeing the pre-bake desktop instead of the Web page.
-            screenStates[screenIdx]?.bakeShieldWindow?.orderFrontRegardless()
             w.orderFrontRegardless()
         } else {
             w.orderBack(nil)
@@ -1821,7 +2220,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         runWebWallpaperBootstrap(screen: s) { [weak self] in
             guard let self = self else { return }
             if self.screenStates[s]?.isOffscreen == true {
-                self.beginSettlingOfflineBakeFirstFrame(screen: s)
+                // Compositor recording does not need a stable WKWebView snapshot.
+                // Snapshot settling pauses/seeks video and is the source of judder.
+                self.completeOfflineBakeLoad(screen: s)
             } else {
                 self.completeLiveWallpaperLoad(screen: s)
             }
@@ -2152,13 +2553,12 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         state.webView = nil
         state.cropContainer?.removeFromSuperview()
         state.cropContainer = nil
-        state.bakeShieldWindow?.close()
-        state.bakeShieldWindow = nil
         state.window?.close()
         state.window = nil
         state.isLoaded = false
         if let dir = state.extractedPKGDir { try? FileManager.default.removeItem(at: dir); state.extractedPKGDir = nil }
         if let dir = state.mergedDependencyDir { try? FileManager.default.removeItem(at: dir); state.mergedDependencyDir = nil }
+        state.projectContentDir = nil
         state.injectedPropertiesJSON = nil
         screenStates[screen] = state
     }
@@ -2288,6 +2688,17 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         state.pendingCompletion?(true)
         screenStates[screen]?.pendingCompletion = nil
         dlog("[WebRendererBridge] live Web load complete screen=\(screen)")
+    }
+
+    private func completeOfflineBakeLoad(screen: Int) {
+        guard let state = screenStates[screen],
+              state.isLoaded,
+              state.webView != nil else {
+            return
+        }
+        state.pendingCompletion?(true)
+        screenStates[screen]?.pendingCompletion = nil
+        dlog("[WebRendererBridge] offline Web load complete screen=\(screen)")
     }
 
     private func beginSettlingOfflineBakeFirstFrame(screen: Int) {
@@ -2445,6 +2856,315 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         return CGWindowID(window.windowNumber)
     }
 
+    func resolveOfflineBakeMediaAudioPlan(
+        screen: Int,
+        completion: @escaping (WebOfflineBakeMediaAudioPlan?) -> Void
+    ) {
+        guard let state = screenStates[screen],
+              let webView = state.webView else {
+            completion(nil)
+            return
+        }
+        let projectContentDir = state.projectContentDir
+        let js = """
+        (function() {
+          try {
+            var candidates = Array.prototype.slice.call(document.querySelectorAll('video,audio'))
+              .map(function(el) {
+                return {
+                  source: String(el.currentSrc || el.src || ''),
+                  originalMuted: el.__wxBakeOriginalMuted === true,
+                  volume: Number(el.volume || 0),
+                  paused: !!el.paused,
+                  loop: !!el.loop,
+                  videoWidth: Number(el.videoWidth || 0),
+                  videoHeight: Number(el.videoHeight || 0),
+                  readyState: Number(el.readyState || 0)
+                };
+              })
+              .filter(function(el) {
+                return !!el.source && !el.originalMuted && el.volume > 0 && el.readyState >= 2;
+              })
+              .sort(function(a, b) {
+                var scoreA = (a.paused ? 0 : 1000000) + a.videoWidth * a.videoHeight;
+                var scoreB = (b.paused ? 0 : 1000000) + b.videoWidth * b.videoHeight;
+                return scoreB - scoreA;
+              });
+            return JSON.stringify(candidates.length ? candidates[0] : null);
+          } catch (e) {
+            return 'null';
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js) { result, _ in
+            guard let text = result as? String,
+                  let data = text.data(using: .utf8),
+                  let probe = try? JSONDecoder().decode(WebOfflineBakeMediaAudioProbe.self, from: data),
+                  let url = URL(string: probe.source),
+                  url.isFileURL,
+                  FileManager.default.fileExists(atPath: url.path) else {
+                let fallback = projectContentDir.flatMap {
+                    Self.resolveProjectBackgroundAudioPlan(contentDir: $0)
+                }
+                DispatchQueue.main.async { completion(fallback) }
+                return
+            }
+            let plan = WebOfflineBakeMediaAudioPlan(
+                sourceURL: url,
+                volume: max(0, min(1, probe.volume)),
+                loops: probe.loop
+            )
+            DispatchQueue.main.async { completion(plan) }
+        }
+    }
+
+    /// Some Workshop authors create BGM through script-managed `Audio` objects.
+    /// If their initialization fails before a DOM media element exists, recover the
+    /// intended looping background track from the authored script and property defaults.
+    private static func resolveProjectBackgroundAudioPlan(
+        contentDir: URL
+    ) -> WebOfflineBakeMediaAudioPlan? {
+        let projectURL = contentDir.appendingPathComponent("project.json")
+        guard let projectData = try? Data(contentsOf: projectURL),
+              let project = try? JSONSerialization.jsonObject(with: projectData) as? [String: Any],
+              let general = project["general"] as? [String: Any],
+              let properties = general["properties"] as? [String: Any] else {
+            return nil
+        }
+
+        let backgroundVolume = properties.reduce(into: Double?.none) { result, item in
+            let key = item.key.lowercased()
+            guard key.contains("bgm") || key.contains("music") else { return }
+            guard key.contains("volume"),
+                  let descriptor = item.value as? [String: Any],
+                  let value = Self.numericPropertyValue(descriptor["value"]) else {
+                return
+            }
+            result = value > 1 ? value / 100 : value
+        }
+        guard let backgroundVolume, backgroundVolume > 0 else {
+            return nil
+        }
+
+        let ignoredScriptNames = Set(["spine-player.js", "spine-player4.1.js"])
+        let scriptURLs = (try? FileManager.default.contentsOfDirectory(
+            at: contentDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ))?.filter {
+            $0.pathExtension.lowercased() == "js"
+                && !ignoredScriptNames.contains($0.lastPathComponent.lowercased())
+        } ?? []
+
+        let expression = try? NSRegularExpression(
+            pattern: #"new\s+Audio\s*\(\s*["']([^"']+\.(?:aac|flac|m4a|mp3|ogg|opus|wav))["']\s*\)"#,
+            options: [.caseInsensitive]
+        )
+        guard let expression else { return nil }
+
+        var best: (url: URL, score: Int, loops: Bool)?
+        for scriptURL in scriptURLs {
+            guard let scriptData = try? Data(contentsOf: scriptURL),
+                  let source = String(data: scriptData, encoding: .utf8)
+                    ?? String(data: scriptData, encoding: .isoLatin1) else {
+                continue
+            }
+            let nsSource = source as NSString
+            let fullRange = NSRange(location: 0, length: nsSource.length)
+            for match in expression.matches(in: source, options: [], range: fullRange) {
+                guard match.numberOfRanges >= 2 else { continue }
+                let relativePath = nsSource.substring(with: match.range(at: 1))
+                let candidateURL: URL
+                if let absoluteURL = URL(string: relativePath), absoluteURL.isFileURL {
+                    candidateURL = absoluteURL
+                } else {
+                    candidateURL = contentDir.appendingPathComponent(relativePath)
+                }
+                guard FileManager.default.fileExists(atPath: candidateURL.path) else {
+                    continue
+                }
+
+                let before = max(0, match.range.location - 240)
+                let after = min(nsSource.length, NSMaxRange(match.range) + 360)
+                let context = nsSource.substring(with: NSRange(location: before, length: after - before))
+                    .lowercased()
+                var score = 0
+                if context.range(of: #"\bbgm\b|\bbackground\s*music\b"#, options: .regularExpression) != nil {
+                    score += 160
+                }
+                if context.range(of: #"\bloop\s*=\s*true\b"#, options: .regularExpression) != nil {
+                    score += 80
+                }
+                let fileName = candidateURL.lastPathComponent.lowercased()
+                if fileName.range(of: #"bgm|music|soundtrack|ost"#, options: .regularExpression) != nil {
+                    score += 60
+                }
+                if fileName.range(of: #"click|voice|idle|clicked|_se|soundeffect"#, options: .regularExpression) != nil {
+                    score -= 240
+                }
+                guard score >= 160 else { continue }
+
+                let loops = context.range(of: #"\bloop\s*=\s*true\b"#, options: .regularExpression) != nil
+                if best == nil || score > best!.score {
+                    best = (candidateURL, score, loops)
+                }
+            }
+        }
+
+        guard let best else { return nil }
+        dlog(
+            "[WebRendererBridge] offline bake recovered script BGM: \(best.url.lastPathComponent) score=\(best.score)"
+        )
+        return WebOfflineBakeMediaAudioPlan(
+            sourceURL: best.url,
+            volume: max(0, min(1, backgroundVolume)),
+            loops: best.loops
+        )
+    }
+
+    private static func numericPropertyValue(_ value: Any?) -> Double? {
+        switch value {
+        case let number as NSNumber:
+            return number.doubleValue
+        case let string as String:
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            return nil
+        }
+    }
+
+    /// Rewind HTML media before the capture stream begins. The stream remains idle
+    /// until `startOfflineBakeRealtimeMedia` issues matching play requests, keeping
+    /// the separately muxed audio aligned with captured frame zero.
+    func prepareOfflineBakeRealtimeMedia(
+        screen: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion(false)
+            return
+        }
+        let token = UUID().uuidString
+        let js = """
+        (function() {
+          try {
+            var token = '\(token)';
+            var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
+            var waits = media.map(function(el) {
+              return new Promise(function(resolve) {
+                try {
+                  el.pause();
+                  if (!isFinite(el.duration) || el.duration <= 0
+                    || (isFinite(el.currentTime) && Math.abs(el.currentTime) <= 0.0005)) {
+                    resolve();
+                    return;
+                  }
+                  var done = false;
+                  var timer = setTimeout(finish, 1200);
+                  function finish() {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    try { el.removeEventListener('seeked', finish); } catch (e) {}
+                    resolve();
+                  }
+                  el.addEventListener('seeked', finish, { once: true });
+                  el.currentTime = 0;
+                  if (!el.seeking && isFinite(el.currentTime)
+                    && Math.abs(el.currentTime) <= 0.0005) {
+                    finish();
+                  }
+                } catch (e) {
+                  resolve();
+                }
+              });
+            });
+            Promise.all(waits).then(function() {
+              window.__wxBakeRealtimeReadyToken = token;
+            }, function() {
+              window.__wxBakeRealtimeReadyToken = token;
+            });
+            return true;
+          } catch (e) {
+            return false;
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js) { result, _ in
+            guard (result as? Bool) == true else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            self.waitForOfflineBakeRealtimeToken(
+                webView: webView,
+                token: token,
+                completion: completion
+            )
+        }
+    }
+
+    func startOfflineBakeRealtimeMedia(
+        screen: Int,
+        preroll: TimeInterval,
+        completion: @escaping () -> Void
+    ) {
+        guard let webView = screenStates[screen]?.webView else {
+            completion()
+            return
+        }
+        let js = """
+        (function() {
+          try {
+            Array.prototype.slice.call(document.querySelectorAll('video,audio')).forEach(function(el) {
+              try {
+                var p = el.play();
+                if (p && typeof p.catch === 'function') p.catch(function(){});
+              } catch (e) {}
+            });
+          } catch (e) {}
+          return true;
+        })();
+        """
+        webView.evaluateJavaScript(js) { _, _ in
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + max(0, preroll),
+                execute: completion
+            )
+        }
+    }
+
+    private func waitForOfflineBakeRealtimeToken(
+        webView: WKWebView,
+        token: String,
+        attempt: Int = 0,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let escapedToken = token.replacingOccurrences(of: "'", with: "\\'")
+        let js = "window.__wxBakeRealtimeReadyToken === '\(escapedToken)';"
+        webView.evaluateJavaScript(js) { result, _ in
+            if (result as? Bool) == true {
+                DispatchQueue.main.async { completion(true) }
+                return
+            }
+            if attempt >= 240 {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self, weak webView] in
+                guard let self, let webView else {
+                    completion(false)
+                    return
+                }
+                self.waitForOfflineBakeRealtimeToken(
+                    webView: webView,
+                    token: token,
+                    attempt: attempt + 1,
+                    completion: completion
+                )
+            }
+        }
+    }
+
     /// Enable offline-bake virtual clock (no-op if script missing).
     func enableOfflineBakeClock(screen: Int, completion: (() -> Void)? = nil) {
         guard let webView = screenStates[screen]?.webView else {
@@ -2587,6 +3307,19 @@ private enum WebOfflineBakeError: LocalizedError {
     }
 }
 
+private struct WebOfflineBakeMediaAudioProbe: Decodable {
+    let source: String
+    let volume: Double
+    let loop: Bool
+}
+
+private struct WebOfflineBakeMediaAudioPlan {
+    let sourceURL: URL
+    let volume: Double
+    let loops: Bool
+    var startOffset: TimeInterval = 0
+}
+
 /// Records a display-backed Web window at its actual compositor cadence. Unlike
 /// `WKWebView.takeSnapshot`, SCStream delivers new WindowServer frames only when
 /// the page has genuinely presented them, so Web videos are not converted into
@@ -2597,7 +3330,9 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
         let width: Int
         let height: Int
         let duration: TimeInterval
+        let maximumFrameRate: Double
         let outputURL: URL
+        let captureReady: () -> Void
     }
 
     private let options: Options
@@ -2614,6 +3349,8 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
     private var writtenFrameCount = 0
     private var writerBackpressureDropCount = 0
     private var isFinishing = false
+    private var didComplete = false
+    private var isRecording = false
 
     init(
         options: Options,
@@ -2686,7 +3423,14 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
                 let configuration = SCStreamConfiguration()
                 configuration.width = options.width
                 configuration.height = options.height
-                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+                // Keep the output at standard display/video cadence. The source PTS
+                // remain intact, so 59.56fps workshop media is not forced through
+                // a seek/pause resampling loop.
+                let rate = max(1, min(120, options.maximumFrameRate))
+                configuration.minimumFrameInterval = CMTime(
+                    value: 1,
+                    timescale: CMTimeScale(rate.rounded())
+                )
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
                 configuration.queueDepth = 8
                 configuration.scalesToFit = true
@@ -2698,10 +3442,35 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
                 self.stream = stream
+                DispatchQueue.main.async {
+                    self.options.captureReady()
+                }
                 try await stream.startCapture()
             } catch {
                 finish(.failure(error))
             }
+        }
+    }
+
+    func beginRecording() {
+        sampleQueue.async { [weak self] in
+            guard let self, !self.isFinishing else { return }
+            self.firstPresentationTime = nil
+            self.lastPresentationTimeValue = nil
+            self.isRecording = true
+        }
+    }
+
+    func failIfNoFirstFrame(after timeout: TimeInterval) {
+        sampleQueue.asyncAfter(deadline: .now() + max(1, timeout)) { [weak self] in
+            guard let self,
+                  !self.isFinishing,
+                  self.writtenFrameCount == 0 else {
+                return
+            }
+            self.finish(.failure(
+                WebOfflineBakeError.streamCaptureFailed("ScreenCaptureKit 未在限定时间内返回 Web 烘焙画面")
+            ))
         }
     }
 
@@ -2716,6 +3485,7 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
             return
         }
         guard !isFinishing,
+              isRecording,
               let writer,
               let videoInput,
               let adaptor,
@@ -2771,6 +3541,7 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard !isFinishing else { return }
         finish(.failure(WebOfflineBakeError.streamCaptureFailed(error.localizedDescription)))
     }
 
@@ -2807,9 +3578,14 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
     }
 
     private func finish(_ result: Result<Void, Error>) {
-        guard !isFinishing || writer?.status != .writing else { return }
+        guard !didComplete else { return }
+        didComplete = true
         isFinishing = true
         if case .failure = result {
+            let activeStream = stream
+            Task {
+                try? await activeStream?.stopCapture()
+            }
             writer?.cancelWriting()
             try? FileManager.default.removeItem(at: options.outputURL)
         }
@@ -2819,6 +3595,282 @@ private final class WebRealtimeStreamRecorder: NSObject, SCStreamOutput, SCStrea
     private static func averageBitRate(width: Int, height: Int, fps: Double) -> Int {
         let raw = Double(max(1, width) * max(1, height)) * max(15, fps) * 0.10
         return Int(min(max(raw, 8_000_000), 100_000_000))
+    }
+}
+
+/// Receives interleaved stereo Int16 PCM from the offline WKWebView and writes it as
+/// AAC through the same `AVAssetWriter` used for the baked video.
+private final class WebOfflineBakeAudioRecorder {
+    private static let channels = 2
+    private static let bytesPerSample = MemoryLayout<Int16>.size
+    private static let bytesPerFrame = channels * bytesPerSample
+    private static let silenceChunkFrames = 4_096
+
+    private let sampleRate: Double
+    private let timescale: CMTimeScale
+    private let maximumFrameCount: Int64
+
+    private weak var audioInput: AVAssetWriterInput?
+    private var formatDescription: CMAudioFormatDescription?
+    private var pendingPCM: [Data] = []
+    private var acceptedFrameCount: Int64 = 0
+    private var writtenFrameCount: Int64 = 0
+    private var capturedPCMChunkCount = 0
+    private var capturedPCMFrameCount: Int64 = 0
+    private var isCaptureOpen = false
+    private var finishRequested = false
+    private var endReceived = false
+    private var inputMarkedFinished = false
+    private var retryScheduled = false
+    private var finishCompletion: (() -> Void)?
+
+    init(sampleRate: Double, duration: TimeInterval) {
+        let normalizedRate = sampleRate.isFinite && sampleRate >= 8_000
+            ? sampleRate
+            : 48_000
+        self.sampleRate = normalizedRate
+        self.timescale = CMTimeScale(max(8_000, min(192_000, normalizedRate.rounded())))
+        self.maximumFrameCount = Int64(
+            max(0, (max(0, duration) * normalizedRate).rounded(.toNearestOrAwayFromZero))
+        )
+    }
+
+    func makeWriterInput() -> AVAssetWriterInput {
+        let input = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: sampleRate,
+                AVNumberOfChannelsKey: Self.channels,
+                AVEncoderBitRateKey: 192_000
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
+        audioInput = input
+        return input
+    }
+
+    func beginCapture() {
+        isCaptureOpen = true
+        finishRequested = false
+        endReceived = false
+    }
+
+    func receiveStart() {
+        isCaptureOpen = true
+    }
+
+    func receivePCM(sampleRate: Double, channels: Int, base64PCM: String) {
+        guard isCaptureOpen,
+              !inputMarkedFinished,
+              channels == Self.channels,
+              abs(sampleRate - self.sampleRate) < 100,
+              let decoded = Data(base64Encoded: base64PCM),
+              !decoded.isEmpty else {
+            return
+        }
+        let completeFrames = decoded.count / Self.bytesPerFrame
+        guard completeFrames > 0 else { return }
+
+        let remaining = maximumFrameCount - acceptedFrameCount
+        guard remaining > 0 else { return }
+        let acceptedFrames = min(Int64(completeFrames), remaining)
+        let acceptedBytes = Int(acceptedFrames) * Self.bytesPerFrame
+        let data = acceptedBytes == decoded.count ? decoded : decoded.prefix(acceptedBytes)
+
+        pendingPCM.append(Data(data))
+        acceptedFrameCount += acceptedFrames
+        capturedPCMChunkCount += 1
+        capturedPCMFrameCount += acceptedFrames
+        drainPendingPCM()
+    }
+
+    func receiveEnd() {
+        endReceived = true
+        finishIfReady()
+    }
+
+    func finishCapture(completion: @escaping () -> Void) {
+        guard !inputMarkedFinished else {
+            completion()
+            return
+        }
+        finishRequested = true
+        finishCompletion = completion
+        // A malformed page may never send `end`; preserve a valid file rather than
+        // blocking the bake forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.finishIfReady(force: true)
+        }
+        finishIfReady()
+    }
+
+    func cancel() {
+        isCaptureOpen = false
+        pendingPCM.removeAll()
+        finishCompletion = nil
+    }
+
+    private func finishIfReady(force: Bool = false) {
+        guard finishRequested, !inputMarkedFinished,
+              endReceived || force else {
+            return
+        }
+        isCaptureOpen = false
+        appendSilenceToDuration()
+        drainPendingPCM()
+    }
+
+    private func appendSilenceToDuration() {
+        let missing = maximumFrameCount - acceptedFrameCount
+        guard missing > 0 else { return }
+        var remaining = missing
+        while remaining > 0 {
+            let frames = min(Int64(Self.silenceChunkFrames), remaining)
+            pendingPCM.append(Data(repeating: 0, count: Int(frames) * Self.bytesPerFrame))
+            acceptedFrameCount += frames
+            remaining -= frames
+        }
+    }
+
+    private func drainPendingPCM() {
+        guard let audioInput else {
+            markFinished()
+            return
+        }
+        while !pendingPCM.isEmpty, audioInput.isReadyForMoreMediaData {
+            let data = pendingPCM.removeFirst()
+            guard appendPCM(data) else {
+                dlog("[WebOfflineBakeAudioRecorder] Failed to append PCM sample buffer")
+                pendingPCM.removeAll()
+                markFinished()
+                return
+            }
+        }
+        if !pendingPCM.isEmpty {
+            scheduleDrainRetry()
+        } else if finishRequested && (endReceived || !isCaptureOpen) {
+            markFinished()
+        }
+    }
+
+    private func scheduleDrainRetry() {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.retryScheduled = false
+            self.drainPendingPCM()
+        }
+    }
+
+    private func markFinished() {
+        guard !inputMarkedFinished else { return }
+        inputMarkedFinished = true
+        audioInput?.markAsFinished()
+        fputs(
+            "[web-bake] audio pcm chunks=\(capturedPCMChunkCount) frames=\(capturedPCMFrameCount) padded=\(max(0, acceptedFrameCount - capturedPCMFrameCount))\n",
+            stderr
+        )
+        fflush(stderr)
+        let completion = finishCompletion
+        finishCompletion = nil
+        completion?()
+    }
+
+    private func appendPCM(_ data: Data) -> Bool {
+        guard let audioInput,
+              let formatDescription = makeFormatDescription() else {
+            return false
+        }
+        let frames = data.count / Self.bytesPerFrame
+        guard frames > 0 else { return true }
+
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: nil,
+            blockLength: data.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: data.count,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else {
+            return false
+        }
+        let replaceStatus = data.withUnsafeBytes { bytes -> OSStatus in
+            guard let baseAddress = bytes.baseAddress else {
+                return kCMBlockBufferBadPointerParameterErr
+            }
+            return CMBlockBufferReplaceDataBytes(
+                with: baseAddress,
+                blockBuffer: blockBuffer,
+                offsetIntoDestination: 0,
+                dataLength: data.count
+            )
+        }
+        guard replaceStatus == kCMBlockBufferNoErr else {
+            return false
+        }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: timescale),
+            presentationTimeStamp: CMTime(value: writtenFrameCount, timescale: timescale),
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = Self.bytesPerFrame
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            formatDescription: formatDescription,
+            sampleCount: frames,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sampleStatus == noErr,
+              let sampleBuffer,
+              audioInput.append(sampleBuffer) else {
+            return false
+        }
+        writtenFrameCount += Int64(frames)
+        return true
+    }
+
+    private func makeFormatDescription() -> CMAudioFormatDescription? {
+        if let formatDescription { return formatDescription }
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: Double(timescale),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(Self.bytesPerFrame),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(Self.bytesPerFrame),
+            mChannelsPerFrame: UInt32(Self.channels),
+            mBitsPerChannel: UInt32(Self.bytesPerSample * 8),
+            mReserved: 0
+        )
+        var description: CMAudioFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            asbd: &asbd,
+            layoutSize: 0,
+            layout: nil,
+            magicCookieSize: 0,
+            magicCookie: nil,
+            extensions: nil,
+            formatDescriptionOut: &description
+        )
+        guard status == noErr else { return nil }
+        formatDescription = description
+        return description
     }
 }
 
@@ -2837,15 +3889,16 @@ private final class WebOfflineBakeRunner {
     private let options: Options
     private let completion: (Result<Void, Error>) -> Void
     private let renderer = WebRendererBridge.shared
-    /// 目标成片帧数（固定 PTS = index/fps，保证均匀帧间隔）。
+    /// 目标进度帧数（以 60fps 近似显示进度；实际成片保留合成器 PTS）。
     private var totalFrameCount = 0
-    /// 内容时间步长（秒）。虚拟时钟按此推进，与墙钟无关。
+    /// 旧快照烘焙的内容时间步长；保留仅为兼容旧实现。
     private var contentFrameInterval: TimeInterval = 1.0 / 60.0
     private var effectiveFPS: Double = 60
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var mediaAudioPlan: WebOfflineBakeMediaAudioPlan?
     private var temporaryOutputURL: URL?
     private var captureStartedAt: Date?
     private var nextFrameIndex = 0
@@ -2860,6 +3913,9 @@ private final class WebOfflineBakeRunner {
     private static let minimumAutomaticFrameRate = 15.0
     private static let maximumAutomaticFrameRate = 120.0
     private static let presentationTimescale: CMTimeScale = 1_000_000
+    private static let realtimeCapturePreroll: TimeInterval = 0.5
+    private static let mediaPlanRetryInterval: TimeInterval = 0.25
+    private static let mediaPlanRetryCount = 20
 
     /// 4K60 下约 50Mbps（~0.1 bpp），明显优于旧的 width×height×3（~25Mbps）。
     private static func averageBitRate(width: Int, height: Int, fps: Double) -> Int {
@@ -2904,12 +3960,55 @@ private final class WebOfflineBakeRunner {
                 self.finish(.failure(WebOfflineBakeError.rendererFailed("Web 壁纸加载失败")))
                 return
             }
-            // Wait for the wallpaper's own property/bootstrap work before probing
-            // an active video. Web projects choose their cadence independently.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            // Let the page create its default media nodes, then record the actual
+            // compositor output instead of sampling a virtual clock frame by frame.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self, !self.isFinishing else { return }
-                self.resolveFrameRateAndStartEncoding()
+                self.resolveMediaAudioPlanAndBeginCapture()
             }
+        }
+    }
+
+    private func resolveMediaAudioPlanAndBeginCapture(attempt: Int = 0) {
+        renderer.resolveOfflineBakeMediaAudioPlan(
+            screen: WebRendererBridge.offlineBakeScreen
+        ) { [weak self] plan in
+            guard let self, !self.isFinishing else { return }
+            if let plan {
+                self.mediaAudioPlan = plan
+                self.prepareAndBeginRealtimeStreamCapture()
+                return
+            }
+            guard attempt < Self.mediaPlanRetryCount else {
+                self.prepareAndBeginRealtimeStreamCapture()
+                return
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + Self.mediaPlanRetryInterval
+            ) { [weak self] in
+                self?.resolveMediaAudioPlanAndBeginCapture(attempt: attempt + 1)
+            }
+        }
+    }
+
+    private func prepareAndBeginRealtimeStreamCapture() {
+        renderer.prepareOfflineBakeRealtimeMedia(
+            screen: WebRendererBridge.offlineBakeScreen
+        ) { [weak self] ready in
+            guard let self, !self.isFinishing else { return }
+            guard ready else {
+                self.finish(.failure(
+                    WebOfflineBakeError.rendererFailed("Web 壁纸媒体未能准备为实时烘焙")
+                ))
+                return
+            }
+            guard let windowID = self.renderer.windowID(for: WebRendererBridge.offlineBakeScreen) else {
+                self.finish(.failure(
+                    WebOfflineBakeError.streamCaptureFailed("未找到 Web 烘焙窗口")
+                ))
+                return
+            }
+            self.beginRealtimeStreamCapture(windowID: windowID)
         }
     }
 
@@ -2918,20 +4017,21 @@ private final class WebOfflineBakeRunner {
             beginEncoding(frameRate: normalizedFrameRate(requestedFPS), source: "requested")
             return
         }
-        guard let windowID = renderer.windowID(for: WebRendererBridge.offlineBakeScreen) else {
-            beginEncoding(frameRate: Self.fallbackFrameRate, source: "snapshot-fallback")
-            return
+        renderer.probeOfflineBakeMediaFrameRate(screen: WebRendererBridge.offlineBakeScreen) { [weak self] probedFPS in
+            guard let self, !self.isFinishing else { return }
+            let frameRate = probedFPS.map(self.normalizedFrameRate) ?? Self.fallbackFrameRate
+            self.beginEncoding(frameRate: frameRate, source: probedFPS == nil ? "snapshot-fallback" : "media-probe")
         }
-        beginRealtimeStreamCapture(windowID: windowID)
     }
 
     private func beginRealtimeStreamCapture(windowID: CGWindowID) {
         guard !isFinishing else { return }
 
-        totalFrameCount = max(1, Int((options.duration * Self.fallbackFrameRate).rounded(.up)))
+        effectiveFPS = normalizedFrameRate(options.requestedFPS ?? Self.fallbackFrameRate)
+        totalFrameCount = max(1, Int((options.duration * effectiveFPS).rounded(.up)))
         nextFrameIndex = 0
         writtenFrameCount = 0
-        captureStartedAt = Date()
+        captureStartedAt = nil
         let temporaryURL = options.outputURL.deletingLastPathComponent()
             .appendingPathComponent(".\(options.outputURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).stream.mp4")
         try? FileManager.default.removeItem(at: temporaryURL)
@@ -2939,10 +4039,11 @@ private final class WebOfflineBakeRunner {
         emitProgress(phase: "准备", progress: 0)
         fputs(
             String(
-                format: "[web-bake] compositor stream target=%dx%d duration=%.1fs cadence=wallpaper\n",
+                format: "[web-bake] compositor stream target=%dx%d duration=%.1fs max-fps=%.3f cadence=wallpaper\n",
                 options.width,
                 options.height,
-                options.duration
+                options.duration,
+                effectiveFPS
             ),
             stderr
         )
@@ -2954,7 +4055,20 @@ private final class WebOfflineBakeRunner {
                 width: options.width,
                 height: options.height,
                 duration: options.duration,
-                outputURL: temporaryURL
+                maximumFrameRate: effectiveFPS,
+                outputURL: temporaryURL,
+                captureReady: { [weak self] in
+                    guard let self, !self.isFinishing else { return }
+                    self.renderer.startOfflineBakeRealtimeMedia(
+                        screen: WebRendererBridge.offlineBakeScreen,
+                        preroll: Self.realtimeCapturePreroll
+                    ) { [weak self] in
+                        guard let self, !self.isFinishing else { return }
+                        self.mediaAudioPlan?.startOffset = Self.realtimeCapturePreroll
+                        self.captureStartedAt = Date()
+                        self.realtimeRecorder?.beginRecording()
+                    }
+                }
             ),
             progress: { [weak self] frameCount, elapsed in
                 DispatchQueue.main.async {
@@ -2989,6 +4103,7 @@ private final class WebOfflineBakeRunner {
         )
         realtimeRecorder = recorder
         recorder.start()
+        recorder.failIfNoFirstFrame(after: 8)
     }
 
     private func normalizedFrameRate(_ candidate: Double) -> Double {
@@ -3092,7 +4207,8 @@ private final class WebOfflineBakeRunner {
                     ) { [weak self] in
                         guard let self, !self.isFinishing else { return }
                         self.captureStartedAt = Date()
-                        fputs("[web-bake] capturing dense frames (virtual content clock)\n", stderr)
+                        let audioSource = self.mediaAudioPlan?.sourceURL.lastPathComponent ?? "none"
+                        fputs("[web-bake] capturing dense frames (virtual clock + silent media, audio=\(audioSource))\n", stderr)
                         fflush(stderr)
                         self.captureNextFrame()
                     }
@@ -3285,8 +4401,12 @@ private final class WebOfflineBakeRunner {
                 return
             }
             do {
+                let completedURL = try muxMediaAudioIfNeeded(videoURL: temporaryOutputURL)
                 try? FileManager.default.removeItem(at: options.outputURL)
-                try FileManager.default.moveItem(at: temporaryOutputURL, to: options.outputURL)
+                try FileManager.default.moveItem(at: completedURL, to: options.outputURL)
+                if completedURL != temporaryOutputURL {
+                    try? FileManager.default.removeItem(at: temporaryOutputURL)
+                }
                 emitProgress(phase: "完成", progress: 1)
                 completion(.success(()))
             } catch {
@@ -3298,6 +4418,87 @@ private final class WebOfflineBakeRunner {
                 try? FileManager.default.removeItem(at: temporaryOutputURL)
             }
             completion(.failure(error))
+        }
+    }
+
+    private func muxMediaAudioIfNeeded(videoURL: URL) throws -> URL {
+        guard let mediaAudioPlan else { return videoURL }
+        guard let ffmpegURL = resolvedBundledFFmpegURL() else {
+            throw WebOfflineBakeError.writerFailed("未找到打包的 ffmpeg，无法写入 Web 壁纸音轨")
+        }
+
+        let muxedURL = videoURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(videoURL.deletingPathExtension().lastPathComponent).\(UUID().uuidString).audio.mp4"
+        )
+        try? FileManager.default.removeItem(at: muxedURL)
+
+        let filter = String(
+            format: "[1:a]volume=%.6f,apad[a]",
+            mediaAudioPlan.volume
+        )
+        let process = Process()
+        process.executableURL = ffmpegURL
+        var arguments = [
+            "-y",
+            "-i", videoURL.path
+        ]
+        if mediaAudioPlan.loops {
+            arguments += ["-stream_loop", "-1"]
+        }
+        if mediaAudioPlan.startOffset > 0 {
+            arguments += [
+                "-ss", String(format: "%.3f", mediaAudioPlan.startOffset)
+            ]
+        }
+        arguments += [
+            "-i", mediaAudioPlan.sourceURL.path,
+            "-filter_complex", filter,
+            "-map", "0:v:0",
+            "-map", "[a]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-t", String(format: "%.3f", options.duration),
+            muxedURL.path
+        ]
+        process.arguments = arguments
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        process.standardOutput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: muxedURL.path) else {
+            let stderr = String(
+                data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown ffmpeg failure"
+            try? FileManager.default.removeItem(at: muxedURL)
+            throw WebOfflineBakeError.writerFailed("Web 音频 mux 失败: \(stderr)")
+        }
+        fputs(
+            "[web-bake] muxed media audio=\(mediaAudioPlan.sourceURL.lastPathComponent) volume=\(String(format: "%.3f", mediaAudioPlan.volume)) loop=\(mediaAudioPlan.loops) offset=\(String(format: "%.3f", mediaAudioPlan.startOffset))\n",
+            stderr
+        )
+        fflush(stderr)
+        return muxedURL
+    }
+
+    private func resolvedBundledFFmpegURL() -> URL? {
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments.first ?? "")
+            .standardizedFileURL
+        let executableDirectory = executableURL.deletingLastPathComponent()
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "ffmpeg", withExtension: nil),
+            executableDirectory.appendingPathComponent("ffmpeg"),
+            executableDirectory.appendingPathComponent("Resources/ffmpeg"),
+            executableDirectory.deletingLastPathComponent()
+                .appendingPathComponent("Resources/ffmpeg"),
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("Resources/ffmpeg")
+        ]
+        return candidates.compactMap { $0 }.first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
         }
     }
 

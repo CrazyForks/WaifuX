@@ -53,7 +53,7 @@ class DownloadTaskService: ObservableObject {
     private let userDefaultsKey = "download_tasks"
     private var saveTask: Task<Void, Never>?
     private var lastProgressUpdateTimes: [String: Date] = [:]
-    private let progressUpdateMinInterval: TimeInterval = 0.08
+    private let progressUpdateMinInterval: TimeInterval = 0.15
     private var suppressedToastTaskIDs = Set<String>()
 
     // MARK: - Active Download Tasks Management
@@ -133,7 +133,9 @@ class DownloadTaskService: ObservableObject {
 
     func resumeTask(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
-        guard tasks[index].status == .paused || tasks[index].status == .failed else { return }
+        guard tasks[index].status == .paused
+                || tasks[index].status == .failed
+                || tasks[index].status == .waitingForSteamLogin else { return }
 
         objectWillChange.send()
         tasks[index].status = .pending
@@ -283,7 +285,7 @@ class DownloadTaskService: ObservableObject {
             return
         }
 
-        // 节流优化：限制高频进度发布，减少主线程重绘压力（约 12.5fps）
+        // 节流优化：限制高频进度发布，减少主线程重绘压力（约 6.7fps）
         let now = Date()
         if !isStart && !isComplete,
            let lastTime = lastProgressUpdateTimes[id],
@@ -332,6 +334,16 @@ class DownloadTaskService: ObservableObject {
         persistTasks()
     }
 
+    func markWaitingForSteamLogin(id: String) {
+        guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
+        objectWillChange.send()
+        tasks[index].status = .waitingForSteamLogin
+        tasks[index].completedAt = nil
+        tasks[index].lastUpdatedAt = .now
+        lastProgressUpdateTimes.removeValue(forKey: id)
+        persistTasks()
+    }
+
     func markPaused(id: String) {
         guard let index = tasks.firstIndex(where: { $0.id == id }) else { return }
         objectWillChange.send()
@@ -372,7 +384,7 @@ class DownloadTaskService: ObservableObject {
     private func schedulePersistTasks() {
         saveTask?.cancel()
         saveTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 200_000_000) // 0.2s
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
             guard !Task.isCancelled else { return }
             persistTasks()
         }
@@ -403,7 +415,12 @@ class DownloadTaskService: ObservableObject {
     // MARK: - Statistics
 
     var activeTasks: [DownloadTask] {
-        tasks.filter { $0.status == .downloading || $0.status == .pending || $0.status == .paused }
+        tasks.filter {
+            $0.status == .downloading
+                || $0.status == .pending
+                || $0.status == .waitingForSteamLogin
+                || $0.status == .paused
+        }
     }
 
     var runningTasks: [DownloadTask] {
@@ -497,6 +514,7 @@ final class PersistentDownloadQueueService {
     private enum State: String, Codable {
         case queued
         case running
+        case waitingForSteamLogin
         case paused
         case failed
     }
@@ -559,9 +577,8 @@ final class PersistentDownloadQueueService {
     /// 覆盖“共享 Job 刚结束，新调用方尚未来得及挂起”的竞态窗口。
     private var terminalResults: [String: Result<URL?, Error>] = [:]
     private var terminalResultOrder: [String] = []
-    /// Steam Guard 码只存内存，不写入持久化队列。
-    private var workshopGuardCodes: [String: String] = [:]
     private var didRestore = false
+    private var shouldResumeWaitingJobsAfterRestore = false
     private weak var wallpaperViewModel: WallpaperViewModel?
     private weak var mediaViewModel: MediaExploreViewModel?
 
@@ -581,7 +598,12 @@ final class PersistentDownloadQueueService {
         }
         didRestore = true
         restoreAndMigrateJobs()
-        pump()
+        if shouldResumeWaitingJobsAfterRestore {
+            shouldResumeWaitingJobsAfterRestore = false
+            resumeWaitingForSteamLogin()
+        } else {
+            pump()
+        }
     }
 
     func enqueueWallpaperAndWait(
@@ -624,7 +646,6 @@ final class PersistentDownloadQueueService {
 
     func enqueueWorkshopAndWait(
         _ item: MediaItem,
-        guardCode: String?,
         folderID: String?,
         using viewModel: MediaExploreViewModel
     ) async throws {
@@ -635,9 +656,6 @@ final class PersistentDownloadQueueService {
             source: .manual,
             persistImmediately: true
         )
-        if let guardCode, !guardCode.isEmpty {
-            workshopGuardCodes[id] = guardCode
-        }
         _ = try await waitForCompletion(of: id)
     }
 
@@ -702,7 +720,9 @@ final class PersistentDownloadQueueService {
 
     func resume(jobID: String) {
         guard let index = jobs.firstIndex(where: { $0.id == jobID }),
-              jobs[index].state == .paused || jobs[index].state == .failed else {
+              jobs[index].state == .paused
+                || jobs[index].state == .failed
+                || jobs[index].state == .waitingForSteamLogin else {
             return
         }
         jobs[index].state = .queued
@@ -714,10 +734,33 @@ final class PersistentDownloadQueueService {
         pump()
     }
 
+    func resumeWaitingForSteamLogin() {
+        guard didRestore else {
+            shouldResumeWaitingJobsAfterRestore = true
+            return
+        }
+        var resumedJobIDs: [String] = []
+        for index in jobs.indices where jobs[index].state == .waitingForSteamLogin {
+            jobs[index].state = .queued
+            jobs[index].updatedAt = .now
+            jobs[index].lastError = nil
+            clearTerminalResult(for: jobs[index].id)
+            resumedJobIDs.append(jobs[index].id)
+        }
+        guard !resumedJobIDs.isEmpty else {
+            pump()
+            return
+        }
+        for jobID in resumedJobIDs {
+            DownloadTaskService.shared.markPending(id: jobID)
+        }
+        persistJobs()
+        pump()
+    }
+
     func cancel(jobID: String) {
         activeWorkers[jobID]?.task.cancel()
         activeWorkers.removeValue(forKey: jobID)
-        workshopGuardCodes.removeValue(forKey: jobID)
         jobs.removeAll { $0.id == jobID }
         let result: Result<URL?, Error> = .failure(CancellationError())
         storeTerminalResult(result, for: jobID)
@@ -886,7 +929,6 @@ final class PersistentDownloadQueueService {
             guard let mediaViewModel else { throw QueueError.notConfigured }
             return try await mediaViewModel.executeQueuedWorkshopDownload(
                 item,
-                guardCode: workshopGuardCodes[job.id],
                 folderID: job.folderID,
                 taskID: job.id
             )
@@ -896,7 +938,6 @@ final class PersistentDownloadQueueService {
     private func finish(jobID: String, workerToken: UUID, result: URL?) {
         guard activeWorkers[jobID]?.token == workerToken else { return }
         activeWorkers.removeValue(forKey: jobID)
-        workshopGuardCodes.removeValue(forKey: jobID)
         DownloadTaskService.shared.unregisterDownloadTask(id: jobID)
         DownloadTaskService.shared.markCompleted(id: jobID)
         jobs.removeAll { $0.id == jobID }
@@ -911,7 +952,6 @@ final class PersistentDownloadQueueService {
         // 取消后同 ID 可能已经重新入队；旧 worker 绝不能删掉新 Job/worker。
         guard activeWorkers[jobID]?.token == workerToken else { return }
         activeWorkers.removeValue(forKey: jobID)
-        workshopGuardCodes.removeValue(forKey: jobID)
         DownloadTaskService.shared.unregisterDownloadTask(id: jobID)
 
         guard let index = jobs.firstIndex(where: { $0.id == jobID }) else {
@@ -935,6 +975,18 @@ final class PersistentDownloadQueueService {
                 storeTerminalResult(result, for: jobID)
                 resumeWaiters(for: jobID, with: result)
             }
+        } else if let workshopError = error as? WorkshopError,
+                  workshopError.requiresSteamLoginRecovery,
+                  case .workshop = jobs[index].payload {
+            jobs[index].state = .waitingForSteamLogin
+            jobs[index].updatedAt = .now
+            jobs[index].lastError = error.localizedDescription
+            DownloadTaskService.shared.markWaitingForSteamLogin(id: jobID)
+            NotificationCenter.default.post(
+                name: .steamWorkshopLoginRequired,
+                object: jobs[index].payload.itemID,
+                userInfo: ["message": error.localizedDescription]
+            )
         } else {
             jobs[index].state = .failed
             jobs[index].updatedAt = .now
@@ -1010,6 +1062,8 @@ final class PersistentDownloadQueueService {
             switch job.state {
             case .queued, .running:
                 DownloadTaskService.shared.markPending(id: job.id)
+            case .waitingForSteamLogin:
+                DownloadTaskService.shared.markWaitingForSteamLogin(id: job.id)
             case .paused:
                 DownloadTaskService.shared.markPaused(id: job.id)
             case .failed:
@@ -1061,7 +1115,10 @@ final class PersistentDownloadQueueService {
 
     private func mergeLegacyPresentationTasks() {
         let unfinished = DownloadTaskService.shared.tasks.filter {
-            $0.status == .pending || $0.status == .downloading || $0.status == .paused
+            $0.status == .pending
+                || $0.status == .downloading
+                || $0.status == .waitingForSteamLogin
+                || $0.status == .paused
         }
         for task in unfinished where !jobs.contains(where: { $0.id == task.id }) {
             let payload: Payload?
@@ -1074,12 +1131,21 @@ final class PersistentDownloadQueueService {
                 payload = (task.workshopItem ?? task.mediaItem).map(Payload.workshop)
             }
             guard let payload, !payload.isAlreadyDownloaded else { continue }
+            let restoredState: State
+            switch task.status {
+            case .waitingForSteamLogin:
+                restoredState = .waitingForSteamLogin
+            case .paused:
+                restoredState = .paused
+            default:
+                restoredState = .queued
+            }
             jobs.append(
                 Job(
                     id: payload.taskID,
                     payload: payload,
                     folderID: nil,
-                    state: .queued,
+                    state: restoredState,
                     source: .legacyMigration,
                     addedAt: task.createdAt,
                     updatedAt: .now,

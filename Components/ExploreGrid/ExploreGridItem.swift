@@ -326,7 +326,10 @@ if let host = req.url?.host?.lowercased() {
                                 req.setValue(WallsflowService.siteOrigin, forHTTPHeaderField: "Referer")
                             } else if host.contains("konachan.net") || host.contains("konachan.com") {
                                 req.setValue(KonachanRequestConfiguration.browserUserAgent, forHTTPHeaderField: "User-Agent")
-                                req.setValue("\(KonachanRequestConfiguration.siteURL.absoluteString)/", forHTTPHeaderField: "Referer")
+                                req.setValue(
+                                    KonachanRequestConfiguration.referer(for: req.url),
+                                    forHTTPHeaderField: "Referer"
+                                )
                             }
                         }
                     return req

@@ -1142,10 +1142,9 @@ final class MediaExploreViewModel: ObservableObject {
         )
     }
 
-    /// 只执行 Workshop 下载；Steam Guard 码仅由当次内存任务传入。
+    /// 只执行 Workshop 下载；SteamCMD 复用本地缓存会话，不接收密码或 Guard 码。
     func executeQueuedWorkshopDownload(
         _ item: MediaItem,
-        guardCode: String?,
         folderID: String?,
         taskID: String
     ) async throws -> URL {
@@ -1156,7 +1155,6 @@ final class MediaExploreViewModel: ObservableObject {
         let workshopID = String(item.id.dropFirst("workshop_".count))
         let localURL = try await workshopService.downloadWorkshopItem(
             workshopID: workshopID,
-            guardCode: guardCode,
             progressHandler: { progress in
                 Task { @MainActor in
                     DownloadTaskService.shared.updateProgress(id: taskID, progress: progress)
@@ -2489,7 +2487,7 @@ final class MediaExploreViewModel: ObservableObject {
 
     /// 下载 Workshop 壁纸（通过 SteamCMD）
     /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
-    func downloadWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil, folderID: String? = nil) async throws {
+    func downloadWorkshopWallpaper(_ item: MediaItem, folderID: String? = nil) async throws {
         guard item.id.hasPrefix("workshop_") else {
             throw WorkshopError.workshopNotSupported
         }
@@ -2501,7 +2499,6 @@ final class MediaExploreViewModel: ObservableObject {
         ])
         try await PersistentDownloadQueueService.shared.enqueueWorkshopAndWait(
             item,
-            guardCode: guardCode,
             folderID: folderID,
             using: self
         )
@@ -2565,7 +2562,7 @@ final class MediaExploreViewModel: ObservableObject {
 
     /// 删除本地 Workshop 包后重新下载（覆盖为最新版）。
     /// 调用方应先停掉正在播放的该壁纸。
-    func updateWorkshopWallpaper(_ item: MediaItem, guardCode: String? = nil) async throws {
+    func updateWorkshopWallpaper(_ item: MediaItem) async throws {
         guard item.id.hasPrefix("workshop_") else {
             throw WorkshopError.workshopNotSupported
         }
@@ -2583,7 +2580,7 @@ final class MediaExploreViewModel: ObservableObject {
         }
 
         mediaLibrary.removeDownloadRecord(withID: item.id)
-        try await downloadWorkshopWallpaper(itemToDownload, guardCode: guardCode, folderID: folderID)
+        try await downloadWorkshopWallpaper(itemToDownload, folderID: folderID)
     }
 
     private func mediaItemByUpdatingRemoteMetadata(

@@ -1277,6 +1277,7 @@ struct WallpaperDetailSheet: View {
             do {
                 let detail = try await viewModel.fetchWallpaperDetail(byID: wallpaperID)
                 await MainActor.run {
+                    guard resolvedWallpaper.id == wallpaperID else { return }
                     // 只替换 uploader 字段（其他字段保持搜索结果的即可）
                     if detail.uploader != nil {
                         let updated = resolvedWallpaper

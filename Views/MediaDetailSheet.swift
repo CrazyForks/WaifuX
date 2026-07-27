@@ -30,9 +30,8 @@ struct MediaDetailSheet: View {
     @State private var showInfoBubble = false
     @State private var isHeroContentHidden = false
     @State private var showDeleteConfirm = false
-    @State private var showSteamGuardAlert = false
-    @State private var showSessionExpiredAlert = false
-    @State private var pendingSteamGuardCode = ""
+    @State private var showSteamLoginRequiredAlert = false
+    @State private var steamLoginRequiredMessage = ""
     @State private var isBakingScene = false
     @State private var showSceneBakeRendererDialog = false
     @State private var sceneBakeDialogAnimating = false
@@ -87,8 +86,9 @@ struct MediaDetailSheet: View {
     /// Workshop 已下载项是否有远端更新
     @State private var hasWorkshopUpdateAvailable: Bool = false
     @State private var remoteWorkshopUpdatedAt: Date?
-    /// 当前下载流程是否为「更新重下」（用于 Steam Guard 重试）
-    @State private var isWorkshopUpdateFlow: Bool = false
+    /// 当前下载流程是否为「更新重下」（用于 Steam Guard 重试）。
+    /// 保存发起更新的 item ID，避免切换详情后把 A 的更新态显示在 B 上。
+    @State private var workshopUpdateItemID: String?
 
     // 挤压动画配置
     private let squeezeThreshold: CGFloat = 80
@@ -107,6 +107,10 @@ struct MediaDetailSheet: View {
 
     private var isDownloading: Bool {
         downloadActivity.isDownloading(itemID: resolvedItem.id)
+    }
+
+    private var isWorkshopUpdateFlow: Bool {
+        workshopUpdateItemID == resolvedItem.id
     }
 
     init(item: MediaItem, viewModel: MediaExploreViewModel, contextItems: [MediaItem]? = nil, onClose: @escaping () -> Void, onNavigateToItem: ((MediaItem) -> Void)? = nil) {
@@ -175,14 +179,25 @@ struct MediaDetailSheet: View {
         return cachedSceneBakeVideoURL
     }
 
+    private var currentDownloadedWallpaperEngineProjectType: String? {
+        guard let record = currentDownloadRecord else { return nil }
+        let contentRoot = WorkshopService.resolveWallpaperEngineProjectRoot(
+            startingAt: record.localFileURL
+        )
+        return Self.projectTypeString(at: contentRoot)
+    }
+
+    private var isCurrentDownloadedSceneProject: Bool {
+        currentDownloadedWallpaperEngineProjectType == "scene"
+    }
+
     private var isCurrentDownloadedWebProject: Bool {
-        guard let record = currentDownloadRecord else { return false }
-        return WebOfflineBakeService.isWebProject(at: record.localFileURL)
+        currentDownloadedWallpaperEngineProjectType == "web"
     }
 
     private var sceneOfflineBakeButtonVisible: Bool {
-        guard isAlreadyDownloaded, let record = currentDownloadRecord else { return false }
-        return record.sceneBakeEligibility != nil || isCurrentDownloadedWebProject
+        guard isAlreadyDownloaded, currentDownloadRecord != nil else { return false }
+        return isCurrentDownloadedSceneProject || isCurrentDownloadedWebProject
     }
 
     var body: some View {
@@ -373,20 +388,6 @@ struct MediaDetailSheet: View {
         } message: {
             Text(errorMessage)
         }
-        .alert("Steam Guard 验证码", isPresented: $showSteamGuardAlert) {
-            TextField("输入验证码", text: $pendingSteamGuardCode)
-            Button("取消", role: .cancel) {}
-            Button("确认下载") {
-                WorkshopSourceManager.shared.updateGuardCode(pendingSteamGuardCode)
-                if isWorkshopUpdateFlow {
-                    updateWorkshopDownload(guardCode: pendingSteamGuardCode)
-                } else {
-                    downloadWorkshop(guardCode: pendingSteamGuardCode)
-                }
-            }
-        } message: {
-            Text("当前账号启用了 Steam Guard，请输入 Authenticator 应用中的验证码以继续下载。")
-        }
         .alert(t("delete"), isPresented: $showDeleteConfirm) {
             Button(t("delete"), role: .destructive) {
                 viewModel.removeDownloads(withIDs: [resolvedItem.id])
@@ -436,10 +437,13 @@ struct MediaDetailSheet: View {
                 dismissSceneBakeRendererDialog()
             }
         }
-        .alert("Steam 登录已过期", isPresented: $showSessionExpiredAlert) {
-            Button("确定", role: .cancel) {}
+        .alert("需要重新登录 Steam", isPresented: $showSteamLoginRequiredAlert) {
+            Button("稍后", role: .cancel) {}
+            Button("打开设置") {
+                openSteamLoginSettings()
+            }
         } message: {
-            Text("Steam 会话已失效，本地登录信息已清除。请前往设置页面重新登录后再试。")
+            Text(steamLoginRequiredMessage)
         }
         .navigationBarBackButtonHidden(true)
         .task {
@@ -455,7 +459,7 @@ struct MediaDetailSheet: View {
             restoreSceneBakeProgressIfNeeded()
             hasWorkshopUpdateAvailable = false
             remoteWorkshopUpdatedAt = nil
-            isWorkshopUpdateFlow = false
+            workshopUpdateItemID = nil
             Task { await checkWorkshopUpdateIfNeeded() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .sceneOfflineBakeProgressDidUpdate)) { notification in
@@ -498,6 +502,14 @@ struct MediaDetailSheet: View {
             }
             isMediaLoaded = false
             mediaBackgroundEpoch &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .steamWorkshopLoginRequired)) { notification in
+            guard let itemID = notification.object as? String,
+                  itemID == resolvedItem.id else {
+                return
+            }
+            let message = notification.userInfo?["message"] as? String
+            presentSteamLoginRequired(message)
         }
         .onDisappear {
             isVisible = false
@@ -676,8 +688,11 @@ struct MediaDetailSheet: View {
     }
 
     /// 下载 / 更新完成后：注入本地视频与预览图，让详情页背景立刻切到本地资源。
+    /// 作者面板可原地切换详情；异步任务只能刷新其发起时对应的 item。
     @MainActor
-    private func refreshResolvedItemAfterLocalDownload() {
+    private func refreshResolvedItemAfterLocalDownload(for itemID: String) -> Bool {
+        guard resolvedItem.id == itemID else { return false }
+
         let merged = mediaItemByMergingAuthorMetadata(resolvedItem, fallback: resolvedItem)
         var item = itemWithLocalWorkshopVideo(merged)
         item = itemWithCorrectedWorkshopPageURL(item)
@@ -728,6 +743,7 @@ struct MediaDetailSheet: View {
         // 强制背景视图按新 URL 重建（.id 依赖 preview 路径）
         isMediaLoaded = false
         resolvedItem = item
+        return true
     }
 
     private func detailScrollTopInset(viewportHeight: CGFloat, heroHidden: Bool) -> CGFloat {
@@ -2328,14 +2344,17 @@ struct MediaDetailSheet: View {
                     itemID: itemID,
                     folderID: preservedFolderID
                 )
-                refreshResolvedItemAfterLocalDownload()
+                let refreshedCurrentDetail = refreshResolvedItemAfterLocalDownload(for: itemID)
                 if let videoURL = videoURLs.first {
                     VideoWallpaperManager.shared.reloadPlaybackAfterInPlaceOptimization(videoURL: videoURL)
                 }
-                sceneBakeStatusFlash = "已重新下载原文件"
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if sceneBakeStatusFlash == "已重新下载原文件" {
-                    sceneBakeStatusFlash = nil
+                if refreshedCurrentDetail {
+                    sceneBakeStatusFlash = "已重新下载原文件"
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if resolvedItem.id == itemID,
+                       sceneBakeStatusFlash == "已重新下载原文件" {
+                        sceneBakeStatusFlash = nil
+                    }
                 }
             }
         } else {
@@ -2709,12 +2728,11 @@ struct MediaDetailSheet: View {
     }
 
     /// 删除本地包后重新下载最新 Workshop 内容
-    private func updateWorkshopDownload(guardCode: String? = nil) {
-        // guardCode 重试时本地可能已删除，允许继续；首次点击需确认有更新
-        guard canUpdateWorkshopDownload || isWorkshopUpdateFlow || guardCode != nil else { return }
+    private func updateWorkshopDownload() {
+        guard canUpdateWorkshopDownload || isWorkshopUpdateFlow else { return }
         let updatingItem = resolvedItem
         let itemID = updatingItem.id
-        isWorkshopUpdateFlow = true
+        workshopUpdateItemID = itemID
 
         AppLogger.info(.download, "开始更新 Workshop 内容", metadata: [
             "id": itemID,
@@ -2731,18 +2749,21 @@ struct MediaDetailSheet: View {
         Task { @MainActor in
             defer { downloadActivity.finish(itemID: itemID) }
             do {
-                try await viewModel.updateWorkshopWallpaper(updatingItem, guardCode: guardCode)
+                try await viewModel.updateWorkshopWallpaper(updatingItem)
+                clearWorkshopUpdateFlow(for: itemID)
+                guard resolvedItem.id == itemID else { return }
+
                 hasWorkshopUpdateAvailable = false
                 remoteWorkshopUpdatedAt = nil
-                isWorkshopUpdateFlow = false
                 // 刷新详情侧元数据（updatedAt 已写入下载记录）
                 if let record = mediaLibrary.downloadRecord(for: itemID) {
                     resolvedItem = record.item
                 }
-                refreshResolvedItemAfterLocalDownload()
+                _ = refreshResolvedItemAfterLocalDownload(for: itemID)
                 sceneBakeStatusFlash = t("workshop.updated")
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if sceneBakeStatusFlash == t("workshop.updated") {
+                if resolvedItem.id == itemID,
+                   sceneBakeStatusFlash == t("workshop.updated") {
                     sceneBakeStatusFlash = nil
                 }
                 AppLogger.info(.download, "Workshop 更新成功", metadata: [
@@ -2750,20 +2771,12 @@ struct MediaDetailSheet: View {
                     "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))
                 ])
             } catch let error as WorkshopError {
-                switch error {
-                case .guardCodeRequired:
-                    // 保留 isWorkshopUpdateFlow，便于 Guard 码确认后继续更新
-                    pendingSteamGuardCode = ""
-                    showSteamGuardAlert = true
-                case .confirmationRequired(let msg):
-                    isWorkshopUpdateFlow = false
-                    errorMessage = msg
-                    showError = true
-                case .sessionExpired:
-                    isWorkshopUpdateFlow = false
-                    showSessionExpiredAlert = true
-                default:
-                    isWorkshopUpdateFlow = false
+                clearWorkshopUpdateFlow(for: itemID)
+                guard resolvedItem.id == itemID else { return }
+
+                if error.requiresSteamLoginRecovery {
+                    presentSteamLoginRequired(error.localizedDescription)
+                } else {
                     presentWorkshopDownloadError(error.localizedDescription)
                 }
                 AppLogger.error(.download, "Workshop 更新失败", metadata: [
@@ -2771,7 +2784,9 @@ struct MediaDetailSheet: View {
                     "error": error.localizedDescription
                 ])
             } catch {
-                isWorkshopUpdateFlow = false
+                clearWorkshopUpdateFlow(for: itemID)
+                guard resolvedItem.id == itemID else { return }
+
                 presentWorkshopDownloadError(error.localizedDescription)
                 AppLogger.error(.download, "Workshop 更新失败", metadata: [
                     "id": itemID,
@@ -2867,12 +2882,17 @@ struct MediaDetailSheet: View {
     }
 
     private func reloadMedia(_ newItem: MediaItem) {
+        // 切到另一个详情项后，旧项的“下载后自动设为壁纸”不能继续作用于新项。
+        autoDownloadTask?.cancel()
+        autoDownloadTask = nil
+
         // iOS 丝滑切换：交叉淡入淡出 + 微位移
         withAnimation(.spring(response: 0.38, dampingFraction: 0.82, blendDuration: 0)) {
             // 更新当前媒体项
             resolvedItem = newItem
 
             // 重置状态
+            isSettingWallpaper = false
             isMediaLoaded = false
             isSourcesReady = false
             showInfoBubble = false
@@ -3044,7 +3064,7 @@ struct MediaDetailSheet: View {
                 }
                 if let targetOption {
                     _ = try await viewModel.downloadMedia(downloadingItem, option: targetOption)
-                    refreshResolvedItemAfterLocalDownload()
+                    _ = refreshResolvedItemAfterLocalDownload(for: itemID)
                     AppLogger.info(.download, "媒体下载成功", metadata:
                         ["id": itemID, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start)),
                          "选中选项": targetOption.label])
@@ -3052,6 +3072,7 @@ struct MediaDetailSheet: View {
                     throw NetworkError.invalidResponse
                 }
             } catch {
+                guard resolvedItem.id == itemID else { return }
                 errorMessage = Self.truncateErrorMessage(error.localizedDescription)
                 showError = true
                 AppLogger.error(.download, "媒体下载失败", metadata:
@@ -3061,12 +3082,12 @@ struct MediaDetailSheet: View {
         }
     }
 
-    private func downloadWorkshop(guardCode: String? = nil) {
+    private func downloadWorkshop() {
         let downloadingItem = resolvedItem
         let itemID = downloadingItem.id
 
         AppLogger.info(.download, "开始下载 Workshop 内容", metadata:
-            ["id": itemID, "title": downloadingItem.title, "guardCode": guardCode != nil ? "provided" : "nil"])
+            ["id": itemID, "title": downloadingItem.title])
         downloadActivity.start(itemID: itemID)
         errorMessage = ""
         let start = Date()
@@ -3074,29 +3095,22 @@ struct MediaDetailSheet: View {
             defer { downloadActivity.finish(itemID: itemID) }
 
             do {
-                try await viewModel.downloadWorkshopWallpaper(downloadingItem, guardCode: guardCode)
-                refreshResolvedItemAfterLocalDownload()
+                try await viewModel.downloadWorkshopWallpaper(downloadingItem)
+                _ = refreshResolvedItemAfterLocalDownload(for: itemID)
                 AppLogger.info(.download, "Workshop 下载成功", metadata:
                     ["id": itemID, "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
             } catch let error as WorkshopError {
-                switch error {
-                case .guardCodeRequired:
-                    pendingSteamGuardCode = ""
-                    showSteamGuardAlert = true
-                case .confirmationRequired(let msg):
-                    errorMessage = msg
-                    showError = true
-                case .sessionExpired:
-                    showSessionExpiredAlert = true
-                    AppLogger.error(.download, "Workshop 会话过期，已清除本地登录信息", metadata:
-                        ["id": itemID])
-                default:
+                guard resolvedItem.id == itemID else { return }
+                if error.requiresSteamLoginRecovery {
+                    presentSteamLoginRequired(error.localizedDescription)
+                } else {
                     presentWorkshopDownloadError(error.localizedDescription)
                     AppLogger.error(.download, "Workshop 下载失败", metadata:
                         ["id": itemID, "error": error.localizedDescription,
                          "耗时(s)": String(format: "%.2f", Date().timeIntervalSince(start))])
                 }
             } catch {
+                guard resolvedItem.id == itemID else { return }
                 presentWorkshopDownloadError(error.localizedDescription)
                 AppLogger.error(.download, "Workshop 下载失败", metadata:
                     ["id": itemID, "error": error.localizedDescription,
@@ -3114,6 +3128,24 @@ struct MediaDetailSheet: View {
     private func presentWorkshopDownloadError(_ message: String) {
         errorMessage = Self.truncateErrorMessage(Self.workshopDownloadUserFacingMessage(message))
         showError = true
+    }
+
+    private func presentSteamLoginRequired(_ message: String?) {
+        let fallback = "Steam 会话需要重新登录。下载任务已保留；请在设置中登录，成功后将自动继续。密码和 Guard 验证码不会保存。"
+        let normalizedMessage = message?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayMessage: String
+        if let normalizedMessage, !normalizedMessage.isEmpty {
+            displayMessage = normalizedMessage
+        } else {
+            displayMessage = fallback
+        }
+        steamLoginRequiredMessage = Self.truncateErrorMessage(displayMessage)
+        showSteamLoginRequiredAlert = true
+    }
+
+    private func openSteamLoginSettings() {
+        (NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)
     }
 
     /// 根据 SteamCMD/业务错误文本生成用户可读提示，避免一律套“检查 VPN”的无效话术。
@@ -3188,18 +3220,13 @@ struct MediaDetailSheet: View {
                         }
                     } catch let error as WorkshopError {
                         await MainActor.run {
-                            let msg: String
-                            switch error {
-                            case .guardCodeRequired:
-                                msg = "依赖项需要 Steam Guard 验证码，请先在下载列表中单独下载母壁纸后再试"
-                            case .credentialsRequired:
-                                msg = "下载依赖项需要 Steam 登录凭证"
-                            case .steamcmdNotFound:
-                                msg = "SteamCMD 未找到，无法下载依赖项"
-                            default:
-                                msg = "依赖项下载失败: \(error.localizedDescription)"
+                            if error.requiresSteamLoginRecovery {
+                                self.presentSteamLoginRequired(error.localizedDescription)
+                            } else {
+                                self.presentWorkshopDownloadError(
+                                    "依赖项下载失败: \(error.localizedDescription)"
+                                )
                             }
-                            self.presentWorkshopDownloadError(msg)
                             self.isSettingWallpaper = false
                         }
                     } catch {
@@ -3221,16 +3248,18 @@ struct MediaDetailSheet: View {
             // 未下载的 Workshop 内容：自动下载后再设置壁纸
             // 取消可能正在进行的上一个自动下载任务，避免并发设置壁纸造成竞态
             autoDownloadTask?.cancel()
+            let itemToDownload = resolvedItem
+            let itemID = itemToDownload.id
             isSettingWallpaper = true
             errorMessage = ""
             autoDownloadTask = Task { @MainActor in
                 do {
                     AppLogger.info(.download, "自动下载 Workshop 内容后设置壁纸", metadata:
-                        ["id": resolvedItem.id, "title": resolvedItem.title])
-                    try await viewModel.downloadWorkshopWallpaper(resolvedItem)
+                        ["id": itemID, "title": itemToDownload.title])
+                    try await viewModel.downloadWorkshopWallpaper(itemToDownload)
                     // 下载被取消则不再继续设置壁纸
                     if Task.isCancelled { return }
-                    refreshResolvedItemAfterLocalDownload()
+                    guard refreshResolvedItemAfterLocalDownload(for: itemID) else { return }
                     // 下载完成后，查找本地文件并设置壁纸
                     if let localURL = findLocalWorkshopFile(for: resolvedItem) {
                         isSettingWallpaper = false
@@ -3241,22 +3270,19 @@ struct MediaDetailSheet: View {
                         showError = true
                     }
                 } catch is CancellationError {
-                    isSettingWallpaper = false
+                    if resolvedItem.id == itemID {
+                        isSettingWallpaper = false
+                    }
                 } catch let error as WorkshopError {
+                    guard resolvedItem.id == itemID else { return }
                     isSettingWallpaper = false
-                    switch error {
-                    case .guardCodeRequired:
-                        pendingSteamGuardCode = ""
-                        showSteamGuardAlert = true
-                    case .confirmationRequired(let msg):
-                        errorMessage = msg
-                        showError = true
-                    case .sessionExpired:
-                        showSessionExpiredAlert = true
-                    default:
+                    if error.requiresSteamLoginRecovery {
+                        presentSteamLoginRequired(error.localizedDescription)
+                    } else {
                         presentWorkshopDownloadError(error.localizedDescription)
                     }
                 } catch {
+                    guard resolvedItem.id == itemID else { return }
                     isSettingWallpaper = false
                     presentWorkshopDownloadError(error.localizedDescription)
                 }
@@ -3368,7 +3394,6 @@ struct MediaDetailSheet: View {
     private func downloadWorkshopDependency(dependencyID: String) async throws {
         let localURL = try await WorkshopService.shared.downloadWorkshopItem(
             workshopID: dependencyID,
-            guardCode: nil,
             progressHandler: { progress in
                 print("[DependencyDownload] \(dependencyID) progress: \(String(format: "%.1f", progress * 100))%")
             }
@@ -4694,6 +4719,11 @@ struct MediaDetailSheet: View {
             self.isNavigating = false
             self.isAuthorPanelFade = false
         }
+    }
+
+    private func clearWorkshopUpdateFlow(for itemID: String) {
+        guard workshopUpdateItemID == itemID else { return }
+        workshopUpdateItemID = nil
     }
 }
 

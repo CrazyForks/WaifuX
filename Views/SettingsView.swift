@@ -318,10 +318,6 @@ private struct GeneralSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @State private var showClearLockScreenAlert = false
-    @State private var showDynamicLockScreenAutomationAlert = false
-    @State private var showDynamicLockScreenAutomationFailureAlert = false
-    @State private var dynamicLockScreenAutomationFailure: LockScreenWallpaperService.AutomaticSetupResult?
-    @State private var isConfiguringDynamicLockScreen = false
     @State private var importProfileURL = ""
 
     private var languageBinding: Binding<LocalizationService.Language> {
@@ -338,49 +334,6 @@ private struct GeneralSettingsTab: View {
     private func openAccessibilitySettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
         NSWorkspace.shared.open(url)
-    }
-
-    private var dynamicLockScreenBinding: Binding<Bool> {
-        Binding(
-            get: { viewModel.dynamicLockScreenEnabled },
-            set: { enabled in
-                guard enabled != viewModel.dynamicLockScreenEnabled else { return }
-                viewModel.dynamicLockScreenEnabled = enabled
-                if enabled {
-                    showDynamicLockScreenAutomationAlert = true
-                }
-            }
-        )
-    }
-
-    private func configureDynamicLockScreenAutomatically() {
-        isConfiguringDynamicLockScreen = true
-        Task { @MainActor in
-            let result = await LockScreenWallpaperService.shared.automaticallyConfigureLockScreen()
-            isConfiguringDynamicLockScreen = false
-
-            guard result != .configured else { return }
-            dynamicLockScreenAutomationFailure = result
-            NSApp.activate(ignoringOtherApps: true)
-            showDynamicLockScreenAutomationFailureAlert = true
-        }
-    }
-
-    private var dynamicLockScreenAutomationFailureMessage: String {
-        switch dynamicLockScreenAutomationFailure {
-        case .accessibilityPermissionRequired:
-            return t("dynamicLockScreenAutoSetupAccessibilityMessage")
-        case .ambiguousDisplayNames:
-            return t("dynamicLockScreenAutoSetupAmbiguousDisplaysMessage")
-        case .noDisplayInstances:
-            return t("dynamicLockScreenAutoSetupNoDisplaysMessage")
-        case .unavailable:
-            return t("dynamicLockScreenAutoSetupUnavailableMessage")
-        case .systemSettingsUnavailable, .timedOut:
-            return t("dynamicLockScreenAutoSetupManualMessage")
-        case .configured, .none:
-            return ""
-        }
     }
 
     var body: some View {
@@ -633,13 +586,7 @@ private struct GeneralSettingsTab: View {
                         subtitle: t("dynamicLockScreenDesc"),
                         showDivider: true
                     ) {
-                        if isConfiguringDynamicLockScreen {
-                            ProgressView()
-                                .controlSize(.small)
-                                .frame(width: 32, height: 24)
-                        } else {
-                            MacToggle(isOn: dynamicLockScreenBinding)
-                        }
+                        MacToggle(isOn: $viewModel.dynamicLockScreenEnabled)
                     }
 
                     MacSettingsRow(
@@ -756,30 +703,6 @@ private struct GeneralSettingsTab: View {
             }
         } message: {
             Text(t("clearLockScreenInstancesConfirm"))
-        }
-        .alert(t("dynamicLockScreenAutoSetupTitle"), isPresented: $showDynamicLockScreenAutomationAlert) {
-            Button(t("dynamicLockScreenAutoSetupLater"), role: .cancel) {}
-            Button(t("dynamicLockScreenAutoSetupAction")) {
-                configureDynamicLockScreenAutomatically()
-            }
-        } message: {
-            Text(t("dynamicLockScreenAutoSetupConfirm"))
-        }
-        .alert(
-            t("dynamicLockScreenAutoSetupFailedTitle"),
-            isPresented: $showDynamicLockScreenAutomationFailureAlert
-        ) {
-            if dynamicLockScreenAutomationFailure == .accessibilityPermissionRequired {
-                Button(t("openAccessibilitySettings")) {
-                    openAccessibilitySettings()
-                }
-            }
-            Button(t("dynamicLockScreenOpenWallpaperSettings")) {
-                LockScreenWallpaperService.shared.openWallpaperSettings()
-            }
-            Button(t("cancel"), role: .cancel) {}
-        } message: {
-            Text(dynamicLockScreenAutomationFailureMessage)
         }
     }
 
@@ -2019,7 +1942,7 @@ private struct WorkshopSettingsTab: View {
         }
         .onAppear {
             refreshSteamCMDStatus()
-            sourceManager.refreshStoredSteamCredentials()
+            sourceManager.refreshStoredSteamIdentity()
             syncCredentialPresentation()
         }
         .onChange(of: sourceManager.steamCredentialState) { _, _ in
@@ -2037,9 +1960,9 @@ private struct WorkshopSettingsTab: View {
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 if case .available = sourceManager.steamCredentialState {
-                    Label("已保存", systemImage: "checkmark.circle.fill")
+                    Label("已保存用户名", systemImage: "person.crop.circle.badge.checkmark")
                         .font(.system(size: 12))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -2049,7 +1972,7 @@ private struct WorkshopSettingsTab: View {
                         Text(String(format: t("accountSaved"), username))
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
-                        Text("下次下载需要 Steam 账号的 Workshop 内容时会直接使用这组凭据。")
+                        Text("下载会复用 SteamCMD 的本地会话。密码和 Guard 验证码不会保存。")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary.opacity(0.85))
                     }
@@ -2063,7 +1986,7 @@ private struct WorkshopSettingsTab: View {
                     }
                     .controlSize(.small)
                     Button(t("logout")) {
-                        sourceManager.clearSteamCredentials()
+                        sourceManager.clearSteamIdentity()
                         steamUsername = ""
                         steamPassword = ""
                         steamGuardCode = ""
@@ -2138,16 +2061,13 @@ private struct WorkshopSettingsTab: View {
                                         password: steamPassword,
                                         guardCode: steamGuardCode
                                     )
-                                    sourceManager.setSteamCredentials(
-                                        username: steamUsername,
-                                        password: steamPassword,
-                                        guardCode: steamGuardCode
-                                    )
+                                    sourceManager.setSteamIdentity(username: steamUsername)
+                                    PersistentDownloadQueueService.shared.resumeWaitingForSteamLogin()
                                     await MainActor.run {
                                         steamPassword = ""
                                         steamGuardCode = ""
                                         if case .available = sourceManager.steamCredentialState {
-                                            steamLoginStatusText = "账号验证成功，已保存到本机。"
+                                            steamLoginStatusText = "Steam 会话验证成功。已保存用户名，密码和验证码未保存。"
                                             showLoginForm = false
                                         } else {
                                             steamLoginStatusText = "账号验证成功，但本机保存状态未更新。可以先尝试下载，如仍提示需要登录，再重新保存一次。"
@@ -2164,7 +2084,7 @@ private struct WorkshopSettingsTab: View {
                                         case .loginTimeout:
                                             steamLoginStatusText = "Steam 登录超时，请检查网络或代理设置后重试。"
                                         case .sessionExpired:
-                                            steamLoginStatusText = "Steam 登录已过期，请重新登录。"
+                                            steamLoginStatusText = "Steam 会话需要重新登录。"
                                         case .invalidCredentials:
                                             steamLoginStatusText = "账号、密码或验证码不正确，请检查后重试。"
                                         case .steamLoginFailed(let msg):
@@ -2197,7 +2117,7 @@ private struct WorkshopSettingsTab: View {
                 .cornerRadius(8)
             }
 
-            Text("SteamCMD 下载会使用这里保存的账号进行验证。未保存账号时，涉及 Steam 账号校验的 Workshop 内容将无法完成下载。")
+            Text("SteamCMD 下载只保存用户名并复用本机会话。密码与 Guard 验证码仅用于当前登录，不会写入本地。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
@@ -2379,7 +2299,7 @@ private struct WorkshopSettingsTab: View {
         case .unknown:
             return "尚未加载本地账号"
         case .missing:
-            return "未发现已保存账号"
+            return "未发现 Steam 会话账号"
         case .failure:
             return "读取本地账号失败"
         case .available(let username):
@@ -2392,11 +2312,11 @@ private struct WorkshopSettingsTab: View {
         case .unknown:
             return "正在准备本地账号信息。"
         case .missing:
-            return "当前没有检测到已保存的 SteamCMD 账号。你可以直接填写下面的表单进行验证并保存。"
+            return "当前没有可用于会话探测的 Steam 用户名。登录成功后只保存用户名，不保存密码。"
         case .failure(let message):
             return "读取本地已保存账号时发生错误：\(message)"
         case .available:
-            return "本机已经保存了可用账号。如果你想换账号，可以直接在下面重新验证并覆盖保存。"
+            return "本机已记录 Steam 用户名。真实登录状态会由 SteamCMD session probe 验证。"
         }
     }
 
@@ -2425,10 +2345,8 @@ private struct WorkshopSettingsTab: View {
     private func syncCredentialPresentation() {
         if case .available(let username) = sourceManager.steamCredentialState {
             steamUsername = username
-            if let credentials = sourceManager.steamCredentials {
-                steamPassword = credentials.password
-                steamGuardCode = credentials.guardCode ?? ""
-            }
+            steamPassword = ""
+            steamGuardCode = ""
             if !isVerifyingSteamLogin {
                 showLoginForm = false
             }
