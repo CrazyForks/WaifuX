@@ -322,6 +322,10 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 屏幕参数变化（分辨率、显示器热插拔等）时重启渲染进程
     private var screenChangeRestartWorkItem: DispatchWorkItem?
     private var lastAppliedScreenConfigurations: [ScreenConfigurationSignature] = []
+    /// 合盖唤醒后的 renderer 重建任务。scene 的 Metal surface 与 Web 的 WKWebView
+    /// 都可能在深度睡眠后保持进程存活却不再出帧，不能只依赖 AutoPause 的 resume。
+    private var wakeRecoveryTask: Task<Void, Never>?
+    private var wakeRecoveryGeneration: UInt64 = 0
 
     // MARK: - 初始化
 
@@ -360,6 +364,22 @@ final class WallpaperEngineXBridge: ObservableObject {
             self.handleCropDidChange(note)
         }
         .store(in: &self.cancellables)
+
+        // 合盖后的系统唤醒有时只发 didWake，有时还会补发 screensDidWake。
+        // 两者统一防抖到一次 renderer 重建，避免 scene Metal / WebView 保留失效表面而黑屏。
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { @MainActor [weak self] _ in
+                self?.scheduleWakeRecovery(reason: "systemWake")
+            }
+            .store(in: &self.cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { @MainActor [weak self] _ in
+                self?.scheduleWakeRecovery(reason: "screensWake")
+            }
+            .store(in: &self.cancellables)
 
         // Web 烘焙完成后，若该工程正作为实时 Web 壁纸运行，立刻将新 MP4 同步给锁屏。
         // 不能等首次静帧兜底的 6 秒定时器，否则会出现已有 MP4 仍短暂走静态帧的竞态。
@@ -444,7 +464,14 @@ final class WallpaperEngineXBridge: ObservableObject {
     ///   - targetScreens: 目标屏幕列表（nil 表示所有屏幕）
     ///   - userProperties: 用户属性覆盖 JSON（nil 时不传 --user-properties）
     ///   - forceRestart: 强制重启进程（例如屏幕分辨率变化时），默认 false 走热切换
-    func setWallpaper(path: String, assetsPath: String? = nil, targetScreens: [NSScreen]? = nil, userProperties: String? = nil, forceRestart: Bool = false) async throws {
+    func setWallpaper(
+        path: String,
+        assetsPath: String? = nil,
+        targetScreens: [NSScreen]? = nil,
+        userProperties: String? = nil,
+        forceRestart: Bool = false,
+        preserveAutoPauseState: Bool = false
+    ) async throws {
         print("[WallpaperEngineXBridge] >>> setWallpaper START path=\(path)")
         let lockScreenInfo: String
         if #available(macOS 26.0, *) {
@@ -633,7 +660,9 @@ final class WallpaperEngineXBridge: ObservableObject {
                 oldWallpaperPresentationHold?.cancel()
                 await commitPreparedRendererOverNativeVideo(on: effectiveScreens)
             }
-            DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
+            if !preserveAutoPauseState {
+                DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
+            }
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             ensureAudioRelayMatchesActiveWallpaper(projectRoot: resolvedPath)
             // Web 壁纸窗口已提交后，刷新系统静态底图确保状态栏重新采样
@@ -1035,7 +1064,9 @@ final class WallpaperEngineXBridge: ObservableObject {
         ])
         // 清除旧的前台暂停状态，避免 reevaluateCurrentState() 对新启动的渲染器误发 SIGSTOP。
         // 用户之后切走应用时，NSWorkspace app activation 通知会重新施加前台暂停。
-        DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
+        if !preserveAutoPauseState {
+            DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
+        }
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
 
         // 真实渲染已经启动，UI 可立即结束“设置中”状态。
@@ -4061,6 +4092,92 @@ final class WallpaperEngineXBridge: ObservableObject {
             targetScreenIDs.contains(screen.wallpaperScreenIdentifier) ||
             targetScreenFingerprints.contains(screen.wallpaperScreenFingerprint)
         }
+    }
+
+    // MARK: - System Wake Recovery
+
+    /// scene 进程和 Web daemon 在长睡眠后都可能仍存活，但其图形上下文已经失效。
+    /// 因此不把“PID 还在”当成健康信号；在显示器恢复稳定后按屏重新创建运行时。
+    private func scheduleWakeRecovery(reason: String) {
+        let hasManagedState = isControllingExternalEngine
+            || !screenRenderStates.isEmpty
+            || !screenProcesses.isEmpty
+        guard hasManagedState else { return }
+
+        wakeRecoveryGeneration &+= 1
+        let generation = wakeRecoveryGeneration
+        wakeRecoveryTask?.cancel()
+        wakeRecoveryTask = Task { @MainActor [weak self] in
+            do {
+                // 给 WindowServer、Metal 和 daemon 充分恢复时间；didWake 与
+                // screensDidWake 会被 generation 防抖成最后一次通知的一轮重建。
+                try await Task.sleep(for: .milliseconds(650))
+            } catch {
+                return
+            }
+
+            guard let self, !Task.isCancelled,
+                  self.wakeRecoveryGeneration == generation else {
+                return
+            }
+            await self.rebuildRenderersAfterSystemWake(reason: reason, generation: generation)
+            if self.wakeRecoveryGeneration == generation {
+                self.wakeRecoveryTask = nil
+            }
+        }
+    }
+
+    private func rebuildRenderersAfterSystemWake(reason: String, generation: UInt64) async {
+        guard wakeRecoveryGeneration == generation, !isSettingWallpaper else { return }
+        processPendingTermination()
+
+        let targets = activeTargetScreens().compactMap { screen -> (NSScreen, ScreenRenderState)? in
+            let screenID = screen.wallpaperScreenIdentifier
+            guard !isPaused(screenID: screenID),
+                  let state = renderState(for: screen),
+                  FileManager.default.fileExists(atPath: state.path) else {
+                return nil
+            }
+            return (screen, state)
+        }
+        guard !targets.isEmpty else {
+            DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+            return
+        }
+
+        AppLogger.error(.wallpaper, "WallpaperEngineX recovering renderers after system wake", metadata: [
+            "reason": reason,
+            "screens": targets.map { "\($0.0.wallpaperScreenIdentifier):\($0.1.renderKind.rawValue)" }.joined(separator: ","),
+            "pausedScreens": perScreenPausedScreenIDs.sorted().joined(separator: ",")
+        ])
+
+        for (screen, state) in targets {
+            guard wakeRecoveryGeneration == generation, !isSettingWallpaper else { return }
+            let userProperties = state.userProperties
+                ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path)
+            do {
+                // forceRestart 会重建 scene 的 Metal 进程；web 路径会重新 set 到
+                // daemon，从而创建新的 WKWebView。保留 AutoPause 记账，避免醒来
+                // 后错误恢复本应暂停的其它屏幕。
+                try await setWallpaper(
+                    path: state.path,
+                    targetScreens: [screen],
+                    userProperties: userProperties,
+                    forceRestart: true,
+                    preserveAutoPauseState: true
+                )
+                print("[WallpaperEngineXBridge] 已恢复唤醒后渲染器 screen=\(screen.wallpaperScreenIdentifier) kind=\(state.renderKind.rawValue)")
+            } catch {
+                AppLogger.error(.wallpaper, "WallpaperEngineX wake recovery failed", metadata: [
+                    "screen": screen.wallpaperScreenIdentifier,
+                    "kind": state.renderKind.rawValue,
+                    "error": error.localizedDescription
+                ])
+                print("[WallpaperEngineXBridge] ⚠️ 唤醒后重建失败 screen=\(screen.wallpaperScreenIdentifier): \(error.localizedDescription)")
+            }
+        }
+
+        DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
     }
 
     private func relinkTargetScreens() {
