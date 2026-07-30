@@ -154,6 +154,7 @@ let wallpaperCommandQueue = DispatchQueue(label: "com.waifux.wallpaperextension.
 @main
 final class WaifuXWallpaperExtension: NSObject, AppExtension {
     typealias Configuration = WallpaperExtensionConfiguration
+    private static let wakeRecoveryGeneration = OSAllocatedUnfairLock(initialState: 0)
 
     var configuration: WallpaperExtensionConfiguration {
         WallpaperExtensionConfiguration()
@@ -265,21 +266,71 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
             forName: NSWorkspace.screensDidSleepNotification,
             object: nil, queue: .main
         ) { _ in
-            WallpaperState.shared.isDisplayAsleep = true
-            WallpaperState.shared.forEachRenderer { $0.applyPolicy(.paused) }
-            extLog("[Extension] Displays asleep — paused all renderers")
+            Self.handleDisplaySleep(source: "screensDidSleep")
+        }
+        center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil, queue: .main
+        ) { _ in
+            Self.handleDisplaySleep(source: "willSleep")
         }
         center.addObserver(
             forName: NSWorkspace.screensDidWakeNotification,
             object: nil, queue: .main
         ) { _ in
-            WallpaperState.shared.isDisplayAsleep = false
-            Self.recomputeAndApplyPolicy()
-            extLog("[Extension] Displays awake — recomputed policy")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                Self.recomputeAndApplyPolicy()
+            Self.handleDisplayWake(source: "screensDidWake")
+        }
+        center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { _ in
+            Self.handleDisplayWake(source: "didWake")
+        }
+    }
+
+    private static func nextWakeRecoveryGeneration() -> Int {
+        wakeRecoveryGeneration.withLock { generation in
+            generation &+= 1
+            return generation
+        }
+    }
+
+    private static func isCurrentWakeRecoveryGeneration(_ generation: Int) -> Bool {
+        wakeRecoveryGeneration.withLock { $0 == generation }
+    }
+
+    private static func handleDisplaySleep(source: String) {
+        _ = nextWakeRecoveryGeneration()
+        WallpaperState.shared.isDisplayAsleep = true
+        WallpaperState.shared.forEachRenderer { $0.applyPolicy(.paused) }
+        extLog("[Extension] Display sleep (\(source)) — paused all renderers")
+    }
+
+    /// 合盖后的完整系统唤醒不保证发送 `screensDidWakeNotification`。
+    /// 两类唤醒通知都走这里；第一次立即恢复，随后再补两次，覆盖显示器、背光和
+    /// VideoToolbox 在不同阶段恢复的时序。
+    private static func handleDisplayWake(source: String) {
+        let generation = nextWakeRecoveryGeneration()
+        WallpaperState.shared.isDisplayAsleep = false
+
+        recoverRenderersAfterDisplayWake(source: source, generation: generation)
+        for delay in [0.75, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard isCurrentWakeRecoveryGeneration(generation) else { return }
+                recoverRenderersAfterDisplayWake(
+                    source: "\(source)+\(String(format: "%.2f", delay))s",
+                    generation: generation
+                )
             }
         }
+    }
+
+    private static func recoverRenderersAfterDisplayWake(source: String, generation: Int) {
+        guard isCurrentWakeRecoveryGeneration(generation) else { return }
+        PowerMonitor.shared.refreshNow()
+        WallpaperState.shared.forEachRenderer { $0.recoverFromDisplayWake() }
+        Self.recomputeAndApplyPolicy()
+        extLog("[Extension] Display wake (\(source)) — refreshed power state and recovered renderers")
     }
 
     // MARK: - Screen Lock

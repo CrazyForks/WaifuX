@@ -307,6 +307,20 @@ final class VideoRenderer: @unchecked Sendable {
         }
     }
 
+    /// 显示器经过长时间睡眠后，AVSampleBufferVideoRenderer 可能仍保留一个失效的
+    /// 解码会话；仅恢复 timebase 不会再次产出帧。重建 reader 和渲染队列，保留当前
+    /// 暂停状态，使锁屏和桌面在唤醒后都能重新提交首帧。
+    func recoverFromDisplayWake() {
+        queue.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.cancelRamp()
+            self.cancelDeepPauseTimer()
+            self.recreatePlayback()
+            CMTimebaseSetRate(self.timebase, rate: self.isPaused ? 0.0 : 1.0)
+            extLog("  [Renderer] 显示器唤醒后已重建解码管线")
+        }
+    }
+
     /// 热切换视频文件。保留当前 CAContext/layer，只替换视频源。
     func replaceVideo(with videoURL: URL) {
         let newAsset = AVURLAsset(url: videoURL)

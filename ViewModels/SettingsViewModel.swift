@@ -16,6 +16,9 @@ class SettingsViewModel: ObservableObject {
     }
     @Published private var themeModeRawValue: String = ThemeMode.system.rawValue { didSet { UserDefaults.standard.set(themeModeRawValue, forKey: "theme_mode") } }
     @Published var launchAtLogin = false { didSet { UserDefaults.standard.set(launchAtLogin, forKey: "launch_at_login") } }
+    @Published var swapMenuBarClickActions = false {
+        didSet { UserDefaults.standard.set(swapMenuBarClickActions, forKey: "menu_bar_swap_click_actions") }
+    }
     /// 永不休眠：持有 IOPM assertion，阻止空闲息屏 / 系统睡眠，锁屏时桌面可继续显示。
     @Published var preventSystemSleep = false {
         didSet {
@@ -464,6 +467,7 @@ class SettingsViewModel: ObservableObject {
                 themeModeRawValue = raw
             }
             launchAtLogin = defaults.bool(forKey: "launch_at_login")
+            swapMenuBarClickActions = defaults.bool(forKey: "menu_bar_swap_click_actions")
             preventSystemSleep = defaults.bool(forKey: "prevent_system_sleep")
             grainTextureEnabled = defaults.object(forKey: "grain_texture_enabled") as? Bool ?? false
             grainTextureQuality = defaults.string(forKey: "grain_texture_quality") ?? "high"

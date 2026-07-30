@@ -162,6 +162,7 @@ final class StatusBarController: NSObject {
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
+    private lazy var quickSwitcherController = MenuBarQuickSwitcherController()
 
     private lazy var openWindowItem = NSMenuItem(title: t("statusbar.showWindow"), action: #selector(showMainWindow), keyEquivalent: "")
     private lazy var openLibraryItem = NSMenuItem(title: t("statusbar.openMyLibrary"), action: #selector(openMyLibrary), keyEquivalent: "")
@@ -254,6 +255,9 @@ final class StatusBarController: NSObject {
         }
 
         button.toolTip = "WaifuX"
+        button.target = self
+        button.action = #selector(handleStatusItemClick(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         openWindowItem.target = self
         openLibraryItem.target = self
@@ -280,8 +284,34 @@ final class StatusBarController: NSObject {
         menu.addItem(checkUpdateItem)
         menu.addItem(quitItem)
 
-        statusItem.menu = menu
+        // Keep the contextual controls on the right click only. The left click opens
+        // the local-library quick switcher, so assigning `statusItem.menu` here would
+        // make AppKit consume both clicks before the button action can route them.
+        statusItem.menu = nil
         menu.delegate = self
+    }
+
+    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
+        guard let event = NSApp.currentEvent else { return }
+
+        let clickActionsSwapped = UserDefaults.standard.bool(forKey: "menu_bar_swap_click_actions")
+        let showQuickSwitcher = (event.type == .leftMouseUp) != clickActionsSwapped
+
+        if showQuickSwitcher {
+            let targetScreen = sender.window?.screen ?? NSScreen.main ?? NSScreen.screens.first
+            quickSwitcherController.toggle(
+                relativeTo: sender,
+                targetScreen: targetScreen,
+                currentWallpaperURL: targetScreen.flatMap { currentWallpaperURL(for: $0) },
+                onOpenSettings: { [weak self] in
+                    self?.openAppSettingsPanel()
+                }
+            )
+        } else if event.type == .leftMouseUp || event.type == .rightMouseUp {
+            quickSwitcherController.dismiss()
+            refreshMenuState()
+            statusItem.popUpMenu(menu)
+        }
     }
 
     private func bindLocalizationState() {
@@ -781,7 +811,7 @@ final class StatusBarController: NSObject {
         guard let screen = sender.representedObject as? NSScreen else { return }
         // 菜单 tracking 模式下立刻 apply 时，desktop 层合帧常被推迟到点一下其它 App。
         // 先关掉菜单，再在下一拍主线程 runloop 里切换，并强制提交桌面窗。
-        statusItem.menu?.cancelTracking()
+        menu.cancelTracking()
         let targetScreen = screen
         DispatchQueue.main.async {
             if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {

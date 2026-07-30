@@ -248,6 +248,9 @@
 		DB3C45216E9CC68BCAC555A8 /* PowerSourceMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCB5D4A6D1AA43902CF9E13E /* PowerSourceMonitor.swift */; };
 		DB540D9F6379FDAEFB285F76 /* VideoThumbnailCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45A0C1ABDB171C326129A73E /* VideoThumbnailCache.swift */; };
 		DB8871BEB9E5BFA5DF65AA40 /* StatusBarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9FBFD203D24AC295FEDADA9 /* StatusBarController.swift */; };
+		F203A4C1B6B74E98A2D5B301 /* MenuBarQuickWallpaperItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F203A4C1B6B74E98A2D5C301 /* MenuBarQuickWallpaperItem.swift */; };
+		F203A4C1B6B74E98A2D5B302 /* MenuBarQuickSwitcherView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F203A4C1B6B74E98A2D5C302 /* MenuBarQuickSwitcherView.swift */; };
+		F203A4C1B6B74E98A2D5B303 /* MenuBarQuickSwitcherController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F203A4C1B6B74E98A2D5C303 /* MenuBarQuickSwitcherController.swift */; };
 		DBF4F63F9D69E02FB6A63BB0 /* WallpaperSchedulerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5433F5B3470D14D8CE5A3029 /* WallpaperSchedulerViewModel.swift */; };
 		DC52EEC8FB18CE59615FCBBE /* AddToFolderSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62BFEA014005A1398938CD1A /* AddToFolderSheet.swift */; };
 		DDA9519C500666EFB4DE29D7 /* DisplayCropSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 241C406FB2E706A93ABEB4EC /* DisplayCropSettings.swift */; };
@@ -521,6 +524,9 @@
 		C7E5EA68B40F08C0C4032C1D /* FourKWallpapersParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FourKWallpapersParser.swift; sourceTree = "<group>"; };
 		C82778D3A307A22A7032D5B6 /* WebViewCookieSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebViewCookieSync.swift; sourceTree = "<group>"; };
 		C9FBFD203D24AC295FEDADA9 /* StatusBarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarController.swift; sourceTree = "<group>"; };
+		F203A4C1B6B74E98A2D5C301 /* MenuBarQuickWallpaperItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarQuickWallpaperItem.swift; sourceTree = "<group>"; };
+		F203A4C1B6B74E98A2D5C302 /* MenuBarQuickSwitcherView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarQuickSwitcherView.swift; sourceTree = "<group>"; };
+		F203A4C1B6B74E98A2D5C303 /* MenuBarQuickSwitcherController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarQuickSwitcherController.swift; sourceTree = "<group>"; };
 		CA65FFAE56365FA08F8C12B2 /* WallpaperDetailSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperDetailSheet.swift; sourceTree = "<group>"; };
 		CB351D653953FE395C1E15FB /* FolderStackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FolderStackView.swift; sourceTree = "<group>"; };
 		CC6E9443ECE5DC4B6554F655 /* WebWallpaperDesignPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebWallpaperDesignPanel.swift; sourceTree = "<group>"; };
@@ -810,6 +816,7 @@
 				0536692A0BF2778A553D8E82 /* SleepPreventer.swift */,
 				43F380AEDBCA52734E0802C2 /* StaticImageWallpaperOverlayManager.swift */,
 				2FF8A1F8B7C857E9D5DE0A6B /* StaticWallpaperGrainManager.swift */,
+				F203A4C1B6B74E98A2D5C303 /* MenuBarQuickSwitcherController.swift */,
 				C9FBFD203D24AC295FEDADA9 /* StatusBarController.swift */,
 				69E901FF6D205414875FD5F4 /* SuperResolutionService.swift */,
 				EF3780096BAEA3E2C4E58765 /* SystemAudioCaptureService.swift */,
@@ -890,6 +897,7 @@
 				FEEBA93D7CC0380CF9E1693B /* MediaDetailSheet.swift */,
 				229CDC52631E90C60BE30BEE /* MediaExploreContentView.swift */,
 				98C879F4D11EE89FC032C815 /* MessagesContentView.swift */,
+				F203A4C1B6B74E98A2D5C302 /* MenuBarQuickSwitcherView.swift */,
 				D600194FF5989B7E11C9E138 /* MyLibraryContentView.swift */,
 				2EB8D69CAADE135414C7A5CA /* SceneConfigOverridePanel.swift */,
 				EBB7ADD11EE352129A30930A /* SceneWallpaperDesignPanel.swift */,
@@ -986,6 +994,7 @@
 				ED321504BADDC0FCBA8515DB /* LibraryFolder.swift */,
 				43498E7A9DF3A409E2F15E14 /* LiquidGlassClockConfiguration.swift */,
 				B3F4D6935CD6C40A16F284FA /* MangaModels.swift */,
+				F203A4C1B6B74E98A2D5C301 /* MenuBarQuickWallpaperItem.swift */,
 				64E863AB4B82C85983EF0D89 /* MediaFilters.swift */,
 				AC6136D9FACBC166FFE1B697 /* MediaItem.swift */,
 				B8ABAC235052098531A787A3 /* NetworkError.swift */,
@@ -1369,6 +1378,9 @@
 				3CE4244D02FFAFEA3BA52943 /* SourceSwitchTooltip.swift in Sources */,
 				33455A4520F051AA31E488AB /* StaticImageWallpaperOverlayManager.swift in Sources */,
 				3024FC211183045D592C08B4 /* StaticWallpaperGrainManager.swift in Sources */,
+				F203A4C1B6B74E98A2D5B301 /* MenuBarQuickWallpaperItem.swift in Sources */,
+				F203A4C1B6B74E98A2D5B302 /* MenuBarQuickSwitcherView.swift in Sources */,
+				F203A4C1B6B74E98A2D5B303 /* MenuBarQuickSwitcherController.swift in Sources */,
 				DB8871BEB9E5BFA5DF65AA40 /* StatusBarController.swift in Sources */,
 				76DFAF3ABE568DDD785DC8F0 /* SteamLoginWebView.swift in Sources */,
 				E14C8D6FB374C89B70996BEC /* SuperResolutionService.swift in Sources */,

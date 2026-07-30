@@ -72,8 +72,7 @@ final class PowerMonitor: Sendable {
         state.withLock {
             $0.thermalState = ProcessInfo.processInfo.thermalState
         }
-        updateBatteryState()
-        updateBrightnessState()
+        refreshNow()
 
         // 热状态 — 事件驱动
         NotificationCenter.default.addObserver(
@@ -111,6 +110,13 @@ final class PowerMonitor: Sendable {
 
         let thermal = ProcessInfo.processInfo.thermalState.rawValue
         extLog("[PowerMonitor] 已启动 (thermal: \(thermal))")
+    }
+
+    /// 设备从睡眠恢复时，亮度和电源来源可能在通知到达前后发生变化。
+    /// 立即刷新，避免睡眠期间读取到的 0 亮度一直把壁纸策略锁在暂停状态。
+    func refreshNow() {
+        updateBatteryState()
+        updateBrightnessState()
     }
 
     // MARK: - Private

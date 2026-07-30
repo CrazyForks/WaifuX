@@ -672,6 +672,14 @@ private struct GeneralSettingsTab: View {
                 }
 
                 MacSettingsRow(
+                    title: t("menuBarClickActions"),
+                    subtitle: t("menuBarClickActionsDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.swapMenuBarClickActions)
+                }
+
+                MacSettingsRow(
                     title: t("preventSystemSleep"),
                     subtitle: t("preventSystemSleepDesc"),
                     showDivider: true

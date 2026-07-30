@@ -2858,6 +2858,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     func resolveOfflineBakeMediaAudioPlan(
         screen: Int,
+        fallbackStartOffset: TimeInterval = 0,
         completion: @escaping (WebOfflineBakeMediaAudioPlan?) -> Void
     ) {
         guard let state = screenStates[screen],
@@ -2876,14 +2877,21 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                   originalMuted: el.__wxBakeOriginalMuted === true,
                   volume: Number(el.volume || 0),
                   paused: !!el.paused,
+                  ended: !!el.ended,
                   loop: !!el.loop,
+                  currentTime: Number(el.currentTime || 0),
                   videoWidth: Number(el.videoWidth || 0),
                   videoHeight: Number(el.videoHeight || 0),
                   readyState: Number(el.readyState || 0)
                 };
               })
               .filter(function(el) {
-                return !!el.source && !el.originalMuted && el.volume > 0 && el.readyState >= 2;
+                return !!el.source
+                  && !el.originalMuted
+                  && el.volume > 0
+                  && el.readyState >= 2
+                  && !el.paused
+                  && !el.ended;
               })
               .sort(function(a, b) {
                 var scoreA = (a.paused ? 0 : 1000000) + a.videoWidth * a.videoHeight;
@@ -2904,7 +2912,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                   url.isFileURL,
                   FileManager.default.fileExists(atPath: url.path) else {
                 let fallback = projectContentDir.flatMap {
-                    Self.resolveProjectBackgroundAudioPlan(contentDir: $0)
+                    Self.resolveProjectBackgroundAudioPlan(
+                        contentDir: $0,
+                        startOffset: fallbackStartOffset
+                    )
                 }
                 DispatchQueue.main.async { completion(fallback) }
                 return
@@ -2912,7 +2923,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             let plan = WebOfflineBakeMediaAudioPlan(
                 sourceURL: url,
                 volume: max(0, min(1, probe.volume)),
-                loops: probe.loop
+                loops: probe.loop,
+                startOffset: max(0, probe.currentTime.isFinite ? probe.currentTime : 0)
             )
             DispatchQueue.main.async { completion(plan) }
         }
@@ -2922,7 +2934,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     /// If their initialization fails before a DOM media element exists, recover the
     /// intended looping background track from the authored script and property defaults.
     private static func resolveProjectBackgroundAudioPlan(
-        contentDir: URL
+        contentDir: URL,
+        startOffset: TimeInterval = 0
     ) -> WebOfflineBakeMediaAudioPlan? {
         let projectURL = contentDir.appendingPathComponent("project.json")
         guard let projectData = try? Data(contentsOf: projectURL),
@@ -3018,7 +3031,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         return WebOfflineBakeMediaAudioPlan(
             sourceURL: best.url,
             volume: max(0, min(1, backgroundVolume)),
-            loops: best.loops
+            loops: best.loops,
+            startOffset: max(0, startOffset)
         )
     }
 
@@ -3033,9 +3047,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         }
     }
 
-    /// Rewind HTML media before the capture stream begins. The stream remains idle
-    /// until `startOfflineBakeRealtimeMedia` issues matching play requests, keeping
-    /// the separately muxed audio aligned with captured frame zero.
+    /// Freeze the page's current media state before the capture stream begins.
+    ///
+    /// Only media that the wallpaper itself had already started are resumed later.
+    /// This avoids accidentally playing click / idle voice tracks during a bake.
     func prepareOfflineBakeRealtimeMedia(
         screen: Int,
         completion: @escaping (Bool) -> Void
@@ -3050,9 +3065,35 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
           try {
             var token = '\(token)';
             var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
+            var loopVideos = media.filter(function(el) {
+              return el instanceof HTMLVideoElement
+                && !!el.loop
+                && !!String(el.currentSrc || el.src || '');
+            });
+            var openingCandidates = media.filter(function(el) {
+              return el instanceof HTMLVideoElement
+                && !el.loop
+                && (!el.paused || !!el.autoplay)
+                && !!String(el.currentSrc || el.src || '')
+                && el.readyState >= 2
+                && isFinite(el.duration)
+                && el.duration > 0;
+            }).sort(function(a, b) {
+              return (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight);
+            });
+            // Skip an opening only when the page has a concrete looping video to
+            // transition into. A single non-looping video may be the actual wallpaper.
+            var opening = loopVideos.length && openingCandidates.length
+              ? openingCandidates[0] : null;
+            window.__wxBakeRealtimeState = {
+              token: token,
+              openingIndex: opening ? media.indexOf(opening) : -1,
+              loopVideoIndexes: loopVideos.map(function(el) { return media.indexOf(el); })
+            };
             var waits = media.map(function(el) {
               return new Promise(function(resolve) {
                 try {
+                  el.__wxBakeShouldResume = !el.paused || !!el.autoplay;
                   el.pause();
                   if (!isFinite(el.duration) || el.duration <= 0
                     || (isFinite(el.currentTime) && Math.abs(el.currentTime) <= 0.0005)) {
@@ -3105,30 +3146,82 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     func startOfflineBakeRealtimeMedia(
         screen: Int,
-        preroll: TimeInterval,
-        completion: @escaping () -> Void
+        warmup: TimeInterval,
+        completion: @escaping (Bool) -> Void
     ) {
         guard let webView = screenStates[screen]?.webView else {
-            completion()
+            completion(false)
             return
         }
+        let token = UUID().uuidString
         let js = """
         (function() {
           try {
-            Array.prototype.slice.call(document.querySelectorAll('video,audio')).forEach(function(el) {
+            var token = '\(token)';
+            var warmupMS = \(Int(max(0, warmup * 1_000).rounded()));
+            var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
+            var state = window.__wxBakeRealtimeState || {};
+            var opening = state.openingIndex >= 0 ? media[state.openingIndex] : null;
+            var loopVideos = Array.isArray(state.loopVideoIndexes)
+              ? state.loopVideoIndexes.map(function(index) { return media[index]; }).filter(Boolean)
+              : [];
+
+            function play(el) {
               try {
                 var p = el.play();
                 if (p && typeof p.catch === 'function') p.catch(function(){});
               } catch (e) {}
+            }
+
+            // The page owns the media topology. Resume only the elements that were
+            // active at the stable load point; script event handlers can start their
+            // own successor media (for example, opening.onended -> loop.play()).
+            media.forEach(function(el) {
+              if (el !== opening && el.__wxBakeShouldResume) play(el);
             });
+
+            if (opening && isFinite(opening.duration) && opening.duration > 0) {
+              try {
+                opening.currentTime = Math.max(
+                  0,
+                  opening.duration - Math.min(0.08, opening.duration * 0.1)
+                );
+              } catch (e) {}
+              play(opening);
+            }
+
+            var settled = false;
+            var startedAt = Date.now();
+            var transitionDeadlineMS = 2500;
+            function finish() {
+              if (settled) return;
+              settled = true;
+              setTimeout(function() {
+                window.__wxBakeRealtimeStartedToken = token;
+              }, warmupMS);
+            }
+            function loopIsRunning() {
+              return loopVideos.some(function(el) {
+                return el && el.readyState >= 2 && !el.paused && !el.ended;
+              });
+            }
+            function waitForStableLoop() {
+              if (!opening || loopIsRunning() || Date.now() - startedAt >= transitionDeadlineMS) {
+                finish();
+                return;
+              }
+              setTimeout(waitForStableLoop, 25);
+            }
+            waitForStableLoop();
           } catch (e) {}
           return true;
         })();
         """
         webView.evaluateJavaScript(js) { _, _ in
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + max(0, preroll),
-                execute: completion
+            self.waitForOfflineBakeRealtimeStartToken(
+                webView: webView,
+                token: token,
+                completion: completion
             )
         }
     }
@@ -3156,6 +3249,40 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                     return
                 }
                 self.waitForOfflineBakeRealtimeToken(
+                    webView: webView,
+                    token: token,
+                    attempt: attempt + 1,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private func waitForOfflineBakeRealtimeStartToken(
+        webView: WKWebView,
+        token: String,
+        attempt: Int = 0,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let escapedToken = token.replacingOccurrences(of: "'", with: "\\'")
+        let js = "window.__wxBakeRealtimeStartedToken === '\(escapedToken)';"
+        webView.evaluateJavaScript(js) { result, _ in
+            if (result as? Bool) == true {
+                DispatchQueue.main.async { completion(true) }
+                return
+            }
+            // Opening transition (up to 2.5s) + the steady-state warmup can exceed
+            // the old 8s limit before the recorder is intentionally armed.
+            if attempt >= 750 {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self, weak webView] in
+                guard let self, let webView else {
+                    completion(false)
+                    return
+                }
+                self.waitForOfflineBakeRealtimeStartToken(
                     webView: webView,
                     token: token,
                     attempt: attempt + 1,
@@ -3311,6 +3438,7 @@ private struct WebOfflineBakeMediaAudioProbe: Decodable {
     let source: String
     let volume: Double
     let loop: Bool
+    let currentTime: Double
 }
 
 private struct WebOfflineBakeMediaAudioPlan {
@@ -3913,9 +4041,9 @@ private final class WebOfflineBakeRunner {
     private static let minimumAutomaticFrameRate = 15.0
     private static let maximumAutomaticFrameRate = 120.0
     private static let presentationTimescale: CMTimeScale = 1_000_000
-    private static let realtimeCapturePreroll: TimeInterval = 0.5
-    private static let mediaPlanRetryInterval: TimeInterval = 0.25
-    private static let mediaPlanRetryCount = 20
+    /// Match the live Web poster sampler: complex Web/Spine wallpapers often create
+    /// their steady animation and BGM several seconds after the document first loads.
+    private static let realtimeCaptureWarmup: TimeInterval = 7.0
 
     /// 4K60 下约 50Mbps（~0.1 bpp），明显优于旧的 width×height×3（~25Mbps）。
     private static func averageBitRate(width: Int, height: Int, fps: Double) -> Int {
@@ -3964,29 +4092,7 @@ private final class WebOfflineBakeRunner {
             // compositor output instead of sampling a virtual clock frame by frame.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self, !self.isFinishing else { return }
-                self.resolveMediaAudioPlanAndBeginCapture()
-            }
-        }
-    }
-
-    private func resolveMediaAudioPlanAndBeginCapture(attempt: Int = 0) {
-        renderer.resolveOfflineBakeMediaAudioPlan(
-            screen: WebRendererBridge.offlineBakeScreen
-        ) { [weak self] plan in
-            guard let self, !self.isFinishing else { return }
-            if let plan {
-                self.mediaAudioPlan = plan
                 self.prepareAndBeginRealtimeStreamCapture()
-                return
-            }
-            guard attempt < Self.mediaPlanRetryCount else {
-                self.prepareAndBeginRealtimeStreamCapture()
-                return
-            }
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + Self.mediaPlanRetryInterval
-            ) { [weak self] in
-                self?.resolveMediaAudioPlanAndBeginCapture(attempt: attempt + 1)
             }
         }
     }
@@ -4059,14 +4165,38 @@ private final class WebOfflineBakeRunner {
                 outputURL: temporaryURL,
                 captureReady: { [weak self] in
                     guard let self, !self.isFinishing else { return }
+                    self.emitProgress(phase: "预热", progress: 0)
                     self.renderer.startOfflineBakeRealtimeMedia(
                         screen: WebRendererBridge.offlineBakeScreen,
-                        preroll: Self.realtimeCapturePreroll
-                    ) { [weak self] in
+                        warmup: Self.realtimeCaptureWarmup
+                    ) { [weak self] ready in
                         guard let self, !self.isFinishing else { return }
-                        self.mediaAudioPlan?.startOffset = Self.realtimeCapturePreroll
-                        self.captureStartedAt = Date()
-                        self.realtimeRecorder?.beginRecording()
+                        guard ready else {
+                            self.finish(.failure(
+                                WebOfflineBakeError.rendererFailed("Web 壁纸媒体未能完成预热")
+                            ))
+                            return
+                        }
+                        self.renderer.resolveOfflineBakeMediaAudioPlan(
+                            screen: WebRendererBridge.offlineBakeScreen,
+                            fallbackStartOffset: Self.realtimeCaptureWarmup
+                        ) { [weak self] plan in
+                            guard let self, !self.isFinishing else { return }
+                            self.mediaAudioPlan = plan
+                            let audioSource = plan?.sourceURL.lastPathComponent ?? "none"
+                            fputs(
+                                String(
+                                    format: "[web-bake] media stabilized warmup=%.1fs audio=%@\n",
+                                    Self.realtimeCaptureWarmup,
+                                    audioSource
+                                ),
+                                stderr
+                            )
+                            fflush(stderr)
+                            self.emitProgress(phase: "预热", progress: 0.15)
+                            self.captureStartedAt = Date()
+                            self.realtimeRecorder?.beginRecording()
+                        }
                     }
                 }
             ),
@@ -4077,7 +4207,10 @@ private final class WebOfflineBakeRunner {
                     self.nextFrameIndex = frameCount
                     self.emitProgress(
                         phase: "录制",
-                        progress: min(0.99, max(0, elapsed / self.options.duration))
+                        progress: min(
+                            0.99,
+                            max(0.15, 0.15 + 0.84 * elapsed / self.options.duration)
+                        )
                     )
                 }
             },
@@ -4103,7 +4236,7 @@ private final class WebOfflineBakeRunner {
         )
         realtimeRecorder = recorder
         recorder.start()
-        recorder.failIfNoFirstFrame(after: 8)
+        recorder.failIfNoFirstFrame(after: Self.realtimeCaptureWarmup + 6)
     }
 
     private func normalizedFrameRate(_ candidate: Double) -> Double {

@@ -1,0 +1,563 @@
+import AppKit
+import SwiftUI
+import Kingfisher
+
+/// The compact local-library browser shown from a left click on the menu-bar item.
+/// Visual target: floating frosted card, fixed-size rounded hero, scrollable thumbnail rail.
+struct MenuBarQuickSwitcherView: View {
+    /// Shared panel size — also referenced by MenuBarQuickSwitcherController.
+    static let panelSize = NSSize(width: 370, height: 385)
+
+    @ObservedObject var viewModel: MenuBarQuickSwitcherViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @State private var readyVideoURL: URL?
+
+    // Panel: previous height kept; width bumped slightly for breathing room.
+    private let panelWidth: CGFloat = 370
+    private let panelHeight: CGFloat = 385
+    private let panelCorner: CGFloat = 26
+    private let contentPadding: CGFloat = 14
+
+    // Hero is intentionally fixed — never flexible max frames that can overflow.
+    private let heroWidth: CGFloat = 342
+    private let heroHeight: CGFloat = 240
+    private let heroCorner: CGFloat = 16
+
+    private let thumbnailSize: CGFloat = 56
+    private let thumbnailSpacing: CGFloat = 8
+    private let thumbnailCorner: CGFloat = 11
+    private let footerButtonHeight: CGFloat = 36
+    private let footerIconSize: CGFloat = 17
+
+    private var selectionSpring: Animation {
+        reduceMotion
+            ? .easeInOut(duration: 0.16)
+            : .spring(response: 0.30, dampingFraction: 0.86, blendDuration: 0)
+    }
+
+    private var crossfadeAnimation: Animation {
+        reduceMotion
+            ? .easeInOut(duration: 0.12)
+            : .spring(response: 0.28, dampingFraction: 0.90, blendDuration: 0)
+    }
+
+    private var panelShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: panelCorner, style: .continuous)
+    }
+
+    private var heroShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: heroCorner, style: .continuous)
+    }
+
+    var body: some View {
+        ZStack {
+            // System frosted glass only — no muddy green wash.
+            panelShape
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    panelShape
+                        .fill(Color.primary.opacity(0.04))
+                }
+                .overlay {
+                    panelShape
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                }
+                .shadow(color: .black.opacity(0.22), radius: 18, y: 10)
+
+            VStack(spacing: 0) {
+                hero
+                    .frame(width: heroWidth, height: heroHeight)
+
+                thumbnailRail
+                    .padding(.top, 12)
+
+                footer
+                    .padding(.top, 12)
+            }
+            .padding(contentPadding)
+        }
+        .frame(width: panelWidth, height: panelHeight)
+        .clipShape(panelShape)
+        .compositingGroup()
+        .task(id: viewModel.previewWarmupToken) {
+            await viewModel.warmVisiblePreviews()
+        }
+        .onChange(of: viewModel.selectedItem?.videoPreviewURL) { _, _ in
+            readyVideoURL = nil
+        }
+    }
+
+    private var hero: some View {
+        ZStack(alignment: .topTrailing) {
+            if let selected = viewModel.selectedItem {
+                // Fixed-size slot. Media is painted as an overlay so scaledToFill
+                // cannot expand layout or poke past the rounded clip.
+                Color.black.opacity(0.10)
+                    .overlay {
+                        QuickSwitcherImage(url: selected.thumbnailURL, fallbackSymbol: "photo")
+                            .id(selected.id + (selected.thumbnailURL?.absoluteString ?? ""))
+                            .transition(.opacity)
+                    }
+                    .overlay {
+                        if let videoURL = selected.videoPreviewURL {
+                            LoopingVideoBackgroundView(
+                                url: videoURL,
+                                isMuted: true,
+                                contentMode: .fill,
+                                // Outer SwiftUI clip owns the corner; avoid double-radius mismatch.
+                                cornerRadius: 0,
+                                onReady: { @MainActor in
+                                    withAnimation(crossfadeAnimation) {
+                                        readyVideoURL = videoURL
+                                    }
+                                }
+                            )
+                            .id(videoURL)
+                            .opacity(readyVideoURL == videoURL ? 1 : 0)
+                            .allowsHitTesting(false)
+                        }
+                    }
+                    .frame(width: heroWidth, height: heroHeight)
+                    .clipped()
+                    .clipShape(heroShape)
+                    .contentShape(heroShape)
+                    .overlay(alignment: .bottomLeading) {
+                        if let errorMessage = viewModel.errorMessage {
+                            Text(errorMessage)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white)
+                                .lineLimit(2)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(.black.opacity(0.54), in: Capsule())
+                                .padding(10)
+                                .transition(
+                                    .opacity.combined(with: .scale(scale: 0.96, anchor: .bottomLeading))
+                                )
+                        }
+                    }
+                    .overlay {
+                        if viewModel.isApplying {
+                            ZStack {
+                                Color.black.opacity(0.22)
+                                ProgressView()
+                                    .controlSize(.large)
+                                    .tint(.white)
+                            }
+                            .clipShape(heroShape)
+                            .transition(.opacity)
+                        }
+                    }
+
+                Button {
+                    viewModel.toggleFavorite()
+                } label: {
+                    Image(systemName: viewModel.isSelectedItemFavorite ? "heart.fill" : "heart")
+                        .font(.system(size: 14, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .background(Color.black.opacity(0.22), in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.8)
+                        }
+                }
+                .buttonStyle(QuickSwitcherPressButtonStyle())
+                .help(viewModel.isSelectedItemFavorite ? t("player.unfavorite") : t("player.favorite"))
+                .padding(10)
+                .disabled(viewModel.isApplying)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "photo.on.rectangle.angled")
+                        .font(.system(size: 32, weight: .light))
+                    Text(t("menubar.quick.empty"))
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .frame(width: heroWidth, height: heroHeight)
+                .background(Color.primary.opacity(0.06))
+                .clipShape(heroShape)
+            }
+        }
+        .frame(width: heroWidth, height: heroHeight)
+        .clipShape(heroShape)
+        .animation(crossfadeAnimation, value: viewModel.selectedItem?.id)
+        .animation(crossfadeAnimation, value: viewModel.isApplying)
+        .animation(crossfadeAnimation, value: viewModel.errorMessage)
+    }
+
+    private var thumbnailRail: some View {
+        NativeHorizontalThumbnailRail {
+            HStack(spacing: thumbnailSpacing) {
+                ForEach(viewModel.batchItems) { item in
+                    let isSelected = item.id == viewModel.selectedItem?.id
+                    thumbnailChip(item: item, isSelected: isSelected)
+                }
+            }
+            .padding(.horizontal, 1)
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .frame(height: thumbnailSize + 4)
+    }
+
+    private func thumbnailChip(item: MenuBarQuickWallpaperItem, isSelected: Bool) -> some View {
+        Button {
+            withAnimation(selectionSpring) {
+                viewModel.select(item)
+            }
+        } label: {
+            Color.black.opacity(0.08)
+                .overlay {
+                    QuickSwitcherImage(url: item.thumbnailURL, fallbackSymbol: "photo")
+                }
+                .frame(width: thumbnailSize, height: thumbnailSize)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: thumbnailCorner, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: thumbnailCorner, style: .continuous)
+                        .strokeBorder(
+                            isSelected ? Color.white : Color.primary.opacity(0.08),
+                            lineWidth: isSelected ? 2.5 : 0.6
+                        )
+                }
+                .shadow(
+                    color: isSelected ? .black.opacity(0.16) : .clear,
+                    radius: isSelected ? 5 : 0,
+                    y: isSelected ? 2 : 0
+                )
+                .scaleEffect(isSelected ? 1.0 : 0.97)
+                .opacity(isSelected ? 1.0 : 0.92)
+                .animation(selectionSpring, value: isSelected)
+        }
+        .buttonStyle(QuickSwitcherPressButtonStyle())
+        .help(item.title)
+        .disabled(viewModel.isApplying)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .accessibilityLabel(item.title)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 0) {
+                iconButton(systemName: "gearshape", help: t("settings")) {
+                    viewModel.openSettings()
+                }
+                iconButton(systemName: "arrow.clockwise", help: t("menubar.quick.refreshBatch")) {
+                    withAnimation(selectionSpring) {
+                        viewModel.refreshBatch()
+                    }
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 8) {
+                Menu {
+                    Button {
+                        withAnimation(selectionSpring) {
+                            viewModel.selectEntireLibrary()
+                        }
+                    } label: {
+                        HStack {
+                            Text(t("menubar.quick.myLibrary"))
+                            if viewModel.isUsingEntireLibrary {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+
+                    if !viewModel.availableFolders.isEmpty {
+                        Divider()
+                        ForEach(viewModel.availableFolders) { folder in
+                            Button {
+                                withAnimation(selectionSpring) {
+                                    viewModel.toggleFolderSelection(folder.id)
+                                }
+                            } label: {
+                                HStack {
+                                    Text(viewModel.folderOptionLabel(for: folder))
+                                    if viewModel.isFolderSelected(folder.id) {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(viewModel.selectedFolderLabel)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.86))
+                        .frame(width: 152, height: footerButtonHeight)
+                        .background(Color.white, in: Capsule())
+                        .shadow(color: .black.opacity(0.05), radius: 1.5, y: 1)
+                }
+                .menuStyle(.borderlessButton)
+                .help(viewModel.selectedFolderLabel)
+                .disabled(viewModel.isApplying)
+
+                Button {
+                    viewModel.applySelectedItem()
+                } label: {
+                    Text(t("setWallpaper"))
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 88, minHeight: footerButtonHeight)
+                        .padding(.horizontal, 14)
+                        .background(Color.black.opacity(0.92), in: Capsule())
+                }
+                .buttonStyle(QuickSwitcherPressButtonStyle())
+                .disabled(viewModel.selectedItem == nil || viewModel.isApplying)
+            }
+        }
+        .frame(height: footerButtonHeight)
+    }
+
+    private func iconButton(
+        systemName: String,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: footerIconSize, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(0.58))
+                .frame(width: 30, height: footerButtonHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(QuickSwitcherPressButtonStyle())
+        .help(help)
+        .disabled(viewModel.isApplying)
+    }
+
+}
+
+// MARK: - Press feedback
+
+private struct QuickSwitcherPressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .opacity(configuration.isPressed ? 0.88 : 1.0)
+            .animation(
+                .spring(response: 0.22, dampingFraction: 0.78, blendDuration: 0),
+                value: configuration.isPressed
+            )
+    }
+}
+
+// MARK: - Thumbnail rail wheel support
+
+/// Native scroll view for the candidate rail. Vertical mouse-wheel deltas are
+/// mapped to its horizontal content offset, while thumbnail buttons remain in
+/// the hosted SwiftUI view and receive normal clicks.
+@MainActor
+private struct NativeHorizontalThumbnailRail<Content: View>: NSViewRepresentable {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(rootView: content)
+    }
+
+    func makeNSView(context: Context) -> VerticalWheelHorizontalScrollView {
+        let scrollView = VerticalWheelHorizontalScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = context.coordinator.hostingView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: VerticalWheelHorizontalScrollView, context: Context) {
+        let hostingView = context.coordinator.hostingView
+        hostingView.rootView = content
+
+        DispatchQueue.main.async {
+            guard scrollView.documentView === hostingView else { return }
+            hostingView.layoutSubtreeIfNeeded()
+            let fittingSize = hostingView.fittingSize
+            let size = NSSize(
+                width: max(fittingSize.width, scrollView.contentSize.width),
+                height: max(fittingSize.height, scrollView.contentSize.height)
+            )
+            if hostingView.frame.size != size {
+                hostingView.setFrameSize(size)
+            }
+        }
+    }
+
+    @MainActor
+    final class Coordinator {
+        let hostingView: NSHostingView<Content>
+
+        init(rootView: Content) {
+            hostingView = NSHostingView(rootView: rootView)
+            hostingView.wantsLayer = true
+            hostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        }
+    }
+}
+
+private final class VerticalWheelHorizontalScrollView: NSScrollView {
+    private var dragStartLocation: NSPoint?
+    private var dragStartOffset: CGFloat = 0
+    private var isDraggingRail = false
+    private var dragMonitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installDragMonitorIfNeeded()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeDragMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            removeDragMonitor()
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let documentView else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let viewportWidth = contentView.bounds.width
+        let maxOffset = max(0, documentView.frame.width - viewportWidth)
+        guard maxOffset > 0 else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let rawDelta: CGFloat
+        if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
+            rawDelta = event.scrollingDeltaX
+        } else {
+            rawDelta = -event.scrollingDeltaY
+        }
+        guard abs(rawDelta) > 0.001 else { return }
+
+        let multiplier: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 24
+        var origin = contentView.bounds.origin
+        origin.x = min(max(origin.x + rawDelta * multiplier, 0), maxOffset)
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+    }
+
+    private func installDragMonitorIfNeeded() {
+        guard dragMonitor == nil, window != nil else { return }
+        dragMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            guard let self else { return event }
+            return self.handleDragEvent(event)
+        }
+    }
+
+    private func removeDragMonitor() {
+        if let dragMonitor {
+            NSEvent.removeMonitor(dragMonitor)
+            self.dragMonitor = nil
+        }
+    }
+
+    private func handleDragEvent(_ event: NSEvent) -> NSEvent? {
+        let location = convert(event.locationInWindow, from: nil)
+
+        switch event.type {
+        case .leftMouseDown:
+            guard bounds.contains(location) else { return event }
+            dragStartLocation = location
+            dragStartOffset = contentView.bounds.origin.x
+            isDraggingRail = false
+            return event
+
+        case .leftMouseDragged:
+            guard let dragStartLocation else { return event }
+            let delta = location.x - dragStartLocation.x
+            if !isDraggingRail, abs(delta) >= 3 {
+                isDraggingRail = true
+            }
+            guard isDraggingRail else { return event }
+
+            scrollHorizontally(to: dragStartOffset - delta)
+            return nil
+
+        case .leftMouseUp:
+            guard self.dragStartLocation != nil else { return event }
+            let shouldConsume = isDraggingRail
+            dragStartLocation = nil
+            isDraggingRail = false
+            return shouldConsume ? nil : event
+
+        default:
+            return event
+        }
+    }
+
+    private func scrollHorizontally(to requestedOffset: CGFloat) {
+        guard let documentView else { return }
+        let maxOffset = max(0, documentView.frame.width - contentView.bounds.width)
+        var origin = contentView.bounds.origin
+        origin.x = min(max(requestedOffset, 0), maxOffset)
+        contentView.scroll(to: origin)
+        reflectScrolledClipView(contentView)
+    }
+}
+
+// MARK: - Image
+
+private struct QuickSwitcherImage: View {
+    let url: URL?
+    let fallbackSymbol: String
+
+    var body: some View {
+        Group {
+            if let url {
+                KFImage(url)
+                    .fade(duration: 0.16)
+                    .resizable()
+                    .placeholder {
+                        placeholder
+                    }
+                    .scaledToFill()
+            } else {
+                placeholder
+            }
+        }
+        // Fill the parent-proposed size (overlay/frame), then clip overflow.
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+        .clipped()
+    }
+
+    private var placeholder: some View {
+        ZStack {
+            Color.black.opacity(0.18)
+            Image(systemName: fallbackSymbol)
+                .font(.system(size: 20, weight: .light))
+                .foregroundStyle(.white.opacity(0.72))
+        }
+    }
+}

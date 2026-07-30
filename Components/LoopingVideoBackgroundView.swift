@@ -12,6 +12,7 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
     let url: URL
     let isMuted: Bool
     var contentMode: ContentMode = .fill
+    var cornerRadius: CGFloat = 0
     let onReady: (@MainActor @Sendable () -> Void)?
 
     func makeCoordinator() -> Coordinator {
@@ -19,13 +20,17 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> LoopingVideoPlayerContainerView {
-        let view = LoopingVideoPlayerContainerView(contentMode: contentMode)
+        let view = LoopingVideoPlayerContainerView(
+            contentMode: contentMode,
+            cornerRadius: cornerRadius
+        )
         context.coordinator.attach(to: view)
         context.coordinator.update(url: url, isMuted: isMuted, in: view)
         return view
     }
 
     func updateNSView(_ nsView: LoopingVideoPlayerContainerView, context: Context) {
+        nsView.setCornerRadius(cornerRadius)
         context.coordinator.update(url: url, isMuted: isMuted, in: nsView)
     }
 
@@ -222,14 +227,20 @@ struct LoopingVideoBackgroundView: NSViewRepresentable {
 
 final class LoopingVideoPlayerContainerView: NSView {
     private let contentMode: LoopingVideoBackgroundView.ContentMode
+    private var cornerRadius: CGFloat
 
-    init(contentMode: LoopingVideoBackgroundView.ContentMode = .fill) {
+    init(
+        contentMode: LoopingVideoBackgroundView.ContentMode = .fill,
+        cornerRadius: CGFloat = 0
+    ) {
         self.contentMode = contentMode
+        self.cornerRadius = cornerRadius
         super.init(frame: .zero)
     }
 
     required init?(coder: NSCoder) {
         self.contentMode = .fill
+        self.cornerRadius = 0
         super.init(coder: coder)
     }
 
@@ -240,6 +251,8 @@ final class LoopingVideoPlayerContainerView: NSView {
         layer.videoGravity = contentMode == .fill ? .resizeAspectFill : .resizeAspect
         layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer.frame = bounds
+        layer.cornerRadius = cornerRadius
+        layer.masksToBounds = cornerRadius > 0
         return layer
     }
 
@@ -249,10 +262,19 @@ final class LoopingVideoPlayerContainerView: NSView {
             fallback.videoGravity = contentMode == .fill ? .resizeAspectFill : .resizeAspect
             fallback.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             fallback.frame = bounds
+            fallback.cornerRadius = cornerRadius
+            fallback.masksToBounds = cornerRadius > 0
             self.layer = fallback
             return fallback
         }
         return avLayer
+    }
+
+    func setCornerRadius(_ cornerRadius: CGFloat) {
+        guard self.cornerRadius != cornerRadius else { return }
+        self.cornerRadius = cornerRadius
+        playerLayer.cornerRadius = cornerRadius
+        playerLayer.masksToBounds = cornerRadius > 0
     }
 
     override func layout() {
