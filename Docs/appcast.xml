@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.139</title>
-      <sparkle:version>38.0.139</sparkle:version>
-      <sparkle:shortVersionString>38.0.139</sparkle:shortVersionString>
-      <pubDate>Fri, 24 Jul 2026 19:54:11 +0800</pubDate>
+      <title>Version 38.0.140</title>
+      <sparkle:version>38.0.140</sparkle:version>
+      <sparkle:shortVersionString>38.0.140</sparkle:shortVersionString>
+      <pubDate>Thu, 30 Jul 2026 17:32:04 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.139</h3><ul><li><strong>refactor(Library): optimize scroll idle handling and preload logic (595b740)</strong><ul><li>为 LibraryScrollHoverGate 添加 generation 机制避免旧回调误触发</li><li>重构滚动 idle 后执行的缩略图加载逻辑，替换原轮询方案</li><li>拆分预加载方法，新增滚动结束后恢复预载的逻辑</li><li>记录当前可见itemID，滚动停滞后精准触发附近内容预加载</li></ul></li><li><strong>fix(ExploreGrid): 修复可见单元格刷新的越界和崩溃问题 (5f617c5)</strong><ul><li>给targetVisibleIndexPaths增加数据源数量校验，过滤过期indexPath</li><li>添加canSafelyMutateVisibleItems判断，避免在数据未对齐时调用reloadItems</li><li>刷新前增加双重安全校验，防止AppKit内部断言崩溃</li><li>局部reload时禁用隐式动画，避免布局冲突</li></ul></li><li><strong>fix: 修复多种坏文件误判、下载超时与菜单栏重采样问题 (c7435c6)</strong><ul><li>修复热链失败的大体积HTML被误判为有效视频文件的问题，新增全类型媒体文件头校验</li><li>增大网络请求超时时间，避免大文件下载中途失败</li><li>重构下载任务为下载文件后再读取，优化大文件下载体验与进度回调</li><li>优化重新下载逻辑，保留删除前的文件夹归属</li><li>改进菜单栏重采样逻辑，改为仅露出菜单栏条带，避免全屏闪烁</li><li>新增多种坏文件检测场景，包括伪装扩展名的非媒体文件</li></ul></li><li><strong>feat: 优化动态壁纸切换过渡并修复菜单栏采样与库体验 (781b982)</strong><ul><li>动态壁纸提交后强制菜单栏重采样（窗口 poke / 交替路径 poster / 桌面闪露）</li><li>视频切换改为预热后交叉淡入，延后写系统底图，避免黑场与跨类型闪帧</li><li>优化履历迁入 Application Support，并补充锁屏自动配置、Wallsflow 与库滚动体验</li></ul></li><li><strong>fix: 修复多场景下壁纸显示异常与恢复问题 (4efa49d)</strong><ul><li>本次提交修复了多个壁纸相关的问题：</li><li>主窗口从菜单栏/状态栏重新打开时，恢复本地壁纸与媒体库缓存，避免列表为空</li><li>修复静态壁纸窗口无法及时刷新的问题，改用orderFrontRegardless并强制合帧</li><li>优化壁纸切换逻辑，保留旧壁纸直到新渲染就绪，避免黑场闪烁</li><li>修复状态栏切换壁纸时的桌面合帧延迟问题</li><li>优化离线烘焙的窗口遮挡逻辑，避免录制时桌面画面异常</li><li>修复Web渲染器的帧率控制与时间戳问题，避免视频卡顿</li><li>完善跨类型壁纸切换的状态管理与资源清理逻辑</li></ul></li><li><strong>feat: 完成多项功能优化与 bug 修复 (a3f8a33)</strong><ul><li>更新本地壁纸烘焙逻辑，支持无产物时临时烘焙1秒仅保留高清poster</li><li>新增本地媒体高清poster更新通知，优化媒体详情页背景加载</li><li>移除状态栏菜单中Web壁纸不支持裁切的提示逻辑</li><li>新增Esc键返回文件夹功能，完善库页面键盘交互</li><li>更新多语言本地化文案，修正动态元素与实时渲染的互斥说明</li><li>重构CLI与Web渲染桥接，支持Web壁纸裁切参数同步</li><li>移除桌面静态截图缓存逻辑，改用Host统一同步静态壁纸源</li></ul></li><li><strong>refactor(MyLibraryContentView): 提取删除弹窗的绑定逻辑 (77c1278)</strong><ul><li>将重复的Binding创建代码抽为私有计算属性，简化视图代码结构，提升可读性和可维护性</li></ul></li><li><strong>refactor: 重构本地壁纸库管理逻辑，移除本地扫描依赖 (b63948a)</strong><ul><li>移除application类型壁纸支持，清理相关枚举和本地化</li><li>改用持久化下载记录作为唯一数据源，不再依赖LocalWallpaperScanner实时扫盘</li><li>新增受管库索引重建能力，支持升级迁移和手动修复</li><li>优化导入和修复流程，改用通知触发UI更新</li><li>修复详情页和锁屏的Web壁纸海报生成逻辑</li><li>简化缓存重建和库刷新流程，移除冗余的扫描调用</li></ul></li></ul>
+<h3>WaifuX 38.0.140</h3><ul><li><strong>fix: 修复合盖唤醒后壁纸渲染黑屏的问题 (0966186)</strong><ul><li>新增系统唤醒防抖恢复机制，处理Metal/WebView上下文失效问题。添加wakeRecovery相关状态管理，监听系统唤醒通知并延迟重建渲染器，同时新增preserveAutoPauseState参数避免误恢复暂停状态，解决睡眠后壁纸黑屏无画面的问题。</li></ul></li><li><strong>feat: 新增菜单栏快捷壁纸面板与点击交换功能 (e7609a1)</strong><ul><li>新增了菜单栏快捷壁纸切换功能，支持通过菜单栏快速选择本地壁纸，同时添加了交换菜单栏左右键操作的设置项。修复了显示器唤醒后壁纸无法恢复的问题，优化了离线烘焙的媒体处理逻辑，并完善了相关本地化字符串。</li></ul></li><li><strong>refactor(web/offline bake): 统一并简化离线烘焙文件命名规则 (cdbef42)</strong><ul><li>移除属性哈希后缀的冗余文件名格式，统一Web和Scene离线烘焙的命名规范</li><li>重构临时文件命名为统一的`.web-bake-xxx`前缀格式</li><li>添加旧缓存文件自动迁移逻辑，兼容历史命名格式避免重复烘焙</li><li>清理废弃的自动帧率缓存标签相关代码</li></ul></li><li>refactor: 重构 Steam 登录流程与 Konachan 适配，新增等待登录状态 1.  重构 Steam 凭证存储，仅保存用户名并移除明文密码存储 2.  新增等待 Steam 登录的下载状态，优化下载队列逻辑 3.  适配 Konachan 双域名分级查询，修复 Referer 和 rating 筛选逻辑 4.  优化壁纸详情页更新逻辑，避免无效UI更新 5.  调整下载进度节流间隔，减少主线程压力 6.  简化动态锁屏相关代码，移除自动化配置逻辑 7.  修复 Wallhaven API Key 依赖判断逻辑 (d4a4bea)</li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.139/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.140/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
