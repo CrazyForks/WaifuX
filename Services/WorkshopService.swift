@@ -1667,19 +1667,21 @@ class WorkshopService: ObservableObject {
         }
 
         do {
-            return try await downloadWorkshopItemOnce(
+            let downloadedURL = try await downloadWorkshopItemOnce(
                 workshopID: workshopID,
                 username: username,
                 route: .configured,
                 progressHandler: progressHandler
             )
+            return await VideoTranscodeService.ensureAppleCompatibleContainer(downloadedURL)
         } catch let error as WorkshopError {
-            return try await recoverWorkshopDownloadFailure(
+            let downloadedURL = try await recoverWorkshopDownloadFailure(
                 error,
                 workshopID: workshopID,
                 username: username,
                 progressHandler: progressHandler
             )
+            return await VideoTranscodeService.ensureAppleCompatibleContainer(downloadedURL)
         }
     }
 
