@@ -60,9 +60,9 @@ final class MenuBarQuickSwitcherController: NSObject {
 
         positionPanel(relativeTo: anchorView, on: targetScreen)
         panel.alphaValue = 1
-        // Become key so trackpad / mouse-wheel scrolling the thumbnail rail works reliably.
+        // A nonactivating panel can become key for input without making WaifuX the
+        // foreground application, so background Screen Time does not resume here.
         panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         installDismissMonitors()
     }
 

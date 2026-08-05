@@ -453,7 +453,9 @@ private final class VerticalWheelHorizontalScrollView: NSScrollView {
 
         let rawDelta: CGFloat
         if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
-            rawDelta = event.scrollingDeltaX
+            // AppKit deltas already respect the system's natural-scrolling setting.
+            // Moving the clip-view origin must use the opposite sign, matching NSScrollView.
+            rawDelta = -event.scrollingDeltaX
         } else {
             rawDelta = -event.scrollingDeltaY
         }

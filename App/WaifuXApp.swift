@@ -447,8 +447,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         if isLoginLaunch {
             // 窗口已创建但保持隐藏，用户可通过 Dock 图标或状态栏菜单显示
             // 动态壁纸恢复在 restoreAllDataAsync 中完成
-            // 设置激活策略为 .accessory（无 Dock 图标和菜单栏）
-            NSApp.setActivationPolicy(.accessory)
+            // 登录启动不应短暂占用前台应用身份或累计屏幕使用时间。
+            enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
             AppResponsivenessMonitor.noteWindowVisible(false)
             AppResponsivenessMonitor.noteScenePhase("loginLaunchHidden")
         } else {
@@ -776,6 +776,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         window?.orderOut(nil)
         AppResponsivenessMonitor.noteWindowVisible(false)
         AppResponsivenessMonitor.noteScenePhase("hideMainWindow")
+        enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
 
         // 主窗口隐藏后尽快卸载前台视图树，后台只保留状态栏、动态壁纸、调度器和下载任务。
         delayedReleaseTask?.cancel()
@@ -783,10 +784,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             // 先让窗口服务器完成 orderOut，避免拆 contentView 时和窗口隐藏动画抢布局。
             try? await Task.sleep(nanoseconds: 150_000_000)
             guard !Task.isCancelled else { return }
-
-            if !(self.settingsWindowController?.window?.isVisible ?? false) {
-                self.updateActivationPolicy(showDockIcon: false)
-            }
 
             NotificationCenter.default.post(name: .appDidHideWindow, object: nil)
             try? await Task.sleep(nanoseconds: 150_000_000)
@@ -803,6 +800,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         delayedReleaseTask = nil
 
         guard let window else {
+            enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
             DisplaySelectorManager.shared.cancelForMemoryRelease()
             AnimeWindowManager.shared.closeAllWindowsForMemoryRelease()
             AnimeVideoExtractor.shared.cancel()
@@ -832,9 +830,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             window.orderOut(nil)
         }
 
-        if !(self.settingsWindowController?.window?.isVisible ?? false) {
-            updateActivationPolicy(showDockIcon: false)
-        }
+        enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
 
         releaseForegroundResourcesForHiddenWindow(window)
     }
@@ -1322,6 +1318,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         }
     }
 
+    /// Drop the app's foreground identity once its user-facing windows are gone.
+    /// Background wallpaper/render/download services keep running under accessory mode.
+    private func enterBackgroundModeIfNoForegroundInterface(hideDockIcon: Bool) {
+        let mainWindowVisible = window.map { $0.isVisible && !$0.isMiniaturized } ?? false
+        let settingsWindowVisible = settingsWindowController?.window.map {
+            $0.isVisible && !$0.isMiniaturized
+        } ?? false
+        guard !mainWindowVisible, !settingsWindowVisible else { return }
+
+        if hideDockIcon {
+            updateActivationPolicy(showDockIcon: false)
+        }
+        if NSApp.isActive {
+            NSApp.deactivate()
+        }
+    }
+
     // MARK: - 设置窗口
 
     @objc func showSettingsWindow(_ sender: Any?) {
@@ -1408,6 +1421,32 @@ extension AppDelegate {
         FolderLockService.shared.lockAllFolders()
         hideMainWindow()
         return false
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let minimizedWindow = notification.object as? NSWindow else { return }
+        if minimizedWindow === window {
+            DynamicWallpaperAutoPauseManager.shared.suppressForegroundPauseForMainWindowHide()
+            AppResponsivenessMonitor.noteWindowVisible(false)
+            AppResponsivenessMonitor.noteScenePhase("mainWindowMiniaturized")
+        }
+        enterBackgroundModeIfNoForegroundInterface(hideDockIcon: false)
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let restoredWindow = notification.object as? NSWindow,
+              restoredWindow === window else {
+            return
+        }
+        AppResponsivenessMonitor.noteWindowVisible(true)
+        AppResponsivenessMonitor.noteScenePhase("mainWindowDeminiaturized")
+    }
+
+    func windowDidClose(_ notification: Notification) {
+        // Wait until AppKit has removed the closed window from visibility/key-window state.
+        DispatchQueue.main.async { [weak self] in
+            self?.enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
+        }
     }
 
     /// 处理设置窗口关闭：若有待应用的模块开关改动，弹三选项确认。
