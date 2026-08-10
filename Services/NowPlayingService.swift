@@ -12,7 +12,7 @@ import MusicKit
 // 数据源优先级：
 //   1. MediaRemote（dlopen 私有框架）— 全源统一；在部分签名/TCC 下会
 //      kMRMediaRemoteFrameworkErrorDomain Code=3 Operation not permitted
-//   2. Music.app / Spotify AppleScript — 当 MediaRemote 连续失败时启用
+//   2. Music.app AppleScript — 当 MediaRemote 连续失败时启用
 //   3. DistributedNotificationCenter（Music playerInfo）— 切歌即时
 //
 // 回调纪律：MediaRemote block 内禁止嵌套 Task { @MainActor }。
@@ -242,7 +242,6 @@ public final class NowPlayingService: ObservableObject {
         let names = [
             "com.apple.Music.playerInfo",
             "com.apple.iTunes.playerInfo",
-            "com.spotify.client.PlaybackStateChanged",
         ]
         let center = DistributedNotificationCenter.default()
         for name in names {
@@ -398,13 +397,11 @@ public final class NowPlayingService: ObservableObject {
         }
     }
 
-    // MARK: - AppleScript fallback (Music / Spotify)
+    // MARK: - AppleScript fallback (Music)
 
     private func fetchViaAppleScript() {
         scriptQueue.async { [weak self] in
-            let music = NowPlayingScriptBackend.readMusic()
-            let spotify = music == nil ? NowPlayingScriptBackend.readSpotify() : nil
-            let result = music ?? spotify
+            let result = NowPlayingScriptBackend.readMusic()
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let result {
@@ -794,27 +791,6 @@ private enum NowPlayingScriptBackend {
         if data.starts(with: [0xFF, 0xD8, 0xFF]) { return data } // JPEG
         if data.count > 12, data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46 { return data } // RIFF/WebP
         return data // 仍返回，让 NSImage 尝试
-    }
-
-    static func readSpotify() -> ScriptTrack? {
-        let script = """
-        tell application "System Events"
-          if not (exists process "Spotify") then return ""
-        end tell
-        tell application "Spotify"
-          if player state is stopped then return ""
-          set isPlay to (player state is playing)
-          set trackName to name of current track
-          set trackArtist to artist of current track
-          set trackAlbum to album of current track
-          set pos to player position
-          set dur to (duration of current track) / 1000
-          set flag to "paused"
-          if isPlay then set flag to "playing"
-          return trackName & "||" & trackArtist & "||" & trackAlbum & "||" & flag & "||" & (pos as string) & "||" & (dur as string)
-        end tell
-        """
-        return parse(runOsascript(script), source: "Spotify.applescript", sep: "||", durationIsMillis: false)
     }
 
     private static func runOsascript(_ source: String) -> String? {

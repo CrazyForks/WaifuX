@@ -481,6 +481,11 @@ enum SceneOfflineBakeService {
         let height: Int
     }
 
+    private struct RealtimePosterTarget: Sendable {
+        let displayID: UInt32
+        let size: WallpaperPosterPixelSize
+    }
+
     /// 已连接显示器中的最高刷新率，用作离线烘焙输出的帧率上限。
     private static var maximumBakeFPS: Double {
         Double(NSScreen.screens.map(\.maxRefreshRate).max() ?? 60)
@@ -500,11 +505,36 @@ enum SceneOfflineBakeService {
         return Int32(min(max(selectedFPS, 15), maximumBakeFPS))
     }
 
-    private static func displayIDs(for screens: [NSScreen]?) -> [UInt32] {
+    @MainActor
+    private static func realtimePosterTargets(for screens: [NSScreen]?) -> [RealtimePosterTarget] {
         let targetScreens = (screens?.isEmpty == false) ? screens! : NSScreen.screens
+        var seenDisplayIDs = Set<UInt32>()
         return targetScreens.compactMap { screen in
-            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            guard let screenNumber = screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber else {
+                return nil
+            }
+            let displayID = screenNumber.uint32Value
+            guard seenDisplayIDs.insert(displayID).inserted else { return nil }
+
+            let frame = screen.frame
+            return RealtimePosterTarget(
+                displayID: displayID,
+                size: WallpaperPosterGeometry.evenPixelSize(
+                    widthPoints: frame.width,
+                    heightPoints: frame.height,
+                    scale: screen.backingScaleFactor
+                )
+            )
         }
+    }
+
+    private static func realtimePosterVariantKey(
+        eligibility: SceneBakeEligibilitySnapshot,
+        size: WallpaperPosterPixelSize
+    ) -> String {
+        "\(eligibility.analysisId.uuidString.lowercased())_\(size.width)x\(size.height)"
     }
 
     static func usableArtifact(from record: MediaDownloadRecord?) -> SceneBakeArtifact? {
@@ -555,7 +585,8 @@ enum SceneOfflineBakeService {
             return
         }
 
-        let displayIDs = displayIDs(for: targetScreens)
+        let posterTargets = realtimePosterTargets(for: targetScreens)
+        let displayIDs = posterTargets.map(\.displayID)
 
         Task(priority: .utility) {
             do {
@@ -570,10 +601,10 @@ enum SceneOfflineBakeService {
                 }
 
                 guard autoBakeEnabled else {
-                    await generateTransientRealtimePoster(
+                    await generateTransientRealtimePosters(
                         contentRoot: contentRoot,
                         record: record,
-                        displayIDs: displayIDs,
+                        targets: posterTargets,
                         reason: reason
                     )
                     return
@@ -627,10 +658,10 @@ enum SceneOfflineBakeService {
     /// 临时 MP4 仅用于给 `AVAssetImageGenerator` 提供抽帧源：不会进入 SceneBakes、
     /// 不写 `sceneBakeArtifact`、不持久化任务，也不会进入视频优化队列。
     @MainActor
-    private static func generateTransientRealtimePoster(
+    private static func generateTransientRealtimePosters(
         contentRoot: URL,
         record: MediaDownloadRecord?,
-        displayIDs: [UInt32],
+        targets: [RealtimePosterTarget],
         reason: String
     ) async {
         let videoManager = VideoWallpaperManager.shared
@@ -638,17 +669,13 @@ enum SceneOfflineBakeService {
             print("[SceneOfflineBake] transient poster skipped (\(reason)): no static poster target is enabled")
             return
         }
+        guard !targets.isEmpty else {
+            print("[SceneOfflineBake] transient poster skipped (\(reason)): no target display geometry")
+            return
+        }
 
         let itemID = record?.item.id
         let posterCacheID = itemID ?? stableOrphanCacheItemID(contentRootPath: contentRoot.path)
-        if let cachedPoster = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: posterCacheID) {
-            await syncRealtimeStaticPoster(
-                cachedPoster,
-                displayIDs: displayIDs,
-                reason: "\(reason), cached transient poster"
-            )
-            return
-        }
 
         let eligibility: SceneBakeEligibilitySnapshot
         if let existing = record?.sceneBakeEligibility,
@@ -681,9 +708,110 @@ enum SceneOfflineBakeService {
             }
         }
 
-        let displaySize = mainDisplayPixelSize()
-        let width = max(64, (displaySize.width / 2) * 2)
-        let height = max(64, (displaySize.height / 2) * 2)
+        let groupedTargets = Dictionary(grouping: targets, by: \.size)
+        let orderedSizes = groupedTargets.keys.sorted {
+            if $0.width != $1.width { return $0.width < $1.width }
+            return $0.height < $1.height
+        }
+        let primarySize = targets.first?.size
+        var postersBySize: [WallpaperPosterPixelSize: URL] = [:]
+        var missingSizes: [WallpaperPosterPixelSize] = []
+
+        for size in orderedSizes {
+            let variantKey = realtimePosterVariantKey(eligibility: eligibility, size: size)
+            if let cachedPoster = VideoThumbnailCache.shared
+                .cachedSceneRealtimePosterFileURLIfExists(
+                    itemID: posterCacheID,
+                    variantKey: variantKey
+                ) {
+                postersBySize[size] = cachedPoster
+                await syncRealtimeStaticPoster(
+                    cachedPoster,
+                    displayIDs: groupedTargets[size, default: []].map(\.displayID),
+                    reason: "\(reason), cached \(size.width)x\(size.height) transient poster"
+                )
+            } else {
+                missingSizes.append(size)
+            }
+        }
+
+        if !missingSizes.isEmpty {
+            let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
+                userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(
+                    for: contentRoot.path
+                ),
+                for: contentRoot.path
+            )
+            let jobID = UUID()
+            await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
+
+            for size in missingSizes {
+                let variantKey = realtimePosterVariantKey(eligibility: eligibility, size: size)
+                let displayIDs = groupedTargets[size, default: []].map(\.displayID)
+
+                // 在等待 GPU 队列期间，另一个同场景请求可能已经写好了同尺寸 poster。
+                if let cachedPoster = VideoThumbnailCache.shared
+                    .cachedSceneRealtimePosterFileURLIfExists(
+                        itemID: posterCacheID,
+                        variantKey: variantKey
+                    ) {
+                    postersBySize[size] = cachedPoster
+                    await syncRealtimeStaticPoster(
+                        cachedPoster,
+                        displayIDs: displayIDs,
+                        reason: "\(reason), shared \(size.width)x\(size.height) transient poster"
+                    )
+                    continue
+                }
+
+                guard let posterURL = await bakeTransientRealtimePoster(
+                    contentRoot: contentRoot,
+                    eligibility: eligibility,
+                    posterCacheID: posterCacheID,
+                    variantKey: variantKey,
+                    size: size,
+                    userProperties: userProperties,
+                    reason: reason
+                ) else {
+                    continue
+                }
+
+                postersBySize[size] = posterURL
+                await syncRealtimeStaticPoster(
+                    posterURL,
+                    displayIDs: displayIDs,
+                    reason: "\(reason), temporary 1s bake \(size.width)x\(size.height)"
+                )
+                print(
+                    "[SceneOfflineBake] transient poster finished (\(reason)) "
+                        + "size=\(size.width)x\(size.height): \(posterURL.path)"
+                )
+            }
+
+            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
+        }
+
+        if let itemID,
+           let primarySize,
+           let primaryPoster = postersBySize[primarySize] {
+            NotificationCenter.default.post(
+                name: .sceneOfflineBakeThumbnailDidUpdate,
+                object: itemID,
+                userInfo: ["thumbnailURL": primaryPoster]
+            )
+        }
+    }
+
+    @MainActor
+    private static func bakeTransientRealtimePoster(
+        contentRoot: URL,
+        eligibility: SceneBakeEligibilitySnapshot,
+        posterCacheID: String,
+        variantKey: String,
+        size: WallpaperPosterPixelSize,
+        userProperties: String?,
+        reason: String
+    ) async -> URL? {
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("WaifuX", isDirectory: true)
             .appendingPathComponent("TransientScenePosters", isDirectory: true)
@@ -699,68 +827,50 @@ enum SceneOfflineBakeService {
             )
         } catch {
             print("[SceneOfflineBake] transient poster setup failed (\(reason)): \(error.localizedDescription)")
-            return
+            return nil
         }
         defer {
             try? FileManager.default.removeItem(at: temporaryVideoURL)
             try? FileManager.default.removeItem(at: temporarySidecarURL)
         }
 
-        let jobID = UUID()
-        await OfflineBakeSerialQueue.shared.waitForTurn(jobID: jobID)
         let artifact: SceneBakeArtifact
         do {
-            // 在等待 GPU 队列期间，另一个同场景请求可能已经写好了 poster。
-            if let cachedPoster = VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: posterCacheID) {
-                await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
-                await syncRealtimeStaticPoster(
-                    cachedPoster,
-                    displayIDs: displayIDs,
-                    reason: "\(reason), shared transient poster"
-                )
-                return
-            }
-
-            let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
-                userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(for: contentRoot.path),
-                for: contentRoot.path
-            )
             artifact = try await bakeWithWallpaperWgpu(
                 contentRoot: contentRoot,
                 outURL: temporaryVideoURL,
                 eligibility: eligibility,
-                width: width,
-                height: height,
+                width: size.width,
+                height: size.height,
                 fps: min(resolvedBakeFPS(requestedFPS: nil), 30),
                 durationSeconds: 1,
                 userProperties: userProperties,
                 progress: nil
             )
-            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
         } catch {
-            await OfflineBakeSerialQueue.shared.leave(jobID: jobID)
-            print("[SceneOfflineBake] transient poster bake failed (\(reason)): \(error.localizedDescription)")
-            return
-        }
-
-        guard isUsableBakedVideo(at: URL(fileURLWithPath: artifact.videoPath)),
-              let posterURL = await VideoThumbnailCache.shared.sceneBakePosterJPEGFileURL(
-                  forLocalVideo: URL(fileURLWithPath: artifact.videoPath),
-                  itemID: posterCacheID
-              ) else {
-            print("[SceneOfflineBake] transient poster extraction failed (\(reason)): \(temporaryVideoURL.path)")
-            return
-        }
-
-        if let itemID {
-            NotificationCenter.default.post(
-                name: .sceneOfflineBakeThumbnailDidUpdate,
-                object: itemID,
-                userInfo: ["thumbnailURL": posterURL]
+            print(
+                "[SceneOfflineBake] transient poster bake failed (\(reason)) "
+                    + "size=\(size.width)x\(size.height): \(error.localizedDescription)"
             )
+            return nil
         }
-        await syncRealtimeStaticPoster(posterURL, displayIDs: displayIDs, reason: "\(reason), temporary 1s bake")
-        print("[SceneOfflineBake] transient poster finished (\(reason)): \(posterURL.path)")
+
+        let videoURL = URL(fileURLWithPath: artifact.videoPath)
+        guard isUsableBakedVideo(at: videoURL),
+              let posterURL = await VideoThumbnailCache.shared.sceneRealtimePosterJPEGFileURL(
+                  forLocalVideo: videoURL,
+                  itemID: posterCacheID,
+                  variantKey: variantKey,
+                  targetWidth: size.width,
+                  targetHeight: size.height
+              ) else {
+            print(
+                "[SceneOfflineBake] transient poster extraction failed (\(reason)) "
+                    + "size=\(size.width)x\(size.height): \(temporaryVideoURL.path)"
+            )
+            return nil
+        }
+        return posterURL
     }
 
     @MainActor
@@ -850,16 +960,25 @@ enum SceneOfflineBakeService {
             .allowClipping: true
         ]
         var appliedScreens = 0
+        var appliedTargetScreens: [NSScreen] = []
         for screen in targetScreens {
             do {
                 try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
                 DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
                 appliedScreens += 1
+                appliedTargetScreens.append(screen)
             } catch {
                 print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
             }
         }
         print("[SceneOfflineBake] set desktop static poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
+        if !appliedTargetScreens.isEmpty {
+            // poster 晚于 scene 首帧写入时，再补一次菜单栏重采样；renderer-owned flash 在
+            // wallpaper-wgpu 下一帧 present 后执行，不依赖主 App 是否前台。
+            DesktopWallpaperSyncManager.shared
+                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: appliedTargetScreens, delay: 0.02)
+            WallpaperEngineXBridge.shared.requestSceneMenuBarFlash(on: appliedTargetScreens, reason: reason)
+        }
     }
 
     @MainActor

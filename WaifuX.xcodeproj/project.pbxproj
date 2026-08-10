@@ -46,6 +46,7 @@
 		1E47B8BBAE80FE7CCAD4381E /* Kingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = 7406A65B952FEC95D5076CEB /* Kingfisher */; };
 		1F21A7ECABA2636B4FC373C1 /* LiquidGlassDesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A6FAAE3D996B466B7354FC /* LiquidGlassDesignSystem.swift */; };
 		1FB9475DD4151BE801BED2FA /* Wallpaper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 220B0056F95AF393DBFDDEBC /* Wallpaper.swift */; };
+		2C4A7D9B1E5F4A6C8D0B2E3F /* LibraryFolderMembershipPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C4A7D9B1E5F4A6C8D0B2E40 /* LibraryFolderMembershipPolicy.swift */; };
 		1FC194CB6FE28B96F7756A1F /* SmoothAnimations.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62D57CBF90122DC1D11BC1FE /* SmoothAnimations.swift */; };
 		212FEF9422990A482070A473 /* UnixSocketClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB3C0713026606E42DCCE8F9 /* UnixSocketClient.swift */; };
 		232BCC08D5E1BF5521A51688 /* ErrorStateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39D6BA8E5F4378581C163E29 /* ErrorStateView.swift */; };
@@ -71,6 +72,7 @@
 		378F8D6878222C1121DCE84F /* ArcBackgroundSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CE736888A84E23833953C49 /* ArcBackgroundSettings.swift */; };
 		37F59B1CD348D187E96DCD3E /* SceneConfigOverrideService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F844D3946D7D634FFBE47D3 /* SceneConfigOverrideService.swift */; };
 		3AB9CA4DC78C3EE5C05B81F2 /* VideoWallpaperManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */; };
+		A1B2C3D4E5F6A7B8C9D0E1F2 /* VideoRendererProcessController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E2D3C4B5A6978879605141 /* VideoRendererProcessController.swift */; };
 		3BCAAE449E23F411D5BCFEB7 /* Danmaku.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1909660C314E363CB12A5857 /* Danmaku.swift */; };
 		3C167FEA842C4C6D02F8CE64 /* WallpaperViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0420F76E4897B34782FAF6 /* WallpaperViewModel.swift */; };
 		3C3D1D709E6DD0518BC81253 /* WallpaperGridCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8B4DF44A83DE72A33A8BE3F /* WallpaperGridCell.swift */; };
@@ -469,6 +471,7 @@
 		91E6D95488469530050E4E91 /* GuessYouLikeViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuessYouLikeViewModel.swift; sourceTree = "<group>"; };
 		92360DB7D61D511F712E8CC6 /* DownloadError.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadError.swift; sourceTree = "<group>"; };
 		9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoWallpaperManager.swift; sourceTree = "<group>"; };
+		F1E2D3C4B5A6978879605141 /* VideoRendererProcessController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoRendererProcessController.swift; sourceTree = "<group>"; };
 		92926695BBCFC62936A5FADE /* WorkshopViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkshopViewModel.swift; sourceTree = "<group>"; };
 		92F7E4EFC4F9FF86BBDC4354 /* CloudSyncModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncModels.swift; sourceTree = "<group>"; };
 		93B2EB16B350D0A586479BD5 /* NetworkState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkState.swift; sourceTree = "<group>"; };
@@ -568,6 +571,7 @@
 		EAFBE638C95E9FD01F7DCA2F /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		EBB7ADD11EE352129A30930A /* SceneWallpaperDesignPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneWallpaperDesignPanel.swift; sourceTree = "<group>"; };
 		ED321504BADDC0FCBA8515DB /* LibraryFolder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryFolder.swift; sourceTree = "<group>"; };
+		2C4A7D9B1E5F4A6C8D0B2E40 /* LibraryFolderMembershipPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryFolderMembershipPolicy.swift; sourceTree = "<group>"; };
 		EE9C4EA78094E6C55FED9BED /* WallpaperCategory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperCategory.swift; sourceTree = "<group>"; };
 		EF3780096BAEA3E2C4E58765 /* SystemAudioCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemAudioCaptureService.swift; sourceTree = "<group>"; };
 		F0C58CFDFB69A95820165F4F /* WorkshopService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkshopService.swift; sourceTree = "<group>"; };
@@ -833,6 +837,7 @@
 				2D9714C3DBCF062B148341C8 /* VideoToolboxProcessor.swift */,
 				D658BC393B2A381F062DE3F5 /* VideoTranscodeService.swift */,
 				9269D131C8EB8763B1E9471C /* VideoWallpaperManager.swift */,
+				F1E2D3C4B5A6978879605141 /* VideoRendererProcessController.swift */,
 				9EB00ACA846F3DBC547A2F3A /* WallpaperDynamicTextParser.swift */,
 				2934909A6169304E41884812 /* WallpaperEngineXBridge.swift */,
 				E13861C6C9277D5A73C9DCF3 /* WallpaperExtensionSocketServer.swift */,
@@ -992,6 +997,7 @@
 				4462B9EB484AA7BCB2E7ADED /* HeroPalette.swift */,
 				3E0B8FBA853691DEFB867233 /* KonachanModels.swift */,
 				ED321504BADDC0FCBA8515DB /* LibraryFolder.swift */,
+				2C4A7D9B1E5F4A6C8D0B2E40 /* LibraryFolderMembershipPolicy.swift */,
 				43498E7A9DF3A409E2F15E14 /* LiquidGlassClockConfiguration.swift */,
 				B3F4D6935CD6C40A16F284FA /* MangaModels.swift */,
 				F203A4C1B6B74E98A2D5C301 /* MenuBarQuickWallpaperItem.swift */,
@@ -1133,7 +1139,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# 修复旧 wallpaperengine-cli 相关 dylib 的 @@HOMEBREW_ 占位符路径\nCLI_LIB_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib\"\nif [[ -d \"$CLI_LIB_DIR\" ]]; then\n  for f in \"$CLI_LIB_DIR\"/*.dylib; do\n    [[ -L \"$f\" ]] && continue\n    [[ ! -f \"$f\" ]] && continue\n    otool -L \"$f\" 2>/dev/null | tail -n +2 | while IFS= read -r line; do\n      dep_path=$(echo \"$line\" | awk '{print $1}')\n      if [[ \"$dep_path\" == *\"@@HOMEBREW_CELLAR@@\"* ]] || [[ \"$dep_path\" == *\"@@HOMEBREW_PREFIX@@\"* ]]; then\n        dep_base=$(basename \"$dep_path\")\n        echo \"fix-dylib-cli: $(basename \"$f\") — ${dep_path} -> @loader_path/${dep_base}\"\n        install_name_tool -change \"$dep_path\" \"@loader_path/$dep_base\" \"$f\" 2>/dev/null || true\n      fi\n    done\n  done\n  for f in \"$CLI_LIB_DIR\"/*.dylib; do\n    [[ -L \"$f\" ]] && continue\n    [[ ! -f \"$f\" ]] && continue\n    codesign --force -s - \"$f\" 2>/dev/null || true\n  done\nfi\n\n# Resources/assets 已通过 zip_data.o 嵌入主程序，不能再作为普通资源复制进 .app。\n# Xcode 的 folder reference 会保留整棵 Resources 目录，这里清掉仅用于构建的产物，避免包体重复膨胀。\nBUNDLED_RESOURCES_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources\"\nif [[ -d \"$BUNDLED_RESOURCES_DIR\" ]]; then\n  rm -rf \"$BUNDLED_RESOURCES_DIR/assets\"\n  rm -f \"$BUNDLED_RESOURCES_DIR\"/zip_data.s \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_data.o \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_accessor.c \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_accessor.o\nfi\n\nsign_file_if_present() {\n  local f=\"$1\"\n  if [[ -f \"$f\" ]]; then\n    codesign --force -s - \"$f\" 2>/dev/null || true\n  fi\n}\n\nsign_wgpu_if_present() {\n  local f=\"$1\"\n  local entitlements=\"${SRCROOT}/WallpaperRenderer.entitlements\"\n  if [[ -f \"$f\" ]]; then\n    if [[ -f \"$entitlements\" ]]; then\n      codesign --force --options runtime --entitlements \"$entitlements\" -s - \"$f\" 2>/dev/null || \\\n        codesign --force -s - \"$f\" 2>/dev/null || true\n    else\n      codesign --force -s - \"$f\" 2>/dev/null || true\n    fi\n  fi\n}\n\n# Xcode folder reference 可能复制为 Contents/Resources/Resources/...；\n# 本地 Run 也要覆盖扁平与嵌套两种布局，避免只有打包脚本签名成功。\nfor DXC_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/dxc\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/dxc\"; do\n  if [[ -f \"$DXC_BIN\" ]]; then\n    install_name_tool -add_rpath \"@loader_path/lib\" \"$DXC_BIN\" 2>/dev/null || true\n    install_name_tool -add_rpath \"@loader_path/../lib\" \"$DXC_BIN\" 2>/dev/null || true\n    sign_file_if_present \"$DXC_BIN\"\n  fi\ndone\n\nfor WGPU_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-wgpu\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-wgpu\"; do\n  sign_wgpu_if_present \"$WGPU_BIN\"\ndone\n\nfor CLI_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaperengine-cli\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaperengine-cli\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaperengine-cli\"; do\n  sign_file_if_present \"$CLI_BIN\"\ndone\n\nfor DXC_LIB in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/lib/libdxcompiler.dylib\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib\"; do\n  sign_file_if_present \"$DXC_LIB\"\ndone\n";
+			shellScript = "# 修复旧 wallpaperengine-cli 相关 dylib 的 @@HOMEBREW_ 占位符路径\nCLI_LIB_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib\"\nif [[ -d \"$CLI_LIB_DIR\" ]]; then\n  for f in \"$CLI_LIB_DIR\"/*.dylib; do\n    [[ -L \"$f\" ]] && continue\n    [[ ! -f \"$f\" ]] && continue\n    otool -L \"$f\" 2>/dev/null | tail -n +2 | while IFS= read -r line; do\n      dep_path=$(echo \"$line\" | awk '{print $1}')\n      if [[ \"$dep_path\" == *\"@@HOMEBREW_CELLAR@@\"* ]] || [[ \"$dep_path\" == *\"@@HOMEBREW_PREFIX@@\"* ]]; then\n        dep_base=$(basename \"$dep_path\")\n        echo \"fix-dylib-cli: $(basename \"$f\") — ${dep_path} -> @loader_path/${dep_base}\"\n        install_name_tool -change \"$dep_path\" \"@loader_path/$dep_base\" \"$f\" 2>/dev/null || true\n      fi\n    done\n  done\n  for f in \"$CLI_LIB_DIR\"/*.dylib; do\n    [[ -L \"$f\" ]] && continue\n    [[ ! -f \"$f\" ]] && continue\n    codesign --force -s - \"$f\" 2>/dev/null || true\n  done\nfi\n\n# Resources/assets 已通过 zip_data.o 嵌入主程序，不能再作为普通资源复制进 .app。\n# Xcode 的 folder reference 会保留整棵 Resources 目录，这里清掉仅用于构建的产物，避免包体重复膨胀。\nBUNDLED_RESOURCES_DIR=\"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources\"\nif [[ -d \"$BUNDLED_RESOURCES_DIR\" ]]; then\n  rm -rf \"$BUNDLED_RESOURCES_DIR/assets\"\n  rm -f \"$BUNDLED_RESOURCES_DIR\"/zip_data.s \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_data.o \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_accessor.c \\\n        \"$BUNDLED_RESOURCES_DIR\"/zip_accessor.o\nfi\n\nsign_file_if_present() {\n  local f=\"$1\"\n  if [[ -f \"$f\" ]]; then\n    codesign --force -s - \"$f\" 2>/dev/null || true\n  fi\n}\n\nsign_wgpu_if_present() {\n  local f=\"$1\"\n  local entitlements=\"${SRCROOT}/WallpaperRenderer.entitlements\"\n  if [[ -f \"$f\" ]]; then\n    if [[ -f \"$entitlements\" ]]; then\n      codesign --force --options runtime --entitlements \"$entitlements\" -s - \"$f\" 2>/dev/null || \\\n        codesign --force -s - \"$f\" 2>/dev/null || true\n    else\n      codesign --force -s - \"$f\" 2>/dev/null || true\n    fi\n  fi\n}\n\n# Xcode folder reference 可能复制为 Contents/Resources/Resources/...；\n# 本地 Run 也要覆盖扁平与嵌套两种布局，避免只有打包脚本签名成功。\nfor DXC_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/dxc\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/dxc\"; do\n  if [[ -f \"$DXC_BIN\" ]]; then\n    install_name_tool -add_rpath \"@loader_path/lib\" \"$DXC_BIN\" 2>/dev/null || true\n    install_name_tool -add_rpath \"@loader_path/../lib\" \"$DXC_BIN\" 2>/dev/null || true\n    sign_file_if_present \"$DXC_BIN\"\n  fi\ndone\n\nfor WGPU_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-wgpu\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-wgpu\"; do\n  sign_wgpu_if_present \"$WGPU_BIN\"\ndone\n\nfor CLI_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaperengine-cli\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaperengine-cli\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaperengine-cli\"; do\n  sign_file_if_present \"$CLI_BIN\"\ndone\n\nfor VIDEO_BIN in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/wallpaper-video-renderer\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/wallpaper-video-renderer\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/wallpaper-video-renderer\"; do\n  sign_file_if_present \"$VIDEO_BIN\"\ndone\n\nfor DXC_LIB in \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/lib/libdxcompiler.dylib\" \\\n  \"${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib\"; do\n  sign_file_if_present \"$DXC_LIB\"\ndone\n";
 		};
 		F956DAE409E6A7AAF455BEC5 /* Run Script */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -1298,6 +1304,7 @@
 				665C80997AFFE13CF895B7BA /* KonachanTagSearchField.swift in Sources */,
 				293C846F46D6A8FD15010F50 /* LibraryCards.swift in Sources */,
 				8A8ED8229FA48E7F289F409A /* LibraryFolder.swift in Sources */,
+				2C4A7D9B1E5F4A6C8D0B2E3F /* LibraryFolderMembershipPolicy.swift in Sources */,
 				D4BA1209D23A79F61056C3B2 /* LibraryFolderStore.swift in Sources */,
 				5D0FCD4319EAA71A1E73BDBD /* LiquidGlassAudioVisualizer.swift in Sources */,
 				BAD8824F9969C4088BD87D87 /* LiquidGlassClockConfiguration.swift in Sources */,
@@ -1403,6 +1410,7 @@
 				E721812719872412E439B046 /* VideoToolboxProcessor.swift in Sources */,
 				E516A5F7AB176EAABEECE5AD /* VideoTranscodeService.swift in Sources */,
 				3AB9CA4DC78C3EE5C05B81F2 /* VideoWallpaperManager.swift in Sources */,
+				A1B2C3D4E5F6A7B8C9D0E1F2 /* VideoRendererProcessController.swift in Sources */,
 				71CA95FCFE98D1F5968921DE /* ViewExtensions.swift in Sources */,
 				1A9632409BCF492AB4FDA6E2 /* WaifuXApp.swift in Sources */,
 				0F6B71021B5B8B1BBFE853C4 /* WallhavenAPI.swift in Sources */,
@@ -1755,7 +1763,7 @@
 			repositoryURL = "https://github.com/scinfu/SwiftSoup.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 2.7.0;
+				minimumVersion = 2.13.7;
 			};
 		};
 		CF90BE4B76A6DBEDBB2A4DFF /* XCRemoteSwiftPackageReference "Kingfisher" */ = {

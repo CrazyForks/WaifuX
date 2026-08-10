@@ -43,7 +43,7 @@
     <key>NSAppleMusicUsageDescription</key>
     <string>WaifuX 需要读取「正在播放」信息，以便 Web 音频可视化壁纸显示歌名、艺人与封面。</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>WaifuX 在系统媒体接口不可用时，通过 Apple Events 读取 Music / Spotify 的正在播放信息，供壁纸 Media Integration 使用。</string>
+    <string>WaifuX 在系统媒体接口不可用时，通过 Apple Events 读取 Music 的正在播放信息，供壁纸 Media Integration 使用。</string>
     <key>SUFeedURL</key>
     <string>https://jipika.github.io/WaifuX/appcast.xml</string>
     <key>SUEnableAutomaticChecks</key>

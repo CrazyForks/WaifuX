@@ -31,7 +31,10 @@ final class LibraryFolderStore: ObservableObject {
         // 启动时 MediaLibrary 比 FolderStore 更晚 restore；sanitize 由 App 在库数据都恢复后统一调用。
     }
 
-    /// 启动时/同步后：把空字符串、孤儿、跨集合 folderID 清回根目录。
+    /// 启动时/同步后：审计空字符串、孤儿、跨集合 folderID。
+    ///
+    /// 这是只读审计。文件夹定义和库记录分开持久化，暂时缺失的文件夹
+    /// 列表不能证明记录归属无效，因此绝不在这里改写 folderID。
     func sanitizeLibraryFolderMemberships() {
         let wallpaperFavIDs = Set(
             wallpaperFolders

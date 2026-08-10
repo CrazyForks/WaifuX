@@ -24,6 +24,39 @@ import notify
 final class LockScreenWallpaperService: ObservableObject {
     static let shared = LockScreenWallpaperService()
 
+    /// P3 锁屏/显示器睡眠状态契约。
+    ///
+    /// `notificationName` 使用 Foundation 通知供 App 内订阅；
+    /// `distributedNotificationName` 使用 NSDistributedNotificationCenter 供
+    /// 外部 video renderer 跨进程订阅。状态同时写入 `stateFileURL`，这样
+    /// renderer 在启动晚于锁屏通知时仍能读取当前状态，而不会误播或误恢复。
+    struct PlaybackState: Codable, Equatable, Sendable {
+        let isScreenLocked: Bool
+        let isDisplayAsleep: Bool
+        let shouldPauseVideo: Bool
+        let shouldShowPoster: Bool
+        let transitionGeneration: UInt64
+        let source: String
+
+        var shouldHidePoster: Bool {
+            !shouldShowPoster && !shouldPauseVideo
+        }
+    }
+
+    static let playbackStateNotification = Notification.Name(
+        "com.waifux.wallpaper.lockScreenPlaybackStateDidChange"
+    )
+    static let distributedPlaybackStateNotification = Notification.Name(
+        "com.waifux.wallpaper.lockScreenPlaybackStateDidChange"
+    )
+    static let stateUserInfoKey = "state"
+    static let generationUserInfoKey = "transitionGeneration"
+    static let lockedUserInfoKey = "isScreenLocked"
+    static let displayAsleepUserInfoKey = "isDisplayAsleep"
+    static let shouldPauseUserInfoKey = "shouldPauseVideo"
+    static let shouldShowPosterUserInfoKey = "shouldShowPoster"
+    static let sourceUserInfoKey = "source"
+
     struct DisplayInstance: Codable, Sendable {
         let id: String
         let displayID: UInt32
@@ -48,11 +81,22 @@ final class LockScreenWallpaperService: ObservableObject {
     /// 已写入共享容器的视频 ID 集合（兼容旧缓存清理）
     private var deployedVideoIDs: Set<String> = []
 
+    /// 当前系统锁屏/显示器可见性状态，供主进程和外部 renderer 共同读取。
+    private(set) var playbackState = PlaybackState(
+        isScreenLocked: false,
+        isDisplayAsleep: false,
+        shouldPauseVideo: false,
+        shouldShowPoster: false,
+        transitionGeneration: 0,
+        source: "initial"
+    )
+
     private let appGroupID = "group.com.waifux.app"
     private let prefsFileName = "waifux-wallpaper-prefs.json"
     private let videoDirName = "WallpaperVideos"
     private let imageDirName = "WallpaperImages"
     private let displayInstancesFileName = "waifux-display-instances.json"
+    private let playbackStateFileName = "waifux-video-renderer-lock-state.json"
 
     private var sharedContainerURL: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID)
@@ -60,10 +104,200 @@ final class LockScreenWallpaperService: ObservableObject {
 
     private init() {
         restoreStaticImageSourceURLs()
+        restoreInitialPlaybackState()
+        observeSystemPlaybackState()
+        publishPlaybackState(source: "initial")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: - External Renderer Playback State
+
+    private func restoreInitialPlaybackState() {
+        let persisted: PlaybackState? = {
+            guard let url = playbackStateURL,
+                  let data = try? Data(contentsOf: url) else {
+                return nil
+            }
+            return try? JSONDecoder().decode(PlaybackState.self, from: data)
+        }()
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        let isLocked = (session?["CGSSessionScreenIsLocked"] as? Bool) ?? false
+        playbackState = PlaybackState(
+            isScreenLocked: isLocked,
+            // App 能初始化并运行到这里时显示器通常已醒；不要沿用上次异常退出
+            // 留下的 stale asleep=true。
+            isDisplayAsleep: false,
+            shouldPauseVideo: isLocked,
+            shouldShowPoster: isLocked,
+            transitionGeneration: (persisted?.transitionGeneration ?? 0) &+ 1,
+            source: "sessionRestore"
+        )
+    }
+
+    /// Keep the lock/sleep state in one place so the in-process manager and the
+    /// external video renderer observe the same transitions.
+    private func observeSystemPlaybackState() {
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSystemScreenLocked),
+            name: Notification.Name("com.apple.screenIsLocked"),
+            object: nil
+        )
+        DistributedNotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSystemScreenUnlocked),
+            name: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleScreensDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleScreensDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleSystemWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleSystemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleSystemScreenLocked() {
+        updatePlaybackVisibility(isScreenLocked: true, source: "screenLocked")
+    }
+
+    @objc private func handleSystemScreenUnlocked() {
+        updatePlaybackVisibility(isScreenLocked: false, source: "screenUnlocked")
+    }
+
+    @objc private func handleScreensDidSleep() {
+        updatePlaybackVisibility(isDisplayAsleep: true, source: "screensDidSleep")
+    }
+
+    @objc private func handleScreensDidWake() {
+        updatePlaybackVisibility(isDisplayAsleep: false, source: "screensDidWake")
+    }
+
+    @objc private func handleSystemWillSleep() {
+        updatePlaybackVisibility(isDisplayAsleep: true, source: "systemWillSleep")
+    }
+
+    @objc private func handleSystemDidWake() {
+        updatePlaybackVisibility(isDisplayAsleep: false, source: "systemDidWake")
+    }
+
+    private func updatePlaybackVisibility(
+        isScreenLocked: Bool? = nil,
+        isDisplayAsleep: Bool? = nil,
+        source: String
+    ) {
+        let current = playbackState
+        let next = PlaybackState(
+            isScreenLocked: isScreenLocked ?? current.isScreenLocked,
+            isDisplayAsleep: isDisplayAsleep ?? current.isDisplayAsleep,
+            shouldPauseVideo: (isScreenLocked ?? current.isScreenLocked)
+                || (isDisplayAsleep ?? current.isDisplayAsleep),
+            shouldShowPoster: (isScreenLocked ?? current.isScreenLocked)
+                || (isDisplayAsleep ?? current.isDisplayAsleep),
+            transitionGeneration: current.transitionGeneration &+ 1,
+            source: source
+        )
+        guard next != current else { return }
+        playbackState = next
+        publishPlaybackState(source: source)
+    }
+
+    /// Persist scalar-only state for a renderer that starts after the original
+    /// notification, then publish the same state through both notification
+    /// centers for a renderer that is already alive.
+    private func publishPlaybackState(source: String) {
+        let state = PlaybackState(
+            isScreenLocked: playbackState.isScreenLocked,
+            isDisplayAsleep: playbackState.isDisplayAsleep,
+            shouldPauseVideo: playbackState.shouldPauseVideo,
+            shouldShowPoster: playbackState.shouldShowPoster,
+            transitionGeneration: playbackState.transitionGeneration,
+            source: source
+        )
+        playbackState = state
+
+        if let url = playbackStateURL,
+           let data = try? JSONEncoder().encode(state) {
+            do {
+                try data.write(to: url, options: .atomic)
+            } catch {
+                print("[LockScreenWallpaper] Failed to persist playback state: \(error)")
+            }
+        }
+
+        let userInfo: [AnyHashable: Any] = [
+            Self.stateUserInfoKey: [
+                Self.lockedUserInfoKey: state.isScreenLocked,
+                Self.displayAsleepUserInfoKey: state.isDisplayAsleep,
+                Self.shouldPauseUserInfoKey: state.shouldPauseVideo,
+                Self.shouldShowPosterUserInfoKey: state.shouldShowPoster,
+                Self.generationUserInfoKey: NSNumber(value: state.transitionGeneration),
+                Self.sourceUserInfoKey: state.source
+            ],
+            Self.lockedUserInfoKey: state.isScreenLocked,
+            Self.displayAsleepUserInfoKey: state.isDisplayAsleep,
+            Self.shouldPauseUserInfoKey: state.shouldPauseVideo,
+            Self.shouldShowPosterUserInfoKey: state.shouldShowPoster,
+            Self.generationUserInfoKey: NSNumber(value: state.transitionGeneration),
+            Self.sourceUserInfoKey: state.source
+        ]
+        NotificationCenter.default.post(
+            name: Self.playbackStateNotification,
+            object: self,
+            userInfo: userInfo
+        )
+        DistributedNotificationCenter.default().postNotificationName(
+            Self.distributedPlaybackStateNotification,
+            object: nil,
+            userInfo: userInfo,
+            deliverImmediately: true
+        )
     }
 
     var displayInstancesURL: URL? {
         sharedContainerURL?.appendingPathComponent(displayInstancesFileName)
+    }
+
+    /// 外部 renderer 可读取的共享状态文件。
+    var playbackStateURL: URL? {
+        sharedContainerURL?.appendingPathComponent(playbackStateFileName)
+    }
+
+    /// 外部 renderer 的稳定状态/通知契约说明。
+    /// userInfo 中的值均为 Property List 标量，避免跨进程解码 Swift 类型。
+    static var externalRendererPlaybackContract: [String: String] {
+        [
+            "notification": distributedPlaybackStateNotification.rawValue,
+            "lockedKey": lockedUserInfoKey,
+            "displayAsleepKey": displayAsleepUserInfoKey,
+            "pauseKey": shouldPauseUserInfoKey,
+            "showPosterKey": shouldShowPosterUserInfoKey,
+            "generationKey": generationUserInfoKey,
+            "sourceKey": sourceUserInfoKey
+        ]
     }
 
     /// 返回扩展当前在指定屏幕上渲染的静态图原始来源。

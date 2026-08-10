@@ -600,9 +600,7 @@ struct MediaExploreContentView: View {
                 translatedText: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? translationBridge.translatedText : nil,
                 isTranslating: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? translationBridge.isTranslating : false,
                 onDismissTranslation: (workshopSourceManager.activeSource != .wallpaperEngine && workshopSourceManager.activeSource != .dongtai) ? {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
-                        translationBridge.dismiss()
-                    }
+                    dismissTranslationAndSearchOriginal()
                 } : nil
             )
 
@@ -1493,6 +1491,13 @@ struct MediaExploreContentView: View {
         mediaSearchQuery = searchQuery
         pendingSearchText = nil
         executeSearch(query: searchQuery)
+    }
+
+    private func dismissTranslationAndSearchOriginal() {
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+            translationBridge.dismiss()
+        }
+        submitSearch()
     }
 
     private func executeSearch(query: String) {

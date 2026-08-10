@@ -8,6 +8,7 @@ final class MenuBarQuickSwitcherController: NSObject {
     private let panel: MenuBarQuickSwitcherPanel
     private var localEventMonitor: Any?
     private var globalEventMonitor: Any?
+    private var presentationGeneration = 0
 
     override init() {
         panel = MenuBarQuickSwitcherPanel(
@@ -26,16 +27,20 @@ final class MenuBarQuickSwitcherController: NSObject {
         panel.animationBehavior = .utilityWindow
         panel.hidesOnDeactivate = false
 
+        viewModel.onApplied = { [weak self] in
+            self?.dismiss()
+        }
+    }
+
+    private func mountContentIfNeeded() {
+        guard panel.contentViewController == nil else { return }
+
         let hostingController = NSHostingController(
             rootView: MenuBarQuickSwitcherView(viewModel: viewModel)
         )
         hostingController.view.wantsLayer = true
         hostingController.view.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentViewController = hostingController
-
-        viewModel.onApplied = { [weak self] in
-            self?.dismiss()
-        }
     }
 
     func toggle(
@@ -49,6 +54,7 @@ final class MenuBarQuickSwitcherController: NSObject {
             return
         }
 
+        presentationGeneration &+= 1
         viewModel.onOpenSettings = { [weak self] in
             self?.dismiss()
             onOpenSettings()
@@ -57,6 +63,7 @@ final class MenuBarQuickSwitcherController: NSObject {
             targetScreen: targetScreen,
             currentWallpaperURL: currentWallpaperURL
         )
+        mountContentIfNeeded()
 
         positionPanel(relativeTo: anchorView, on: targetScreen)
         panel.alphaValue = 1
@@ -67,9 +74,25 @@ final class MenuBarQuickSwitcherController: NSObject {
     }
 
     func dismiss() {
-        guard panel.isVisible else { return }
-        panel.orderOut(nil)
         removeDismissMonitors()
+        guard panel.isVisible || panel.contentViewController != nil else { return }
+
+        presentationGeneration &+= 1
+        let dismissedGeneration = presentationGeneration
+        panel.orderOut(nil)
+        viewModel.suspendPreviewWork()
+
+        // Keep the responder tree alive until AppKit finishes dispatching the
+        // mouse event that dismissed the panel, then release its players,
+        // tracking areas, layers, and hosted SwiftUI hierarchy.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self,
+                  self.presentationGeneration == dismissedGeneration,
+                  !self.panel.isVisible else {
+                return
+            }
+            self.panel.contentViewController = nil
+        }
     }
 
     private func positionPanel(relativeTo anchorView: NSView, on screen: NSScreen?) {
@@ -605,6 +628,13 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
                 self.previewTasks[item.id] = nil
             }
         }
+    }
+
+    func suspendPreviewWork() {
+        for task in previewTasks.values {
+            task.cancel()
+        }
+        previewTasks.removeAll()
     }
 
     private func replaceBatch(preferredCurrentURL: URL?, avoidPreviousBatch: Bool) {

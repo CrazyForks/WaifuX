@@ -1,6 +1,26 @@
 import AppKit
 import CoreGraphics
 
+struct WallpaperPosterPixelSize: Hashable, Sendable {
+    let width: Int
+    let height: Int
+}
+
+enum WallpaperPosterGeometry {
+    static func evenPixelSize(
+        widthPoints: CGFloat,
+        heightPoints: CGFloat,
+        scale: CGFloat
+    ) -> WallpaperPosterPixelSize {
+        let rawWidth = max(64, Int((widthPoints * scale).rounded()))
+        let rawHeight = max(64, Int((heightPoints * scale).rounded()))
+        return WallpaperPosterPixelSize(
+            width: max(64, (rawWidth / 2) * 2),
+            height: max(64, (rawHeight / 2) * 2)
+        )
+    }
+}
+
 enum WallpaperScreenIdentity {
     static func fingerprint(legacyFingerprint: String, hasHardwareSerial: Bool, position: CGPoint) -> String {
         guard !hasHardwareSerial else { return legacyFingerprint }

@@ -176,10 +176,14 @@ final class SearchTranslationBridge: ObservableObject, @unchecked Sendable {
 
     @MainActor
     func effectiveQuery(for originalText: String) -> String {
-        if let translated = translatedText, !translationDismissed {
+        let trimmedOriginal = originalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let translated = translatedText,
+           !translated.isEmpty,
+           !translationDismissed,
+           translatedSourceText == trimmedOriginal {
             return translated
         }
-        return originalText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedOriginal
     }
 }
 

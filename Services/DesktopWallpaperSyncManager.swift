@@ -46,6 +46,10 @@ final class DesktopWallpaperSyncManager {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
+    /// 正在进行的菜单栏 backdrop poke 窗口（创建即销毁，不长期复用）。
+    /// 用户观察：任意窗口树变化都会触发菜单栏重采样；短生命周期 NSWindow
+    /// 的 map/unmap 比只 setDesktop 更接近“点一下其它 App”的触发条件。
+    private var liveMenuBarBackdropPokeWindows: [NSWindow] = []
     /// 标记“应用重新激活时确实需要做一次恢复性同步”。
     /// 仅在显示器参数变化/系统唤醒等场景置为 true，避免普通前后台切换也去重写桌面壁纸。
     private var requiresActivationRecoverySync = false
@@ -191,11 +195,21 @@ final class DesktopWallpaperSyncManager {
 
     /// 动态壁纸窗口已提交到 WindowServer 后，强制菜单栏外观重新采样。
     ///
-    /// 使用系统桌面刷新通知，并在允许时重设交替路径的静态背板。
+    /// ## 底层机制
+    /// 菜单栏毛玻璃 / 图标深浅由 Dock 的 `CABackdropLayer` + `IconAppearance` 驱动。
+    /// 用户实测：**任意窗口树变化**（orderFront / orderOut / 切 App）都会触发重采样；
+    /// 只靠 `setDesktopImageURL` 或 `com.apple.desktop` 在动态层盖住桌面时经常不生效
+    /// （WallpaperAgent 对同一路径 no-op，或 backdrop 缓存未失效）。
     ///
-    /// 不创建临时状态栏层级窗口：macOS 27 beta 会在后台 App 的
-    /// `orderFrontRegardless()` 路径中，让 ViewBridge 对远程视图抛出不可恢复的
-    /// Objective-C 异常。通知与 `setDesktopImageURL` 都不会触发该窗口生命周期。
+    /// ## 策略（按可靠度）
+    /// 1. **主路径**：App 活跃时在菜单栏条带创建短生命周期透明 NSWindow（真实 create → map → unmap → destroy），
+    ///    模拟用户观察到的“任意窗口变化就刷新”（不抢焦点、不可见、不接鼠标）。
+    ///    App 在后台时降级为 `com.apple.desktop` 分布式通知——macOS 27 beta 在后台 App
+    ///    `orderFrontRegardless()` 路径会让 ViewBridge 的 `NSRemoteView
+    ///    containingWindowWillOrderOnScreen:` 抛出不可恢复 ObjC 异常（SIGSEGV）。
+    /// 2. **补充**：若已登记系统背板且允许写桌面，再把 poster 复制到交替路径 set 一次
+    ///    （帮 WallpaperAgent 认“新图”，改善锁屏/Space 侧一致性）。
+    /// 3. 动态锁屏 / 关系统壁纸同步时仍执行 (1)，不写桌面。
     func scheduleSystemWallpaperRefreshAfterDynamicPresentation(
         on screens: [NSScreen],
         delay: TimeInterval = 0.12
@@ -223,9 +237,11 @@ final class DesktopWallpaperSyncManager {
                     return
                 }
 
-                self.requestSystemDesktopAppearanceResample()
+                // 1) 窗口树 poke：与“点一下其它 App”同类触发，不依赖焦点切换。
+                //    App 后台时内部降级为系统通知，避免 macOS 27 ViewBridge 崩溃。
+                self.pokeMenuBarBackdropResample(on: currentScreen)
 
-                // 可选：换路径重提系统背板（仅在允许写桌面时）。
+                // 2) 可选：换路径重提系统背板（仅在允许写桌面时）。
                 let canRewriteDesktop = VideoWallpaperManager.shared.isSystemWallpaperSyncEnabled
                     && {
                         if #available(macOS 26.0, *) {
@@ -255,13 +271,13 @@ final class DesktopWallpaperSyncManager {
                     } catch {
                         self.requestSystemDesktopAppearanceResample()
                     }
-                    // setDesktop 后再发一次刷新通知：WallpaperAgent 可能刚缓存完旧帧。
+                    // setDesktop 后再 poke 一次：backdrop 可能刚缓存完旧帧。
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-                        self?.requestSystemDesktopAppearanceResample()
+                        self?.pokeMenuBarBackdropResample(on: currentScreen)
                     }
                 }
 
-                AppLogger.debug(.wallpaper, "Menu-bar appearance refresh requested after dynamic presentation", metadata: [
+                AppLogger.debug(.wallpaper, "Menu-bar appearance poke after dynamic presentation", metadata: [
                     "screen": currentScreen.localizedName,
                     "desktopRewrite": canRewriteDesktop
                 ])
@@ -269,6 +285,118 @@ final class DesktopWallpaperSyncManager {
             pendingPresentationRefreshWorkItems[fingerprint] = workItem
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         }
+    }
+
+    /// 用短生命周期透明窗口制造一次完整窗口树变化，迫使菜单栏 CABackdrop / IconAppearance 重采样。
+    ///
+    /// 用户实测“任意窗口变化就会刷新”；1pt / 极低 alpha 的复用窗常被 WindowServer 优化掉。
+    /// 这里改为：覆盖整条菜单栏条带、alpha=1 但内容透明、停留约 2 帧再 orderOut + close。
+    /// 不 makeKey、不激活 App、不接鼠标；用户不可见。
+    ///
+    /// ## 后台降级（macOS 27 beta 崩溃修复）
+    /// App 在后台（`NSApp.isActive == false`）时调用 `orderFrontRegardless()` 会让
+    /// ViewBridge 的 `NSRemoteView containingWindowWillOrderOnScreen:` 抛出不可恢复的
+    /// ObjC 异常，最终 SIGSEGV（见 crash report：Role=Background，Thread 0 Crashed）。
+    /// 后台时降级为 `com.apple.desktop` 分布式通知，不创建任何 NSWindow。
+    private func pokeMenuBarBackdropResample(on screen: NSScreen) {
+        guard NSApp.isActive else {
+            requestSystemDesktopAppearanceResample()
+            return
+        }
+
+        let barHeight = max(24, screen.frame.maxY - screen.visibleFrame.maxY)
+        // 与 NotchOverlay 一致：盖住菜单栏区域 + 向下 1pt，确保 backdrop 采样矩形相交。
+        let pokeFrame = NSRect(
+            x: screen.frame.minX,
+            y: screen.frame.maxY - barHeight - 1,
+            width: max(1, screen.frame.width),
+            height: barHeight + 1
+        )
+
+        let window = NSWindow(
+            contentRect: pokeFrame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false,
+            screen: screen
+        )
+        // 高于 desktop 壁纸，低于普通 UI / 状态栏；保证合入菜单栏 backdrop 的采样层。
+        // statusWindow-1 比 desktop+1 更接近“普通窗口进出”的合成路径，但仍不抢焦点。
+        let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
+        window.level = .init(rawValue: max(statusLevel - 1, Int(CGWindowLevelForKey(.desktopWindow)) + 2))
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
+        window.isMovable = false
+        window.animationBehavior = .none
+        window.hidesOnDeactivate = false
+        window.alphaValue = 1
+
+        let view = NSView(frame: NSRect(origin: .zero, size: pokeFrame.size))
+        view.wantsLayer = true
+        // 完全透明但仍参与合成（有 layer surface），比 alpha=0.01 的 1pt 窗更难被优化掉。
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        window.contentView = view
+        window.setFrame(pokeFrame, display: false)
+
+        liveMenuBarBackdropPokeWindows.append(window)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // 不要 orderBack：那会把它塞回桌面底，菜单栏 backdrop 可能采不到。
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        CATransaction.commit()
+        CATransaction.flush()
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+
+        // 保持约 2 帧（~33ms@60Hz）再 unmap，给 WindowServer 时间把窗口纳入合成并触发 IconAppearance。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
+            guard let self, let window else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.orderOut(nil)
+            CATransaction.commit()
+            CATransaction.flush()
+
+            // 再 pulse 一次：部分系统要连续两次 map/unmap 才重算。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak window] in
+                guard let self, let window else { return }
+                // App 在两次 pulse 之间失焦时跳过二次上屏：后台 orderFrontRegardless 会触发
+                // macOS 27 ViewBridge 崩溃。直接走清理路径销毁窗口即可。
+                guard NSApp.isActive else {
+                    self.tearDownPokeWindow(window)
+                    return
+                }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                window.orderFrontRegardless()
+                window.displayIfNeeded()
+                CATransaction.commit()
+                CATransaction.flush()
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
+                    guard let self, let window else { return }
+                    self.tearDownPokeWindow(window)
+                }
+            }
+        }
+    }
+
+    /// 销毁一个 poke 窗口：orderOut + close + 清引用。
+    /// `orderOut` 不会触发 `containingWindowWillOrderOnScreen:`，后台调用安全。
+    private func tearDownPokeWindow(_ window: NSWindow) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+        CATransaction.commit()
+        CATransaction.flush()
+        liveMenuBarBackdropPokeWindows.removeAll { $0 === window }
     }
 
     /// Request a desktop refresh without creating or ordering an AppKit window.

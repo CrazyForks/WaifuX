@@ -1159,61 +1159,38 @@ final class MediaLibraryService: ObservableObject {
         }
     }
 
-    /// 清理无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
-    /// 返回被修正的记录数。
+    /// 审计无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
+    ///
+    /// 重要：该方法保持历史名称以兼容现有调用方，但现在只读并报告，
+    /// 永远不会把 folderID 改成 nil，也不会重建或覆盖库缓存。
+    /// 用户明确执行“移到根目录”或删除文件夹时，仍由 moveItemsToRoot()
+    /// 负责执行实际变更。
     @discardableResult
     func sanitizeFolderMembership(
         validFavoriteFolderIDs: Set<String>,
         validDownloadFolderIDs: Set<String>
     ) -> Int {
-        var fixed = 0
-        var favoritesChanged = false
-        var downloadsChanged = false
+        let favoriteAudit = LibraryFolderMembershipPolicy.audit(
+            folderIDs: favoriteRecords.map(\.folderID),
+            validFolderIDs: validFavoriteFolderIDs
+        )
+        let downloadAudit = LibraryFolderMembershipPolicy.audit(
+            folderIDs: downloadRecords.map(\.folderID),
+            validFolderIDs: validDownloadFolderIDs
+        )
+        let invalidCount = favoriteAudit.invalidCount + downloadAudit.invalidCount
 
-        for index in favoriteRecords.indices {
-            let raw = favoriteRecords[index].folderID
-            let normalized = Self.normalizedFolderID(raw)
-            let next: String?
-            if let normalized, validFavoriteFolderIDs.contains(normalized) {
-                next = normalized
-            } else {
-                next = nil
-            }
-            if raw != next {
-                favoriteRecords[index].folderID = next
-                favoritesChanged = true
-                fixed += 1
-            }
+        if invalidCount > 0 {
+            let invalidIDs = favoriteAudit.invalidFolderIDs
+                .union(downloadAudit.invalidFolderIDs)
+                .sorted()
+                .joined(separator: ",")
+            print(
+                "[MediaLibraryService] Preserved \(invalidCount) invalid folder "
+                    + "membership field(s); folderIDs=\(invalidIDs)"
+            )
         }
-
-        for index in downloadRecords.indices {
-            let raw = downloadRecords[index].folderID
-            let normalized = Self.normalizedFolderID(raw)
-            let next: String?
-            if let normalized, validDownloadFolderIDs.contains(normalized) {
-                next = normalized
-            } else {
-                next = nil
-            }
-            if raw != next {
-                downloadRecords[index].folderID = next
-                downloadsChanged = true
-                fixed += 1
-            }
-        }
-
-        if favoritesChanged {
-            rebuildFavCache()
-            favoriteRecords = Array(favoriteRecords)
-        }
-        if downloadsChanged {
-            rebuildDlCache()
-            downloadRecords = Array(downloadRecords)
-        }
-        if fixed > 0 {
-            print("[MediaLibraryService] Sanitized \(fixed) folder membership field(s)")
-        }
-        return fixed
+        return invalidCount
     }
 
     /// 清理无效下载记录（文件不存在的记录）
@@ -2086,61 +2063,38 @@ final class WallpaperLibraryService: ObservableObject {
         }
     }
 
-    /// 清理无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
-    /// 返回被修正的记录数。
+    /// 审计无效 folderID：空字符串、指向不存在文件夹、或跨集合引用。
+    ///
+    /// 重要：该方法保持历史名称以兼容现有调用方，但现在只读并报告，
+    /// 永远不会把 folderID 改成 nil，也不会重建或覆盖库缓存。
+    /// 用户明确执行“移到根目录”或删除文件夹时，仍由 moveItemsToRoot()
+    /// 负责执行实际变更。
     @discardableResult
     func sanitizeFolderMembership(
         validFavoriteFolderIDs: Set<String>,
         validDownloadFolderIDs: Set<String>
     ) -> Int {
-        var fixed = 0
-        var favoritesChanged = false
-        var downloadsChanged = false
+        let favoriteAudit = LibraryFolderMembershipPolicy.audit(
+            folderIDs: favoriteRecords.map(\.folderID),
+            validFolderIDs: validFavoriteFolderIDs
+        )
+        let downloadAudit = LibraryFolderMembershipPolicy.audit(
+            folderIDs: downloadRecords.map(\.folderID),
+            validFolderIDs: validDownloadFolderIDs
+        )
+        let invalidCount = favoriteAudit.invalidCount + downloadAudit.invalidCount
 
-        for index in favoriteRecords.indices {
-            let raw = favoriteRecords[index].folderID
-            let normalized = Self.normalizedFolderID(raw)
-            let next: String?
-            if let normalized, validFavoriteFolderIDs.contains(normalized) {
-                next = normalized
-            } else {
-                next = nil
-            }
-            if raw != next {
-                favoriteRecords[index].folderID = next
-                favoritesChanged = true
-                fixed += 1
-            }
+        if invalidCount > 0 {
+            let invalidIDs = favoriteAudit.invalidFolderIDs
+                .union(downloadAudit.invalidFolderIDs)
+                .sorted()
+                .joined(separator: ",")
+            print(
+                "[WallpaperLibraryService] Preserved \(invalidCount) invalid folder "
+                    + "membership field(s); folderIDs=\(invalidIDs)"
+            )
         }
-
-        for index in downloadRecords.indices {
-            let raw = downloadRecords[index].folderID
-            let normalized = Self.normalizedFolderID(raw)
-            let next: String?
-            if let normalized, validDownloadFolderIDs.contains(normalized) {
-                next = normalized
-            } else {
-                next = nil
-            }
-            if raw != next {
-                downloadRecords[index].folderID = next
-                downloadsChanged = true
-                fixed += 1
-            }
-        }
-
-        if favoritesChanged {
-            rebuildFavCache()
-            favoriteRecords = Array(favoriteRecords)
-        }
-        if downloadsChanged {
-            rebuildDlCache()
-            downloadRecords = Array(downloadRecords)
-        }
-        if fixed > 0 {
-            print("[WallpaperLibraryService] Sanitized \(fixed) folder membership field(s)")
-        }
-        return fixed
+        return invalidCount
     }
 
     private func loadPersistedState() {

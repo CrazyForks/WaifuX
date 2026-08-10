@@ -1701,11 +1701,21 @@ class WallpaperViewModel: ObservableObject {
     /// - Note: macOS 的锁屏壁纸即桌面壁纸，没有独立的锁屏壁纸 API。
     ///   `.lockScreen` 和 `.both` 最终都等同于设置桌面壁纸，避免重复操作。
     func setWallpaper(from imageURL: URL, option: WallpaperOption) async throws {
+        VideoWallpaperManager.shared.cancelPendingExternalVideoTransition(
+            reason: "WallpaperViewModel.setWallpaper"
+        )
         let screens = NSScreen.screens
+        let transitionToken = WallpaperCrossTypeTransitionCoordinator.shared
+            .beginRequest(on: screens)
         let imageURLByScreen = try await preparedStaticImageURLs(
             from: imageURL,
             for: screens
         )
+        guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+            transitionToken
+        ) else {
+            return
+        }
         WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
             on: screens,
             reason: "applyStaticWallpaper"
@@ -1746,6 +1756,11 @@ class WallpaperViewModel: ObservableObject {
                     imageURL: resolvedImageURL,
                     displayIDs: [displayID]
                 )
+                guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                    transitionToken
+                ) else {
+                    return
+                }
             }
             StaticWallpaperGrainManager.shared.updateOverlay()
             // 互斥：清除可能残留的静态图 overlay
@@ -1753,7 +1768,8 @@ class WallpaperViewModel: ObservableObject {
             print("[WallpaperViewModel] 🔒 动态锁屏已启用，已将静态图同步到 WaifuX 锁屏/桌面实例")
             await finishStaticWallpaperTransitionIfNeeded(
                 screens: screens,
-                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+                requestToken: transitionToken
             )
             return
         }
@@ -1771,11 +1787,17 @@ class WallpaperViewModel: ObservableObject {
                     imageURL: resolvedImageURL,
                     for: screen
                 )
+                guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                    transitionToken
+                ) else {
+                    return
+                }
             }
             StaticWallpaperGrainManager.shared.updateOverlay()
             await finishStaticWallpaperTransitionIfNeeded(
                 screens: screens,
-                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+                requestToken: transitionToken
             )
             return
         }
@@ -1789,6 +1811,11 @@ class WallpaperViewModel: ObservableObject {
             let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(
                 for: resolvedImageURL
             )
+            guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                transitionToken
+            ) else {
+                return
+            }
             try workspace.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: screen, options: fillOptions)
             DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: screen)
         }
@@ -1800,7 +1827,8 @@ class WallpaperViewModel: ObservableObject {
         StaticWallpaperGrainManager.shared.updateOverlay()
         await finishStaticWallpaperTransitionIfNeeded(
             screens: screens,
-            preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+            preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+            requestToken: transitionToken
         )
     }
 
@@ -1808,14 +1836,24 @@ class WallpaperViewModel: ObservableObject {
     /// - Note: macOS 的锁屏壁纸即桌面壁纸，没有独立的锁屏壁纸 API。
     ///   `.lockScreen` 和 `.both` 最终都等同于设置桌面壁纸。
     func setWallpaper(from imageURL: URL, option: WallpaperOption, for targetScreen: NSScreen?) async throws {
+        VideoWallpaperManager.shared.cancelPendingExternalVideoTransition(
+            reason: "WallpaperViewModel.setWallpaperForScreen"
+        )
         let workspace = NSWorkspace.shared
 
         // 如果指定了特定屏幕，只设置到该屏幕
         if let targetScreen = targetScreen {
+            let transitionToken = WallpaperCrossTypeTransitionCoordinator.shared
+                .beginRequest(on: [targetScreen])
             let resolvedImageURL = try await preparedStaticImageURL(
                 from: imageURL,
                 for: targetScreen
             )
+            guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                transitionToken
+            ) else {
+                return
+            }
             WallpaperEngineXBridge.shared.prepareForNonExternalWallpaperSwitch(
                 on: [targetScreen],
                 reason: "applyStaticWallpaperForScreen"
@@ -1853,6 +1891,11 @@ class WallpaperViewModel: ObservableObject {
                         imageURL: resolvedImageURL,
                         displayIDs: [displayID]
                     )
+                    guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                        transitionToken
+                    ) else {
+                        return
+                    }
                     StaticWallpaperGrainManager.shared.updateOverlay()
                     // 互斥：清除可能残留的静态图 overlay
                     StaticImageWallpaperOverlayManager.shared.clearState()
@@ -1860,7 +1903,8 @@ class WallpaperViewModel: ObservableObject {
                 }
                 await finishStaticWallpaperTransitionIfNeeded(
                     screens: [targetScreen],
-                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+                    requestToken: transitionToken
                 )
                 return
             }
@@ -1873,10 +1917,16 @@ class WallpaperViewModel: ObservableObject {
                     imageURL: resolvedImageURL,
                     for: targetScreen
                 )
+                guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                    transitionToken
+                ) else {
+                    return
+                }
                 StaticWallpaperGrainManager.shared.updateOverlay()
                 await finishStaticWallpaperTransitionIfNeeded(
                     screens: [targetScreen],
-                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                    preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+                    requestToken: transitionToken
                 )
                 return
             }
@@ -1888,6 +1938,11 @@ class WallpaperViewModel: ObservableObject {
             let systemWallpaperURL = await StaticImageWallpaperOverlayManager.shared.preparedSystemWallpaperURL(
                 for: resolvedImageURL
             )
+            guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                transitionToken
+            ) else {
+                return
+            }
             try workspace.setDesktopImageURLForAllSpaces(systemWallpaperURL, for: targetScreen, options: fillOptions)
             DesktopWallpaperSyncManager.shared.registerWallpaperSet(systemWallpaperURL, for: targetScreen)
 
@@ -1895,7 +1950,8 @@ class WallpaperViewModel: ObservableObject {
             StaticImageWallpaperOverlayManager.shared.clearState()
             await finishStaticWallpaperTransitionIfNeeded(
                 screens: [targetScreen],
-                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady
+                preservesDynamicWallpaperUntilReady: preservesDynamicWallpaperUntilReady,
+                requestToken: transitionToken
             )
         } else {
             try await setWallpaper(from: imageURL, option: option)
@@ -1904,19 +1960,59 @@ class WallpaperViewModel: ObservableObject {
 
     private func finishStaticWallpaperTransitionIfNeeded(
         screens: [NSScreen],
-        preservesDynamicWallpaperUntilReady: Bool
+        preservesDynamicWallpaperUntilReady: Bool,
+        requestToken: WallpaperCrossTypeTransitionCoordinator.RequestToken
     ) async {
         guard preservesDynamicWallpaperUntilReady else { return }
+        guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+            requestToken
+        ) else {
+            return
+        }
+        let liveScreens = Self.uniqueLiveScreens(preferred: screens)
+        guard !liveScreens.isEmpty else { return }
         // 独立静态 overlay 与视频窗处于同一 desktop level。overlay 准备完成时
         // 先把仍在播放的旧视频提回前方，避免新图片在黑场出现前闪一帧。
-        VideoWallpaperManager.shared.keepNativeVideoPresentationFront(on: screens)
-        await WallpaperCrossTypeTransitionCoordinator.shared.commitPreparedContent(on: screens) {
-            for screen in screens {
+        VideoWallpaperManager.shared.keepNativeVideoPresentationFront(on: liveScreens)
+        await WallpaperCrossTypeTransitionCoordinator.shared.commitPreparedContent(
+            on: liveScreens,
+            requestToken: requestToken
+        ) {
+            for screen in liveScreens {
+                guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                    requestToken
+                ) else {
+                    return
+                }
                 await WallpaperEngineXBridge.shared.ensureStoppedForNonCLIWallpaperForTransition(
                     for: screen
                 )
+                guard WallpaperCrossTypeTransitionCoordinator.shared.isCurrent(
+                    requestToken
+                ) else {
+                    return
+                }
                 VideoWallpaperManager.shared.stopNativeVideoWallpaperOnly(for: screen)
             }
+        }
+    }
+
+    private static func uniqueLiveScreens(preferred: [NSScreen]) -> [NSScreen] {
+        let live = NSScreen.screens
+        var byID: [String: NSScreen] = [:]
+        var byFingerprint: [String: NSScreen] = [:]
+        for screen in live {
+            byID[screen.wallpaperScreenIdentifier] = screen
+            byFingerprint[screen.wallpaperScreenFingerprint] = screen
+        }
+        var seen = Set<String>()
+        return preferred.compactMap { screen in
+            let resolved = byID[screen.wallpaperScreenIdentifier]
+                ?? byFingerprint[screen.wallpaperScreenFingerprint]
+            guard let resolved, seen.insert(resolved.wallpaperScreenIdentifier).inserted else {
+                return nil
+            }
+            return resolved
         }
     }
 

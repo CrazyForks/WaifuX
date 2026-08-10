@@ -161,6 +161,17 @@ final class VideoThumbnailCache {
         return poster
     }
 
+    /// 实时 Scene 在关闭自动烘焙时生成的按目标尺寸静帧。
+    /// 与真正烘焙产物的 `scene_bake_*` 隔离，避免横屏主屏 poster 污染竖屏副屏。
+    func cachedSceneRealtimePosterFileURLIfExists(
+        itemID: String,
+        variantKey: String
+    ) -> URL? {
+        let poster = sceneRealtimePosterCacheURL(itemID: itemID, variantKey: variantKey)
+        guard isUsableCachedImage(at: poster) else { return nil }
+        return poster
+    }
+
     /// 仅返回已缓存的**高清**动态壁纸 poster，不触发 AVFoundation 抽帧。
     /// 调度器切换下一张时优先走这里，避免串行抽帧把切换卡住。
     ///
@@ -302,6 +313,41 @@ final class VideoThumbnailCache {
         return await generatePosterJPEGFile(from: URL(fileURLWithPath: pathKey), outputURL: outURL)
     }
 
+    /// 为实时 Scene 的临时 1 秒视频生成目标屏幕专用封面。
+    /// `variantKey` 应包含内容版本与目标像素尺寸；不同横竖比例不会共享缓存。
+    func sceneRealtimePosterJPEGFileURL(
+        forLocalVideo videoURL: URL,
+        itemID: String,
+        variantKey: String,
+        targetWidth: Int,
+        targetHeight: Int,
+        forceRegenerate: Bool = false
+    ) async -> URL? {
+        guard videoURL.isFileURL else { return nil }
+        let pathKey = videoURL.standardizedFileURL.path
+        guard fileManager.fileExists(atPath: pathKey) else { return nil }
+
+        let outURL = sceneRealtimePosterCacheURL(itemID: itemID, variantKey: variantKey)
+        if !forceRegenerate,
+           let existing = cachedSceneRealtimePosterFileURLIfExists(
+               itemID: itemID,
+               variantKey: variantKey
+           ) {
+            scheduleCropExistingPosterIfNeeded(existing)
+            return existing
+        }
+
+        try? fileManager.removeItem(at: outURL)
+        return await generatePosterJPEGFile(
+            from: URL(fileURLWithPath: pathKey),
+            outputURL: outURL,
+            maximumSize: CGSize(
+                width: max(1, targetWidth),
+                height: max(1, targetHeight)
+            )
+        )
+    }
+
     /// 将 Wallpaper Engine Web renderer 的直接截图写入稳定 poster 缓存。
     ///
     /// 截图源通常在 `/tmp`，不能直接作为详情页或锁屏长期引用；这里编码为与离线烘焙
@@ -330,6 +376,18 @@ final class VideoThumbnailCache {
     /// 删除 Scene 烘焙稳定封面，并顺手清掉旧的 path-based poster，避免历史重复缓存继续被列表命中。
     func removeSceneBakePoster(itemID: String, videoPath: String? = nil) {
         try? fileManager.removeItem(at: sceneBakePosterCacheURL(itemID: itemID))
+        let realtimePrefix = "scene_realtime_\(itemID.md5)_"
+        if let cachedFiles = try? fileManager.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            for file in cachedFiles
+            where file.lastPathComponent.hasPrefix(realtimePrefix)
+                && file.pathExtension.lowercased() == "jpg" {
+                try? fileManager.removeItem(at: file)
+            }
+        }
         if let videoPath, !videoPath.isEmpty {
             let videoURL = URL(fileURLWithPath: videoPath)
             try? fileManager.removeItem(at: posterCacheURL(forPathKey: videoURL.standardizedFileURL.path))
@@ -381,7 +439,17 @@ final class VideoThumbnailCache {
         cacheDirectory.appendingPathComponent("scene_bake_\(itemID.md5).jpg")
     }
 
-    private func generatePosterJPEGFile(from videoURL: URL, outputURL: URL) async -> URL? {
+    private func sceneRealtimePosterCacheURL(itemID: String, variantKey: String) -> URL {
+        cacheDirectory.appendingPathComponent(
+            "scene_realtime_\(itemID.md5)_\(variantKey.md5).jpg"
+        )
+    }
+
+    private func generatePosterJPEGFile(
+        from videoURL: URL,
+        outputURL: URL,
+        maximumSize: CGSize = CGSize(width: 3840, height: 2160)
+    ) async -> URL? {
         await VideoPosterGenerationCoordinator.shared.generate(key: outputURL.path) {
             await Task.detached(priority: .userInitiated) {
                 let startedAt = CFAbsoluteTimeGetCurrent()
@@ -391,7 +459,7 @@ final class VideoThumbnailCache {
                 // 允许就近关键帧，显著快于精确 seek（尤其长 GOP / 4K）
                 generator.requestedTimeToleranceBefore = CMTime(seconds: 0.35, preferredTimescale: 600)
                 generator.requestedTimeToleranceAfter = CMTime(seconds: 0.35, preferredTimescale: 600)
-                generator.maximumSize = CGSize(width: 3840, height: 2160)
+                generator.maximumSize = maximumSize
 
                 // 少候选 + 优先靠近片头的可读帧，避免 4K 中间帧随机 seek 过慢。
                 // 中间帧只作为首轮失败后的备选，不再默认先抽 50%。

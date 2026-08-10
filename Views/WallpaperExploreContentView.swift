@@ -890,11 +890,7 @@ struct WallpaperExploreContentView: View {
                     onClear: { searchText = ""; translationBridge.reset(); submitSearch() },
                     translatedText: translationBridge.translatedText,
                     isTranslating: translationBridge.isTranslating,
-                    onDismissTranslation: {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
-                            translationBridge.dismiss()
-                        }
-                    }
+                    onDismissTranslation: dismissTranslationAndSearchOriginal
                 )
             }
 
@@ -1716,7 +1712,6 @@ struct WallpaperExploreContentView: View {
                 AppLogger.debug(.wallpaper, "[翻译] submitSearch: 缓存命中，直接搜索")
                 pendingSearchText = nil
                 let query = translationBridge.effectiveQuery(for: trimmed)
-                searchText = query
                 viewModel.searchQuery = query
                 reloadData()
                 return
@@ -1734,6 +1729,13 @@ struct WallpaperExploreContentView: View {
         AppLogger.debug(.wallpaper, "[翻译] submitSearch: 直接搜索 query='\(query)'")
         viewModel.searchQuery = query
         reloadData()
+    }
+
+    private func dismissTranslationAndSearchOriginal() {
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+            translationBridge.dismiss()
+        }
+        submitSearch()
     }
 
     private func reloadData() {

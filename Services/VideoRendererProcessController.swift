@@ -1,0 +1,927 @@
+// VideoRendererProcessController.swift
+//
+// 视频壁纸子进程控制器（主进程侧）。
+// 负责：
+//   1. 启动/终止 wallpaper-video-renderer 子进程
+//   2. 通过 Unix Socket IPC 向子进程发送命令
+//   3. 接收子进程上报的事件（首帧就绪、播放结束等）
+//
+// P1 阶段：与 VideoWallpaperManager 的主进程内渲染路径并存，
+// 通过 VideoWallpaperManager.useExternalVideoRenderer 开关切换。
+// 验证 Screen Time 不再计入主进程后，再逐步把功能迁移到子进程。
+
+import Foundation
+import AppKit
+import CoreAudio
+
+/// Renderer 侧音频输出策略。
+///
+/// `builtInNonBluetooth` 与 VideoWallpaperManager 现有的
+/// `audioOutputDeviceUniqueID` 语义一致：静音时固定到内置/非蓝牙输出，
+/// 非静音时恢复系统默认输出。
+enum VideoRendererAudioOutputStrategy: String, Codable {
+    case systemDefault
+    case builtInNonBluetooth
+}
+
+struct VideoRendererAudioPolicy: Codable, Equatable {
+    let muted: Bool
+    let volume: Double
+    let outputStrategy: VideoRendererAudioOutputStrategy
+    let outputDeviceUniqueID: String?
+
+    var effectiveVolume: Double {
+        muted ? 0 : volume
+    }
+}
+
+/// 主进程侧的音频路由策略解析器。
+///
+/// 仅由视频 renderer 控制器使用，不会影响 Web/Scene 音频。
+@MainActor
+final class VideoRendererAudioRouting {
+    static let shared = VideoRendererAudioRouting()
+
+    private var cachedBuiltInOutputDeviceUID: String?
+
+    func policy(muted: Bool, volume: Double) -> VideoRendererAudioPolicy {
+        let clampedVolume = max(0, min(1, volume))
+        if muted {
+            return VideoRendererAudioPolicy(
+                muted: true,
+                volume: clampedVolume,
+                outputStrategy: .builtInNonBluetooth,
+                outputDeviceUniqueID: findBuiltInOutputDeviceUID()
+            )
+        }
+
+        return VideoRendererAudioPolicy(
+            muted: false,
+            volume: clampedVolume,
+            outputStrategy: .systemDefault,
+            outputDeviceUniqueID: nil
+        )
+    }
+
+    /// 音频设备变化后可由上层主动调用，重新发现内置输出设备。
+    func invalidateCachedOutputDevice() {
+        cachedBuiltInOutputDeviceUID = nil
+    }
+
+    /// 与 VideoWallpaperManager.findBuiltInOutputDeviceUID() 保持相同的选择顺序：
+    /// 优先 Built-in/Speaker，其次第一个有输出能力且不是蓝牙类的设备。
+    private func findBuiltInOutputDeviceUID() -> String? {
+        var propertySize: UInt32 = 0
+        var devicesProperty = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesProperty,
+            0,
+            nil,
+            &propertySize
+        ) == noErr, propertySize > 0 else {
+            return nil
+        }
+
+        let deviceCount = Int(propertySize) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: deviceCount)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesProperty,
+            0,
+            nil,
+            &propertySize,
+            &deviceIDs
+        ) == noErr else {
+            return nil
+        }
+
+        var fallbackUID: String?
+        for deviceID in deviceIDs {
+            guard deviceID != kAudioObjectUnknown else { continue }
+
+            var outputStreamProperty = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var outputStreamSize: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(
+                deviceID,
+                &outputStreamProperty,
+                0,
+                nil,
+                &outputStreamSize
+            ) == noErr, outputStreamSize > 0 else {
+                continue
+            }
+
+            var uidProperty = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var uidRef: Unmanaged<CFString>?
+            var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            guard AudioObjectGetPropertyData(
+                deviceID,
+                &uidProperty,
+                0,
+                nil,
+                &uidSize,
+                &uidRef
+            ) == noErr, let retainedUID = uidRef?.takeRetainedValue() as String? else {
+                continue
+            }
+
+            var transportProperty = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyTransportType,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var transportType: UInt32 = 0
+            var transportSize = UInt32(MemoryLayout<UInt32>.size)
+            let hasTransport = AudioObjectGetPropertyData(
+                deviceID,
+                &transportProperty,
+                0,
+                nil,
+                &transportSize,
+                &transportType
+            ) == noErr
+            if hasTransport,
+               transportType == kAudioDeviceTransportTypeBluetooth
+                || transportType == kAudioDeviceTransportTypeBluetoothLE {
+                continue
+            }
+
+            if (hasTransport && transportType == kAudioDeviceTransportTypeBuiltIn)
+                || retainedUID.localizedCaseInsensitiveContains("built")
+                || retainedUID.localizedCaseInsensitiveContains("speaker") {
+                cachedBuiltInOutputDeviceUID = retainedUID
+                return retainedUID
+            }
+
+            if !retainedUID.localizedCaseInsensitiveContains("bluetooth")
+                && !retainedUID.localizedCaseInsensitiveContains("airpods")
+                && !retainedUID.localizedCaseInsensitiveContains("beats") {
+                fallbackUID = fallbackUID ?? retainedUID
+            }
+        }
+
+        cachedBuiltInOutputDeviceUID = fallbackUID
+        return cachedBuiltInOutputDeviceUID
+    }
+}
+
+/// 子进程上报的事件
+enum VideoRendererEvent {
+    case ready
+    case windowCreated(screen: Int, screenID: String?, requestID: String?)
+    case firstFrameReady(screen: Int, screenID: String?, requestID: String?)
+    case playbackEnded(screen: Int, screenID: String?, requestID: String?)
+    case error(screen: Int?, screenID: String?, requestID: String?, message: String)
+    case stopped(screen: Int, screenID: String?, requestID: String?)
+    case terminated(status: Int32, expected: Bool)
+}
+
+/// 视频壁纸子进程控制器。单例。
+@MainActor
+final class VideoRendererProcessController {
+    static let shared = VideoRendererProcessController()
+
+    // MARK: - 状态
+
+    private var process: Process?
+    private var processPID: pid_t = 0
+    private var socketPath: String = ""
+    private var pidPath: String = ""
+    private var generation: UInt64 = 0  // 防止旧进程的退出事件污染新进程状态
+    private var expectedTerminationGeneration: UInt64?
+    private var stderrBuffer = Data()
+    private var lastAudioMuted = true
+    private var lastAudioVolume = 1.0
+
+    /// 事件回调（主线程）
+    var eventHandler: ((VideoRendererEvent) -> Void)?
+
+    /// 子进程是否存活
+    var isRunning: Bool {
+        guard processPID > 0 else { return false }
+        return kill(processPID, 0) == 0
+    }
+
+    // MARK: - 启动 / 停止子进程
+
+    /// 启动 wallpaper-video-renderer 子进程。
+    /// - Returns: true 表示启动成功且子进程已就绪
+    @discardableResult
+    func startDaemon() -> Bool {
+        if isRunning {
+            AppLogger.info(.wallpaper, "video-renderer 子进程已在运行，跳过启动")
+            return waitForSocket(timeout: 2.0)
+        }
+
+        guard let executableURL = resolvedExecutableURL() else {
+            AppLogger.error(.wallpaper, "未找到 wallpaper-video-renderer 二进制")
+            return false
+        }
+
+        generation &+= 1
+        let currentGen = generation
+        expectedTerminationGeneration = nil
+
+        // 每次启动用独立 socket 路径，避免与旧进程残留冲突
+        socketPath = "/tmp/waifux-video-renderer-\(currentGen).sock"
+        pidPath = "/tmp/waifux-video-renderer-\(currentGen).pid"
+
+        // 清理旧文件
+        try? FileManager.default.removeItem(atPath: socketPath)
+        try? FileManager.default.removeItem(atPath: pidPath)
+
+        let proc = Process()
+        proc.executableURL = executableURL
+        proc.arguments = [
+            "--socket", socketPath,
+            "--parent-pid", String(ProcessInfo.processInfo.processIdentifier),
+        ]
+        proc.environment = ProcessInfo.processInfo.environment
+        proc.environment?["WAIFUX_VIDEO_RENDERER_PID_PATH"] = pidPath
+        proc.environment?["LSUIElement"] = "1"  // 无 Dock 图标
+        if let lockStateURL = LockScreenWallpaperService.shared.playbackStateURL {
+            proc.environment?["WAIFUX_VIDEO_RENDERER_LOCK_STATE_PATH"] = lockStateURL.path
+        }
+
+        // stdout/stderr 用 Pipe 接收事件（子进程通过 stderr 的 WAIFUX_EVENT: 前缀上报）
+        let stderrPipe = Pipe()
+        proc.standardError = stderrPipe
+        proc.standardOutput = FileHandle.nullDevice
+
+        // 异步读取 stderr，解析事件
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let copy = data
+            Task { @MainActor in
+                self?.handleStderrData(copy)
+            }
+        }
+
+        proc.terminationHandler = { [weak self] terminatedProcess in
+            Task { @MainActor in
+                guard let self else { return }
+                // 只有当前 generation 的进程退出才处理，防止旧进程退出污染新进程
+                guard self.generation == currentGen else { return }
+                let expected = self.expectedTerminationGeneration == currentGen
+                if expected {
+                    self.expectedTerminationGeneration = nil
+                }
+                AppLogger.info(.wallpaper, "video-renderer 子进程退出 code=\(terminatedProcess.terminationStatus)")
+                self.process = nil
+                self.processPID = 0
+                // 清理 socket 文件
+                try? FileManager.default.removeItem(atPath: self.socketPath)
+                try? FileManager.default.removeItem(atPath: self.pidPath)
+                self.eventHandler?(
+                    .terminated(
+                        status: terminatedProcess.terminationStatus,
+                        expected: expected
+                    )
+                )
+            }
+        }
+
+        do {
+            try proc.run()
+            process = proc
+            processPID = proc.processIdentifier
+            AppLogger.info(.wallpaper, "video-renderer 子进程已启动 pid=\(processPID) socket=\(socketPath)")
+            guard waitForSocket(timeout: 2.0) else {
+                AppLogger.error(.wallpaper, "video-renderer 子进程启动后未监听 socket")
+                terminateFailedLaunch(proc)
+                return false
+            }
+            guard sendCommandSync(.ping, screen: nil, timeout: 1.0) == "OK" else {
+                AppLogger.error(.wallpaper, "video-renderer socket 已出现但 ping 未通过")
+                terminateFailedLaunch(proc)
+                return false
+            }
+            return true
+        } catch {
+            AppLogger.error(.wallpaper, "video-renderer 子进程启动失败: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 停止子进程
+    func stopDaemon() {
+        guard isRunning else { return }
+        AppLogger.info(.wallpaper, "停止 video-renderer 子进程 pid=\(processPID)")
+        expectedTerminationGeneration = generation
+
+        // 先发 shutdown 命令（优雅退出），失败再 SIGTERM
+        _ = sendCommandSync(.shutdown, screen: nil, timeout: 1.0)
+
+        // 等待 0.5s
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // 若仍存活，SIGTERM
+        if isRunning {
+            kill(processPID, SIGTERM)
+        }
+
+        // watchdog: 2s 后 SIGKILL
+        let pid = processPID
+        DispatchQueue.global().async {
+            Thread.sleep(forTimeInterval: 2.0)
+            if kill(pid, 0) == 0 {
+                kill(pid, SIGKILL)
+            }
+        }
+
+        process = nil
+        processPID = 0
+        try? FileManager.default.removeItem(atPath: socketPath)
+        try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    // MARK: - IPC 客户端
+
+    /// IPC 命令（与子进程的 IPCCommand 枚举对应）
+    enum Command {
+        case set(
+            screen: Int,
+            screenID: String,
+            requestID: String,
+            path: String,
+            posterPath: String?,
+            frame: CGRect,
+            muted: Bool,
+            volume: Double,
+            looping: Bool,
+            shared: Bool,
+            forceNewPipeline: Bool,
+            hdrMetadataEnabled: Bool,
+            deferredPresentation: Bool,
+            transitionDuration: Double,
+            globalPaused: Bool,
+            screenPaused: Bool
+        )
+        case pause(screen: Int?)
+        case resume(screen: Int?)
+        case stop(screen: Int?)
+        case seek(screen: Int, time: Double)
+        case setVolume(screen: Int?, volume: Double)
+        case setMuted(Bool)
+        case setCrop(screen: Int, crop: CGRect?, viewport: CGRect?, letterboxColor: String?, revision: UInt64?)
+        case updatePoster(screen: Int, path: String?)
+        case showPoster(screen: Int, path: String)
+        case hidePoster(screen: Int)
+        case setGrainOverlay(screen: Int?, intensity: Double)
+        case bringToFront(screen: Int)
+        case commitTransition(requestID: String)
+        case cancelTransition(requestID: String)
+        case forceCommit(screen: Int?)
+        case flashMenuBar(screen: Int)
+        case ping
+        case shutdown
+    }
+
+    /// 发送命令并等待响应（同步，带超时）
+    @discardableResult
+    func sendCommandSync(_ cmd: Command, screen: Int?, timeout: TimeInterval = 5.0) -> String? {
+        guard isRunning else {
+            AppLogger.error(.wallpaper, "video-renderer 子进程未运行，无法发送命令")
+            return nil
+        }
+
+        let msg = encodeCommand(cmd)
+        guard let body = try? JSONEncoder().encode(msg) else { return nil }
+
+        // The API is synchronous by design. Execute the socket operation on a
+        // worker queue and wait for its return value without sharing mutable
+        // captured state across concurrency domains.
+        return DispatchQueue.global(qos: .userInitiated).sync { [socketPath] in
+            Self.sendOverSocket(socketPath: socketPath, body: body, timeout: timeout)
+        }
+    }
+
+    /// 发送命令但不等待响应（fire-and-forget，用于高频命令）
+    func sendCommandFireAndForget(_ cmd: Command) {
+        guard isRunning else { return }
+        let msg = encodeCommand(cmd)
+        guard let body = try? JSONEncoder().encode(msg) else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [socketPath] in
+            Self.sendOverSocketFireAndForget(socketPath: socketPath, body: body)
+        }
+    }
+
+    // MARK: - 私有
+
+    /// `Process.run()` 只代表 fork/exec 成功，不代表 daemon 已完成 bind/listen。
+    /// 等待 socket 出现，避免首条 set 命令撞在子进程初始化窗口上。
+    private func waitForSocket(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if socketIsReachable() {
+                return true
+            }
+            guard isRunning else { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        return socketIsReachable() && isRunning
+    }
+
+    private func socketIsReachable() -> Bool {
+        guard FileManager.default.fileExists(atPath: socketPath) else { return false }
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        let sunPathSize = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        let count = min(pathBytes.count - 1, sunPathSize - 1)
+        withUnsafeMutableBytes(of: &addr.sun_path) { dest in
+            for i in 0..<count {
+                dest[i] = UInt8(bitPattern: pathBytes[i])
+            }
+        }
+
+        let result = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return result == 0
+    }
+
+    private func terminateFailedLaunch(_ proc: Process) {
+        expectedTerminationGeneration = generation
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGTERM)
+        }
+        process = nil
+        processPID = 0
+        try? FileManager.default.removeItem(atPath: socketPath)
+        try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    private func resolvedExecutableURL() -> URL? {
+        // 查找优先级与 WallpaperEngineXBridge.resolvedCLIExecutableURL 一致
+        let candidates: [URL] = [
+            Bundle.main.url(forResource: "wallpaper-video-renderer", withExtension: nil),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/wallpaper-video-renderer"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Resources/wallpaper-video-renderer"),
+            Bundle.main.resourceURL?.appendingPathComponent("wallpaper-video-renderer"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("wallpaper-video-renderer"),
+            // 开发 fallback
+            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/wallpaper-video-renderer"),
+            URL(fileURLWithPath: "/Volumes/mac/CodeLibrary/Claude/WallHaven/Resources/wallpaper-video-renderer"),
+        ].compactMap { $0 }
+
+        for candidate in candidates {
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    // MARK: 命令编码
+
+    private struct IPCMessageDTO: Codable {
+        var command: String
+        var screen: Int?
+        var screenID: String?
+        var requestID: String?
+        var path: String?
+        var screenFrameX: Double?
+        var screenFrameY: Double?
+        var screenFrameW: Double?
+        var screenFrameH: Double?
+        var muted: Bool?
+        var volume: Double?
+        var audioEffectiveVolume: Double?
+        var audioOutputDeviceStrategy: String?
+        var audioOutputDeviceUniqueID: String?
+        var enableLooping: Bool?
+        var usesSharedDecoder: Bool?
+        var forceNewPipeline: Bool?
+        var hdrMetadataEnabled: Bool?
+        var deferredPresentation: Bool?
+        var transitionDuration: Double?
+        var globalPaused: Bool?
+        var screenPaused: Bool?
+        var time: Double?
+        var cropX: Double?
+        var cropY: Double?
+        var cropW: Double?
+        var cropH: Double?
+        var viewportX: Double?
+        var viewportY: Double?
+        var viewportW: Double?
+        var viewportH: Double?
+        var letterboxColorHex: String?
+        var cropRevision: UInt64?
+        var posterPath: String?
+        var grainIntensity: Double?
+        var message: String?
+    }
+
+    private func encodeCommand(_ cmd: Command) -> IPCMessageDTO {
+        var msg = IPCMessageDTO(
+            command: "",
+            screen: nil,
+            screenID: nil,
+            requestID: nil,
+            path: nil,
+            screenFrameX: nil,
+            screenFrameY: nil,
+            screenFrameW: nil,
+            screenFrameH: nil,
+            muted: nil,
+            volume: nil,
+            audioEffectiveVolume: nil,
+            audioOutputDeviceStrategy: nil,
+            audioOutputDeviceUniqueID: nil,
+            enableLooping: nil,
+            usesSharedDecoder: nil,
+            forceNewPipeline: nil,
+            hdrMetadataEnabled: nil,
+            deferredPresentation: nil,
+            transitionDuration: nil,
+            globalPaused: nil,
+            screenPaused: nil,
+            time: nil,
+            cropX: nil,
+            cropY: nil,
+            cropW: nil,
+            cropH: nil,
+            viewportX: nil,
+            viewportY: nil,
+            viewportW: nil,
+            viewportH: nil,
+            letterboxColorHex: nil,
+            cropRevision: nil,
+            posterPath: nil,
+            grainIntensity: nil,
+            message: nil
+        )
+
+        switch cmd {
+        case .set(
+            let screen,
+            let screenID,
+            let requestID,
+            let path,
+            let posterPath,
+            let frame,
+            let muted,
+            let volume,
+            let looping,
+            let shared,
+            let forceNewPipeline,
+            let hdrMetadataEnabled,
+            let deferredPresentation,
+            let transitionDuration,
+            let globalPaused,
+            let screenPaused
+        ):
+            msg.command = "set"
+            msg.screen = screen
+            msg.screenID = screenID
+            msg.requestID = requestID
+            msg.path = path
+            msg.posterPath = posterPath
+            msg.screenFrameX = frame.origin.x
+            msg.screenFrameY = frame.origin.y
+            msg.screenFrameW = frame.size.width
+            msg.screenFrameH = frame.size.height
+            msg.muted = muted
+            msg.volume = volume
+            msg.enableLooping = looping
+            msg.usesSharedDecoder = shared
+            msg.forceNewPipeline = forceNewPipeline
+            msg.hdrMetadataEnabled = hdrMetadataEnabled
+            msg.deferredPresentation = deferredPresentation
+            msg.transitionDuration = transitionDuration
+            msg.globalPaused = globalPaused
+            msg.screenPaused = screenPaused
+            lastAudioMuted = muted
+            lastAudioVolume = max(0, min(1, volume))
+            updateAudioPolicyFields(
+                in: &msg,
+                muted: muted,
+                volume: lastAudioVolume
+            )
+
+        case .pause(let screen):
+            msg.command = "pause"
+            msg.screen = screen
+
+        case .resume(let screen):
+            msg.command = "resume"
+            msg.screen = screen
+
+        case .stop(let screen):
+            msg.command = "stop"
+            msg.screen = screen
+
+        case .seek(let screen, let time):
+            msg.command = "seek"
+            msg.screen = screen
+            msg.time = time
+
+        case .setVolume(let screen, let vol):
+            msg.command = "setVolume"
+            msg.screen = screen
+            lastAudioVolume = max(0, min(1, vol))
+            msg.volume = lastAudioVolume
+            // Carry the complete snapshot so the renderer can preserve the
+            // anti-Bluetooth route while the volume slider changes.
+            msg.muted = lastAudioMuted
+            updateAudioPolicyFields(
+                in: &msg,
+                muted: lastAudioMuted,
+                volume: lastAudioVolume
+            )
+
+        case .setMuted(let muted):
+            msg.command = "setMuted"
+            lastAudioMuted = muted
+            msg.muted = muted
+            msg.volume = lastAudioVolume
+            updateAudioPolicyFields(
+                in: &msg,
+                muted: muted,
+                volume: lastAudioVolume
+            )
+
+        case .setCrop(let screen, let crop, let viewport, let letterboxColor, let revision):
+            msg.command = "setCrop"
+            msg.screen = screen
+            if let crop {
+                msg.cropX = crop.origin.x
+                msg.cropY = crop.origin.y
+                msg.cropW = crop.size.width
+                msg.cropH = crop.size.height
+            }
+            if let viewport {
+                msg.viewportX = viewport.origin.x
+                msg.viewportY = viewport.origin.y
+                msg.viewportW = viewport.size.width
+                msg.viewportH = viewport.size.height
+            }
+            msg.letterboxColorHex = letterboxColor
+            msg.cropRevision = revision
+
+        case .updatePoster(let screen, let path):
+            msg.command = "updatePoster"
+            msg.screen = screen
+            msg.posterPath = path
+
+        case .showPoster(let screen, let path):
+            msg.command = "showPoster"
+            msg.screen = screen
+            msg.posterPath = path
+
+        case .hidePoster(let screen):
+            msg.command = "hidePoster"
+            msg.screen = screen
+
+        case .setGrainOverlay(let screen, let intensity):
+            msg.command = "setGrainOverlay"
+            msg.screen = screen
+            msg.grainIntensity = max(0, min(1, intensity))
+
+        case .bringToFront(let screen):
+            msg.command = "bringToFront"
+            msg.screen = screen
+
+        case .commitTransition(let requestID):
+            msg.command = "commitTransition"
+            msg.requestID = requestID
+
+        case .cancelTransition(let requestID):
+            msg.command = "cancelTransition"
+            msg.requestID = requestID
+
+        case .forceCommit(let screen):
+            msg.command = "forceCommit"
+            msg.screen = screen
+
+        case .flashMenuBar(let screen):
+            msg.command = "flashMenuBar"
+            msg.screen = screen
+
+        case .ping:
+            msg.command = "ping"
+
+        case .shutdown:
+            msg.command = "shutdown"
+        }
+
+        return msg
+    }
+
+    private func updateAudioPolicyFields(
+        in msg: inout IPCMessageDTO,
+        muted: Bool,
+        volume: Double
+    ) {
+        let policy = VideoRendererAudioRouting.shared.policy(muted: muted, volume: volume)
+        msg.audioOutputDeviceStrategy = policy.outputStrategy.rawValue
+        msg.audioOutputDeviceUniqueID = policy.outputDeviceUniqueID
+        msg.audioEffectiveVolume = policy.effectiveVolume
+    }
+
+    // MARK: Socket 操作
+
+    private nonisolated static func sendOverSocket(socketPath: String, body: Data, timeout: TimeInterval) -> String? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        // 设置接收超时
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout.truncatingRemainder(dividingBy: 1)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        let sunPathSize = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        let count = min(pathBytes.count - 1, sunPathSize - 1)
+        withUnsafeMutableBytes(of: &addr.sun_path) { dest in
+            for i in 0..<count {
+                dest[i] = UInt8(bitPattern: pathBytes[i])
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else { return nil }
+
+        // 发送长度前缀 + body
+        var length = UInt32(body.count)
+        let headerData = Data(bytes: &length, count: 4)
+        let payload = headerData + body
+
+        guard writeAll(fd: fd, data: payload) else { return nil }
+
+        // 接收响应
+        var responseBuf = [UInt8](repeating: 0, count: 256)
+        let received = responseBuf.withUnsafeMutableBufferPointer { buf in
+            recv(fd, buf.baseAddress, buf.count, 0)
+        }
+        guard received > 0 else { return nil }
+
+        return String(bytes: responseBuf.prefix(received), encoding: .utf8)
+    }
+
+    private nonisolated static func sendOverSocketFireAndForget(socketPath: String, body: Data) {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        let sunPathSize = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        let count = min(pathBytes.count - 1, sunPathSize - 1)
+        withUnsafeMutableBytes(of: &addr.sun_path) { dest in
+            for i in 0..<count {
+                dest[i] = UInt8(bitPattern: pathBytes[i])
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else {
+            close(fd)
+            return
+        }
+
+        var length = UInt32(body.count)
+        let headerData = Data(bytes: &length, count: 4)
+        let payload = headerData + body
+
+        guard writeAll(fd: fd, data: payload) else {
+            close(fd)
+            return
+        }
+
+        // shutdown 写端，让服务端 recv 返回
+        shutdown(fd, SHUT_WR)
+        close(fd)
+    }
+
+    private nonisolated static func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else { return data.isEmpty }
+            var written = 0
+            while written < buffer.count {
+                let count = send(
+                    fd,
+                    baseAddress.advanced(by: written),
+                    buffer.count - written,
+                    0
+                )
+                if count < 0 && errno == EINTR {
+                    continue
+                }
+                guard count > 0 else { return false }
+                written += count
+            }
+            return true
+        }
+    }
+
+    // MARK: stderr 事件解析
+
+    private func handleStderrData(_ data: Data) {
+        stderrBuffer.append(data)
+        guard let str = String(data: stderrBuffer, encoding: .utf8) else { return }
+        let lines = str.split(separator: "\n", omittingEmptySubsequences: false)
+        guard !lines.isEmpty else { return }
+        if !str.hasSuffix("\n") {
+            stderrBuffer = Data(lines.last!.utf8)
+        } else {
+            stderrBuffer.removeAll(keepingCapacity: true)
+        }
+
+        for line in lines.dropLast(str.hasSuffix("\n") ? 0 : 1) {
+            if line.isEmpty { continue }
+            guard line.hasPrefix("WAIFUX_EVENT:") else { continue }
+            let jsonStr = String(line.dropFirst("WAIFUX_EVENT:".count))
+            guard let jsonData = jsonStr.data(using: .utf8),
+                  let evt = try? JSONDecoder().decode(EventDTO.self, from: jsonData) else {
+                continue
+            }
+
+            let event: VideoRendererEvent
+            switch evt.event {
+            case "ready":
+                event = .ready
+            case "windowCreated":
+                event = .windowCreated(
+                    screen: evt.screen ?? -1,
+                    screenID: evt.screenID,
+                    requestID: evt.requestID
+                )
+            case "firstFrameReady":
+                event = .firstFrameReady(
+                    screen: evt.screen ?? -1,
+                    screenID: evt.screenID,
+                    requestID: evt.requestID
+                )
+            case "playbackEnded":
+                event = .playbackEnded(
+                    screen: evt.screen ?? -1,
+                    screenID: evt.screenID,
+                    requestID: evt.requestID
+                )
+            case "error":
+                event = .error(
+                    screen: evt.screen,
+                    screenID: evt.screenID,
+                    requestID: evt.requestID,
+                    message: evt.message ?? ""
+                )
+            case "stopped":
+                event = .stopped(
+                    screen: evt.screen ?? -1,
+                    screenID: evt.screenID,
+                    requestID: evt.requestID
+                )
+            default:
+                continue
+            }
+
+            Task { @MainActor in
+                self.eventHandler?(event)
+            }
+        }
+    }
+
+    private struct EventDTO: Codable {
+        let event: String
+        let screen: Int?
+        let screenID: String?
+        let requestID: String?
+        let message: String?
+    }
+}
