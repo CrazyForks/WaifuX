@@ -16,6 +16,7 @@
 
 import AppKit
 import AVFoundation
+import CoreGraphics
 import CoreImage
 import Foundation
 import os
@@ -190,6 +191,8 @@ private final class VideoRendererDaemon {
     private var pendingSharedFollowerScreensByPlayerID: [ObjectIdentifier: Set<Int>] = [:]
     private var sharedFollowerAttachmentTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var menuBarFlashInProgressScreens = Set<Int>()
+    /// 菜单栏重采样用的短生命周期透明 poke 窗；不再缩视频窗露出上边缘条带。
+    private var menuBarPokeWindows: [Int: NSWindow] = [:]
 
     struct ScreenState {
         var screenID: String
@@ -751,12 +754,10 @@ private final class VideoRendererDaemon {
         items[screen] = components.item
 
         containerView.playerLayer.videoGravity = .resizeAspectFill
-        let observedLayer: AVPlayerLayer
         if wantsDeferredPresentation,
            let replacementSource,
            let oldPlayer = replacementSource.player {
             containerView.attachPlayer(oldPlayer)
-            observedLayer = containerView.preparePlayerForCrossfade(components.player)
             pendingReplacements[screen] = PendingReplacement(
                 requestID: requestID,
                 screen: screen,
@@ -770,11 +771,34 @@ private final class VideoRendererDaemon {
                 newItem: components.item,
                 transitionDuration: max(0, transitionDuration)
             )
+            if isSharedWarmupFollower {
+                // 共享解码 follower：transition layer 延迟到串行挂载调度时创建。
+                // 多块屏的 layer 同时挂到未起播的共享 player 上时，跨屏场景
+                // 部分 layer 可能永远拿不到帧（isReadyForDisplay 不变 true），
+                // 该屏窗口会永远停在 alpha 0.02 只显示静态 poster。
+                enqueueSharedFollowerAttachment(screen: screen, player: components.player)
+            } else {
+                let transitionLayer = containerView.preparePlayerForCrossfade(components.player)
+                observeFirstFrameReadiness(
+                    on: transitionLayer,
+                    screen: screen,
+                    generation: generation,
+                    player: components.player
+                )
+            }
         } else {
-            observedLayer = containerView.playerLayer
-            if !isSharedWarmupFollower || isReplacement {
+            if isSharedWarmupFollower {
+                // 同上：follower 一律走串行挂载队列，不再因窗口复用而立即 attach。
+                enqueueSharedFollowerAttachment(screen: screen, player: components.player)
+            } else {
                 containerView.attachPlayer(components.player)
             }
+            observeFirstFrameReadiness(
+                on: containerView.playerLayer,
+                screen: screen,
+                generation: generation,
+                player: components.player
+            )
         }
 
         // A replacement keeps the old freeze frame fully visible in the same
@@ -794,24 +818,6 @@ private final class VideoRendererDaemon {
             requestID: requestID,
             message: nil
         )
-
-        // 观察首帧就绪
-        let observer = observedLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player = components.player] _, change in
-            guard change.newValue == true else { return }
-            Task { @MainActor in
-                guard let self, let player else { return }
-                self.onFirstFrameReady(
-                    screen: screen,
-                    generation: generation,
-                    player: player
-                )
-            }
-        }
-        firstFrameObservers[screen] = observer
-
-        if isSharedWarmupFollower && !wantsDeferredPresentation && !isReplacement {
-            enqueueSharedFollowerAttachment(screen: screen, player: components.player)
-        }
 
         // 启动播放（首帧 reveal 会在 isReadyForDisplay 回调中处理）
         applyAudioPolicy()
@@ -1027,11 +1033,36 @@ private final class VideoRendererDaemon {
 
     // MARK: 首帧就绪
 
+    /// 注册首帧就绪观察。layer ready 后触发 onFirstFrameReady（reveal + 上报主进程）。
+    /// follower 屏在串行挂载调度 attach 之后也会调用本函数（deferred 路径观察 transition layer）。
+    private func observeFirstFrameReadiness(
+        on layer: AVPlayerLayer,
+        screen: Int,
+        generation: UInt64,
+        player: AVQueuePlayer
+    ) {
+        firstFrameObservers[screen]?.invalidate()
+        let observer = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player] _, change in
+            guard change.newValue == true else { return }
+            Task { @MainActor in
+                guard let self, let player else { return }
+                self.onFirstFrameReady(
+                    screen: screen,
+                    generation: generation,
+                    player: player
+                )
+            }
+        }
+        firstFrameObservers[screen] = observer
+    }
+
     private func onFirstFrameReady(
         screen: Int,
         generation: UInt64,
         player: AVQueuePlayer
     ) {
+        // 幂等闸：KVO 触发与串行挂载调度的主动检查可能重复进入。
+        guard firstFrameObservers[screen] != nil else { return }
         guard let state = screenStates[screen],
               state.generation == generation,
               players[screen] === player,
@@ -1353,24 +1384,51 @@ private final class VideoRendererDaemon {
 
         let task = Task { @MainActor [weak self, weak player] in
             guard let self, let player else { return }
-            let initialSeconds = player.currentTime().seconds
+            var anchorSeconds = player.currentTime().seconds
             let deadline = Date().addingTimeInterval(30)
             var playbackAdvanced = self.isPaused
+            AppLogger.info(.wallpaper, "video-renderer follower 任务启动 initial=\(anchorSeconds) rate=\(player.rate) pending=\(self.pendingSharedFollowerScreensByPlayerID[playerID]?.sorted() ?? [])")
 
             while !playbackAdvanced, Date() < deadline {
                 guard self.screenIDsReferencingPlayer(player).count >= 2 else {
+                    AppLogger.error(.wallpaper, "video-renderer follower 任务中止：引用屏数 < 2")
                     self.pendingSharedFollowerScreensByPlayerID.removeValue(forKey: playerID)
                     self.sharedFollowerAttachmentTasks.removeValue(forKey: playerID)
                     return
                 }
                 let currentSeconds = player.currentTime().seconds
-                playbackAdvanced = player.rate > 0
-                    && initialSeconds.isFinite
-                    && currentSeconds.isFinite
-                    && currentSeconds - initialSeconds >= 1.0 / 30.0
+                // AVQueuePlayer 在 rate=1 但 timebase 未建立时 currentTime 会返回
+                // NaN；若锚点恰好在那一刻取到，等它变有限后重新锚定，否则会
+                // 卡满整个 30s 超时窗口。
+                if !anchorSeconds.isFinite, currentSeconds.isFinite {
+                    anchorSeconds = currentSeconds
+                }
+                // leader 屏（非 pending 的引用屏）layer 出帧是共享 player 已开始
+                // 供帧的最直接证据，命中后无需再等时间轴推进。
+                let followerScreens = self.pendingSharedFollowerScreensByPlayerID[playerID] ?? []
+                let leaderLayerReady = self.screenIDsReferencingPlayer(player)
+                    .filter { !followerScreens.contains($0) }
+                    .contains { refScreen in
+                        let container = self.screenStates[refScreen]?.containerView
+                        return container?.playerLayer.isReadyForDisplay == true
+                            || container?.preparedPlayerLayer?.isReadyForDisplay == true
+                    }
+                // 循环视频在 loop 边界 currentTime 会跳回 0；时间轴只要动过
+                // （含回绕）即视为已起播。
+                playbackAdvanced = player.rate > 0 && (
+                    leaderLayerReady
+                        || (anchorSeconds.isFinite
+                            && currentSeconds.isFinite
+                            && (currentSeconds - anchorSeconds >= 1.0 / 30.0
+                                || currentSeconds < anchorSeconds))
+                )
                 if !playbackAdvanced {
                     try? await Task.sleep(for: .milliseconds(16))
                 }
+            }
+
+            if !playbackAdvanced {
+                AppLogger.error(.wallpaper, "video-renderer 共享 player 起播等待超时，强制挂载 follower")
             }
 
             while let screen = self.pendingSharedFollowerScreensByPlayerID[playerID]?.sorted().first {
@@ -1380,14 +1438,45 @@ private final class VideoRendererDaemon {
                       let container = state.containerView else {
                     continue
                 }
-                container.attachPlayer(player)
+
+                // deferred follower：此时才创建 transition layer 并注册首帧观察；
+                // 普通 follower：直接 attach 主 layer（首帧观察已在 setWallpaper 注册）。
+                let readyLayer: AVPlayerLayer
+                if self.pendingReplacements[screen]?.newPlayer === player {
+                    let transitionLayer = container.preparePlayerForCrossfade(player)
+                    self.observeFirstFrameReadiness(
+                        on: transitionLayer,
+                        screen: screen,
+                        generation: state.generation,
+                        player: player
+                    )
+                    readyLayer = transitionLayer
+                    AppLogger.info(.wallpaper, "video-renderer follower attach(deferred) screen=\(screen)")
+                } else {
+                    container.attachPlayer(player)
+                    readyLayer = container.playerLayer
+                    AppLogger.info(.wallpaper, "video-renderer follower attach screen=\(screen)")
+                }
                 CATransaction.flush()
 
                 let layerDeadline = Date().addingTimeInterval(5)
                 while Date() < layerDeadline,
-                      !container.playerLayer.isReadyForDisplay {
+                      !readyLayer.isReadyForDisplay {
                     guard self.players[screen] === player else { break }
                     try? await Task.sleep(for: .milliseconds(16))
+                }
+                if !readyLayer.isReadyForDisplay {
+                    AppLogger.error(.wallpaper, "video-renderer follower 首帧等待超时 screen=\(screen)")
+                } else {
+                    // KVO 会错过「attach 时已经 ready」的情况：replacement 下 layer
+                    // 换绑到已起播的共享 player 时 isReadyForDisplay 保持 true 无跳变，
+                    // 首帧事件会因此永远丢失（副屏停在静态 poster/冻结帧）。
+                    // 主动补一次检查（onFirstFrameReady 内部幂等）。
+                    self.onFirstFrameReady(
+                        screen: screen,
+                        generation: state.generation,
+                        player: player
+                    )
                 }
             }
 
@@ -1499,50 +1588,91 @@ private final class VideoRendererDaemon {
 
     private func flashMenuBarStrip(screen: Int) -> Bool {
         guard !menuBarFlashInProgressScreens.contains(screen),
-              let state = screenStates[screen],
-              let window = state.window,
-              let contentView = state.containerView,
+              screenStates[screen]?.window != nil,
               NSScreen.screens.indices.contains(screen) else {
             return false
         }
         let targetScreen = NSScreen.screens[screen]
-        let fullFrame = targetScreen.frame
-        guard abs(window.frame.origin.x - fullFrame.origin.x) <= 4,
-              abs(window.frame.origin.y - fullFrame.origin.y) <= 4,
-              abs(window.frame.width - fullFrame.width) <= 4,
-              abs(window.frame.height - fullFrame.height) <= 4 else {
-            return false
-        }
-
         menuBarFlashInProgressScreens.insert(screen)
-        let barHeight = max(24, fullFrame.maxY - targetScreen.visibleFrame.maxY)
-        let strip = barHeight + 2
-        var exposedFrame = fullFrame
-        exposedFrame.size.height = max(1, fullFrame.height - strip)
-        let previousMask = contentView.autoresizingMask
-        let fullContentFrame = NSRect(origin: .zero, size: fullFrame.size)
+
+        let barHeight = max(24, targetScreen.frame.maxY - targetScreen.visibleFrame.maxY)
+        let pokeFrame = NSRect(
+            x: targetScreen.frame.minX,
+            y: targetScreen.frame.maxY - barHeight - 1,
+            width: max(1, targetScreen.frame.width),
+            height: barHeight + 1
+        )
+        let window = NSWindow(
+            contentRect: pokeFrame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false,
+            screen: targetScreen
+        )
+        let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
+        window.level = .init(rawValue: max(statusLevel - 1, Int(CGWindowLevelForKey(.desktopWindow)) + 2))
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
+        window.isMovable = false
+        window.animationBehavior = .none
+        window.hidesOnDeactivate = false
+        window.alphaValue = 1
+
+        let view = NSView(frame: NSRect(origin: .zero, size: pokeFrame.size))
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        window.contentView = view
+        menuBarPokeWindows[screen] = window
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        contentView.autoresizingMask = []
-        window.setFrame(exposedFrame, display: true)
-        contentView.frame = fullContentFrame
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
         CATransaction.commit()
         CATransaction.flush()
+        CFRunLoopWakeUp(CFRunLoopGetMain())
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.034) { [weak self, weak window, weak contentView] in
-            guard let self else { return }
-            defer { self.menuBarFlashInProgressScreens.remove(screen) }
-            guard let window, let contentView else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
+            guard let self, let window, self.menuBarPokeWindows[screen] === window else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            window.setFrame(targetScreen.frame, display: true)
-            contentView.frame = NSRect(origin: .zero, size: targetScreen.frame.size)
-            contentView.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
+            window.orderOut(nil)
             CATransaction.commit()
             CATransaction.flush()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak window] in
+                guard let self, let window, self.menuBarPokeWindows[screen] === window else { return }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                window.orderFrontRegardless()
+                window.displayIfNeeded()
+                CATransaction.commit()
+                CATransaction.flush()
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
+                    guard let self, let window else { return }
+                    self.tearDownMenuBarPokeWindow(screen: screen, window: window)
+                }
+            }
         }
         return true
+    }
+
+    private func tearDownMenuBarPokeWindow(screen: Int, window: NSWindow) {
+        guard menuBarPokeWindows[screen] === window else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+        CATransaction.commit()
+        CATransaction.flush()
+        menuBarPokeWindows.removeValue(forKey: screen)
+        menuBarFlashInProgressScreens.remove(screen)
     }
 
     // MARK: 音频策略

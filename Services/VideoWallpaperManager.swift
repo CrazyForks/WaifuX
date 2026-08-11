@@ -59,6 +59,8 @@ final class VideoWallpaperManager: ObservableObject {
     private var externalCropRevisionByScreenID: [String: UInt64] = [:]
     /// 屏幕仍在等待主进程提交跨类型/视频交叉淡入；提交前不能触发菜单栏条带暴露。
     private var externalPendingCommitScreenIDs = Set<String>()
+    /// 共享解码首帧超时后已降级为独立解码重试过的屏。每次 apply 重置，防死循环。
+    private var externalFallbackAttemptedScreenIDs = Set<String>()
     /// 取消过期的 Scene/Web -> video 交接任务。
     private var externalTransitionGeneration: UInt64 = 0
     private var externalRendererRestartAttempt = 0
@@ -238,11 +240,8 @@ final class VideoWallpaperManager: ObservableObject {
     /// 启动淡入超时工作项（key: screenID）
     private var fadeInTimeouts: [String: DispatchWorkItem] = [:]
 
-    /// 菜单栏重采样的桌面暴露闪烁工作项（key: screenID）。
-    /// 新一轮切换会取消上一轮未发射的闪烁，避免打断新内容的过渡动画。
-    private var menuBarFlashWorkItems: [String: [DispatchWorkItem]] = [:]
-    /// 菜单栏条带暴露进行中的屏：期间禁止 synchronizeWindow 把 frame 拉回全屏。
-    private var menuBarFlashInProgressScreenIDs = Set<String>()
+    /// 菜单栏重采样不再通过缩视频窗露出上边缘条带触发；external renderer / 主进程
+    /// 回退都改走透明 poke，避免 macOS 27 用户看到屏幕上边缘闪烁。
 
     /// "播完即换"模式下的播放器播放结束观察者（key: screenID）
     private var playbackEndObservers: [String: Any] = [:]
@@ -764,6 +763,11 @@ final class VideoWallpaperManager: ObservableObject {
             }
             externalFirstFrameReadyScreenIDs.insert(screenID)
             externalPresentedScreenIDs.insert(screenID)
+            AppLogger.info(.wallpaper, "video-renderer 首帧就绪", metadata: [
+                "screenID": screenID,
+                "screenIndex": screenIndex,
+                "requestID": requestID
+            ])
             if !externalIsPaused(screenID: screen.wallpaperScreenIdentifier) {
                 hidePosterImage(for: screen.wallpaperScreenIdentifier)
             }
@@ -803,12 +807,85 @@ final class VideoWallpaperManager: ObservableObject {
                 .wallpaper,
                 "video-renderer error screen=\(screenIndex.map(String.init) ?? "nil") id=\(stableScreenID ?? "nil") request=\(requestID ?? "nil"): \(message)"
             )
+            // 共享解码首帧超时的保险丝：该屏降级为独立解码器重试一次。
+            // 仍在等待 commit 的屏由 transition 超时回滚统一处理，不在此重试。
+            if message.contains("first frame timeout"),
+               let requestID,
+               let screen = externalScreen(
+                   for: screenIndex ?? -1,
+                   stableScreenID: stableScreenID
+               ) {
+                retryExternalScreenWithDedicatedDecoder(
+                    screen: screen,
+                    failedRequestID: requestID
+                )
+            }
         case .terminated(let status, let expected):
             guard !expected else { return }
             externalFirstFrameReadyScreenIDs.removeAll()
             externalPresentedScreenIDs.removeAll()
             scheduleExternalRendererRestart(afterExitStatus: status)
         }
+    }
+
+    /// 共享解码首帧超时后的保险丝：对该屏单独重发 set（forceNewPipeline + 新 requestID）。
+    /// 子进程 findReusablePlayerComponents 的 requestID 过滤会让它拿到独立 player，
+    /// `shared` 字段保持原值，不扰乱其他屏的共享语义。
+    /// 仍在等待 commit 的屏由 transition 超时回滚统一处理，这里直接跳过。
+    private func retryExternalScreenWithDedicatedDecoder(
+        screen: NSScreen,
+        failedRequestID: String
+    ) {
+        let screenID = screen.wallpaperScreenIdentifier
+        guard externalRenderingActive,
+              externalRenderer.isRunning,
+              externalRequestIDByScreenID[screenID] == failedRequestID,
+              !externalPendingCommitScreenIDs.contains(screenID),
+              !externalFallbackAttemptedScreenIDs.contains(screenID),
+              let videoURL = videoURLByScreen[screenID],
+              let screenIndex = externalScreenIndex(for: screen) else {
+            return
+        }
+        externalFallbackAttemptedScreenIDs.insert(screenID)
+
+        let newRequestID = UUID().uuidString
+        let posterURL = posterURLByScreen[screenID]
+        let schedulerConfig = WallpaperSchedulerService.shared.config
+            .resolvedDisplayConfig(for: screenID)
+        let isOnEndMode = schedulerConfig.isEnabled && schedulerConfig.isOnEndMode
+        let hdrMetadataEnabled = UserDefaults.standard
+            .object(forKey: "hdr_enabled") as? Bool ?? false
+        let playbackURL = resolvedExternalPlaybackURL(for: videoURL, screen: screen)
+
+        externalRequestIDByScreenID[screenID] = newRequestID
+        let cmd = VideoRendererProcessController.Command.set(
+            screen: screenIndex,
+            screenID: screenID,
+            requestID: newRequestID,
+            path: playbackURL.path,
+            posterPath: posterURL?.isFileURL == true ? posterURL?.path : nil,
+            frame: screen.frame,
+            muted: isMuted,
+            volume: volume(for: screen),
+            looping: !isOnEndMode,
+            shared: usesSharedVideoDecoder,
+            forceNewPipeline: true,
+            hdrMetadataEnabled: hdrMetadataEnabled,
+            deferredPresentation: false,
+            transitionDuration: 0,
+            globalPaused: isPaused,
+            screenPaused: externalPausedScreenIDs.contains(screenID)
+        )
+        let response = externalRenderer.sendCommandSync(
+            cmd,
+            screen: screenIndex,
+            timeout: 10.0
+        )
+        AppLogger.info(.wallpaper, "外部视频首帧超时，已降级独立解码重试", metadata: [
+            "screenID": screenID,
+            "screenIndex": screenIndex,
+            "response": response ?? "nil"
+        ])
     }
 
     private func scheduleExternalRendererRestart(afterExitStatus status: Int32) {
@@ -1984,6 +2061,7 @@ final class VideoWallpaperManager: ObservableObject {
         isPaused = false
         self.usesSharedVideoDecoder = usesSharedVideoDecoder
         externalRenderingActive = true
+        externalFallbackAttemptedScreenIDs.removeAll()
 
         if targetScreen == nil {
             videoURLByScreen.removeAll()
@@ -4592,109 +4670,18 @@ final class VideoWallpaperManager: ObservableObject {
             }
             return
         }
-        for screen in screens {
-            let screenID = screen.wallpaperScreenIdentifier
-            menuBarFlashWorkItems[screenID]?.forEach { $0.cancel() }
-            var scheduled: [DispatchWorkItem] = []
-            for delay in delays {
-                let item = DispatchWorkItem { [weak self, weak screen] in
-                    guard let self, let screen,
-                          let entry = self.existingVideoWindowEntry(for: screen) else { return }
-                    // 过渡/预热仍在进行时跳过：交叉淡入被中途打断会产生
-                    // "旧→新→旧→新"的来回跳变。过渡完成点会自行调度。
-                    guard self.playerItemObserverTokens[screenID] == nil,
-                          self.pendingGlobalTransitionPlayer == nil,
-                          self.globalTransitionPendingCompletionScreenIDs.isEmpty else { return }
-                    if let container = entry.window.contentView as? WallpaperVideoContainerView,
-                       container.hasPreparedPlayerTransitionInFlight { return }
-                    self.performMenuBarStripExposureFlash(
-                        window: entry.window,
-                        screen: screen,
-                        screenID: entry.screenID
-                    )
-                }
-                scheduled.append(item)
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                // 主进程内回退路径不再缩视频窗露出上边缘条带；改走透明 poke。
+                // poke 内部仍有 macOS 27 防护：App 后台时只发系统通知。
+                DesktopWallpaperSyncManager.shared.requestMenuBarBackdropResamplePoke(on: screens)
             }
-            menuBarFlashWorkItems[screenID] = scheduled
         }
     }
 
-    /// 只缩掉菜单栏高度：桌面主体仍盖着视频，菜单栏 backdrop 能采到新 poster。
-    /// 约 2–3 帧后恢复全屏；contentView 保持全尺寸以免视频被压扁/上跳。
-    private func performMenuBarStripExposureFlash(
-        window: NSWindow,
-        screen: NSScreen,
-        screenID: String
-    ) {
-        guard !menuBarFlashInProgressScreenIDs.contains(screenID) else { return }
-        // 非全屏/已异常 frame 时不冒险缩框，避免把窗口弄丢。
-        guard framesApproximatelyEqual(window.frame, screen.frame, tolerance: 4) else { return }
-
-        menuBarFlashInProgressScreenIDs.insert(screenID)
-
-        let fullFrame = screen.frame
-        let barHeight = max(24, fullFrame.maxY - screen.visibleFrame.maxY)
-        // +2pt：确保与菜单栏采样矩形相交（Notch / 菜单栏底缘）。
-        let strip = barHeight + 2
-        var exposedFrame = fullFrame
-        exposedFrame.size.height = max(1, fullFrame.height - strip)
-        // origin.y 不变 → 只把上沿下移，露出顶部条带下的系统壁纸。
-
-        let contentView = window.contentView
-        let previousMask = contentView?.autoresizingMask ?? [.width, .height]
-        let fullContentFrame = NSRect(origin: .zero, size: fullFrame.size)
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        contentView?.autoresizingMask = []
-        window.setFrame(exposedFrame, display: true)
-        // 窗口变矮后 contentView 仍铺满「原全屏」高度：顶端被窗裁掉，
-        // 菜单栏以下像素与缩框前一致，不会出现整屏内容上移/缩放。
-        if let contentView {
-            contentView.frame = fullContentFrame
-        }
-        CATransaction.commit()
-        CATransaction.flush()
-
-        // ~2 帧@60Hz：够 WindowServer 把桌面条带纳入合成；再长只会拖慢菜单栏体感，
-        // 不会让 Dock 更快算完 IconAppearance。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.034) { [weak self, weak window, weak screen] in
-            guard let self else { return }
-            defer { self.menuBarFlashInProgressScreenIDs.remove(screenID) }
-            guard let window else { return }
-
-            let restoreFrame = screen?.frame ?? fullFrame
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            window.setFrame(restoreFrame, display: true)
-            if let contentView = window.contentView {
-                contentView.frame = NSRect(origin: .zero, size: restoreFrame.size)
-                contentView.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
-            }
-            CATransaction.commit()
-            CATransaction.flush()
-        }
-    }
-
-    /// 取消菜单栏条带暴露闪烁的待执行任务，并清除 in-progress 标记。
-    ///
-    /// 必须在 stop/teardown 路径调用：否则 0.12s 延迟内的 DispatchWorkItem 会在窗口
-    /// 销毁后触发（entry 查找返回 nil 被 guard 挡掉，相对安全），但
-    /// `menuBarFlashInProgressScreenIDs` 残留会让后续 `synchronizeWindow` 对该屏
-    /// 永久跳过 frame 校正。传入 nil 清理全部。
+    /// 菜单栏条带暴露已移除；保留该入口避免 stop/teardown 路径改动。
     private func cancelMenuBarFlashWorkItems(for screenID: String?) {
-        if let screenID {
-            menuBarFlashWorkItems[screenID]?.forEach { $0.cancel() }
-            menuBarFlashWorkItems.removeValue(forKey: screenID)
-            menuBarFlashInProgressScreenIDs.remove(screenID)
-        } else {
-            for items in menuBarFlashWorkItems.values {
-                items.forEach { $0.cancel() }
-            }
-            menuBarFlashWorkItems.removeAll()
-            menuBarFlashInProgressScreenIDs.removeAll()
-        }
+        _ = screenID
     }
 
     /// 立即写入系统静态底图。动态壁纸开始展示前必须走这里，保证菜单栏采样
@@ -5687,11 +5674,6 @@ final class VideoWallpaperManager: ObservableObject {
 
     @discardableResult
     private func synchronizeWindow(_ window: WallpaperVideoWindow, to screen: NSScreen) -> Bool {
-        // 菜单栏条带暴露期间 frame 故意不是全屏；此处拉回会抵消重采样触发。
-        if menuBarFlashInProgressScreenIDs.contains(screen.wallpaperScreenIdentifier) {
-            return false
-        }
-
         let targetFrame = screen.frame
         var didAdjust = false
 

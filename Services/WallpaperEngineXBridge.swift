@@ -292,6 +292,14 @@ final class WallpaperEngineXBridge: ObservableObject {
     private(set) var isSettingWallpaper = false
     /// 跨类型切换代次：新的 apply/static/video 请求会递增，旧 setWallpaper 收尾直接退出。
     private var wallpaperSwitchGeneration: UInt64 = 0
+    /// Scene 菜单栏重采样按屏去重：同一轮切换、同一背板来源只闪一次；
+    /// 只有背板来源真的变化（例如 realtime poster 替换 baked cover）才允许再闪。
+    private struct SceneMenuBarFlashMarker {
+        let backplatePath: String
+        let generation: UInt64
+        let at: Date
+    }
+    private var lastSceneMenuBarFlashMarkerByScreen: [String: SceneMenuBarFlashMarker] = [:]
     /// 视频 -> Scene/Web 的准备态。旧视频由 VideoWallpaperManager 保持到这里
     /// 完成；状态按屏幕记录，避免多屏中一块屏超时影响其它屏。
     private struct PendingCrossTypeTransition {
@@ -574,10 +582,11 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         // Scene/Web 也使用烘焙封面作为系统桌面静态底图。若已有封面，必须在
         // renderer 进程创建之前提交，才能让状态栏立刻按新底图重新采样。
-        let didCommitBakedCoverBeforeRendererStart = await commitExistingBakedCoverBeforeRendererStart(
+        let committedBakedCoverURL = await commitExistingBakedCoverBeforeRendererStart(
             path: resolvedPath,
             targetScreens: effectiveScreens
         )
+        let didCommitBakedCoverBeforeRendererStart = committedBakedCoverURL != nil
         guard wallpaperSwitchGeneration == switchGeneration else { return }
 	
         // 跨类型切换不能先拆视频窗。先让 Scene/Web 在旧视频后方完整加载，
@@ -855,7 +864,10 @@ final class WallpaperEngineXBridge: ObservableObject {
                     upscaling: upscalingEnabled,
                     upscalingPercent: upscalingPercentValue,
                     effectReduction: effectReductionEnabled,
-                    flashMenuBar: didCommitBakedCoverBeforeRendererStart && isSceneMenuBarFlashAllowed()
+                    flashMenuBar: didCommitBakedCoverBeforeRendererStart && shouldRequestSceneMenuBarFlash(
+                        for: screen,
+                        backplateURL: committedBakedCoverURL
+                    )
                 )
                 if let acURL = existingInfo.audioControlURL {
                     writeAudioControl(
@@ -1025,7 +1037,11 @@ final class WallpaperEngineXBridge: ObservableObject {
                 AppLogger.error(.wallpaper, "wallpaper-wgpu 进程已启动", metadata: ["screenID": screenID, "pid": launchedPID, "renderKind": renderKind.rawValue, "screenProcesses": screenProcesses.count])
                 if didCommitBakedCoverBeforeRendererStart {
                     // renderer 还未首帧也没关系：flashMenuBar 会在 wallpaper-wgpu 下一次 present 后执行。
-                    requestSceneMenuBarFlash(on: [screen], reason: "scene-fresh-launch")
+                    requestSceneMenuBarFlash(
+                        on: [screen],
+                        reason: "scene-fresh-launch",
+                        backplateURL: committedBakedCoverURL
+                    )
                 }
 
                 // 异步等待 canvas_size 就绪后重算 crop
@@ -3332,16 +3348,44 @@ final class WallpaperEngineXBridge: ObservableObject {
         return true
     }
 
+    /// 同一轮切换、同一背板来源只请求一次 renderer flash；背板来源变化才允许第二次。
+    private func shouldRequestSceneMenuBarFlash(for screen: NSScreen, backplateURL: URL?) -> Bool {
+        guard isSceneMenuBarFlashAllowed() else { return false }
+        let screenID = screen.wallpaperScreenIdentifier
+        let pathKey = backplateURL?.standardizedFileURL.path
+            ?? DesktopWallpaperSyncManager.shared.imageURL(for: screen)?.standardizedFileURL.path
+            ?? ""
+        guard !pathKey.isEmpty else { return false }
+
+        let now = Date()
+        if let marker = lastSceneMenuBarFlashMarkerByScreen[screenID] {
+            let sameBackplate = marker.backplatePath == pathKey
+            let sameSwitch = marker.generation == wallpaperSwitchGeneration
+            // 同一轮切换里同一背板的 fresh/hot、baked-cover、manual/scheduler 重复请求只保留第一次。
+            if sameBackplate && sameSwitch { return false }
+            // 不同轮切换但背板没变时做短限速，避免调度器/手动连续触发同一张图连闪。
+            if sameBackplate && now.timeIntervalSince(marker.at) < 1.0 { return false }
+        }
+
+        lastSceneMenuBarFlashMarkerByScreen[screenID] = SceneMenuBarFlashMarker(
+            backplatePath: pathKey,
+            generation: wallpaperSwitchGeneration,
+            at: now
+        )
+        return true
+    }
+
     /// 请求运行中的 scene renderer 在下一帧 present 后短暂露出菜单栏条带。
     /// 触发点在 wallpaper-wgpu 自己的桌面窗上，不经过主 App 的 ViewBridge。
-    func requestSceneMenuBarFlash(on screens: [NSScreen], reason: String) {
-        guard isSceneMenuBarFlashAllowed(), !screens.isEmpty else { return }
+    func requestSceneMenuBarFlash(on screens: [NSScreen], reason: String, backplateURL: URL? = nil) {
+        guard !screens.isEmpty else { return }
         for screen in Self.uniqueLiveScreens(preferred: screens) {
             let screenID = screen.wallpaperScreenIdentifier
             guard screenRenderStates[screenID]?.renderKind == .scene,
                   let info = screenProcesses[screenID],
                   info.process.isRunning,
-                  let wallpaperControlURL = info.wallpaperControlURL else {
+                  let wallpaperControlURL = info.wallpaperControlURL,
+                  shouldRequestSceneMenuBarFlash(for: screen, backplateURL: backplateURL) else {
                 continue
             }
             writeWallpaperControl(
@@ -3353,7 +3397,8 @@ final class WallpaperEngineXBridge: ObservableObject {
             )
             AppLogger.debug(.wallpaper, "Requested scene menu-bar flash", metadata: [
                 "screenID": screenID,
-                "reason": reason
+                "reason": reason,
+                "backplate": backplateURL?.lastPathComponent ?? "registered"
             ])
         }
     }
@@ -4150,14 +4195,15 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 在外部 renderer 启动前同步写入已有的烘焙封面。没有可用封面时不阻塞
     /// Scene/Web 的实时渲染，后续仍由常规异步同步和烘焙完成通知接管。
+    /// 返回已提交的背板来源 URL，供首帧菜单栏重采样按来源去重。
     @discardableResult
     private func commitExistingBakedCoverBeforeRendererStart(
         path: String,
         targetScreens: [NSScreen]
-    ) async -> Bool {
-        guard !targetScreens.isEmpty else { return false }
+    ) async -> URL? {
+        guard !targetScreens.isEmpty else { return nil }
         guard let existing = await existingBakedCoverURL(forScenePath: path) else {
-            return false
+            return nil
         }
         let didApply = applyBakedStaticImage(
             existing,
@@ -4168,8 +4214,9 @@ final class WallpaperEngineXBridge: ObservableObject {
         )
         if didApply {
             print("[WallpaperEngineXBridge] ✅ renderer 启动前已提交烘焙静态底图: \(existing.lastPathComponent)")
+            return existing
         }
-        return didApply
+        return nil
     }
 
     /// 读取已有烘焙静态资源。Scene 只有在存在真实烘焙产物时才使用通用
@@ -4276,7 +4323,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             DesktopWallpaperSyncManager.shared
                 .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens)
             if requestMenuBarFlash {
-                requestSceneMenuBarFlash(on: screens, reason: "baked-cover")
+                requestSceneMenuBarFlash(on: screens, reason: "baked-cover", backplateURL: imageURL)
             }
         }
         return didApply

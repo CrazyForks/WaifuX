@@ -977,7 +977,11 @@ enum SceneOfflineBakeService {
             // wallpaper-wgpu 下一帧 present 后执行，不依赖主 App 是否前台。
             DesktopWallpaperSyncManager.shared
                 .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: appliedTargetScreens, delay: 0.02)
-            WallpaperEngineXBridge.shared.requestSceneMenuBarFlash(on: appliedTargetScreens, reason: reason)
+            WallpaperEngineXBridge.shared.requestSceneMenuBarFlash(
+                on: appliedTargetScreens,
+                reason: reason,
+                backplateURL: posterURL
+            )
         }
     }
 

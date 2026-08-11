@@ -409,6 +409,14 @@ final class DesktopWallpaperSyncManager {
         )
     }
 
+    /// 给主进程内视频回退路径使用的菜单栏 poke 入口。
+    /// 内部仍保留 macOS 27 防护：App 后台时只发系统通知，不创建/排序 NSWindow。
+    func requestMenuBarBackdropResamplePoke(on screens: [NSScreen]) {
+        for screen in screens {
+            pokeMenuBarBackdropResample(on: screen)
+        }
+    }
+
     /// 把当前系统背板复制到交替缓存路径，迫使 WallpaperAgent 重新加载。
     private func makeMenuBarAppearanceRefreshURL(from sourceURL: URL) throws -> URL {
         menuBarAppearanceRefreshSlot = 1 - menuBarAppearanceRefreshSlot
