@@ -1244,6 +1244,7 @@ final class MediaExploreViewModel: ObservableObject {
     private enum WorkshopContentType {
         case video        // 纯视频类型，WaifuX 可直接播放
         case scene        // 场景/应用类型，需要 Wallpaper Engine CLI 渲染
+        case web          // Web 类型，由 WKWebView daemon 渲染
         case unknown
     }
 
@@ -1260,18 +1261,24 @@ final class MediaExploreViewModel: ObservableObject {
             return .video
         } else if type == "scene" {
             return .scene
+        } else if type == "web" {
+            return .web
         }
         return .unknown
     }
 
-    /// 递归查找目录中的视频文件
+    /// 递归查找目录中的视频文件。
+    /// AVPlayer 对 h264/h265 (mp4/mov) 兼容性最好，vp9 (webm) 可能无法打开；
+    /// Workshop 壁纸常同时自带预烘焙 mp4 + webm，优先 mp4/mov，webm 仅兜底。
     private func findVideoFile(in directory: URL) -> URL? {
-        let videoExts = ["mp4", "mov", "webm"]
-        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else {
-            return nil
+        let preferredExts = ["mp4", "mov", "m4v"]
+        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator where preferredExts.contains(fileURL.pathExtension.lowercased()) {
+                return fileURL
+            }
         }
-        for case let fileURL as URL in enumerator {
-            if videoExts.contains(fileURL.pathExtension.lowercased()) {
+        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator where fileURL.pathExtension.lowercased() == "webm" {
                 return fileURL
             }
         }
@@ -1307,8 +1314,9 @@ final class MediaExploreViewModel: ObservableObject {
 
                 // 先检查 project.json 确定内容类型
                 let contentType = determineWorkshopContentType(at: resolved)
-                if contentType == .scene {
-                    // scene 类型跳过
+                if contentType == .scene || contentType == .web {
+                    // scene / web 类型跳过（web 由 WKWebView daemon 渲染，
+                    // 自带预烘焙视频不应走视频路径）
                     continue
                 }
 
@@ -1338,7 +1346,8 @@ final class MediaExploreViewModel: ObservableObject {
                 }
 
                 let contentType = determineWorkshopContentType(at: resolved)
-                if contentType == .scene {
+                if contentType == .scene || contentType == .web {
+                    // scene / web 类型不应走视频路径（web 由 daemon 渲染）
                     return nil
                 }
                 if let videoURL = findVideoFile(in: resolved) {

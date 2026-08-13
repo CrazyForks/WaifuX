@@ -474,11 +474,16 @@ enum LocalWallpaperApplyService {
                 }
             }
         }
-        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else {
-            return nil
+        // AVPlayer 对 h264/h265 (mp4/mov) 兼容性最好，vp9 (webm) 可能无法打开；
+        // Workshop 壁纸常同时自带预烘焙 mp4 + webm，优先 mp4/mov，webm 仅兜底。
+        let preferredExts: Set<String> = ["mp4", "mov", "m4v"]
+        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator where preferredExts.contains(fileURL.pathExtension.lowercased()) {
+                return fileURL
+            }
         }
-        for case let fileURL as URL in enumerator {
-            if videoExts.contains(fileURL.pathExtension.lowercased()) {
+        if let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) {
+            for case let fileURL as URL in enumerator where fileURL.pathExtension.lowercased() == "webm" {
                 return fileURL
             }
         }

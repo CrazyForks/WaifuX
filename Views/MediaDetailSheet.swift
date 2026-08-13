@@ -4082,9 +4082,16 @@ struct MediaDetailSheet: View {
             return contentPath
         }
 
-        // 3. 如果根目录直接有 .mp4/.mov/.webm 文件（这是纯视频 Workshop 的常见情况）
+        // 3. 如果根目录直接有视频文件（纯视频 Workshop 的常见情况）。
+        // AVPlayer 对 h264/h265 (mp4/mov) 兼容性最好，vp9 (webm) 可能无法打开；
+        // Workshop 壁纸常同时自带预烘焙 mp4 + webm，必须优先 mp4/mov，webm 仅兜底。
         if let rootVideo = rootContents?.first(where: {
-            ["mp4", "mov", "webm"].contains($0.pathExtension.lowercased())
+            ["mp4", "mov", "m4v"].contains($0.pathExtension.lowercased())
+        }) {
+            return rootVideo
+        }
+        if let rootVideo = rootContents?.first(where: {
+            $0.pathExtension.lowercased() == "webm"
         }) {
             return rootVideo
         }
