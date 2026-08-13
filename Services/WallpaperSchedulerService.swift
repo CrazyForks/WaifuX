@@ -1924,7 +1924,6 @@ class WallpaperSchedulerService: ObservableObject {
                     animatedTransition: true,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
-                    fallbackPosterURL: nil,
                     // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
                     generatePosterFromVideoIfNeeded: true,
                     sceneBakeItemID: item.sceneBakeItemID,
@@ -1995,7 +1994,6 @@ class WallpaperSchedulerService: ObservableObject {
                     animatedTransition: true,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
-                    fallbackPosterURL: nil,
                     // 无预生成 HD poster 时后台抽帧补系统静帧（不阻塞切换）
                     generatePosterFromVideoIfNeeded: true,
                     sceneBakeItemID: item.sceneBakeItemID,

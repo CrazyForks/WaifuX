@@ -67,6 +67,7 @@ private enum IPCCommand: String, Codable {
     case commitTransition
     case cancelTransition
     case forceCommit
+    case sampleMenuBar  // poster 写入后动态缩高露出条带，采样完成后恢复全高
     case ping           // 存活探测
     case shutdown       // 优雅退出
 }
@@ -195,6 +196,8 @@ private final class VideoRendererDaemon {
     private var pendingReplacements: [Int: PendingReplacement] = [:]
     private var pendingSharedFollowerScreensByPlayerID: [ObjectIdentifier: Set<Int>] = [:]
     private var sharedFollowerAttachmentTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    /// 菜单栏采样曝光进行中的屏（防重入，采样窗口期 0.5s）
+    private var menuBarSamplingInProgressScreens = Set<Int>()
 
     struct ScreenState {
         var screenID: String
@@ -677,6 +680,11 @@ private final class VideoRendererDaemon {
 
         case .forceCommit:
             forceCommit(screen: msg.screen)
+            return "OK"
+
+        case .sampleMenuBar:
+            guard let screen = msg.screen else { return "ERROR: missing screen" }
+            sampleMenuBarStrip(screen: screen)
             return "OK"
 
         case .shutdown:
@@ -1694,6 +1702,61 @@ private final class VideoRendererDaemon {
         CATransaction.commit()
         CATransaction.flush()
         CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
+    /// poster 写入系统壁纸后触发菜单栏重采样：动态把窗口高度减掉菜单栏条带
+    /// （露出条带下的新 poster，菜单栏 backdrop 自动重采样），1s 后恢复全高。
+    /// 只动 size.height（origin.y 不变，底边不动）；缩高/恢复时**冻结 contentView**
+    /// （autoresizingMask=[] + 保持全屏 frame），渲染内容不 reflow、不缩放，画面无抖动。
+    private func sampleMenuBarStrip(screen: Int) {
+        guard !menuBarSamplingInProgressScreens.contains(screen),
+              let state = screenStates[screen],
+              let window = state.window,
+              let contentView = state.containerView,
+              NSScreen.screens.indices.contains(screen) else {
+            return
+        }
+        let targetScreen = NSScreen.screens[screen]
+        let fullFrame = targetScreen.frame
+        guard abs(window.frame.origin.x - fullFrame.origin.x) <= 4,
+              abs(window.frame.origin.y - fullFrame.origin.y) <= 4,
+              abs(window.frame.width - fullFrame.width) <= 4,
+              abs(window.frame.height - fullFrame.height) <= 4 else {
+            return
+        }
+
+        menuBarSamplingInProgressScreens.insert(screen)
+        let barHeight = max(0, fullFrame.maxY - targetScreen.visibleFrame.maxY)
+        guard barHeight > 1 else {
+            menuBarSamplingInProgressScreens.remove(screen)
+            return
+        }
+        var stripFrame = fullFrame
+        stripFrame.size.height = max(1, fullFrame.height - barHeight)
+        let previousMask = contentView.autoresizingMask
+        let fullContentFrame = NSRect(origin: .zero, size: fullFrame.size)
+
+        // 冻结 contentView：窗口缩高但渲染内容保持全屏尺寸（顶部条带被窗口裁剪）。
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentView.autoresizingMask = []
+        window.setFrame(stripFrame, display: true)
+        contentView.frame = fullContentFrame
+        CATransaction.commit()
+        CATransaction.flush()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak window, weak contentView] in
+            guard let self else { return }
+            defer { self.menuBarSamplingInProgressScreens.remove(screen) }
+            guard let window, let contentView else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.setFrame(targetScreen.frame, display: true)
+            contentView.frame = NSRect(origin: .zero, size: targetScreen.frame.size)
+            contentView.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
+            CATransaction.commit()
+            CATransaction.flush()
+        }
     }
 
     // MARK: 音频策略

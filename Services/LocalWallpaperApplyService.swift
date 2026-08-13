@@ -25,9 +25,6 @@ enum LocalWallpaperApplyService {
         /// 播完即换且未开 web/scene 定时：跳过无播放完成事件的类型
         var requirePlaybackEndSupport: Bool = false
         var muted: Bool = true
-        /// 视频高清 poster 的非视频 fallback（站点/工程预览图）。
-        /// 注意：这里只接受可直接当桌面/锁屏底图的图，不能塞列表 800×600 小图。
-        var fallbackPosterURL: URL? = nil
         /// true 时若无**高清** poster 缓存，允许从视频抽高清帧（最大 3840×2160）。
         /// 抽帧始终在后台 Task 中执行，不阻塞起播热路径。
         /// 调度器也应 true：否则无预生成 poster 的视频会永远写不上系统静帧。
@@ -220,17 +217,16 @@ enum LocalWallpaperApplyService {
         //
         // 性能关键：只同步读取已有高清缓存；缺失时先起播视频，再后台抽帧补静帧，
         // 避免 4K copyCGImage 阻塞「设为壁纸 / 调度切换」热路径（静态图很快、动态却很慢的主因）。
-        // 只查真正的 HD poster（scene_bake / poster_wallpaper），不把 fallback 预览算作已缓存，
-        // 否则有站点预览图时永远不会后台抽帧补系统静帧。
+        // 只查真正的 HD poster（scene_bake / poster_wallpaper），不把任何 fallback 预览
+        // （WE 工程 preview.* / 站点封面）算作已缓存或桌面底图——预览图是商店缩略图，
+        // 不适合桌面/锁屏；无 HD poster 时系统壁纸保持旧图，由后台补帧回写高清静帧。
         let hdPosterURL = VideoThumbnailCache.shared.existingWallpaperPosterURL(
             forLocalVideo: videoURL,
-            sceneBakeItemID: options.sceneBakeItemID,
-            fallbackPosterURL: nil
+            sceneBakeItemID: options.sceneBakeItemID
         )
-        // 没有 HD 缓存时先用调用方 fallback（站点/工程预览，不能是列表小图）；仍无则 nil，视频先起播
-        let immediatePosterURL = hdPosterURL ?? options.fallbackPosterURL
-        // 无 HD 缓存时后台补静帧（异步、不阻塞切换）。
-        // 即使 immediate 用了 fallback，也尽量补一张真正的 HD poster 写回系统桌面/锁屏底图。
+        // 没有 HD 缓存时不写 fallback：immediate 为 nil 时视频先起播、系统壁纸保持旧图
+        let immediatePosterURL = hdPosterURL
+        // 无 HD 缓存时后台补静帧（异步、不阻塞切换），生成后回写系统桌面/锁屏底图。
         // 调度器必须允许补帧，否则无预生成 poster 的视频会「偶尔设置不到静态帧」。
         let needsBackgroundPoster = (hdPosterURL == nil && options.generatePosterFromVideoIfNeeded)
 

@@ -461,17 +461,15 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
     
             let screens = targetScreens.flatMap { $0.isEmpty ? nil : $0 } ?? NSScreen.screens
             let bakePath = resolvedBakedVideoPath(for: selectedItem, applyURL: applyURL)
-            let fallbackPosterURL = resolvedFallbackPosterURL(for: selectedItem, applyURL: applyURL)
-    
+
             let coversMultiple = screens.count > 1
-    
+
             // 菜单栏只解析当前选中项；类型分发、烘焙产物选择、海报生成和实际设置
             // 都由 LocalWallpaperApplyService 统一处理，和详情页/调度器保持一致。
             let options = LocalWallpaperApplyService.Options(
                 animatedTransition: true,
                 requirePlaybackEndSupport: false,
                 muted: VideoWallpaperManager.shared.isMuted,
-                fallbackPosterURL: fallbackPosterURL,
                 generatePosterFromVideoIfNeeded: true,
                 sceneBakeItemID: selectedItem.sceneBakeItemID,
                 bakedVideoPath: bakePath,
@@ -563,26 +561,6 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
             return art.videoPath
         }
         return item.bakedVideoPath
-    }
-
-    private func resolvedFallbackPosterURL(
-        for item: MenuBarQuickWallpaperItem,
-        applyURL: URL
-    ) -> URL? {
-        // 1) 本地 Workshop 预览图（可直接当静帧底图）
-        if let preview = MediaItem.resolveLocalWorkshopPreviewImage(from: applyURL)
-            ?? MediaItem.resolveLocalWorkshopPreviewImage(from: item.localURL) {
-            return preview
-        }
-        // 2) MediaItem 远程/缓存 poster
-        if case .media(let mediaItem) = item.source, let poster = mediaItem.posterURL {
-            return poster
-        }
-        // 3) 已有缩略图（仅当它是本地文件时）
-        if let thumb = item.thumbnailURL, thumb.isFileURL {
-            return thumb
-        }
-        return nil
     }
 
     private func readWorkshopDependencyID(from contentDir: URL) -> String? {

@@ -11,7 +11,6 @@ final class GlobalWallpaperSyncCoordinator {
     struct Snapshot: Codable, Equatable {
         let localPath: String
         let muted: Bool
-        let fallbackPosterPath: String?
         let sceneBakeItemID: String?
         let bakedVideoPath: String?
         let requirePlaybackEndSupport: Bool
@@ -20,7 +19,6 @@ final class GlobalWallpaperSyncCoordinator {
         private enum CodingKeys: String, CodingKey {
             case localPath
             case muted
-            case fallbackPosterPath
             case sceneBakeItemID
             case bakedVideoPath
             case requirePlaybackEndSupport
@@ -30,7 +28,6 @@ final class GlobalWallpaperSyncCoordinator {
         init(
             localPath: String,
             muted: Bool,
-            fallbackPosterPath: String?,
             sceneBakeItemID: String?,
             bakedVideoPath: String?,
             requirePlaybackEndSupport: Bool,
@@ -38,7 +35,6 @@ final class GlobalWallpaperSyncCoordinator {
         ) {
             self.localPath = localPath
             self.muted = muted
-            self.fallbackPosterPath = fallbackPosterPath
             self.sceneBakeItemID = sceneBakeItemID
             self.bakedVideoPath = bakedVideoPath
             self.requirePlaybackEndSupport = requirePlaybackEndSupport
@@ -49,7 +45,6 @@ final class GlobalWallpaperSyncCoordinator {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             localPath = try container.decode(String.self, forKey: .localPath)
             muted = try container.decode(Bool.self, forKey: .muted)
-            fallbackPosterPath = try container.decodeIfPresent(String.self, forKey: .fallbackPosterPath)
             sceneBakeItemID = try container.decodeIfPresent(String.self, forKey: .sceneBakeItemID)
             bakedVideoPath = try container.decodeIfPresent(String.self, forKey: .bakedVideoPath)
             // Older durable snapshots omitted this flag; default keeps reapply permissive.
@@ -69,7 +64,6 @@ final class GlobalWallpaperSyncCoordinator {
                 animatedTransition: false,
                 requirePlaybackEndSupport: requirePlaybackEndSupport,
                 muted: muted,
-                fallbackPosterURL: fallbackPosterPath.map(URL.init(fileURLWithPath:)),
                 // 与调度器/手动设壁纸一致：无 HD poster 时后台抽帧补系统静帧
                 generatePosterFromVideoIfNeeded: true,
                 sceneBakeItemID: sceneBakeItemID,
@@ -131,7 +125,6 @@ final class GlobalWallpaperSyncCoordinator {
         let snapshot = Snapshot(
             localPath: localURL.standardizedFileURL.path,
             muted: options.muted,
-            fallbackPosterPath: options.fallbackPosterURL?.standardizedFileURL.path,
             sceneBakeItemID: options.sceneBakeItemID,
             bakedVideoPath: options.bakedVideoPath,
             requirePlaybackEndSupport: options.requirePlaybackEndSupport,
@@ -288,7 +281,6 @@ final class GlobalWallpaperSyncCoordinator {
         return Snapshot(
             localPath: standardized.path,
             muted: VideoWallpaperManager.shared.isMuted,
-            fallbackPosterPath: enriched.fallbackPosterPath,
             sceneBakeItemID: enriched.sceneBakeItemID,
             bakedVideoPath: enriched.bakedVideoPath,
             requirePlaybackEndSupport: false,
@@ -300,19 +292,11 @@ final class GlobalWallpaperSyncCoordinator {
     /// carry bake metadata so re-enable / reconnect can prefer the same
     /// baked video path the scheduler would have used.
     private func enrichSnapshotMetadata(for localURL: URL) -> (
-        fallbackPosterPath: String?,
         sceneBakeItemID: String?,
         bakedVideoPath: String?
     ) {
-        var fallbackPosterPath: String?
         var sceneBakeItemID: String?
         var bakedVideoPath: String?
-
-        if let primary = NSScreen.screens.first,
-           let poster = VideoWallpaperManager.shared.posterURL(for: primary),
-           poster.isFileURL {
-            fallbackPosterPath = poster.standardizedFileURL.path
-        }
 
         let path = localURL.path
         if let record = MediaLibraryService.shared.downloadedItems.first(where: { item in
@@ -327,7 +311,7 @@ final class GlobalWallpaperSyncCoordinator {
             }
         }
 
-        return (fallbackPosterPath, sceneBakeItemID, bakedVideoPath)
+        return (sceneBakeItemID, bakedVideoPath)
     }
 
     private func persistLastSuccessfulSnapshot() {

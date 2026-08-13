@@ -791,9 +791,9 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         for screen in effectiveScreens {
             guard wallpaperSwitchGeneration == switchGeneration else { return }
-            // 窗口避开菜单栏条带（见 NSScreen.wallpaperWindowFrame），桌面图条带
-            // 下保持可见，菜单栏自动跟随静态 poster 重采样。
-            let f = screen.wallpaperWindowFrame
+            // 全屏覆盖（含菜单栏条带下方）。菜单栏采样由 wgpu 侧 sample_menu_bar
+            // 动态缩高露出条带触发，采样完成后恢复全高。
+            let f = screen.frame
             let scale = screen.backingScaleFactor
             let screenX = Int(f.origin.x.rounded())
             let screenY = Int(f.origin.y.rounded())
@@ -3379,7 +3379,8 @@ final class WallpaperEngineXBridge: ObservableObject {
         setProperties: String?,
         upscaling: Bool? = nil,
         upscalingPercent: Int? = nil,
-        effectReduction: Bool? = nil
+        effectReduction: Bool? = nil,
+        sampleMenuBar: Bool? = nil
     ) -> Bool {
         var dict: [String: Any] = [:]
         if let sw = setWallpaper {
@@ -3403,6 +3404,10 @@ final class WallpaperEngineXBridge: ObservableObject {
         if let effectReduction = effectReduction {
             dict["effect_reduction"] = effectReduction
         }
+        // 菜单栏采样曝光（poster 写入后触发）
+        if let sampleMenuBar = sampleMenuBar {
+            dict["sampleMenuBar"] = sampleMenuBar
+        }
         do {
             let data = try JSONSerialization.data(withJSONObject: dict, options: [])
             try data.write(to: url, options: .atomic)
@@ -3411,6 +3416,8 @@ final class WallpaperEngineXBridge: ObservableObject {
                 desc = "切换壁纸"
             } else if upscaling != nil || effectReduction != nil {
                 desc = "更新渲染设置"
+            } else if sampleMenuBar != nil {
+                desc = "菜单栏采样曝光"
             } else {
                 desc = "仅更新属性"
             }
@@ -4275,7 +4282,73 @@ final class WallpaperEngineXBridge: ObservableObject {
                 print("[WallpaperEngineXBridge] ⚠️ 设置静态壁纸失败 (screen: \(screen.localizedName)): \(error.localizedDescription)")
             }
         }
+        if didApply {
+            // poster 已写入系统壁纸：让对应渲染器动态缩高露出条带，触发菜单栏重采样。
+            triggerMenuBarSampling(on: screens)
+        }
         return didApply
+    }
+
+    /// poster 写入系统壁纸后触发各渲染器的菜单栏采样曝光（动态缩高露出条带 0.5s）：
+    /// - web 屏：向 wallpaperengine-cli daemon 发 sampleMenuBar IPC
+    /// - scene 屏：向 wallpaper-wgpu 写 sampleMenuBar 控制文件
+    private func triggerMenuBarSampling(on screens: [NSScreen]) {
+        for screen in screens {
+            let screenID = screen.wallpaperScreenIdentifier
+            if isWebWallpaperOn(screen: screen) {
+                sendSampleMenuBarToWebDaemon(screen: screen)
+                continue
+            }
+            guard let info = screenProcesses[screenID]
+                ?? screenProcesses.values.first(where: { $0.screenID == screenID }),
+                  let wcURL = info.wallpaperControlURL else {
+                continue
+            }
+            _ = writeWallpaperControl(
+                url: wcURL,
+                setWallpaper: nil,
+                assets: nil,
+                setProperties: nil,
+                sampleMenuBar: true
+            )
+        }
+    }
+
+    /// 通过 Unix Socket 向 wallpaperengine-cli daemon 发送 sampleMenuBar IPC（fire-and-forget）。
+    private func sendSampleMenuBarToWebDaemon(screen: NSScreen) {
+        guard let screenIndex = Self.legacyCLIScreenIndex(for: screen) else { return }
+        let socketPath = "/tmp/wallpaperengine-cli.sock"
+        let msg = WebDaemonAudioMessage(command: "sampleMenuBar", muted: nil, volume: nil, screen: screenIndex)
+        guard let data = try? JSONEncoder().encode(msg) else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            strncpy(&addr.sun_path, socketPath, MemoryLayout.size(ofValue: addr.sun_path) - 1)
+
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
+
+            var rcvTimeout = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+            let size = MemoryLayout<sockaddr_un>.size
+            let connected = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(size))
+                }
+            }
+            guard connected == 0 else { return }
+
+            var length = UInt32(data.count)
+            let payload = Data(bytes: &length, count: MemoryLayout<UInt32>.size) + data
+            let sent = payload.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, payload.count, 0) }
+            guard sent == payload.count else { return }
+
+            var responseBuf = Data(repeating: 0, count: 64)
+            _ = responseBuf.withUnsafeMutableBytes { recv(fd, $0.baseAddress, 64, 0) }
+        }
     }
 
     // MARK: - 辅助方法
@@ -4402,8 +4475,8 @@ final class WallpaperEngineXBridge: ObservableObject {
         guard let cropControlURL = info?.cropControlURL else { return }
 
         let cropSettings = DisplayCropSettingsStore.shared.settings(for: screen)
-        // 与 wgpu 窗口一致：canvas 尺寸按避开菜单栏条带后的窗口计算。
-        let f = screen.wallpaperWindowFrame
+        // 与 wgpu 窗口一致：canvas 尺寸按全屏窗口计算。
+        let f = screen.frame
         let screenW = Int(f.width.rounded())
         let screenH = Int(f.height.rounded())
         let nextCrop: UnitRect?
@@ -4472,8 +4545,8 @@ final class WallpaperEngineXBridge: ObservableObject {
                     let screenID = screen.wallpaperScreenIdentifier
                     let fingerprint = screen.wallpaperScreenFingerprint
                     let currentSig = ScreenConfigurationSignature(screen: screen)
-                    // 与 launchedScreenWidth/Height 基准一致（窗口避开菜单栏条带）。
-                    let wallpaperFrame = screen.wallpaperWindowFrame
+                    // 与 launchedScreenWidth/Height 基准一致（全屏窗口尺寸）。
+                    let wallpaperFrame = screen.frame
                     let frameW = Int(wallpaperFrame.width.rounded())
                     let frameH = Int(wallpaperFrame.height.rounded())
 

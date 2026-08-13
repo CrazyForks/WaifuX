@@ -245,9 +245,6 @@ final class VideoWallpaperManager: ObservableObject {
     /// 启动淡入超时工作项（key: screenID）
     private var fadeInTimeouts: [String: DispatchWorkItem] = [:]
 
-    /// 菜单栏重采样不再通过缩视频窗露出上边缘条带触发；external renderer / 主进程
-    /// 回退都改走透明 poke，避免 macOS 27 用户看到屏幕上边缘闪烁。
-
     /// "播完即换"模式下的播放器播放结束观察者（key: screenID）
     private var playbackEndObservers: [String: Any] = [:]
 
@@ -399,9 +396,9 @@ final class VideoWallpaperManager: ObservableObject {
         CATransaction.flush()
         // 再跑一圈 runloop，让桌面层在后台 timer 触发路径上也能立刻合帧。
         CFRunLoopWakeUp(CFRunLoopGetMain())
-        // 注意：不要在这里 schedule 菜单栏采样刷新。
-        // reveal 会被 forceCommit / 首帧 / 重排频繁调用；采样刷新只应在
-        // poster 真正写入后或 forceCommit 末尾显式触发（见 DesktopWallpaperSyncManager）。
+        // 注意：不要在这里触发任何菜单栏刷新。reveal 会被 forceCommit / 首帧 /
+        // 重排频繁调用；菜单栏采样只依赖 poster 写入（applyPosterAsDesktopWallpaper*），
+        // 窗口已避开菜单栏条带，poster 写入即产生 damage 自动重采样。
     }
 
     /// 新建窗口首帧就绪后的呈现。
@@ -870,7 +867,7 @@ final class VideoWallpaperManager: ObservableObject {
             requestID: newRequestID,
             path: playbackURL.path,
             posterPath: posterURL?.isFileURL == true ? posterURL?.path : nil,
-            frame: screen.wallpaperWindowFrame,
+            frame: screen.frame,
             muted: isMuted,
             volume: volume(for: screen),
             looping: !isOnEndMode,
@@ -2126,7 +2123,7 @@ final class VideoWallpaperManager: ObservableObject {
                 requestID: requestID,
                 path: playbackURL.path,
                 posterPath: posterURL?.isFileURL == true ? posterURL?.path : nil,
-                frame: screen.wallpaperWindowFrame,
+                frame: screen.frame,
                 muted: muted,
                 volume: volume(for: screen),
                 looping: !isOnEndMode,
@@ -4586,8 +4583,8 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     /// Publish the upcoming poster before an animated video transition reaches its
-    /// deferred desktop write. This invalidates any old menu-bar resample work so
-    /// it cannot reapply the previous wallpaper while the new first frame settles.
+    /// deferred desktop write. Registers the poster so Space-switch resync and
+    /// bookkeeping already reference the new image while the first frame settles.
     private func registerPendingPosterBackplate(
         _ posterURL: URL,
         targetScreen: NSScreen?
@@ -4785,6 +4782,159 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// 立即写入系统静态底图。动态壁纸开始展示前必须走这里，保证菜单栏采样
     /// 与直接设置静态壁纸使用同一条提交顺序。
+    /// 菜单栏采样曝光窗口期：poster 写入系统壁纸后，窗口动态缩高露出菜单栏条带，
+    /// 让菜单栏 backdrop 按新 poster 重采样，采样完成后恢复全高覆盖。
+    private let menuBarSamplingExposureDelay: TimeInterval = 1.0
+
+    /// poster 写入系统壁纸后触发菜单栏重采样：动态把窗口高度减掉菜单栏条带
+    /// （露出条带下的新 poster），1s 后恢复全高。
+    ///
+    /// 只动 `size.height`（origin.y 不变，底边不动），顶部条带短暂露出；
+    /// 视频窗平时全屏覆盖，仅在切换瞬间有采样窗口期。
+    /// 缩高/恢复时**冻结 contentView**（autoresizingMask=[] + 保持全屏 frame）：
+    /// 窗口只是裁剪顶部条带，渲染内容不 reflow、不缩放，画面无抖动。
+    ///
+    /// 实测：**仅窗口 resize 不触发菜单栏 backdrop 重采样**（开「菜单栏背景」毛玻璃时
+    /// 需切换软件/窗口树变化才更新）。所以缩高后延迟 ~0.4s（给 WallpaperAgent 加载
+    /// 新 poster 留时间）再做一次轻量透明窗 map/unmap，仍在 1s 采样窗口期内。
+    /// - 主进程视频窗：直接 setFrame（恢复也用主进程窗口）
+    /// - external 渲染器：发 `sampleMenuBar` IPC 命令，子进程自己缩高/恢复
+    private func exposeMenuBarStripForSampling(on screens: [NSScreen]) {
+        // 与 poster 写入同一门槛：系统壁纸同步关闭 / 动态锁屏启用时桌面图不是
+        // 本次切换的 poster，露出只会闪旧壁纸，直接跳过。
+        guard isSystemWallpaperSyncEnabled, !shouldSkipStaticPosterForDynamicLockScreen else { return }
+        guard !screens.isEmpty else { return }
+
+        if externalRenderingActive {
+            for screen in screens {
+                guard let screenIndex = externalScreenIndex(for: screen) else { continue }
+                externalRenderer.sendCommandFireAndForget(.sampleMenuBar(screen: screenIndex))
+            }
+        } else {
+            for screen in screens {
+                let screenID = screen.wallpaperScreenIdentifier
+                guard let window = windows[screenID],
+                      let container = window.contentView as? WallpaperVideoContainerView,
+                      abs(window.frame.height - screen.frame.height) < 0.5 else {
+                    continue
+                }
+                let barHeight = screen.frame.maxY - screen.visibleFrame.maxY
+                guard barHeight > 1 else { continue }
+                var stripFrame = window.frame
+                stripFrame.size.height = max(1, stripFrame.size.height - barHeight)
+                let previousMask = container.autoresizingMask
+                let fullContentFrame = NSRect(origin: .zero, size: screen.frame.size)
+
+                // 冻结 contentView：窗口缩高但渲染内容保持全屏尺寸（顶部条带被窗口裁剪）。
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                container.autoresizingMask = []
+                window.setFrame(stripFrame, display: true)
+                container.frame = fullContentFrame
+                CATransaction.commit()
+                CATransaction.flush()
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + menuBarSamplingExposureDelay) { [weak self] in
+                    guard let self,
+                          let window = self.windows[screenID],
+                          let container = window.contentView as? WallpaperVideoContainerView else {
+                        return
+                    }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    window.setFrame(screen.frame, display: true)
+                    container.frame = fullContentFrame
+                    container.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
+                    CATransaction.commit()
+                    CATransaction.flush()
+                }
+            }
+        }
+
+        // 缩高后做一次轻量窗口树变化（透明窗 map/unmap），触发菜单栏 backdrop
+        // 重采样。延迟 ~0.4s 给 WallpaperAgent 留出加载新 poster 的时间，
+        // 仍在 1s 采样窗口期内。poke 由宿主创建，与渲染器无关。
+        for screen in screens {
+            let barHeight = screen.frame.maxY - screen.visibleFrame.maxY
+            guard barHeight > 1 else { continue }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.pokeMenuBarBackdropForSampling(on: screen)
+            }
+        }
+    }
+
+    /// 轻量窗口树变化（条带区域透明窗 map → 0.15s → unmap）触发菜单栏 backdrop 重采样。
+    /// 实测：仅窗口 resize（缩高露出条带）不触发 backdrop 重采样，需要
+    /// orderFront/orderOut 或 App 激活变化。App 后台时降级为 `com.apple.desktop`
+    /// 分布式通知——macOS 27 beta 在后台 `orderFrontRegardless()` 会让 ViewBridge
+    /// 的 `NSRemoteView containingWindowWillOrderOnScreen:` 抛不可恢复异常（SIGSEGV）。
+    private func pokeMenuBarBackdropForSampling(on screen: NSScreen) {
+        guard NSApp.isActive else {
+            DistributedNotificationCenter.default().postNotificationName(
+                NSNotification.Name("com.apple.desktop"),
+                object: nil,
+                userInfo: nil,
+                deliverImmediately: true
+            )
+            return
+        }
+
+        let barHeight = max(0, screen.frame.maxY - screen.visibleFrame.maxY)
+        guard barHeight > 1 else { return }
+        let pokeFrame = NSRect(
+            x: screen.frame.minX,
+            y: screen.frame.maxY - barHeight,
+            width: max(1, screen.frame.width),
+            height: barHeight
+        )
+
+        let window = NSWindow(
+            contentRect: pokeFrame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false,
+            screen: screen
+        )
+        // 高于 desktop 壁纸、低于普通 UI：合入菜单栏 backdrop 的采样层。
+        let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
+        window.level = .init(rawValue: max(statusLevel - 1, Int(CGWindowLevelForKey(.desktopWindow)) + 2))
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.isReleasedWhenClosed = false
+        window.isMovable = false
+        window.animationBehavior = .none
+        window.alphaValue = 1
+
+        let view = NSView(frame: NSRect(origin: .zero, size: pokeFrame.size))
+        view.wantsLayer = true
+        // 完全透明但仍参与合成（有 layer surface），map/unmap 即窗口树变化。
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        window.contentView = view
+        window.setFrame(pokeFrame, display: false)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        CATransaction.commit()
+        CATransaction.flush()
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
+            guard let window else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+            CATransaction.commit()
+            CATransaction.flush()
+        }
+    }
+
     private func applyPosterAsDesktopWallpaperSync(_ posterURL: URL, targetScreen: NSScreen? = nil) {
         // 安全兜底：动态锁屏启用时绝不设置静态桌面壁纸。
         if shouldSkipStaticPosterForDynamicLockScreen {
@@ -4830,6 +4980,9 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             print("[VideoWallpaperManager] [sync] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
+            // poster 已写入系统壁纸：动态缩高露出条带让菜单栏 backdrop 重采样，
+            // 采样完成后恢复全高覆盖。
+            exposeMenuBarStripForSampling(on: screensToSet)
         } catch {
             print("[VideoWallpaperManager] [sync] Failed to set poster: \(error)")
         }
@@ -4909,6 +5062,9 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             print("[VideoWallpaperManager] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
+            // poster 已写入系统壁纸：动态缩高露出条带让菜单栏 backdrop 重采样，
+            // 采样完成后恢复全高覆盖。
+            exposeMenuBarStripForSampling(on: screensToSet)
             // macOS 锁屏壁纸默认跟随桌面壁纸，无需额外设置
         } catch {
             print("[VideoWallpaperManager] Failed to set poster: \(error)")
@@ -5702,7 +5858,7 @@ final class VideoWallpaperManager: ObservableObject {
                     posterPath: posterURL(for: screen)?.isFileURL == true
                         ? posterURL(for: screen)?.path
                         : nil,
-                    frame: screen.wallpaperWindowFrame,
+                    frame: screen.frame,
                     muted: isMuted,
                     volume: volume(for: screen),
                     looping: looping,
@@ -5825,7 +5981,7 @@ final class VideoWallpaperManager: ObservableObject {
 
     @discardableResult
     private func synchronizeWindow(_ window: WallpaperVideoWindow, to screen: NSScreen) -> Bool {
-        let targetFrame = screen.wallpaperWindowFrame
+        let targetFrame = screen.frame
         var didAdjust = false
 
         if rectsDiffer(window.frame, targetFrame) {
@@ -7242,9 +7398,9 @@ final class VideoWallpaperManager: ObservableObject {
 
     private func createWindow(for screen: NSScreen, videoURL: URL, muted: Bool) throws {
         let screenID = screen.wallpaperScreenIdentifier
-        // 避开菜单栏条带：桌面图在条带下永远可见，菜单栏自动跟随 poster 重采样
-        // （见 NSScreen.wallpaperWindowFrame 注释），不再需要 poke/flash 机制。
-        let frame = screen.wallpaperWindowFrame
+        // 全屏覆盖（含菜单栏条带下方）。菜单栏采样由 exposeMenuBarStripForSampling
+        // 在 poster 写入后动态缩高露出条带触发，采样完成后恢复全高。
+        let frame = screen.frame
 
         let window = WallpaperVideoWindow(
             contentRect: frame,
@@ -8382,7 +8538,7 @@ private final class WallpaperVideoContainerView: NSView {
     private var transitionPlayerLayer: AVPlayerLayer?
 
     /// 是否有已预热的过渡层（交叉淡入准备中/进行中）。
-    /// 菜单栏重采样的桌面暴露闪烁据此避开过渡窗口，防止"旧→新→旧→新"跳变。
+    /// 过渡窗口存在时不执行桌面层提交，避免"旧→新→旧→新"跳变。
     var hasPreparedPlayerTransitionInFlight: Bool { transitionPlayerLayer != nil }
 
     /// 实际播放视频的 AVPlayerLayer。作为容器 backing layer 的子层，

@@ -392,6 +392,7 @@ final class VideoRendererProcessController {
         case commitTransition(requestID: String)
         case cancelTransition(requestID: String)
         case forceCommit(screen: Int?)
+        case sampleMenuBar(screen: Int)
         case ping
         case shutdown
     }
@@ -780,6 +781,10 @@ final class VideoRendererProcessController {
 
         case .forceCommit(let screen):
             msg.command = "forceCommit"
+            msg.screen = screen
+
+        case .sampleMenuBar(let screen):
+            msg.command = "sampleMenuBar"
             msg.screen = screen
 
         case .ping:

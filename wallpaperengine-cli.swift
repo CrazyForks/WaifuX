@@ -158,6 +158,8 @@ private enum IPCCommand: String, Codable {
     case mediaUpdate, mediaThumbnail
     /// Host → daemon：Apple Music 歌词（整首 / 当前行）；Web 只收 JSON
     case mediaLyrics, mediaLyricsLine
+    /// Host → daemon：poster 写入后动态缩高露出菜单栏条带，采样完成后恢复全高
+    case sampleMenuBar
 }
 
 private struct IPCLyricLine: Codable {
@@ -1949,6 +1951,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private var screenStates: [Int: ScreenState] = [:]
     private let mouseMoveThrottle: TimeInterval = 1.0 / 30.0
+    /// 菜单栏采样曝光进行中的屏（防重入，采样窗口期 0.5s）
+    private var menuBarSamplingInProgressScreens = Set<Int>()
 
     private enum OfflineBakeFirstFramePolicy {
         /// 至少经历此时长后才允许「稳定」判真，避免白屏/首帧未绘制误判
@@ -2120,15 +2124,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             w.setFrame(frame, display: false)
             w.alphaValue = 1
         } else {
-            // 避开顶部菜单栏条带：桌面图在条带下保持可见，菜单栏自动跟随
-            // 静态 poster 重采样（与宿主 NSScreen.wallpaperWindowFrame 同策略）。
-            // AppKit 坐标 y 向上，origin.y 是窗口底边：只砍高度、底边不动。
-            var wallpaperFrame = targetScreen.frame
-            let menuBarHeight = targetScreen.frame.maxY - targetScreen.visibleFrame.maxY
-            if menuBarHeight > 1 {
-                wallpaperFrame.size.height -= menuBarHeight
-            }
-            w.setFrame(wallpaperFrame, display: true)
+            // 全屏覆盖（含菜单栏条带下方）。菜单栏采样由 sampleMenuBar IPC
+            // 命令动态缩高露出条带触发，采样完成后恢复全高。
+            w.setFrame(targetScreen.frame, display: true)
         }
         w.acceptsMouseMovedEvents = true
         w.ignoresMouseEvents = offscreen
@@ -2898,6 +2896,63 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             return nil
         }
         return CGWindowID(window.windowNumber)
+    }
+
+    /// poster 写入系统壁纸后触发菜单栏重采样：动态把窗口高度减掉菜单栏条带
+    /// （露出条带下的新 poster，菜单栏 backdrop 自动重采样），1s 后恢复全高。
+    /// 只动 size.height（origin.y 不变，底边不动）；缩高/恢复时**冻结 contentView**
+    /// （autoresizingMask=[] + 保持全屏 frame），cropContainer/WebView 布局不变，
+    /// 画面不 reflow、不缩放，无抖动。
+    func sampleMenuBarStrip(screen: Int) {
+        guard !menuBarSamplingInProgressScreens.contains(screen),
+              let state = screenStates[screen],
+              let window = state.window,
+              let contentView = window.contentView,
+              !state.isOffscreen,
+              NSScreen.screens.indices.contains(screen) else {
+            return
+        }
+        let targetScreen = NSScreen.screens[screen]
+        let fullFrame = targetScreen.frame
+        guard abs(window.frame.origin.x - fullFrame.origin.x) <= 4,
+              abs(window.frame.origin.y - fullFrame.origin.y) <= 4,
+              abs(window.frame.width - fullFrame.width) <= 4,
+              abs(window.frame.height - fullFrame.height) <= 4 else {
+            return
+        }
+
+        menuBarSamplingInProgressScreens.insert(screen)
+        let barHeight = max(0, fullFrame.maxY - targetScreen.visibleFrame.maxY)
+        guard barHeight > 1 else {
+            menuBarSamplingInProgressScreens.remove(screen)
+            return
+        }
+        var stripFrame = fullFrame
+        stripFrame.size.height = max(1, fullFrame.height - barHeight)
+        let previousMask = contentView.autoresizingMask
+        let fullContentFrame = NSRect(origin: .zero, size: fullFrame.size)
+
+        // 冻结 contentView：窗口缩高但渲染内容保持全屏尺寸（顶部条带被窗口裁剪）。
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentView.autoresizingMask = []
+        window.setFrame(stripFrame, display: true)
+        contentView.frame = fullContentFrame
+        CATransaction.commit()
+        CATransaction.flush()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak window, weak contentView] in
+            guard let self else { return }
+            defer { self.menuBarSamplingInProgressScreens.remove(screen) }
+            guard let window, let contentView else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            window.setFrame(targetScreen.frame, display: true)
+            contentView.frame = NSRect(origin: .zero, size: targetScreen.frame.size)
+            contentView.autoresizingMask = previousMask.isEmpty ? [.width, .height] : previousMask
+            CATransaction.commit()
+            CATransaction.flush()
+        }
     }
 
     func resolveOfflineBakeMediaAudioPlan(
@@ -5536,6 +5591,9 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                         hasLine: msg.hasLine ?? false
                     )
                     close(fd)
+                case .sampleMenuBar:
+                    WebRendererBridge.shared.sampleMenuBarStrip(screen: msg.screen ?? 0)
+                    sendResponse("OK")
                 }
             }
         }

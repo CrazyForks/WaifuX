@@ -1179,7 +1179,7 @@ final class MediaExploreViewModel: ObservableObject {
            let localVideoURL = findLocalWorkshopVideo(for: item) {
             print("[MediaExploreViewModel] Using downloaded Workshop video: \(localVideoURL.path)")
             mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
-            let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
+            let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: nil)
             // 用户可见切换：首帧预热 + 短黑场交接，避免视频/跨类型切换露黑。
             try await videoWallpaperManager.applyVideoWallpaper(
                 from: localVideoURL,
@@ -1198,7 +1198,7 @@ final class MediaExploreViewModel: ObservableObject {
             if localURL.isFileURL && FileManager.default.fileExists(atPath: localURL.path) {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
                 mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
-                let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
+                let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: nil)
                 try await videoWallpaperManager.applyVideoWallpaper(
                     from: localURL,
                     posterURL: posterURL,
@@ -1219,7 +1219,7 @@ final class MediaExploreViewModel: ObservableObject {
             folderID: nil,
             using: self
         )
-        let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
+        let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: nil)
         try await videoWallpaperManager.applyVideoWallpaper(
             from: localVideoURL,
             posterURL: posterURL,
