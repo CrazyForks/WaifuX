@@ -39,7 +39,16 @@ class AnimePlayerWindowController: NSWindowController {
         window.minSize = NSSize(width: 900, height: 500)
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
-        window.center()
+        WindowSpaceCoordinator.prepare(window)
+        if let visibleFrame = WindowSpaceCoordinator.visibleFrame() {
+            let origin = NSPoint(
+                x: visibleFrame.midX - window.frame.width / 2,
+                y: visibleFrame.midY - window.frame.height / 2
+            )
+            window.setFrameOrigin(origin)
+        } else {
+            window.center()
+        }
         
         super.init(window: window)
         
@@ -155,8 +164,8 @@ class AnimePlayerWindowController: NSWindowController {
     }
     
     func showWindow() {
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        guard let window else { return }
+        WindowSpaceCoordinator.show(window)
     }
     
     func closeWindow() {

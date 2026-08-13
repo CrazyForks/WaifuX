@@ -14,7 +14,7 @@ final class SceneWallpaperPropertiesPanelController {
     func present(for wallpaperPath: String) {
         if currentPath == wallpaperPath, let window = windowController?.window {
             anchorWindow(window)
-            window.makeKeyAndOrderFront(nil)
+            WindowSpaceCoordinator.show(window)
             return
         }
 
@@ -40,6 +40,7 @@ final class SceneWallpaperPropertiesPanelController {
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.level = .floating
+        WindowSpaceCoordinator.prepare(window)
 
         let rootView = SceneWallpaperPropertiesPanel(viewModel: viewModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -53,7 +54,7 @@ final class SceneWallpaperPropertiesPanelController {
         windowController = controller
         currentPath = wallpaperPath
         controller.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        WindowSpaceCoordinator.show(window)
 
         // 异步加载壁纸属性，避免 .pkg 解压等 I/O 阻塞主线程
         Task { await viewModel.loadAsync() }
@@ -66,7 +67,7 @@ final class SceneWallpaperPropertiesPanelController {
     }
 
     private func anchorWindow(_ window: NSWindow) {
-        guard let visibleFrame = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame else {
+        guard let visibleFrame = WindowSpaceCoordinator.visibleFrame() else {
             window.center()
             return
         }

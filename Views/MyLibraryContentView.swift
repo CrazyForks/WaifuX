@@ -1058,6 +1058,31 @@ struct MyLibraryContentView: View {
         selectedSubTab == .favorites ? .favorites : .downloads
     }
 
+    private func moveTargetFolders(
+        contentType: LibraryFolder.FolderContentType,
+        excluding currentFolderID: String?
+    ) -> [LibraryFolder] {
+        let collection: LibraryFolder.FolderCollection = selectedSubTab == .favorites ? .favorites : .downloads
+        let folders = contentType == .wallpaper ? folderStore.wallpaperFolders : folderStore.mediaFolders
+        return folders
+            .filter { $0.collection == collection && $0.id != currentFolderID }
+            .sorted { lhs, rhs in
+                let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+                if nameOrder != .orderedSame {
+                    return nameOrder == .orderedAscending
+                }
+                return lhs.id < rhs.id
+            }
+    }
+
+    private var wallpaperMoveTargetFolders: [LibraryFolder] {
+        moveTargetFolders(contentType: .wallpaper, excluding: currentWallpaperFolderID)
+    }
+
+    private var mediaMoveTargetFolders: [LibraryFolder] {
+        moveTargetFolders(contentType: .media, excluding: currentMediaFolderID)
+    }
+
     private func moveWallpapersToFolder(ids: [String], folderID: String) {
         // 空字符串不是合法文件夹 ID，统一视为根目录 nil，避免写入 "" 后变成“幽灵归属”
         let normalizedFolderID = WallpaperLibraryService.normalizedFolderID(folderID)
@@ -1352,6 +1377,19 @@ struct MyLibraryContentView: View {
         }
         .equatable()
         .contextMenu {
+            if !wallpaperMoveTargetFolders.isEmpty {
+                Menu {
+                    ForEach(wallpaperMoveTargetFolders) { folder in
+                        Button {
+                            moveWallpapersToFolder(ids: [item.id], folderID: folder.id)
+                        } label: {
+                            Label(folder.name, systemImage: "folder")
+                        }
+                    }
+                } label: {
+                    Label(t("move.to.folder"), systemImage: "folder.badge.gearshape")
+                }
+            }
             if currentWallpaperFolderID != nil {
                 Button {
                     gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)
@@ -1554,6 +1592,19 @@ struct MyLibraryContentView: View {
         }
         .equatable()
         .contextMenu {
+            if !mediaMoveTargetFolders.isEmpty {
+                Menu {
+                    ForEach(mediaMoveTargetFolders) { folder in
+                        Button {
+                            moveMediasToFolder(ids: [item.id], folderID: folder.id)
+                        } label: {
+                            Label(folder.name, systemImage: "folder")
+                        }
+                    }
+                } label: {
+                    Label(t("move.to.folder"), systemImage: "folder.badge.gearshape")
+                }
+            }
             if currentMediaFolderID != nil {
                 Button {
                     gridOrderStore.removeIDs([item.id], from: currentGridOrderScope)

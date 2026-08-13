@@ -2,9 +2,9 @@ import SwiftUI
 import Kingfisher
 import AppKit
 
-// MARK: - 光标追踪视图（不阻塞滚动）
+// MARK: - 光标追踪视图（不参与点击命中）
 /// 替代 .onContinuousHover：通过 NSTrackingArea 追踪光标位置，
-/// 同时将 scrollWheel 事件转发给父级 NSScrollView，避免卡片拦截滚动。
+/// 并让 SwiftUI 按钮和外层 ScrollView 保持正常的事件分发。
 private struct CursorTrackingView: NSViewRepresentable {
     let onCursorMove: (CGPoint) -> Void
     let onCursorEnter: () -> Void
@@ -30,6 +30,12 @@ private class CursorTrackingNSView: NSView {
     var onCursorEnter: (() -> Void)?
     var onCursorExit: (() -> Void)?
     private var trackingArea: NSTrackingArea?
+
+    /// 追踪区域保持在卡片最上层，但不能成为鼠标事件的目标，
+    /// 否则会遮住 SwiftUI 的详情和下载按钮。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -59,19 +65,6 @@ private class CursorTrackingNSView: NSView {
         onCursorExit?()
     }
 
-    /// 将滚动事件转发给父级 NSScrollView，避免卡片拦截滚动
-    override func scrollWheel(with event: NSEvent) {
-        var view: NSView? = superview
-        while let v = view {
-            if let scrollView = v as? NSScrollView {
-                scrollView.scrollWheel(with: event)
-                return
-            }
-            view = v.superview
-        }
-        // 找不到 ScrollView 时走默认路径
-        super.scrollWheel(with: event)
-    }
 }
 
 // MARK: - 猜你喜欢单张卡片
@@ -101,7 +94,7 @@ struct GuessYouLikeCardView: View {
                         .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
                 )
 
-            // ⚡ 光标追踪层：替代 .onContinuousHover，转发滚动事件给 ScrollView
+            // 光标追踪层只处理悬停；点击和滚动继续交给下层 SwiftUI 视图。
             CursorTrackingView(
                 onCursorMove: { location in
                     // NSView 坐标系左下角原点 → 转换为 SwiftUI 左上角原点

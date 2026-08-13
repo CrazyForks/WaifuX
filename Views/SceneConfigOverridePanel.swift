@@ -17,7 +17,7 @@ final class SceneConfigOverridePanelController {
     func present(for wallpaperPath: String) {
         if currentPath == wallpaperPath, let window = windowController?.window {
             anchorWindow(window)
-            window.makeKeyAndOrderFront(nil)
+            WindowSpaceCoordinator.show(window)
             return
         }
 
@@ -43,6 +43,7 @@ final class SceneConfigOverridePanelController {
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.level = .floating
+        WindowSpaceCoordinator.prepare(window)
 
         let rootView = SceneConfigOverridePanel(viewModel: viewModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -56,7 +57,7 @@ final class SceneConfigOverridePanelController {
         windowController = controller
         currentPath = wallpaperPath
         controller.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        WindowSpaceCoordinator.show(window)
     }
 
     func closePanel() {
@@ -66,7 +67,7 @@ final class SceneConfigOverridePanelController {
     }
 
     private func anchorWindow(_ window: NSWindow) {
-        guard let visibleFrame = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame else {
+        guard let visibleFrame = WindowSpaceCoordinator.visibleFrame() else {
             window.center()
             return
         }

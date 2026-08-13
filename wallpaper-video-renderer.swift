@@ -63,10 +63,10 @@ private enum IPCCommand: String, Codable {
     case hidePoster
     case setGrainOverlay
     case bringToFront
+    case revealPreparedWindow
     case commitTransition
     case cancelTransition
     case forceCommit
-    case flashMenuBar
     case ping           // 存活探测
     case shutdown       // 优雅退出
 }
@@ -195,9 +195,6 @@ private final class VideoRendererDaemon {
     private var pendingReplacements: [Int: PendingReplacement] = [:]
     private var pendingSharedFollowerScreensByPlayerID: [ObjectIdentifier: Set<Int>] = [:]
     private var sharedFollowerAttachmentTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
-    private var menuBarFlashInProgressScreens = Set<Int>()
-    /// 菜单栏重采样用的短生命周期透明 poke 窗；不再缩视频窗露出上边缘条带。
-    private var menuBarPokeWindows: [Int: NSWindow] = [:]
 
     struct ScreenState {
         var screenID: String
@@ -209,6 +206,9 @@ private final class VideoRendererDaemon {
         var screenFrame: CGRect
         var generation: UInt64
         var lastCropRevision: UInt64
+        /// Cross-type video warmups keep the renderer window transparent until
+        /// the host has snapshotted and retired the old Scene/Web/static layer.
+        var deferWindowReveal: Bool
     }
 
     private struct ReplacementSource {
@@ -659,6 +659,9 @@ private final class VideoRendererDaemon {
             window.displayIfNeeded()
             return "OK"
 
+        case .revealPreparedWindow:
+            return revealPreparedWindow(screen: msg.screen) ? "OK" : "ERROR: screen not found"
+
         case .commitTransition:
             guard let requestID = msg.requestID else {
                 return "ERROR: missing transition request"
@@ -675,10 +678,6 @@ private final class VideoRendererDaemon {
         case .forceCommit:
             forceCommit(screen: msg.screen)
             return "OK"
-
-        case .flashMenuBar:
-            guard let screen = msg.screen else { return "ERROR: missing screen" }
-            return flashMenuBarStrip(screen: screen) ? "OK" : "ERROR: screen not found"
 
         case .shutdown:
             shutdown()
@@ -712,10 +711,17 @@ private final class VideoRendererDaemon {
         if pendingReplacements[screen] != nil {
             cancelPendingReplacement(screen: screen)
         }
-        let wantsDeferredPresentation = deferredPresentation && screenStates[screen] != nil
+        // `deferredPresentation` has two separate meanings:
+        // - existing renderer state: keep the old video pipeline alive for an
+        //   in-window crossfade;
+        // - no renderer state: preroll a new window behind Scene/Web/static,
+        //   then let the host reveal it only after the old presentation has
+        //   been snapshotted and retired.
+        let preserveExistingPipeline = deferredPresentation && screenStates[screen] != nil
+        let deferWindowReveal = deferredPresentation && !preserveExistingPipeline
         let replacementSource = prepareScreenForReplacement(
             screen,
-            preserveOldPipeline: wantsDeferredPresentation
+            preserveOldPipeline: preserveExistingPipeline
         )
         let reusableState = replacementSource?.state
         let isReplacement = reusableState != nil
@@ -758,7 +764,7 @@ private final class VideoRendererDaemon {
             window.contentView = containerView
         }
 
-        if !wantsDeferredPresentation {
+        if !preserveExistingPipeline {
             if let posterPath, !containerView.showPoster(path: posterPath) {
                 AppLogger.error(
                     .wallpaper,
@@ -790,7 +796,8 @@ private final class VideoRendererDaemon {
             posterPath: posterPath,
             screenFrame: screenFrame,
             generation: generation,
-            lastCropRevision: reusableState?.lastCropRevision ?? 0
+            lastCropRevision: reusableState?.lastCropRevision ?? 0,
+            deferWindowReveal: deferWindowReveal
         )
 
         // 解析 Player 组件（含共享解码逻辑）
@@ -809,7 +816,7 @@ private final class VideoRendererDaemon {
         items[screen] = components.item
 
         containerView.playerLayer.videoGravity = .resizeAspectFill
-        if wantsDeferredPresentation,
+        if preserveExistingPipeline,
            let replacementSource,
            let oldPlayer = replacementSource.player {
             containerView.attachPlayer(oldPlayer)
@@ -857,8 +864,9 @@ private final class VideoRendererDaemon {
         }
 
         // A replacement keeps the old freeze frame fully visible in the same
-        // window. A brand-new window stays nearly transparent until its first
-        // drawable so an older Scene/Web presentation can remain visible.
+        // window. A cross-type warmup remains nearly transparent even after
+        // its first drawable; the host reveals it only once the outgoing
+        // Scene/Web/static presentation is protected by a snapshot.
         window.alphaValue = isReplacement ? 1 : 0.02
         window.orderFrontRegardless()
         window.orderBack(nil)
@@ -1134,7 +1142,8 @@ private final class VideoRendererDaemon {
         firstFrameObservers[screen]?.invalidate()
         firstFrameObservers.removeValue(forKey: screen)
 
-        if pendingReplacements[screen]?.newPlayer !== player {
+        if pendingReplacements[screen]?.newPlayer !== player,
+           !state.deferWindowReveal {
             // Brand-new or immediate replacement: reveal as soon as the live
             // layer owns a drawable. Deferred replacements remain on the old
             // layer until the host commits the request.
@@ -1154,6 +1163,40 @@ private final class VideoRendererDaemon {
         )
 
         AppLogger.info(.wallpaper, "video-renderer 首帧就绪 screen=\(screen)")
+    }
+
+    /// Completes a Scene/Web/static -> video handoff after the host has
+    /// captured the old desktop presentation. This is intentionally distinct
+    /// from `bringToFront`, which is also used to keep an old video visible
+    /// while a different renderer warms up behind it.
+    @discardableResult
+    private func revealPreparedWindow(screen: Int?) -> Bool {
+        guard let screen,
+              var state = screenStates[screen],
+              let window = state.window,
+              let container = state.containerView else {
+            return false
+        }
+
+        state.deferWindowReveal = false
+        screenStates[screen] = state
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        container.resumeFromFreeze()
+        window.alphaValue = 1
+        window.orderFrontRegardless()
+        window.orderBack(nil)
+        window.displayIfNeeded()
+        CATransaction.commit()
+        CATransaction.flush()
+
+        if !systemPlaybackPaused,
+           !isPaused,
+           !manualPausedScreens.contains(screen) {
+            container.hidePoster()
+        }
+        return true
     }
 
     // MARK: 播放结束观察（播完即换）
@@ -1618,19 +1661,31 @@ private final class VideoRendererDaemon {
                   let container = state.containerView else {
                 continue
             }
+            // Detail-page applies issue forceCommit immediately after `set`.
+            // Do not let that maintenance operation expose a cross-type
+            // warmup before the host's snapshot-backed handoff has committed.
+            guard !state.deferWindowReveal else {
+                continue
+            }
             window.orderFrontRegardless()
             window.orderBack(nil)
             window.displayIfNeeded()
-            if let player = players[screen],
-               container.playerLayer.player !== player {
-                container.attachPlayer(player)
-            }
-            if let player = players[screen],
-               !systemPlaybackPaused,
-               !isPaused,
-               !manualPausedScreens.contains(screen),
-               player.rate == 0 {
-                player.play()
+            // A deferred replacement keeps the old player attached while the
+            // incoming player warms up in a separate transition layer. The
+            // host may issue forceCommit immediately after `set` returns; do
+            // not let that maintenance command bypass the pending crossfade.
+            if pendingReplacements[screen] == nil {
+                if let player = players[screen],
+                   container.playerLayer.player !== player {
+                    container.attachPlayer(player)
+                }
+                if let player = players[screen],
+                   !systemPlaybackPaused,
+                   !isPaused,
+                   !manualPausedScreens.contains(screen),
+                   player.rate == 0 {
+                    player.play()
+                }
             }
             container.playerLayer.setNeedsDisplay()
             container.needsDisplay = true
@@ -1639,95 +1694,6 @@ private final class VideoRendererDaemon {
         CATransaction.commit()
         CATransaction.flush()
         CFRunLoopWakeUp(CFRunLoopGetMain())
-    }
-
-    private func flashMenuBarStrip(screen: Int) -> Bool {
-        guard !menuBarFlashInProgressScreens.contains(screen),
-              screenStates[screen]?.window != nil,
-              NSScreen.screens.indices.contains(screen) else {
-            return false
-        }
-        let targetScreen = NSScreen.screens[screen]
-        menuBarFlashInProgressScreens.insert(screen)
-
-        let barHeight = max(24, targetScreen.frame.maxY - targetScreen.visibleFrame.maxY)
-        let pokeFrame = NSRect(
-            x: targetScreen.frame.minX,
-            y: targetScreen.frame.maxY - barHeight - 1,
-            width: max(1, targetScreen.frame.width),
-            height: barHeight + 1
-        )
-        let window = NSWindow(
-            contentRect: pokeFrame,
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false,
-            screen: targetScreen
-        )
-        let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
-        window.level = .init(rawValue: max(statusLevel - 1, Int(CGWindowLevelForKey(.desktopWindow)) + 2))
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.isReleasedWhenClosed = false
-        window.isMovable = false
-        window.animationBehavior = .none
-        window.hidesOnDeactivate = false
-        window.alphaValue = 1
-
-        let view = NSView(frame: NSRect(origin: .zero, size: pokeFrame.size))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.clear.cgColor
-        window.contentView = view
-        menuBarPokeWindows[screen] = window
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        window.orderFrontRegardless()
-        window.displayIfNeeded()
-        CATransaction.commit()
-        CATransaction.flush()
-        CFRunLoopWakeUp(CFRunLoopGetMain())
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
-            guard let self, let window, self.menuBarPokeWindows[screen] === window else { return }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            window.orderOut(nil)
-            CATransaction.commit()
-            CATransaction.flush()
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak window] in
-                guard let self, let window, self.menuBarPokeWindows[screen] === window else { return }
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                window.orderFrontRegardless()
-                window.displayIfNeeded()
-                CATransaction.commit()
-                CATransaction.flush()
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self, weak window] in
-                    guard let self, let window else { return }
-                    self.tearDownMenuBarPokeWindow(screen: screen, window: window)
-                }
-            }
-        }
-        return true
-    }
-
-    private func tearDownMenuBarPokeWindow(screen: Int, window: NSWindow) {
-        guard menuBarPokeWindows[screen] === window else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        window.orderOut(nil)
-        window.contentView = nil
-        window.close()
-        CATransaction.commit()
-        CATransaction.flush()
-        menuBarPokeWindows.removeValue(forKey: screen)
-        menuBarFlashInProgressScreens.remove(screen)
     }
 
     // MARK: 音频策略

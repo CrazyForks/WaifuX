@@ -5257,20 +5257,36 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
         forMainFrameOnly: false
     )
 
-    /// `file://` 本地文件兼容：修复 Spine 纹理 crossOrigin 及 fetch() 读本地文件失败
+    /// `file://` 本地文件兼容：修复 Spine 纹理 crossOrigin 及 atlas/XHR/fetch 读本地文件失败
     private static let localFileCompatScript = WKUserScript(
         source: """
         (function() {
           try {
             if (location.protocol !== "file:") return;
+
+            function resolveURL(input) {
+              if (typeof input === "string") return input;
+              if (!input) return "";
+              if (typeof input.href === "string" && input.href) return input.href;
+              if (typeof input.url === "string" && input.url) return input.url;
+              try { return String(input); } catch (e) { return ""; }
+            }
+
+            function isLocalNonHTTPURL(url) {
+              if (!url) return false;
+              var lower = String(url).toLowerCase();
+              if (lower.indexOf("http:") === 0 || lower.indexOf("https:") === 0) return false;
+              if (lower.indexOf("data:") === 0 || lower.indexOf("blob:") === 0) return false;
+              return true;
+            }
+
             var proto = HTMLImageElement.prototype;
             var srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
             if (srcDesc && srcDesc.set) {
               Object.defineProperty(proto, "src", {
                 set: function(value) {
                   try {
-                    var s = String(value || "");
-                    if (s.indexOf("http:") !== 0 && s.indexOf("https:") !== 0 && s.indexOf("data:") !== 0 && s.indexOf("blob:") !== 0) {
+                    if (isLocalNonHTTPURL(String(value || ""))) {
                       this.removeAttribute("crossorigin");
                     }
                   } catch (e) {}
@@ -5280,33 +5296,80 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
                 configurable: true
               });
             }
+
+            // WebKit 成功读取 file:// XHR 时常返回 status=0。Spine 3.6
+            // 预览脚本会直接判断 status !== 200，导致存在的 atlas 被误报为失败。
+            var xhrProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (xhrProto) {
+              var originalOpen = xhrProto.open;
+              if (typeof originalOpen === "function") {
+                xhrProto.open = function(method, url) {
+                  try {
+                    this.__wxLocalFileRequest = isLocalNonHTTPURL(resolveURL(url));
+                  } catch (e) {}
+                  return originalOpen.apply(this, arguments);
+                };
+              }
+              var statusDesc = Object.getOwnPropertyDescriptor(xhrProto, "status");
+              if (statusDesc && statusDesc.get) {
+                Object.defineProperty(xhrProto, "status", {
+                  get: function() {
+                    var status = statusDesc.get.call(this);
+                    try {
+                      if (status === 0
+                        && this.__wxLocalFileRequest
+                        && this.readyState === XMLHttpRequest.DONE) {
+                        return 200;
+                      }
+                    } catch (e) {}
+                    return status;
+                  },
+                  configurable: true
+                });
+              }
+            }
+
             var origFetch = window.fetch;
             if (typeof origFetch === "function") {
               window.fetch = function(input, init) {
-                var url = typeof input === "string" ? input : (input && input.url) ? input.url : "";
-                if (url && url.indexOf("http:") !== 0 && url.indexOf("https:") !== 0 && url.indexOf("data:") !== 0 && url.indexOf("blob:") !== 0) {
+                var url = resolveURL(input);
+                if (isLocalNonHTTPURL(url)) {
                   return new Promise(function(resolve, reject) {
-                    var xhr = new XMLHttpRequest();
-                    xhr.open("GET", url, true);
-                    xhr.responseType = "arraybuffer";
-                    xhr.onload = function() {
-                      if (xhr.status === 200 || xhr.status === 0) {
-                        var headers = new Headers();
-                        try {
-                          var contentType = xhr.getResponseHeader("Content-Type");
-                          if (contentType) headers.set("Content-Type", contentType);
-                        } catch (e) {}
-                        resolve(new Response(xhr.response, {
-                          status: xhr.status === 0 ? 200 : xhr.status,
-                          statusText: xhr.statusText || "OK",
-                          headers: headers
-                        }));
-                      } else {
-                        reject(new Error("HTTP " + xhr.status));
-                      }
-                    };
-                    xhr.onerror = function() { reject(new Error("network error")); };
-                    xhr.send();
+                    try {
+                      var xhr = new XMLHttpRequest();
+                      xhr.open("GET", String(url), true);
+                      xhr.responseType = "arraybuffer";
+                      xhr.onload = function() {
+                        if (xhr.status === 200 || xhr.status === 0) {
+                          var headers = new Headers();
+                          try {
+                            var contentType = xhr.getResponseHeader("Content-Type");
+                            if (contentType) headers.set("Content-Type", contentType);
+                            var contentLength = xhr.getResponseHeader("Content-Length");
+                            if (contentLength) headers.set("Content-Length", contentLength);
+                          } catch (e) {}
+                          var body = xhr.response || new ArrayBuffer(0);
+                          if (!headers.has("Content-Type")) {
+                            headers.set("Content-Type", "application/octet-stream");
+                          }
+                          if (!headers.has("Content-Length") && body && typeof body.byteLength === "number") {
+                            headers.set("Content-Length", String(body.byteLength));
+                          }
+                          resolve(new Response(body, {
+                            status: 200,
+                            statusText: "OK",
+                            headers: headers
+                          }));
+                        } else {
+                          reject(new Error("HTTP " + xhr.status));
+                        }
+                      };
+                      xhr.onerror = function() { reject(new Error("network error")); };
+                      xhr.onabort = function() { reject(new Error("aborted")); };
+                      xhr.send();
+                    } catch (e) {
+                      reject(e);
+                    }
                   });
                 }
                 return origFetch.call(this, input, init);
@@ -5338,8 +5401,10 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
         // 找到 Web 壁纸入口文件
         if let entryURL = resolveWebEntryURL(from: url) {
             if #available(macOS 11.0, *) {
-                // 允许访问整个壁纸目录及其子目录（资源引用）
-                let allowDir = entryURL.deletingLastPathComponent()
+                // 允许访问工程目录及 Steam Workshop 同级依赖资源。
+                // 某些 Web 壁纸的 HTML 会通过 ../ 引用外层资源，预览也要与 daemon
+                // 的 readAccess 范围保持一致。
+                let allowDir = previewReadAccessURL(for: entryURL)
                 webView.loadFileURL(entryURL, allowingReadAccessTo: allowDir)
             } else {
                 webView.load(URLRequest(url: entryURL))
@@ -5475,6 +5540,25 @@ struct WebWallpaperPreviewView: NSViewRepresentable {
         }
 
         return nil
+    }
+
+    private func previewReadAccessURL(for entryURL: URL) -> URL {
+        let standardized = entryURL.standardizedFileURL
+        let components = standardized.pathComponents
+        guard let workshopIndex = components.firstIndex(of: "431960"),
+              workshopIndex + 1 < components.count else {
+            return standardized.deletingLastPathComponent()
+        }
+
+        let prefix = components.prefix(through: workshopIndex + 1)
+        let workshopRootPath = "/" + prefix.dropFirst().joined(separator: "/")
+        var isDirectory: ObjCBool = false
+        let workshopRoot = URL(fileURLWithPath: workshopRootPath, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: workshopRoot.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return standardized.deletingLastPathComponent()
+        }
+        return workshopRoot
     }
 }
 

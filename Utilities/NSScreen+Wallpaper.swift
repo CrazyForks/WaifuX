@@ -174,6 +174,22 @@ extension NSScreen {
         return result.filter { seen.insert($0).inserted }
     }
 
+    /// 视频壁纸窗口 frame：全屏但避开顶部菜单栏条带。
+    ///
+    /// 菜单栏 backdrop 采样的是系统壁纸而非合成画面（WindowServer 遮挡剔除）。
+    /// 让桌面图在菜单栏条带下永远可见后，poster 写入即产生真实 damage，
+    /// 菜单栏自动重采样，无需再依赖 poke/flash 窗口机制。
+    /// 无菜单栏的副屏 / auto-hide 菜单栏隐藏时 barHeight 为 0，保持全屏。
+    var wallpaperWindowFrame: NSRect {
+        var f = frame
+        let barHeight = frame.maxY - visibleFrame.maxY
+        if barHeight > 1 {
+            f.origin.y += barHeight
+            f.size.height -= barHeight
+        }
+        return f
+    }
+
     /// 当前显示器的主刷新率（Hz），取整。
     ///
     /// 通过 `CGDisplayCopyDisplayMode` 获取当前分辨率模式的刷新率。

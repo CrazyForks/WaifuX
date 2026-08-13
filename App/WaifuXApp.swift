@@ -7,6 +7,55 @@ import WebKit
 import Darwin
 import Sparkle
 
+/// Coordinates ordinary app windows with the macOS Space that is currently active.
+///
+/// `.moveToActiveSpace` is intentionally limited to user-facing windows. Desktop
+/// wallpaper and overlay windows must keep their existing all-Spaces behavior.
+@MainActor
+enum WindowSpaceCoordinator {
+    static var referenceWindow: NSWindow? {
+        if let keyWindow = NSApp.keyWindow, keyWindow.isVisible {
+            return keyWindow
+        }
+        if let mainWindow = NSApp.mainWindow, mainWindow.isVisible {
+            return mainWindow
+        }
+        return nil
+    }
+
+    static func prepare(_ window: NSWindow) {
+        window.collectionBehavior.insert(.moveToActiveSpace)
+    }
+
+    static func show(
+        _ window: NSWindow,
+        following referenceWindow: NSWindow? = nil,
+        activate: Bool = true
+    ) {
+        // Ordering the reference window first brings its Space active when the
+        // caller opened the action from a global menu or the status bar.
+        if let referenceWindow,
+           referenceWindow !== window,
+           referenceWindow.isVisible {
+            referenceWindow.makeKeyAndOrderFront(nil)
+        }
+
+        prepare(window)
+        window.makeKeyAndOrderFront(nil)
+        if activate {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    static func visibleFrame(for referenceWindow: NSWindow? = nil) -> NSRect? {
+        let screen = referenceWindow?.screen
+            ?? self.referenceWindow?.screen
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        return screen?.visibleFrame
+    }
+}
+
 func frameInterpolationDebugPrint(_ message: String) {
     NSLog("[VideoWallpaperManager] [FrameInterpolation] \(message)")
     AppLogger.debug(.wallpaper, "FrameInterpolation", metadata: [
@@ -409,6 +458,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         )
 
         window?.collectionBehavior = .fullScreenPrimary
+        if let window {
+            WindowSpaceCoordinator.prepare(window)
+        }
 
         window?.title = "WaifuX"
         window?.titlebarAppearsTransparent = true
@@ -453,8 +505,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             AppResponsivenessMonitor.noteScenePhase("loginLaunchHidden")
         } else {
             // ⚠️ 关键：立即显示窗口，不要等待
-            window?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            if let window {
+                WindowSpaceCoordinator.show(window)
+            }
             AppResponsivenessMonitor.noteWindowVisible(true)
             AppResponsivenessMonitor.noteScenePhase("mainWindowVisible")
         }
@@ -511,7 +564,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         guard shouldRestoreSettingsWindowAfterUpdateCheck else { return }
         shouldRestoreSettingsWindowAfterUpdateCheck = false
         guard let settingsWindow = settingsWindowController?.window else { return }
-        settingsWindow.makeKeyAndOrderFront(nil)
+        WindowSpaceCoordinator.show(
+            settingsWindow,
+            following: window?.isVisible == true ? window : nil
+        )
     }
 
     // MARK: - 异步恢复所有数据（在窗口显示后执行，避免阻塞主线程）
@@ -693,6 +749,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         delayedReleaseTask = nil
 
         updateActivationPolicy(showDockIcon: true)
+        let settingsWindow = settingsWindowController?.window
+        let visibleSettingsWindow = settingsWindow?.isVisible == true ? settingsWindow : nil
 
         if window == nil {
             let contentView = ContentView(
@@ -719,6 +777,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             window?.isOpaque = true
             window?.backgroundColor = NSColor(Color(hex: "0D0D0D"))
             window?.minSize = Self.minimumWindowSize
+            window?.collectionBehavior = .fullScreenPrimary
+            if let window {
+                WindowSpaceCoordinator.prepare(window)
+            }
 
             // 隐藏系统红绿灯（使用自定义 CustomWindowControls）
             window?.standardWindowButton(.closeButton)?.isHidden = true
@@ -760,12 +822,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             if #available(macOS 14.0, *) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                     guard let self, let window = self.window else { return }
-                    window.makeKeyAndOrderFront(nil)
-                    NSApp.activate(ignoringOtherApps: true)
+                    WindowSpaceCoordinator.show(window, following: visibleSettingsWindow)
                 }
             } else {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
+                WindowSpaceCoordinator.show(window, following: visibleSettingsWindow)
             }
         }
         AppResponsivenessMonitor.noteWindowVisible(true)
@@ -1295,18 +1355,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
     nonisolated private func processOutput(launchPath: String, arguments: [String]) -> String {
         let process = Process()
-        let pipe = Pipe()
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("waifux-process-output-\(UUID().uuidString).log")
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = Pipe()
 
         do {
+            try Data().write(to: outputURL, options: .withoutOverwriting)
+            let outputHandle = try FileHandle(forWritingTo: outputURL)
+            defer {
+                try? outputHandle.close()
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+
+            // Do not use Pipe here: waiting for a child to exit before draining a full
+            // pipe can deadlock `ps` or `pluginkit` during extension registration.
+            process.standardOutput = outputHandle
+            process.standardError = outputHandle
             try process.run()
             process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = try Data(contentsOf: outputURL)
             return String(data: data, encoding: .utf8) ?? ""
         } catch {
+            try? FileManager.default.removeItem(at: outputURL)
             print("[WaifuXApp] \(launchPath) failed: \(error.localizedDescription)")
             return ""
         }
@@ -1342,8 +1413,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // 如果窗口已存在，直接显示（最快路径）
         if let settingsWindow = settingsWindowController?.window {
             centerWindow(settingsWindow, relativeTo: window)
-            settingsWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            WindowSpaceCoordinator.show(
+                settingsWindow,
+                following: window?.isVisible == true ? window : nil
+            )
             return
         }
 
@@ -1379,6 +1452,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         settingsWindow.maxSize = NSSize(width: 680, height: 520)
         settingsWindow.isReleasedWhenClosed = false
         settingsWindow.level = .floating
+        WindowSpaceCoordinator.prepare(settingsWindow)
         centerWindow(settingsWindow, relativeTo: window)
         settingsWindow.tabbingMode = .disallowed
         // 设置窗口复用 AppDelegate 作为 delegate，windowShouldClose 据此区分处理
@@ -1393,7 +1467,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         let windowController = NSWindowController(window: settingsWindow)
         settingsWindowController = windowController
         windowController.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        WindowSpaceCoordinator.show(
+            settingsWindow,
+            following: window?.isVisible == true ? window : nil
+        )
     }
 
     private func centerWindow(_ window: NSWindow, relativeTo parentWindow: NSWindow?) {

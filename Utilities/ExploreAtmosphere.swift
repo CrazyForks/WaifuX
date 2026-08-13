@@ -1110,7 +1110,9 @@ final class PreviewWindowManager: ObservableObject {
         windowController?.close()
         windowController = nil
 
-        let screen = NSScreen.main ?? NSScreen.screens.first
+        let screen = WindowSpaceCoordinator.referenceWindow?.screen
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
         let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
 
         let maxWidth = max(1000, screenFrame.width * 0.85)
@@ -1147,6 +1149,7 @@ final class PreviewWindowManager: ObservableObject {
         window.backgroundColor = .black
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 400, height: 400)
+        WindowSpaceCoordinator.prepare(window)
 
         let hostingView = NSHostingView(
             rootView: WallpaperPreviewSheet(url: url, isWeb: isWeb, posterURL: posterURL)
@@ -1155,7 +1158,7 @@ final class PreviewWindowManager: ObservableObject {
 
         windowController = NSWindowController(window: window)
         windowController?.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        WindowSpaceCoordinator.show(window)
         isPresented = true
 
         // 监听窗口关闭（用户点击关闭按钮时同步状态）

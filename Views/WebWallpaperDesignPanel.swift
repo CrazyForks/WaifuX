@@ -13,7 +13,7 @@ final class WebWallpaperDesignPanelController {
     func present(for wallpaperPath: String) {
         if currentPath == wallpaperPath, let window = windowController?.window {
             anchorWindow(window)
-            window.makeKeyAndOrderFront(nil)
+            WindowSpaceCoordinator.show(window)
             return
         }
 
@@ -40,6 +40,7 @@ final class WebWallpaperDesignPanelController {
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.level = .floating
+        WindowSpaceCoordinator.prepare(window)
 
         let rootView = WebWallpaperDesignPanel(viewModel: viewModel)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -55,7 +56,7 @@ final class WebWallpaperDesignPanelController {
         windowController = controller
         currentPath = wallpaperPath
         controller.showWindow(nil)
-        window.makeKeyAndOrderFront(nil)
+        WindowSpaceCoordinator.show(window)
 
         // 异步加载壁纸数据，避免主线程阻塞
         Task { await viewModel.loadAsync() }
@@ -68,7 +69,7 @@ final class WebWallpaperDesignPanelController {
     }
 
     private func anchorWindow(_ window: NSWindow) {
-        guard let visibleFrame = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame else {
+        guard let visibleFrame = WindowSpaceCoordinator.visibleFrame() else {
             window.center()
             return
         }

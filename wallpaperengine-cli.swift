@@ -763,11 +763,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     /// `file://` 壁纸常见兼容问题：
     /// 1) Spine 等库对 `HTMLImageElement` 设置 `crossOrigin = "anonymous"`，WebKit 在本地文件场景下会拒绝加载同目录纹理 → 画面空白。
-    /// 2) 部分 Workshop 脚本用 `fetch()` 读相对路径 JSON / `.splat` 等二进制资源；
-    ///    原生 `fetch(file://...)` 常返回 status=0 或直接失败。
+    /// 2) 部分 Workshop 脚本用 `XMLHttpRequest` / `fetch()` 读相对路径 atlas、JSON、`.splat` 等资源；
+    ///    WebKit 成功读取 `file://` 时常返回 status=0，部分脚本会将其误判为加载失败。
     ///    尤其是 `fetch(new URL("test.splat", location.href))` 传入的是 URL 对象：
     ///    旧兼容层只识别 string / Request.url，漏掉了 URL.href，导致仍走原生 fetch。
-    ///    改走 XHR，并把 file:// 的 status 0 规范成 200，保证 body.getReader() 可用。
+    ///    对原生 XHR 及 fetch 回退路径都将成功的本地 status=0 规范成 200。
     private static let localFileCompatScript = WKUserScript(
         source: """
         (function() {
@@ -807,7 +807,40 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 },
                 get: srcDesc.get,
                 configurable: true
-              });
+                });
+            }
+
+            // WebKit 会让成功的 file:// XMLHttpRequest 保持 status=0。Spine 等
+            // Workshop runtime 常直接判断 `xhr.status !== 200`，导致存在的 atlas
+            // 被误报为缺失。记录 open() 的本地地址，再仅在请求完成时规范该状态。
+            var xhrProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (xhrProto) {
+              var originalOpen = xhrProto.open;
+              if (typeof originalOpen === "function") {
+                xhrProto.open = function(method, url) {
+                  try {
+                    this.__wxLocalFileRequest = isLocalNonHTTPURL(resolveFetchURL(url));
+                  } catch (e) {}
+                  return originalOpen.apply(this, arguments);
+                };
+              }
+              var statusDesc = Object.getOwnPropertyDescriptor(xhrProto, "status");
+              if (statusDesc && statusDesc.get) {
+                Object.defineProperty(xhrProto, "status", {
+                  get: function() {
+                    var status = statusDesc.get.call(this);
+                    try {
+                      if (status === 0
+                        && this.__wxLocalFileRequest
+                        && this.readyState === XMLHttpRequest.DONE) {
+                        return 200;
+                      }
+                    } catch (e) {}
+                    return status;
+                  },
+                  configurable: true
+                });
+              }
             }
 
             var origFetch = window.fetch;
@@ -2087,7 +2120,15 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             w.setFrame(frame, display: false)
             w.alphaValue = 1
         } else {
-            w.setFrame(targetScreen.frame, display: true)
+            // 避开顶部菜单栏条带：桌面图在条带下保持可见，菜单栏自动跟随
+            // 静态 poster 重采样（与宿主 NSScreen.wallpaperWindowFrame 同策略）。
+            var wallpaperFrame = targetScreen.frame
+            let menuBarHeight = targetScreen.frame.maxY - targetScreen.visibleFrame.maxY
+            if menuBarHeight > 1 {
+                wallpaperFrame.origin.y += menuBarHeight
+                wallpaperFrame.size.height -= menuBarHeight
+            }
+            w.setFrame(wallpaperFrame, display: true)
         }
         w.acceptsMouseMovedEvents = true
         w.ignoresMouseEvents = offscreen
@@ -2152,7 +2193,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         if offscreen {
             w.orderFrontRegardless()
         } else {
-            w.orderBack(nil)
+            // `desktopWindow` 层本身低于普通 App 窗口；在该层内前置不会盖住应用，
+            // 却能避免 WindowServer 将完整遮挡的 WKWebView/WebGL canvas 停止合成。
+            w.orderFront(nil)
         }
 
         let destination = offscreen ? "offscreen bake surface" : "screen \(screenIdx) (\(targetScreen.localizedName))"
@@ -2276,7 +2319,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     func resume(screen: Int = 0) {
         guard let state = screenStates[screen], state.isLoaded else { return }
-        state.window?.orderBack(nil)
+        // 与首次加载保持一致：WebGL 壁纸在 desktop 层内必须前置才会持续合成。
+        state.window?.orderFront(nil)
         state.webView?.evaluateJavaScript("""
             document.querySelectorAll('video, audio').forEach(m => { if(m.paused) m.play().catch(()=>{}); });
             document.querySelectorAll('*').forEach(el => {

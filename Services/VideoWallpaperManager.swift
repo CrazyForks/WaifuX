@@ -432,9 +432,6 @@ final class VideoWallpaperManager: ObservableObject {
             StaticImageWallpaperOverlayManager.shared.keepPresentationFront(on: targets)
             CATransaction.flush()
             CFRunLoopWakeUp(CFRunLoopGetMain())
-            flashDesktopExposureForMenuBarResample(on: targets, delays: [0.08])
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: targets, delay: 0.08)
             return
         }
 
@@ -490,9 +487,6 @@ final class VideoWallpaperManager: ObservableObject {
                 }
             }
             CATransaction.flush()
-            // 桌面窗 settle 后再强制菜单栏按 poster 重采样（交替路径，非同一 URL no-op）。
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: targets, delay: 0.08)
         }
     }
 
@@ -724,6 +718,11 @@ final class VideoWallpaperManager: ObservableObject {
     /// 独立于 screenParametersChanged 的唤醒重建 work item，防止唤醒时序竞争
     private var pendingWakeRebuildWorkItem: DispatchWorkItem?
     private var lastAppliedScreenConfigurations: [ScreenConfigurationSignature] = []
+    /// Pause/resume commands used to be fire-and-forget. A rapid "pause, then
+    /// next" could let the old pause arrive after the next renderer `set`,
+    /// freezing the incoming pipeline before it produced a drawable.
+    private var externalPlaybackControlTask: Task<Void, Never>?
+    private var externalPlaybackControlGeneration: UInt64 = 0
 
     private init() {
         // 恢复静音偏好（独立于视频壁纸状态，场景/Web 壁纸同样生效）
@@ -773,18 +772,18 @@ final class VideoWallpaperManager: ObservableObject {
                 "screenIndex": screenIndex,
                 "requestID": requestID
             ])
-            if !externalIsPaused(screenID: screen.wallpaperScreenIdentifier) {
+            // A cross-type video may report its first drawable while its
+            // window remains intentionally hidden behind Scene/Web/static.
+            // Keep its poster installed until the snapshot-backed commit
+            // reveals that window, so no compositor frame can expose black.
+            if !externalPendingCommitScreenIDs.contains(screenID),
+               !externalIsPaused(screenID: screen.wallpaperScreenIdentifier) {
                 hidePosterImage(for: screen.wallpaperScreenIdentifier)
             }
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [screen], delay: 0.02)
             scheduleDisplaySwitchStableRelease(
                 screenID: screenID,
                 reason: "externalFirstFrameReady"
             )
-            if !externalPendingCommitScreenIDs.contains(screenID) {
-                flashDesktopExposureForMenuBarResample(on: [screen], delays: [0.04])
-            }
         case .playbackEnded(let screenIndex, let stableScreenID, let requestID):
             guard let screen = externalScreen(
                 for: screenIndex,
@@ -871,7 +870,7 @@ final class VideoWallpaperManager: ObservableObject {
             requestID: newRequestID,
             path: playbackURL.path,
             posterPath: posterURL?.isFileURL == true ? posterURL?.path : nil,
-            frame: screen.frame,
+            frame: screen.wallpaperWindowFrame,
             muted: isMuted,
             volume: volume(for: screen),
             looping: !isOnEndMode,
@@ -1415,18 +1414,13 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
-    /// Rebind the shared video layer to the current screen set after connect/disconnect.
+    /// Rebind a globally synchronized video to the current screen set after
+    /// connect/disconnect. The original global apply can start on one display,
+    /// where a shared decoder is unnecessary; when another display appears we
+    /// must still rebuild as shared instead of returning early.
     func refreshSharedDecoderTargets() {
-        guard usesSharedVideoDecoder,
-              let currentVideoURL,
+        guard let currentVideoURL,
               FileManager.default.fileExists(atPath: currentVideoURL.path) else { return }
-        videoTargetScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
-        videoTargetScreenFingerprints = Set(NSScreen.screens.map(\.wallpaperScreenFingerprint))
-        let currentWindowIDs = Set(windows.keys)
-        if currentWindowIDs == videoTargetScreenIDs {
-            // Force rebuild so newly connected screens get a window layer.
-            videoTargetScreenIDs.removeAll()
-        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             try? await self.applyVideoWallpaper(
@@ -1435,7 +1429,8 @@ final class VideoWallpaperManager: ObservableObject {
                 muted: self.isMuted,
                 targetScreens: NSScreen.screens,
                 animatedTransition: false,
-                usesSharedVideoDecoder: true
+                usesSharedVideoDecoder: NSScreen.screens.count > 1,
+                forceRebuild: true
             )
         }
     }
@@ -1673,11 +1668,6 @@ final class VideoWallpaperManager: ObservableObject {
             if let targetScreenID {
                 scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: coalesced ? "reuseExistingCoalesced" : "reuseExisting")
             }
-            // 早退复用：画面本就在屏上，但上一轮 apply 的采样 poke 可能全部打在
-            // 首帧合成之前（菜单栏仍是旧采样）。内容已在屏，短延迟补一次兜底。
-            let reuseRefreshScreens: [NSScreen] = targetScreen.map { [$0] } ?? NSScreen.screens
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: reuseRefreshScreens, delay: 0.1)
             return
         }
 
@@ -1725,6 +1715,10 @@ final class VideoWallpaperManager: ObservableObject {
             print("[VideoWallpaperManager] 🔒 动态锁屏已启用，跳过设置静态桌面 poster")
         } else if let posterURL = posterURL {
             if animatedTransition {
+                registerPendingPosterBackplate(
+                    posterURL,
+                    targetScreen: targetScreen
+                )
                 // 动画切换：等新视频起播/首帧就绪后再写系统底图，避免加载期
                 // 系统墙纸刷新与 desktop-level 动态窗抢合成、拉长可见黑场。
                 schedulePosterAsDesktopWallpaperAfterPlaybackSettles(
@@ -1784,21 +1778,6 @@ final class VideoWallpaperManager: ObservableObject {
         wallpaperChangeCount &+= 1
         DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
-
-        // 动态视频窗口已创建并提交到 WindowServer 后，强制菜单栏外观重采样。
-        // 主手段是“窗口变化 poke”（与点一下其它 App 同类），不依赖 poster 是否已写入。
-        // 动画路径 poster 稍后 apply 时还会再 schedule 一次（含可选 setDesktop 换路径）。
-        let refreshScreens: [NSScreen]
-        if let targetScreen {
-            refreshScreens = [targetScreen]
-        } else {
-            refreshScreens = NSScreen.screens
-        }
-        DesktopWallpaperSyncManager.shared
-            .scheduleSystemWallpaperRefreshAfterDynamicPresentation(
-                on: refreshScreens,
-                delay: animatedTransition ? 0.28 : 0.12
-            )
 
         // 同步到锁屏镜像实例（macOS 26+）
         if #available(macOS 26.0, *) {
@@ -1920,11 +1899,6 @@ final class VideoWallpaperManager: ObservableObject {
                 reason: "reuseExternalVideo"
             )
         }
-        DesktopWallpaperSyncManager.shared
-            .scheduleSystemWallpaperRefreshAfterDynamicPresentation(
-                on: screens,
-                delay: 0.1
-            )
         if #available(macOS 26.0, *) {
             LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
             syncAllDisplayVideosToExtension()
@@ -1975,6 +1949,10 @@ final class VideoWallpaperManager: ObservableObject {
             "video": localFileURL.lastPathComponent,
             "targetScreen": targetScreen?.localizedName ?? "nil(全部)"
         ])
+        // A user can pause and immediately request the next wallpaper. Finish
+        // the pause command (including its poster update) before replacing the
+        // child-owned pipeline so stale IPC cannot pause the incoming player.
+        await waitForExternalPlaybackControl()
 
         let captureScreens: [NSScreen] = {
             if let targetScreen {
@@ -2148,14 +2126,16 @@ final class VideoWallpaperManager: ObservableObject {
                 requestID: requestID,
                 path: playbackURL.path,
                 posterPath: posterURL?.isFileURL == true ? posterURL?.path : nil,
-                frame: screen.frame,
+                frame: screen.wallpaperWindowFrame,
                 muted: muted,
                 volume: volume(for: screen),
                 looping: !isOnEndMode,
                 shared: usesSharedVideoDecoder,
                 forceNewPipeline: false,
                 hdrMetadataEnabled: hdrMetadataEnabled,
-                deferredPresentation: deferredVideoScreens.contains(where: {
+                deferredPresentation: oldExternalScreens.contains(where: {
+                    $0.wallpaperScreenIdentifier == screenID
+                }) || deferredVideoScreens.contains(where: {
                     $0.wallpaperScreenIdentifier == screenID
                 }),
                 transitionDuration: animatedTransition ? automaticSwitchTransitionDuration : 0,
@@ -2235,6 +2215,10 @@ final class VideoWallpaperManager: ObservableObject {
         if !shouldSkipStaticPosterForDynamicLockScreen, let posterURL {
             for screen in captureScreens {
                 if animatedTransition {
+                    registerPendingPosterBackplate(
+                        posterURL,
+                        targetScreen: screen
+                    )
                     schedulePosterAsDesktopWallpaperAfterPlaybackSettles(
                         posterURL,
                         targetScreen: screen,
@@ -2273,10 +2257,6 @@ final class VideoWallpaperManager: ObservableObject {
         syncCurrentVideoURL()
         DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
-
-        // 触发菜单栏重采样
-        DesktopWallpaperSyncManager.shared
-            .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: captureScreens, delay: 0.1)
 
         if !oldExternalScreens.isEmpty || !deferredVideoScreens.isEmpty {
             scheduleExternalTransitionCommit(
@@ -2343,7 +2323,25 @@ final class VideoWallpaperManager: ObservableObject {
 
                 if !uniqueCrossTypeScreens.isEmpty {
                     await WallpaperCrossTypeTransitionCoordinator.shared.commitPreparedContent(
-                        on: uniqueCrossTypeScreens
+                        on: uniqueCrossTypeScreens,
+                        revealPreparedContent: {
+                            for screen in uniqueCrossTypeScreens {
+                                guard let screenIndex = self.externalScreenIndex(for: screen) else {
+                                    continue
+                                }
+                                let response = await self.externalRenderer.sendCommand(
+                                    .revealPreparedWindow(screen: screenIndex),
+                                    screen: screenIndex,
+                                    timeout: 2.0
+                                )
+                                if response?.hasPrefix("OK") != true {
+                                    AppLogger.error(.wallpaper, "跨类型视频窗口揭示失败", metadata: [
+                                        "screenID": screen.wallpaperScreenIdentifier,
+                                        "response": response ?? "nil"
+                                    ])
+                                }
+                            }
+                        }
                     ) {
                         for screen in uniqueCrossTypeScreens {
                             await WallpaperEngineXBridge.shared
@@ -2352,11 +2350,6 @@ final class VideoWallpaperManager: ObservableObject {
                             self.pendingCrossTypeVideoScreenIDs.remove(
                                 screen.wallpaperScreenIdentifier
                             )
-                            if let screenIndex = self.externalScreenIndex(for: screen) {
-                                self.externalRenderer.sendCommandFireAndForget(
-                                    .bringToFront(screen: screenIndex)
-                                )
-                            }
                         }
                     }
                 }
@@ -2371,22 +2364,6 @@ final class VideoWallpaperManager: ObservableObject {
                         reason: "externalTransitionCommitted"
                     )
                 }
-
-                let delay = max(
-                    0.04,
-                    !uniqueVideoScreens.isEmpty && animated
-                        ? automaticSwitchTransitionDuration
-                        : 0.04
-                )
-                self.flashDesktopExposureForMenuBarResample(
-                    on: pendingScreens,
-                    delays: [delay]
-                )
-                DesktopWallpaperSyncManager.shared
-                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(
-                        on: pendingScreens,
-                        delay: delay
-                    )
             } catch {
                 guard self.externalTransitionGeneration == generation else { return }
                 await self.rollbackExternalVideoTransaction(
@@ -2756,18 +2733,17 @@ final class VideoWallpaperManager: ObservableObject {
     func pauseWallpaper(for targetScreen: NSScreen? = nil) {
         if externalRenderingActive {
             let screenIdx = targetScreen.flatMap(externalScreenIndex(for:))
-            externalRenderer.sendCommandFireAndForget(.pause(screen: screenIdx))
             if let targetScreen {
                 externalPausedScreenIDs.insert(targetScreen.wallpaperScreenIdentifier)
                 isPaused = videoTargetScreenIDs.allSatisfy(externalPausedScreenIDs.contains)
-                showPosterImage(for: targetScreen.wallpaperScreenIdentifier)
             } else {
                 isPaused = true
                 externalPausedScreenIDs.formUnion(videoTargetScreenIDs)
-                for screen in externalTargetScreens() {
-                    showPosterImage(for: screen.wallpaperScreenIdentifier)
-                }
             }
+            queueExternalPauseWithPoster(
+                screenIndex: screenIdx,
+                targetScreen: targetScreen
+            )
             persistState()
             return
         }
@@ -2799,18 +2775,17 @@ final class VideoWallpaperManager: ObservableObject {
 
         if externalRenderingActive {
             let screenIdx = targetScreen.flatMap(externalScreenIndex(for:))
-            externalRenderer.sendCommandFireAndForget(.resume(screen: screenIdx))
             if let targetScreen {
                 externalPausedScreenIDs.remove(targetScreen.wallpaperScreenIdentifier)
                 isPaused = false
-                hidePosterImage(for: targetScreen.wallpaperScreenIdentifier)
             } else {
                 isPaused = false
                 externalPausedScreenIDs.removeAll()
-                for screen in externalTargetScreens() {
-                    hidePosterImage(for: screen.wallpaperScreenIdentifier)
-                }
             }
+            queueExternalResumeAndHidePoster(
+                screenIndex: screenIdx,
+                targetScreen: targetScreen
+            )
             persistState()
             return
         }
@@ -2829,6 +2804,157 @@ final class VideoWallpaperManager: ObservableObject {
             }
         }
         persistState()
+    }
+
+    private func waitForExternalPlaybackControl() async {
+        while let task = externalPlaybackControlTask {
+            await task.value
+        }
+    }
+
+    private func enqueueExternalPlaybackControl(
+        _ operation: @escaping @MainActor (VideoWallpaperManager) async -> Void
+    ) {
+        externalPlaybackControlGeneration &+= 1
+        let generation = externalPlaybackControlGeneration
+        let previousTask = externalPlaybackControlTask
+        let task = Task { @MainActor [weak self] in
+            if let previousTask {
+                await previousTask.value
+            }
+            guard let self else { return }
+            await operation(self)
+            if self.externalPlaybackControlGeneration == generation {
+                self.externalPlaybackControlTask = nil
+            }
+        }
+        externalPlaybackControlTask = task
+    }
+
+    private func queueExternalPauseWithPoster(
+        screenIndex: Int?,
+        targetScreen: NSScreen?
+    ) {
+        enqueueExternalPlaybackControl { manager in
+            guard manager.externalRenderingActive,
+                  manager.externalRenderer.isRunning else {
+                return
+            }
+
+            let response = await manager.externalRenderer.sendCommand(
+                .pause(screen: screenIndex),
+                screen: screenIndex,
+                timeout: 5.0
+            )
+            guard response?.hasPrefix("OK") == true else {
+                AppLogger.error(.wallpaper, "外部视频暂停命令失败", metadata: [
+                    "screen": screenIndex.map(String.init) ?? "all",
+                    "response": response ?? "nil"
+                ])
+                return
+            }
+
+            let screens = targetScreen.map { [$0] } ?? manager.externalTargetScreens()
+            for screen in screens {
+                await manager.showExternalPosterAwaitingCommand(for: screen)
+            }
+        }
+    }
+
+    private func queueExternalResumeAndHidePoster(
+        screenIndex: Int?,
+        targetScreen: NSScreen?
+    ) {
+        enqueueExternalPlaybackControl { manager in
+            guard manager.externalRenderingActive,
+                  manager.externalRenderer.isRunning else {
+                return
+            }
+
+            let response = await manager.externalRenderer.sendCommand(
+                .resume(screen: screenIndex),
+                screen: screenIndex,
+                timeout: 5.0
+            )
+            guard response?.hasPrefix("OK") == true else {
+                AppLogger.error(.wallpaper, "外部视频恢复命令失败", metadata: [
+                    "screen": screenIndex.map(String.init) ?? "all",
+                    "response": response ?? "nil"
+                ])
+                return
+            }
+
+            let screens = targetScreen.map { [$0] } ?? manager.externalTargetScreens()
+            for screen in screens {
+                await manager.hideExternalPosterAwaitingCommand(for: screen)
+            }
+        }
+    }
+
+    private func showExternalPosterAwaitingCommand(for screen: NSScreen) async {
+        let screenID = screen.wallpaperScreenIdentifier
+        guard externalRenderingActive,
+              let currentScreen = NSScreen.screens.first(where: {
+                  $0.wallpaperScreenIdentifier == screenID
+              }),
+              let requestedPosterURL = posterURL(for: currentScreen) else {
+            return
+        }
+
+        let localURL: URL?
+        if requestedPosterURL.isFileURL,
+           FileManager.default.fileExists(atPath: requestedPosterURL.path) {
+            localURL = requestedPosterURL
+        } else {
+            localURL = await materializeExternalPoster(
+                requestedPosterURL,
+                screenID: screenID
+            )
+        }
+        guard let localURL,
+              externalRenderingActive,
+              posterURL(for: currentScreen)?.standardizedFileURL
+                  == requestedPosterURL.standardizedFileURL,
+              let currentIndex = externalScreenIndex(for: currentScreen) else {
+            return
+        }
+
+        let response = await externalRenderer.sendCommand(
+            .showPoster(screen: currentIndex, path: localURL.path),
+            screen: currentIndex,
+            timeout: 5.0
+        )
+        guard response?.hasPrefix("OK") == true else {
+            AppLogger.error(.wallpaper, "外部视频 poster 显示命令失败", metadata: [
+                "screen": currentIndex,
+                "response": response ?? "nil"
+            ])
+            return
+        }
+    }
+
+    private func hideExternalPosterAwaitingCommand(for screen: NSScreen) async {
+        let screenID = screen.wallpaperScreenIdentifier
+        guard externalRenderingActive,
+              let currentScreen = NSScreen.screens.first(where: {
+                  $0.wallpaperScreenIdentifier == screenID
+              }),
+              let screenIndex = externalScreenIndex(for: currentScreen) else {
+            return
+        }
+
+        let response = await externalRenderer.sendCommand(
+            .hidePoster(screen: screenIndex),
+            screen: screenIndex,
+            timeout: 5.0
+        )
+        guard response?.hasPrefix("OK") == true else {
+            AppLogger.error(.wallpaper, "外部视频 poster 隐藏命令失败", metadata: [
+                "screen": screenIndex,
+                "response": response ?? "nil"
+            ])
+            return
+        }
     }
 
     /// Restores the just-finished video when the scheduler cannot apply any valid
@@ -3927,7 +4053,6 @@ final class VideoWallpaperManager: ObservableObject {
                 for: nil,
                 reason: "appTermination"
             )
-            cancelMenuBarFlashWorkItems(for: nil)
             discardOriginalWallpaperSnapshot()
             posterTasks.values.forEach { $0.cancel() }
             posterTasks.removeAll()
@@ -3952,7 +4077,6 @@ final class VideoWallpaperManager: ObservableObject {
             return
         }
 
-        cancelMenuBarFlashWorkItems(for: nil)
         discardOriginalWallpaperSnapshot()
         posterTasks.values.forEach { $0.cancel() }
         posterTasks.removeAll()
@@ -4052,6 +4176,8 @@ final class VideoWallpaperManager: ObservableObject {
                     ])
                 }
                 let screenID = targetScreen.wallpaperScreenIdentifier
+                posterTasks[screenID]?.cancel()
+                posterTasks.removeValue(forKey: screenID)
                 externalRequestIDByScreenID.removeValue(forKey: screenID)
                 externalPresentedScreenIDs.remove(screenID)
                 externalFirstFrameReadyScreenIDs.remove(screenID)
@@ -4109,6 +4235,8 @@ final class VideoWallpaperManager: ObservableObject {
                     for: nil,
                     reason: "stopNativeVideoWallpaperOnly"
                 )
+                posterTasks.values.forEach { $0.cancel() }
+                posterTasks.removeAll()
                 cancelExternalRendererRestart()
                 externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
                 externalRenderer.stopDaemon()
@@ -4375,8 +4503,6 @@ final class VideoWallpaperManager: ObservableObject {
             "hasPlaybackEndObserver": playbackEndObservers[screenID] != nil
         ])
 
-        cancelMenuBarFlashWorkItems(for: screenID)
-
         playerItemObservers[screenID]?.invalidate()
         playerItemObservers.removeValue(forKey: screenID)
         playerItemObserverTokens.removeValue(forKey: screenID)
@@ -4446,11 +4572,41 @@ final class VideoWallpaperManager: ObservableObject {
         let targetScreens = targetScreen.map { [$0] } ?? NSScreen.screens
         for screen in targetScreens {
             let screenID = screen.wallpaperScreenIdentifier
+            let expectedVideoURL = videoURL(for: screen)?.standardizedFileURL
             posterTasks[screenID]?.cancel()
             posterTasks[screenID] = Task { @MainActor [weak self] in
-                await self?.applyPosterAsDesktopWallpaper(posterURL, targetScreen: screen)
+                await self?.applyPosterAsDesktopWallpaper(
+                    posterURL,
+                    targetScreen: screen,
+                    expectedVideoURL: expectedVideoURL
+                )
                 self?.posterTasks.removeValue(forKey: screenID)
             }
+        }
+    }
+
+    /// Publish the upcoming poster before an animated video transition reaches its
+    /// deferred desktop write. This invalidates any old menu-bar resample work so
+    /// it cannot reapply the previous wallpaper while the new first frame settles.
+    private func registerPendingPosterBackplate(
+        _ posterURL: URL,
+        targetScreen: NSScreen?
+    ) {
+        guard isSystemWallpaperSyncEnabled, !shouldSkipStaticPosterForDynamicLockScreen else {
+            return
+        }
+
+        let fillOptions: [NSWorkspace.DesktopImageOptionKey: Any] = [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleProportionallyUpOrDown.rawValue),
+            .allowClipping: true
+        ]
+        let screens = targetScreen.map { [$0] } ?? NSScreen.screens
+        for screen in screens {
+            DesktopWallpaperSyncManager.shared.registerWallpaperSet(
+                posterURL,
+                for: screen,
+                options: fillOptions
+            )
         }
     }
 
@@ -4480,7 +4636,11 @@ final class VideoWallpaperManager: ObservableObject {
                 guard self.videoURL(for: currentScreen)?.standardizedFileURL == expectedURL else {
                     return
                 }
-                await self.applyPosterAsDesktopWallpaper(posterURL, targetScreen: currentScreen)
+                await self.applyPosterAsDesktopWallpaper(
+                    posterURL,
+                    targetScreen: currentScreen,
+                    expectedVideoURL: expectedURL
+                )
             }
         }
     }
@@ -4623,61 +4783,6 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
-    /// 短暂只露出菜单栏条带下的系统壁纸，迫使菜单栏按当前 poster 重采样。
-    ///
-    /// ## 为什么需要这个（macOS 26 实测结论）
-    /// 菜单栏采样的是**系统壁纸**而非合成画面；视频窗把桌面图层完全盖住时，
-    /// WindowServer 会剔除被遮挡的桌面图层——写 poster / `com.apple.desktop` 通知 /
-    /// 透明 poke 窗 / 状态栏项闪现**全部**不产生 damage，菜单栏永远拿旧缓存，
-    /// 只有「桌面图重新可见」或「App 激活」才会重采样。
-    ///
-    /// ## 丝滑策略（MBLab Phase B）
-    /// 整窗 `alpha=0` 与「缩掉菜单栏条带」都能触发重采样；后者桌面主体始终被视频盖住，
-    /// 用户几乎只看到菜单栏毛玻璃颜色跟着新 poster 更新，而不是整屏闪一下。
-    /// 缩框时冻结 contentView 尺寸，避免 AVPlayerLayer 跟着 reflow 产生可见缩放跳变。
-    ///
-    /// - Parameter delays: 默认单次 0.12s（本地 poster 写入后 WallpaperAgent 多数已就绪）。
-    ///   交叉淡入完成 / 首帧 reveal 等「poster 早已写完」的路径应传接近 0 的 delays，
-    ///   让菜单栏尽量跟视频切换同步；Dock 侧 IconAppearance 仍有约 1–2 帧系统延迟，无法再压。
-    ///   每次切换只闪一次：过渡中反复露出会有"来回卡"的跳变感。
-    private func flashDesktopExposureForMenuBarResample(
-        on screens: [NSScreen],
-        delays: [TimeInterval] = [0.12]
-    ) {
-        // 与 poster 写入同一门槛：系统壁纸同步关闭 / 动态锁屏启用时，
-        // 桌面图不是本次切换的 poster——暴露只会露出无关旧壁纸，
-        // 菜单栏也没有新内容可采，直接跳过。本函数不触碰 setDesktopImageURL。
-        guard isSystemWallpaperSyncEnabled, !shouldSkipStaticPosterForDynamicLockScreen else { return }
-        if externalRenderingActive {
-            for screen in screens {
-                guard let screenIndex = externalScreenIndex(for: screen) else { continue }
-                for delay in delays {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                        guard let self,
-                              self.externalRenderingActive,
-                              self.externalRenderer.isRunning else { return }
-                        self.externalRenderer.sendCommandFireAndForget(
-                            .flashMenuBar(screen: screenIndex)
-                        )
-                    }
-                }
-            }
-            return
-        }
-        for delay in delays {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                // 主进程内回退路径不再缩视频窗露出上边缘条带；改走透明 poke。
-                // poke 内部仍有 macOS 27 防护：App 后台时只发系统通知。
-                DesktopWallpaperSyncManager.shared.requestMenuBarBackdropResamplePoke(on: screens)
-            }
-        }
-    }
-
-    /// 菜单栏条带暴露已移除；保留该入口避免 stop/teardown 路径改动。
-    private func cancelMenuBarFlashWorkItems(for screenID: String?) {
-        _ = screenID
-    }
-
     /// 立即写入系统静态底图。动态壁纸开始展示前必须走这里，保证菜单栏采样
     /// 与直接设置静态壁纸使用同一条提交顺序。
     private func applyPosterAsDesktopWallpaperSync(_ posterURL: URL, targetScreen: NSScreen? = nil) {
@@ -4725,18 +4830,17 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             print("[VideoWallpaperManager] [sync] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
-            // 关键：被视频窗盖住时写 poster 不会触发菜单栏重采样（遮挡剔除），
-            // 只露出菜单栏条带下的新 poster，迫使菜单栏重采样且桌面主体不闪。
-            flashDesktopExposureForMenuBarResample(on: screensToSet)
         } catch {
             print("[VideoWallpaperManager] [sync] Failed to set poster: \(error)")
         }
     }
 
     /// 异步可等待的 poster 设置核心逻辑
-    private func applyPosterAsDesktopWallpaper(_ posterURL: URL, targetScreen: NSScreen? = nil) async {
+    private func applyPosterAsDesktopWallpaper(
+        _ posterURL: URL,
+        targetScreen: NSScreen? = nil,
+        expectedVideoURL: URL? = nil
+    ) async {
         // 检查是否已被取消（快速连续切换壁纸时，旧任务应放弃）
         try? await Task.sleep(nanoseconds: 0)
         guard !Task.isCancelled else { return }
@@ -4763,6 +4867,7 @@ final class VideoWallpaperManager: ObservableObject {
                 let (d, _) = try await URLSession.shared.data(from: posterURL)
                 data = d
             }
+            guard !Task.isCancelled else { return }
 
             // 2. 保存到持久化目录（而不是临时目录）
             // 使用交替槽位避免 macOS 桌面壁纸缓存旧图
@@ -4791,6 +4896,11 @@ final class VideoWallpaperManager: ObservableObject {
                 .allowClipping: true
             ]
             for screen in screensToSet {
+                if let expectedVideoURL,
+                   videoURL(for: screen)?.standardizedFileURL
+                    != expectedVideoURL.standardizedFileURL {
+                    return
+                }
                 try workspace.setDesktopImageURLForAllSpaces(persistentURL, for: screen, options: fillOptions)
                 DesktopWallpaperSyncManager.shared.registerWallpaperSet(
                     persistentURL,
@@ -4799,10 +4909,6 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             print("[VideoWallpaperManager] Set poster as desktop wallpaper for \(screensToSet.count) screen(s)")
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screensToSet)
-            // 同 sync 版：只缩菜单栏条带触发重采样（遮挡剔除规避，桌面主体不闪）。
-            flashDesktopExposureForMenuBarResample(on: screensToSet)
             // macOS 锁屏壁纸默认跟随桌面壁纸，无需额外设置
         } catch {
             print("[VideoWallpaperManager] Failed to set poster: \(error)")
@@ -5596,7 +5702,7 @@ final class VideoWallpaperManager: ObservableObject {
                     posterPath: posterURL(for: screen)?.isFileURL == true
                         ? posterURL(for: screen)?.path
                         : nil,
-                    frame: screen.frame,
+                    frame: screen.wallpaperWindowFrame,
                     muted: isMuted,
                     volume: volume(for: screen),
                     looping: looping,
@@ -5719,7 +5825,7 @@ final class VideoWallpaperManager: ObservableObject {
 
     @discardableResult
     private func synchronizeWindow(_ window: WallpaperVideoWindow, to screen: NSScreen) -> Bool {
-        let targetFrame = screen.frame
+        let targetFrame = screen.wallpaperWindowFrame
         var didAdjust = false
 
         if rectsDiffer(window.frame, targetFrame) {
@@ -5972,16 +6078,6 @@ final class VideoWallpaperManager: ObservableObject {
                             if let window = self.windows[targetScreenID] {
                                 Self.revealDesktopWallpaperWindow(window)
                             }
-                            // 交叉淡入完成、新帧已可见，再强制菜单栏重采样（见 createWindow 首帧注释）。
-                            if let swapScreen = NSScreen.screens.first(where: {
-                                $0.wallpaperScreenIdentifier == targetScreenID
-                            }) {
-                                // poster 在 apply 开头已写入；淡入期间 WallpaperAgent 通常已就绪，
-                                // 完成后立刻缩条带，避免再白等 150ms。
-                                DesktopWallpaperSyncManager.shared
-                                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [swapScreen], delay: 0.02)
-                                self.flashDesktopExposureForMenuBarResample(on: [swapScreen], delays: [0])
-                            }
                             self.scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: reason)
                         }
                     }
@@ -6066,10 +6162,6 @@ final class VideoWallpaperManager: ObservableObject {
                     }
                     finalizeReplacement()
                     Self.revealDesktopWallpaperWindow(existingWindow)
-                    // 立即替换路径不等待首帧，attach 时新帧可能尚未解码；
-                    // 用较长延迟补 poke，避免采到旧桌面后无人再触发重采样。
-                    DesktopWallpaperSyncManager.shared
-                        .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [targetScreen], delay: 0.4)
                     scheduleDisplaySwitchStableRelease(screenID: targetScreenID, reason: "replacementImmediate")
                 }
 
@@ -6392,12 +6484,6 @@ final class VideoWallpaperManager: ObservableObject {
                 "transitionMS": Int(Date().timeIntervalSince(crossfadeCommitStartedAt) * 1_000)
             ])
             NSLog("[VideoWallpaperManager] Global shared-player crossfade completed")
-            // 全局交叉淡入完成、各屏新帧均已可见，统一强制菜单栏重采样
-            // （动画路径 poster 写入常被动态锁屏跳过，此前没有任何首帧后 poke）。
-            // poster 早已写入；全局淡入完成即触发，不再额外拖延。
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: screens, delay: 0.02)
-            self.flashDesktopExposureForMenuBarResample(on: screens, delays: [0])
         }
 
         for screen in screens {
@@ -7156,7 +7242,9 @@ final class VideoWallpaperManager: ObservableObject {
 
     private func createWindow(for screen: NSScreen, videoURL: URL, muted: Bool) throws {
         let screenID = screen.wallpaperScreenIdentifier
-        let frame = screen.frame
+        // 避开菜单栏条带：桌面图在条带下永远可见，菜单栏自动跟随 poster 重采样
+        // （见 NSScreen.wallpaperWindowFrame 注释），不再需要 poke/flash 机制。
+        let frame = screen.wallpaperWindowFrame
 
         let window = WallpaperVideoWindow(
             contentRect: frame,
@@ -7300,27 +7388,12 @@ final class VideoWallpaperManager: ObservableObject {
                     window.orderFrontRegardless()
                 }
                 self.presentedVideoScreenIDs.insert(screenID)
-                // 首帧已提交可见，此刻再强制菜单栏重采样。apply 时 0.12s 的 poke
-                // 常早于首帧合成，采到旧桌面后无人再补，表现为“切视频不刷新，
-                // 点一下其它 App 才好”。
-                // poster 在 apply 前已写入；首帧 reveal 后立刻触发，仅保留极短 WS 合成余量。
-                DesktopWallpaperSyncManager.shared
-                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [transitionScreen], delay: 0.02)
-                self.flashDesktopExposureForMenuBarResample(on: [transitionScreen], delays: [0.04])
                 self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "crossTypeVideoReady")
                 return
             }
 
             self.presentDesktopWallpaperWindow(window, animated: Self.shouldAnimateDesktopPresentation)
             self.presentedVideoScreenIDs.insert(screenID)
-            if let presentedScreen = NSScreen.screens.first(where: {
-                $0.wallpaperScreenIdentifier == screenID
-            }) {
-                // poster 在重建前已写入；首帧 reveal 后立刻触发。
-                DesktopWallpaperSyncManager.shared
-                    .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: [presentedScreen], delay: 0.02)
-                self.flashDesktopExposureForMenuBarResample(on: [presentedScreen], delays: [0.04])
-            }
             self.scheduleDisplaySwitchStableRelease(screenID: screenID, reason: "windowReady")
         }
 
@@ -7525,7 +7598,6 @@ final class VideoWallpaperManager: ObservableObject {
 
     private func teardownAllWindows(preserveDisplaySwitchGate: Bool = false) {
         cancelPendingGlobalVideoTransition(reason: "teardownAllWindows")
-        cancelMenuBarFlashWorkItems(for: nil)
         // 0. 取消上一次未执行的延迟释放，避免快速切换时多组 AVPlayer 并发驻留
         pendingPlayerCleanups.forEach { $0.cancel() }
         pendingPlayerCleanups.removeAll()
@@ -7951,6 +8023,8 @@ final class WallpaperCrossTypeTransitionCoordinator {
     func commitPreparedContent(
         on screens: [NSScreen],
         requestToken: RequestToken? = nil,
+        snapshotFallback: (@MainActor (NSScreen) -> NSImage?)? = nil,
+        revealPreparedContent: (@MainActor () async -> Void)? = nil,
         teardownOldContent: @MainActor () async -> Void
     ) async {
         let transitionStartedAt = Date()
@@ -7970,13 +8044,26 @@ final class WallpaperCrossTypeTransitionCoordinator {
         var snapshots: [String: NSWindow] = [:]
         for (screenID, screen) in uniqueScreens {
             removeSnapshotWindow(for: screenID)
-            if let snapshot = captureDesktopSnapshot(for: screen) {
+            let snapshot = captureDesktopSnapshot(for: screen)
+                ?? snapshotFallback?(screen)
+            if let snapshot {
                 let window = makeSnapshotWindow(for: screen, image: snapshot)
                 snapshotWindowsByScreen[screenID] = window
                 snapshots[screenID] = window
                 window.orderFrontRegardless()
                 window.displayIfNeeded()
             }
+        }
+
+        guard isCurrent(generations: generations) else {
+            removeMatchingSnapshotWindows(snapshots)
+            return
+        }
+        // Reveal the prepared replacement while the old desktop content (or
+        // its captured snapshot) still covers it. This avoids a black
+        // compositor frame even when desktop screenshot permission is absent.
+        if let revealPreparedContent {
+            await revealPreparedContent()
         }
 
         guard isCurrent(generations: generations) else {

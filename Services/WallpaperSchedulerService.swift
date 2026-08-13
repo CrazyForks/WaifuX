@@ -62,6 +62,14 @@ class WallpaperSchedulerService: ObservableObject {
     private var isScreenLocked = false
     private var lastUnlockSwitchTime: Date?
     private var globalRotationTask: Task<Void, Never>?
+    /// A manual next request must not be lost when a timed/on-end global
+    /// rotation is still committing its renderer transaction.
+    private struct PendingManualGlobalRotation {
+        let overrideOrder: ScheduleOrder?
+        let preferImmediatePresentation: Bool
+    }
+    private var activeGlobalRotationIsManual = false
+    private var pendingManualGlobalRotation: PendingManualGlobalRotation?
     /// Cached per-root health result. Candidate construction stays memory-only;
     /// each actual switch forces one root-level check before applying.
     private var managedLibraryRootAvailability: (path: String, isAvailable: Bool)?
@@ -358,7 +366,15 @@ class WallpaperSchedulerService: ObservableObject {
         preferImmediatePresentation: Bool = false
     ) {
         guard globalRotationTask == nil else {
-            print("\(logTag) Global rotation already in flight; coalescing trigger")
+            if requiredMode == nil, !activeGlobalRotationIsManual {
+                pendingManualGlobalRotation = PendingManualGlobalRotation(
+                    overrideOrder: overrideOrder,
+                    preferImmediatePresentation: preferImmediatePresentation
+                )
+                print("\(logTag) Queued manual global next after in-flight rotation")
+            } else {
+                print("\(logTag) Global rotation already in flight; coalescing trigger")
+            }
             return
         }
         guard !isScreenLocked || requiredMode == nil else { return }
@@ -403,15 +419,29 @@ class WallpaperSchedulerService: ObservableObject {
 
         let generation = globalRotationGeneration
         let immediate = preferImmediatePresentation
+        activeGlobalRotationIsManual = preferImmediatePresentation
         let task = Task { [weak self] in
             guard let self else { return }
             defer {
                 if self.globalRotationGeneration == generation {
                     self.globalRotationTask = nil
+                    self.activeGlobalRotationIsManual = false
                     // Re-arm one-shot timer after any global batch (timed or on-end
                     // with web/scene fallback). Event-only modes get nextFire=nil.
                     if self.isRunning {
                         self.scheduleNextChange()
+                    }
+                    if let pending = self.pendingManualGlobalRotation {
+                        self.pendingManualGlobalRotation = nil
+                        if self.config.isGlobalDisplaySyncEnabled {
+                            DispatchQueue.main.async { [weak self] in
+                                self?.applyNextGlobalWallpaper(
+                                    requiredMode: nil,
+                                    overrideOrder: pending.overrideOrder,
+                                    preferImmediatePresentation: pending.preferImmediatePresentation
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1068,6 +1098,8 @@ class WallpaperSchedulerService: ObservableObject {
         let supersededGlobalTask = globalRotationTask
         supersededGlobalTask?.cancel()
         globalRotationTask = nil
+        activeGlobalRotationIsManual = false
+        pendingManualGlobalRotation = nil
         globalOnEndSwitchCooldownUntil = nil
         failedApplyRetryAfter.removeValue(forKey: globalSchedulerStateKey)
 
@@ -1884,12 +1916,12 @@ class WallpaperSchedulerService: ObservableObject {
 
         do {
             print("\(logTag) applyItem via LocalWallpaperApplyService '\(item.title)' → \(screen.localizedName) immediate=\(preferImmediatePresentation)")
-            // 自动轮播保留平滑预热；状态栏/手动「下一张」立刻提交，避免菜单栏路径桌面层挂起。
+            // 手动「下一张」也保留首帧预热和交叉淡入，避免先露黑再切换。
             let ok = try await LocalWallpaperApplyService.apply(
                 localURL: item.fileURL,
                 targetScreens: [screen],
                 options: LocalWallpaperApplyService.Options(
-                    animatedTransition: !preferImmediatePresentation,
+                    animatedTransition: true,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,
@@ -1960,7 +1992,7 @@ class WallpaperSchedulerService: ObservableObject {
                 localURL: item.fileURL,
                 targetScreens: screens,
                 options: LocalWallpaperApplyService.Options(
-                    animatedTransition: !preferImmediatePresentation,
+                    animatedTransition: true,
                     requirePlaybackEndSupport: requirePlaybackEndSupport,
                     muted: true,
                     fallbackPosterURL: nil,

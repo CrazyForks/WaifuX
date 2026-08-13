@@ -358,7 +358,8 @@ enum LocalWallpaperApplyService {
         try await WallpaperEngineXBridge.shared.setWallpaper(
             path: path,
             targetScreens: screens,
-            userProperties: userProps
+            userProperties: userProps,
+            requireAllTargetScreens: options.isGlobalTransaction
         )
         // companion bake：已有产物直接复用；关闭自动烘焙且无产物时临时烘 1 秒，只保留高清 poster。
         if scheduleSceneCompanionBake {

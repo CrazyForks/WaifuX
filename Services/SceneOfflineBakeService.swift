@@ -960,29 +960,16 @@ enum SceneOfflineBakeService {
             .allowClipping: true
         ]
         var appliedScreens = 0
-        var appliedTargetScreens: [NSScreen] = []
         for screen in targetScreens {
             do {
                 try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
                 DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
                 appliedScreens += 1
-                appliedTargetScreens.append(screen)
             } catch {
                 print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
             }
         }
         print("[SceneOfflineBake] set desktop static poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
-        if !appliedTargetScreens.isEmpty {
-            // poster 晚于 scene 首帧写入时，再补一次菜单栏重采样；renderer-owned flash 在
-            // wallpaper-wgpu 下一帧 present 后执行，不依赖主 App 是否前台。
-            DesktopWallpaperSyncManager.shared
-                .scheduleSystemWallpaperRefreshAfterDynamicPresentation(on: appliedTargetScreens, delay: 0.02)
-            WallpaperEngineXBridge.shared.requestSceneMenuBarFlash(
-                on: appliedTargetScreens,
-                reason: reason,
-                backplateURL: posterURL
-            )
-        }
     }
 
     @MainActor

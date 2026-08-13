@@ -44,6 +44,10 @@ public final class LiquidGlassClockOverlayManager {
     /// key = screenID (NSScreen.wallpaperScreenIdentifier)
     private var clockWindows: [String: NSWindow] = [:]
 
+    /// 与每个时钟窗口绑定的固定尺寸 Hosting View。
+    /// 仅替换 rootView，避免配置刷新时反复更换 window.contentView 触发尺寸协商。
+    private var clockHostingViews: [String: NSHostingView<AnyView>] = [:]
+
     /// 当前配置缓存（用于比对变化）
     private var currentConfig: LiquidGlassClockConfiguration = .init()
 
@@ -366,15 +370,15 @@ public final class LiquidGlassClockOverlayManager {
         window.isMovable = false
         window.acceptsMouseMovedEvents = false
 
-        // 构建时钟视图并包装到 NSHostingView
-        let clockView = makeClockView(for: screen, config: config, screenID: screenID)
-        let hostingView = NSHostingView(rootView: clockView)
+        let hostingView = makeHostingView(for: screen, config: config, screenID: screenID)
         hostingView.frame = CGRect(origin: .zero, size: frame.size)
+        hostingView.autoresizingMask = [.width, .height]
         hostingView.wantsLayer = true
         hostingView.layer?.backgroundColor = .clear
         window.contentView = hostingView
 
         clockWindows[screenID] = window
+        clockHostingViews[screenID] = hostingView
         window.orderFront(nil)
     }
 
@@ -389,25 +393,21 @@ public final class LiquidGlassClockOverlayManager {
     /// 更新单个屏幕的窗口内容
     private func updateWindow(for screen: NSScreen, screenID: String? = nil, config: LiquidGlassClockConfiguration) {
         let sid = screenID ?? screen.wallpaperScreenIdentifier
-        guard let window = clockWindows[sid] else { return }
-
-        let clockView = makeClockView(for: screen, config: config, screenID: sid)
-        let hostingView = NSHostingView(rootView: clockView)
-        hostingView.frame = CGRect(origin: .zero, size: screen.frame.size)
-        hostingView.wantsLayer = true
-        hostingView.layer?.backgroundColor = .clear
-
-        window.contentView = hostingView
+        guard let window = clockWindows[sid],
+              let hostingView = clockHostingViews[sid]
+        else { return }
+        hostingView.rootView = AnyView(makeClockView(for: screen, config: config, screenID: sid))
         window.orderFront(nil)
     }
 
     /// 销毁所有屏幕的时钟窗口
     private func destroyAllWindows() {
-        for (screenID, window) in clockWindows {
+        for window in clockWindows.values {
             window.orderOut(nil)
             window.contentView = nil
-            clockWindows.removeValue(forKey: screenID)
         }
+        clockWindows.removeAll()
+        clockHostingViews.removeAll()
         metalViews.removeAll()
     }
 
@@ -517,6 +517,18 @@ public final class LiquidGlassClockOverlayManager {
         return AnyView(Color.clear.ignoresSafeArea())
     }
 
+    private func makeHostingView(
+        for screen: NSScreen,
+        config: LiquidGlassClockConfiguration,
+        screenID: String
+    ) -> NSHostingView<AnyView> {
+        let hostingView = NSHostingView(
+            rootView: AnyView(makeClockView(for: screen, config: config, screenID: screenID))
+        )
+        hostingView.sizingOptions = []
+        return hostingView
+    }
+
     /// 按位置去重：位置相近（5 scene units 以内）的条目视为同一位置的多语言版本，仅保留一个。
     /// 保留策略：选择 renderOrder 更大的（即上层叠加的），避免阴影/描边层（通常 renderOrder 小、颜色暗）
     /// 被保留而主文本层被丢弃导致文字不可见。
@@ -621,12 +633,10 @@ private struct RendererDynamicTextOverlayView: View {
     private let timer = Timer.publish(every: 1, tolerance: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        let _ = print("[Overlay] overlayView body: entries=\(entries.count) images=\(images.count)")
         ZStack(alignment: .topLeading) {
             Color.clear.ignoresSafeArea()
             // 图片覆盖层（印章等），先渲染图片再渲染文字（文字在上层）
-            ForEach(Array(images.enumerated()), id: \.offset) { idx, image in
-                let _ = print("[Overlay] overlayView ForEach image: idx=\(idx) name=\(image.name)")
+            ForEach(Array(images.enumerated()), id: \.offset) { _, image in
                 RendererImageOverlayView(
                     image: image,
                     sceneWidth: sceneWidth,
@@ -730,7 +740,6 @@ private struct RendererImageOverlayView: View {
                 let scale = max(screenScale, 1)
                 let imgW = (image.width ?? 100) * (image.finalScaleX ?? 1) / max(sourceWidth, 1) * availW / Double(scale)
                 let imgH = (image.height ?? 100) * (image.finalScaleY ?? 1) / max(sourceHeight, 1) * availH / Double(scale)
-                let _ = print("[Overlay] render: \(image.name) pos=\(screenPos) size=(\(imgW),\(imgH)) tint=\(tintColor)")
 
                 Image(nsImage: nsImage)
                     .resizable()

@@ -388,10 +388,10 @@ final class VideoRendererProcessController {
         case hidePoster(screen: Int)
         case setGrainOverlay(screen: Int?, intensity: Double)
         case bringToFront(screen: Int)
+        case revealPreparedWindow(screen: Int)
         case commitTransition(requestID: String)
         case cancelTransition(requestID: String)
         case forceCommit(screen: Int?)
-        case flashMenuBar(screen: Int)
         case ping
         case shutdown
     }
@@ -766,6 +766,10 @@ final class VideoRendererProcessController {
             msg.command = "bringToFront"
             msg.screen = screen
 
+        case .revealPreparedWindow(let screen):
+            msg.command = "revealPreparedWindow"
+            msg.screen = screen
+
         case .commitTransition(let requestID):
             msg.command = "commitTransition"
             msg.requestID = requestID
@@ -776,10 +780,6 @@ final class VideoRendererProcessController {
 
         case .forceCommit(let screen):
             msg.command = "forceCommit"
-            msg.screen = screen
-
-        case .flashMenuBar(let screen):
-            msg.command = "flashMenuBar"
             msg.screen = screen
 
         case .ping:
