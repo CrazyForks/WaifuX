@@ -2122,10 +2122,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         } else {
             // 避开顶部菜单栏条带：桌面图在条带下保持可见，菜单栏自动跟随
             // 静态 poster 重采样（与宿主 NSScreen.wallpaperWindowFrame 同策略）。
+            // AppKit 坐标 y 向上，origin.y 是窗口底边：只砍高度、底边不动。
             var wallpaperFrame = targetScreen.frame
             let menuBarHeight = targetScreen.frame.maxY - targetScreen.visibleFrame.maxY
             if menuBarHeight > 1 {
-                wallpaperFrame.origin.y += menuBarHeight
                 wallpaperFrame.size.height -= menuBarHeight
             }
             w.setFrame(wallpaperFrame, display: true)

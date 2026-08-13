@@ -180,11 +180,14 @@ extension NSScreen {
     /// 让桌面图在菜单栏条带下永远可见后，poster 写入即产生真实 damage，
     /// 菜单栏自动重采样，无需再依赖 poke/flash 窗口机制。
     /// 无菜单栏的副屏 / auto-hide 菜单栏隐藏时 barHeight 为 0，保持全屏。
+    ///
+    /// 注意：AppKit 窗口坐标 y 向上，origin.y 是窗口底边。菜单栏在屏幕顶部，
+    /// 所以只砍 `size.height`、**底边 origin.y 保持不变**；若误把 origin.y
+    /// 上移，底部会漏出约一个菜单栏高度的桌面。
     var wallpaperWindowFrame: NSRect {
         var f = frame
         let barHeight = frame.maxY - visibleFrame.maxY
         if barHeight > 1 {
-            f.origin.y += barHeight
             f.size.height -= barHeight
         }
         return f
