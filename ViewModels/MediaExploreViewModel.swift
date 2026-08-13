@@ -1181,7 +1181,7 @@ final class MediaExploreViewModel: ObservableObject {
             mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localVideoURL)
             let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
             // 用户可见切换：首帧预热 + 短黑场交接，避免视频/跨类型切换露黑。
-            try videoWallpaperManager.applyVideoWallpaper(
+            try await videoWallpaperManager.applyVideoWallpaper(
                 from: localVideoURL,
                 posterURL: posterURL,
                 muted: muted,
@@ -1199,7 +1199,7 @@ final class MediaExploreViewModel: ObservableObject {
                 print("[MediaExploreViewModel] Using local media file: \(localURL.path)")
                 mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localURL)
                 let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localURL, fallbackPosterURL: item.posterURL)
-                try videoWallpaperManager.applyVideoWallpaper(
+                try await videoWallpaperManager.applyVideoWallpaper(
                     from: localURL,
                     posterURL: posterURL,
                     muted: muted,
@@ -1220,7 +1220,7 @@ final class MediaExploreViewModel: ObservableObject {
             using: self
         )
         let posterURL = await VideoThumbnailCache.shared.lockScreenPosterURL(forLocalVideo: localVideoURL, fallbackPosterURL: item.posterURL)
-        try videoWallpaperManager.applyVideoWallpaper(
+        try await videoWallpaperManager.applyVideoWallpaper(
             from: localVideoURL,
             posterURL: posterURL,
             muted: muted,
@@ -1528,6 +1528,10 @@ final class MediaExploreViewModel: ObservableObject {
                         localFileURL: fileLocation.url,
                         folderID: folderID
                     )
+                    try? await cacheService.removeCachedFile(
+                        named: fileLocation.url.lastPathComponent,
+                        in: "Media"
+                    )
                 }
 
                 return fileLocation.url
@@ -1542,10 +1546,12 @@ final class MediaExploreViewModel: ObservableObject {
             throw DownloadError.permissionDenied
         }
 
-        let cachedURL: URL
+        let cachedURL: URL?
+        let downloadedData: Data?
         if let existingCachedURL = await cacheService.cachedFileURL(named: fileURL.lastPathComponent, in: "Media"),
            !Self.localMediaFileLooksCorrupt(existingCachedURL) {
             cachedURL = existingCachedURL
+            downloadedData = nil
             if let taskID {
                 updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.72 : 1.0)
             }
@@ -1579,7 +1585,13 @@ final class MediaExploreViewModel: ObservableObject {
             } else if Self.looksLikeHTMLPayload(data) {
                 throw NetworkError.invalidResponse
             }
-            cachedURL = try await cacheService.cacheFile(data, named: fileURL.lastPathComponent, in: "Media")
+            if saveToDownloads {
+                cachedURL = nil
+                downloadedData = data
+            } else {
+                cachedURL = try await cacheService.cacheFile(data, named: fileURL.lastPathComponent, in: "Media")
+                downloadedData = nil
+            }
             if let taskID {
                 updateDownloadProgress(taskID: taskID, progress: saveToDownloads ? 0.9 : 1.0)
             }
@@ -1596,17 +1608,31 @@ final class MediaExploreViewModel: ObservableObject {
 
                 // 目标若仍是旧坏文件，必须覆盖，不能 early-return
                 if FileManager.default.fileExists(atPath: fileURL.path) {
+                    let incomingSize = downloadedData.map { Int64($0.count) }
+                        ?? ((try? FileManager.default.attributesOfItem(atPath: cachedURL?.path ?? "")[.size] as? NSNumber)?
+                            .int64Value)
                     if Self.localMediaFileLooksCorrupt(fileURL)
-                        || (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value
-                            != (try? FileManager.default.attributesOfItem(atPath: cachedURL.path)[.size] as? NSNumber)?.int64Value {
+                        || (incomingSize != nil
+                            && (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?
+                                .int64Value != incomingSize) {
                         try? FileManager.default.removeItem(at: fileURL)
                         FileExistenceCache.shared.invalidate(atPath: fileURL.path)
                     }
                 }
 
                 if !FileManager.default.fileExists(atPath: fileURL.path) {
-                    let cachedData = try await cachedURL.readDataAsync()
-                    try await cachedData.writeAsync(to: fileURL, options: .atomic)
+                    if let downloadedData {
+                        try await downloadedData.writeAsync(to: fileURL, options: .atomic)
+                    } else if let cachedURL {
+                        let cachedData = try await cachedURL.readDataAsync()
+                        try await cachedData.writeAsync(to: fileURL, options: .atomic)
+                    } else {
+                        throw DownloadError.writeFailed(NSError(
+                            domain: "WaifuX",
+                            code: -1,
+                            userInfo: [NSLocalizedDescriptionKey: "Missing media download source"]
+                        ))
+                    }
                 }
 
                 guard FileManager.default.fileExists(atPath: fileURL.path),
@@ -1637,10 +1663,26 @@ final class MediaExploreViewModel: ObservableObject {
                 localFileURL: fileURL,
                 folderID: folderID
             )
+            if let cachedURL {
+                await removeMediaCacheIfPresent(for: cachedURL)
+            }
             return fileURL
         }
 
+        guard let cachedURL else {
+            throw DownloadError.writeFailed(NSError(
+                domain: "WaifuX",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Missing cached media file"]
+            ))
+        }
         return cachedURL
+    }
+
+    /// 入库完成后，删除同一下载产生的临时中转文件。
+    /// `saveToDownloads == false` 的普通下载仍保留 Cache 复用能力。
+    private func removeMediaCacheIfPresent(for cachedURL: URL) async {
+        try? await cacheService.removeCachedFile(at: cachedURL)
     }
 
     private func updateDownloadProgress(taskID: String, progress: Double) {

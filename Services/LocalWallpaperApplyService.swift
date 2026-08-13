@@ -248,7 +248,7 @@ enum LocalWallpaperApplyService {
                 && screens.count > 1)
             || (coversAllScreens && screens.count > 1)
         if useShared {
-            try VideoWallpaperManager.shared.applyVideoWallpaper(
+            try await VideoWallpaperManager.shared.applyVideoWallpaper(
                 from: videoURL,
                 posterURL: immediatePosterURL,
                 muted: options.muted,
@@ -257,7 +257,7 @@ enum LocalWallpaperApplyService {
                 usesSharedVideoDecoder: true
             )
         } else if coversAllScreens {
-            try VideoWallpaperManager.shared.applyVideoWallpaper(
+            try await VideoWallpaperManager.shared.applyVideoWallpaper(
                 from: videoURL,
                 posterURL: immediatePosterURL,
                 muted: options.muted,
@@ -266,7 +266,7 @@ enum LocalWallpaperApplyService {
                 usesSharedVideoDecoder: false
             )
         } else {
-            try VideoWallpaperManager.shared.applyVideoWallpaper(
+            try await VideoWallpaperManager.shared.applyVideoWallpaper(
                 from: videoURL,
                 posterURL: immediatePosterURL,
                 muted: options.muted,

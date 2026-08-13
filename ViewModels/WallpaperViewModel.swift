@@ -153,7 +153,6 @@ class WallpaperViewModel: ObservableObject {
     private let schedulerService = WallpaperSchedulerService.shared
 
     private let networkService = NetworkService.shared
-    private let cacheService = CacheService.shared
     private let sourceManager = WallpaperSourceManager.shared
 
     /// 壁纸源切换消息（供 UI 层显示 Toast）
@@ -1589,12 +1588,7 @@ class WallpaperViewModel: ObservableObject {
         let imageData = try await downloadWallpaperData(wallpaper, taskID: taskID)
         try Task.checkCancellation()
 
-        guard let originalURL = wallpaper.fullImageURL else {
-            throw NetworkError.invalidResponse
-        }
-
         updateDownloadProgress(taskID: taskID, progress: 0.92)
-        try await cacheService.cacheImage(imageData, for: originalURL)
 
         let fileURL = downloadPathManager.wallpaperFileURL(
             id: wallpaper.id,
@@ -1619,6 +1613,34 @@ class WallpaperViewModel: ObservableObject {
         }
 
         wallpaperLibrary.recordDownload(wallpaper, fileURL: fileURL, folderID: folderID)
+    }
+
+    /// 为「设为壁纸」准备一个持久化的本地文件。
+    /// 直接设置网络壁纸属于明确的用户保存动作，不能只落到临时目录。
+    func localWallpaperFileURLForApplication(_ wallpaper: Wallpaper) async throws -> URL {
+        if let localURL = wallpaperLibrary.localFileURLIfAvailable(for: wallpaper) {
+            return localURL
+        }
+
+        if wallpaper.id.hasPrefix("local_"),
+           let localURL = wallpaper.fullImageURL,
+           localURL.isFileURL,
+           FileManager.default.fileExists(atPath: localURL.path) {
+            wallpaperLibrary.recordDownload(wallpaper, fileURL: localURL)
+            return localURL
+        }
+
+        try await downloadWallpaper(wallpaper)
+        guard let localURL = wallpaperLibrary.localFileURLIfAvailable(for: wallpaper) else {
+            throw DownloadError.writeFailed(
+                NSError(
+                    domain: "WaifuX",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Wallpaper was downloaded but not added to the library"]
+                )
+            )
+        }
+        return localURL
     }
 
     func downloadWallpaperData(_ wallpaper: Wallpaper, taskID: String? = nil) async throws -> Data {
@@ -2055,9 +2077,7 @@ class WallpaperViewModel: ObservableObject {
 
     // MARK: - 设为壁纸（通过 Wallpaper 对象）
     func setAsWallpaper(_ wallpaper: Wallpaper, targetScreen: NSScreen? = nil) async throws {
-        guard let imageURL = wallpaper.fullImageURL else {
-            throw NSError(domain: "WaifuX", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid image URL"])
-        }
+        let imageURL = try await localWallpaperFileURLForApplication(wallpaper)
         let screen = targetScreen ?? NSScreen.main
         guard let screen else {
             throw NSError(domain: "WaifuX", code: 2, userInfo: [NSLocalizedDescriptionKey: "No screen available"])

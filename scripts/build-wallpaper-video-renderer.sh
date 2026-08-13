@@ -15,7 +15,7 @@ swiftc -parse-as-library \
   -Xlinker -rpath -Xlinker @loader_path \
   -Xlinker -rpath -Xlinker @loader_path/Resources \
   -Xlinker -rpath -Xlinker @loader_path/../Resources \
-  -framework AppKit -framework AVFoundation -framework CoreGraphics -framework Combine \
+  -framework AppKit -framework AVFoundation -framework CoreGraphics -framework Combine -framework ExceptionHandling \
   -o Resources/wallpaper-video-renderer \
   wallpaper-video-renderer.swift
 

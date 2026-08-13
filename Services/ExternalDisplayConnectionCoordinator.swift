@@ -114,7 +114,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     }
 
     private func restorePreviousDisplayStateIfAvailable(for screen: NSScreen) async -> Bool {
-        if VideoWallpaperManager.shared.restorePreviousVideoWallpaperIfAvailable(for: screen) {
+        if await VideoWallpaperManager.shared.restorePreviousVideoWallpaperIfAvailable(for: screen) {
             return true
         }
         if await WallpaperEngineXBridge.shared.restorePreviousWallpaperIfAvailable(for: screen) {

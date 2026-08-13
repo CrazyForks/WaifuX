@@ -593,18 +593,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                                 NotchOverlayManager.shared.setEnabled(true)
                             }
 
-                            // 恢复动态壁纸（如果用户之前设置了）
-                            if WallpaperEngineXBridge.shared.hasPersistedRestoreState() {
-                                Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
-                            } else {
-                                VideoWallpaperManager.shared.restoreIfNeeded()
-                                if !VideoWallpaperManager.shared.isVideoWallpaperActive {
-                                    Task { await WallpaperEngineXBridge.shared.restoreIfNeeded() }
+                            // 先完成动态壁纸恢复，再恢复静态 overlay。视频 renderer 的启动
+                            // 现在是异步的；若静态层先出现，会短暂抢占桌面并造成闪屏。
+                            Task { @MainActor in
+                                if WallpaperEngineXBridge.shared.hasPersistedRestoreState() {
+                                    await WallpaperEngineXBridge.shared.restoreIfNeeded()
+                                } else {
+                                    await VideoWallpaperManager.shared.restoreIfNeeded()
+                                    if !VideoWallpaperManager.shared.isVideoWallpaperActive {
+                                        await WallpaperEngineXBridge.shared.restoreIfNeeded()
+                                    }
                                 }
+                                StaticImageWallpaperOverlayManager.shared.restoreIfNeeded()
                             }
-
-                            // 恢复静态壁纸 overlay（系统壁纸同步关闭时，用 overlay 重新显示上次静态图）
-                            StaticImageWallpaperOverlayManager.shared.restoreIfNeeded()
 
                             // 恢复动态壁纸自动暂停设置
                             DynamicWallpaperAutoPauseManager.shared.restoreSettings()

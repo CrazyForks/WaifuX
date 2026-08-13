@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 actor CacheService {
     static let shared = CacheService()
@@ -18,25 +17,6 @@ actor CacheService {
         try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
     }
 
-    /// 生成基于完整 URL 的缓存键（使用 SHA256 哈希）
-    private func cacheKey(for url: URL) -> String {
-        let urlString = url.absoluteString
-        // 使用 SHA256 生成唯一标识符
-        let data = Data(urlString.utf8)
-        let hash = SHA256.hash(data: data)
-        // 取前 16 个字符作为文件名（足够唯一且避免文件名过长）
-        let hashString = hash.compactMap { String(format: "%02x", $0) }.joined().prefix(16)
-        // 保留原始扩展名（如果有）
-        let ext = url.pathExtension.isEmpty ? "" : ".\(url.pathExtension)"
-        return "\(hashString)\(ext)"
-    }
-
-    func cacheImage(_ data: Data, for url: URL) async throws {
-        let fileName = cacheKey(for: url)
-        let fileURL = cacheDirectory.appendingPathComponent(fileName)
-        try data.write(to: fileURL)
-    }
-
     func cacheFile(_ data: Data, named fileName: String, in directoryName: String) async throws -> URL {
         let directoryURL = cacheDirectory.appendingPathComponent(directoryName, isDirectory: true)
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -46,18 +26,29 @@ actor CacheService {
         return fileURL
     }
 
-    func getCachedImage(for url: URL) -> Data? {
-        let fileName = cacheKey(for: url)
-        let fileURL = cacheDirectory.appendingPathComponent(fileName)
-        return try? Data(contentsOf: fileURL)
-    }
-
     func cachedFileURL(named fileName: String, in directoryName: String) -> URL? {
         let fileURL = cacheDirectory
             .appendingPathComponent(directoryName, isDirectory: true)
             .appendingPathComponent(fileName)
 
         return fileManager.fileExists(atPath: fileURL.path) ? fileURL : nil
+    }
+
+    /// 删除一个由 CacheService 创建的临时文件。
+    /// 只接受 cacheDirectory 内的路径，避免调用方误删资料库文件。
+    func removeCachedFile(at fileURL: URL) throws {
+        let cachePath = cacheDirectory.standardizedFileURL.path
+        let filePath = fileURL.standardizedFileURL.path
+        guard filePath.hasPrefix(cachePath + "/") else { return }
+        guard fileManager.fileExists(atPath: filePath) else { return }
+        try fileManager.removeItem(atPath: filePath)
+    }
+
+    func removeCachedFile(named fileName: String, in directoryName: String) throws {
+        let fileURL = cacheDirectory
+            .appendingPathComponent(directoryName, isDirectory: true)
+            .appendingPathComponent(fileName)
+        try removeCachedFile(at: fileURL)
     }
 
     func clearCache() async throws {

@@ -65,6 +65,11 @@ final class VideoWallpaperManager: ObservableObject {
     private var externalTransitionGeneration: UInt64 = 0
     private var externalRendererRestartAttempt = 0
     private var externalRendererRestartWorkItem: DispatchWorkItem?
+    /// IPC 改为 async 后，连续的 set / 显示器重连可能在等待 socket 回包时交错，
+    /// 从而覆盖彼此的 per-screen 映射。只串行实际修改 renderer 状态的短事务；
+    /// 首帧交接仍由独立任务等待，不持有这个门。
+    private var externalRendererTransactionActive = false
+    private var externalRendererTransactionWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// 记录最近一次成功挂载视频壁纸时的目标显示器配置。
     /// 某些窗口激活/隐藏路径会误触发 `didChangeScreenParametersNotification`，
@@ -631,7 +636,7 @@ final class VideoWallpaperManager: ObservableObject {
     }
 
     /// 外接屏重连时按物理指纹恢复之前分配给这块屏的视频壁纸。
-    func restorePreviousVideoWallpaperIfAvailable(for screen: NSScreen) -> Bool {
+    func restorePreviousVideoWallpaperIfAvailable(for screen: NSScreen) async -> Bool {
         let screenID = screen.wallpaperScreenIdentifier
         let fingerprint = screen.wallpaperScreenFingerprint
         let hasPreviousState = videoTargetScreenIDs.contains(screenID)
@@ -653,7 +658,7 @@ final class VideoWallpaperManager: ObservableObject {
         do {
             if useExternalVideoRenderer {
                 guard let videoURL = videoURL(for: screen) else { return false }
-                try applyVideoWallpaperViaExternalRenderer(
+                try await applyVideoWallpaperViaExternalRenderer(
                     from: videoURL,
                     posterURL: posterURL(for: screen),
                     muted: isMuted,
@@ -815,10 +820,12 @@ final class VideoWallpaperManager: ObservableObject {
                    for: screenIndex ?? -1,
                    stableScreenID: stableScreenID
                ) {
-                retryExternalScreenWithDedicatedDecoder(
-                    screen: screen,
-                    failedRequestID: requestID
-                )
+                Task { @MainActor [weak self] in
+                    await self?.retryExternalScreenWithDedicatedDecoder(
+                        screen: screen,
+                        failedRequestID: requestID
+                    )
+                }
             }
         case .terminated(let status, let expected):
             guard !expected else { return }
@@ -835,7 +842,7 @@ final class VideoWallpaperManager: ObservableObject {
     private func retryExternalScreenWithDedicatedDecoder(
         screen: NSScreen,
         failedRequestID: String
-    ) {
+    ) async {
         let screenID = screen.wallpaperScreenIdentifier
         guard externalRenderingActive,
               externalRenderer.isRunning,
@@ -876,7 +883,7 @@ final class VideoWallpaperManager: ObservableObject {
             globalPaused: isPaused,
             screenPaused: externalPausedScreenIDs.contains(screenID)
         )
-        let response = externalRenderer.sendCommandSync(
+        let response = await externalRenderer.sendCommand(
             cmd,
             screen: screenIndex,
             timeout: 10.0
@@ -906,14 +913,17 @@ final class VideoWallpaperManager: ObservableObject {
                   !self.externalRenderer.isRunning else {
                 return
             }
-            guard self.externalRenderer.startDaemon() else {
-                self.scheduleExternalRendererRestart(afterExitStatus: status)
-                return
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard await self.externalRenderer.startDaemon() else {
+                    self.scheduleExternalRendererRestart(afterExitStatus: status)
+                    return
+                }
+                await self.reconfigureExternalRendererForCurrentScreens(
+                    reason: "rendererRestart",
+                    clearExistingRendererState: false
+                )
             }
-            self.reconfigureExternalRendererForCurrentScreens(
-                reason: "rendererRestart",
-                clearExistingRendererState: false
-            )
         }
         externalRendererRestartWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
@@ -1385,20 +1395,23 @@ final class VideoWallpaperManager: ObservableObject {
             return
         }
 
-        do {
-            try applyVideoWallpaper(
-                from: sourceVideoURL,
-                posterURL: sourcePosterURL,
-                muted: isMuted,
-                targetScreen: nil,
-                animatedTransition: false,
-                usesSharedVideoDecoder: enabled
-            )
-        } catch {
-            AppLogger.error(.wallpaper, "Failed to change shared video decoder mode", metadata: [
-                "enabled": enabled,
-                "error": error.localizedDescription,
-            ])
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.applyVideoWallpaper(
+                    from: sourceVideoURL,
+                    posterURL: sourcePosterURL,
+                    muted: self.isMuted,
+                    targetScreen: nil,
+                    animatedTransition: false,
+                    usesSharedVideoDecoder: enabled
+                )
+            } catch {
+                AppLogger.error(.wallpaper, "Failed to change shared video decoder mode", metadata: [
+                    "enabled": enabled,
+                    "error": error.localizedDescription,
+                ])
+            }
         }
     }
 
@@ -1414,14 +1427,17 @@ final class VideoWallpaperManager: ObservableObject {
             // Force rebuild so newly connected screens get a window layer.
             videoTargetScreenIDs.removeAll()
         }
-        try? applyVideoWallpaper(
-            from: currentVideoURL,
-            posterURL: currentPosterURL,
-            muted: isMuted,
-            targetScreens: NSScreen.screens,
-            animatedTransition: false,
-            usesSharedVideoDecoder: true
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await self.applyVideoWallpaper(
+                from: currentVideoURL,
+                posterURL: currentPosterURL,
+                muted: self.isMuted,
+                targetScreens: NSScreen.screens,
+                animatedTransition: false,
+                usesSharedVideoDecoder: true
+            )
+        }
     }
 
     func applyVideoWallpaper(
@@ -1432,9 +1448,9 @@ final class VideoWallpaperManager: ObservableObject {
         animatedTransition: Bool = false,
         usesSharedVideoDecoder: Bool = false,
         forceRebuild: Bool = false
-    ) throws {
+    ) async throws {
         if usesSharedVideoDecoder {
-            try applyVideoWallpaper(
+            try await applyVideoWallpaper(
                 from: localFileURL,
                 posterURL: posterURL,
                 muted: muted,
@@ -1447,7 +1463,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
         if let screens = targetScreens, !screens.isEmpty {
             for screen in screens {
-                try applyVideoWallpaper(
+                try await applyVideoWallpaper(
                     from: localFileURL,
                     posterURL: posterURL,
                     muted: muted,
@@ -1458,7 +1474,7 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
         } else {
-            try applyVideoWallpaper(
+            try await applyVideoWallpaper(
                 from: localFileURL,
                 posterURL: posterURL,
                 muted: muted,
@@ -1478,7 +1494,7 @@ final class VideoWallpaperManager: ObservableObject {
         animatedTransition: Bool = false,
         usesSharedVideoDecoder: Bool = false,
         forceRebuild: Bool = false
-    ) throws {
+    ) async throws {
         AppLogger.error(.wallpaper, "applyVideoWallpaper 开始", metadata: [
             "video": localFileURL.lastPathComponent,
             "targetScreen": targetScreen?.localizedName ?? "nil(全部)"
@@ -1507,7 +1523,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
 
         if useExternalVideoRenderer {
-            try applyVideoWallpaperViaExternalRenderer(
+            try await applyVideoWallpaperViaExternalRenderer(
                 from: localFileURL,
                 posterURL: posterURL,
                 muted: muted,
@@ -1859,11 +1875,7 @@ final class VideoWallpaperManager: ObservableObject {
         isPaused = false
 
         if targetScreen == nil {
-            _ = externalRenderer.sendCommandSync(
-                .resume(screen: nil),
-                screen: nil,
-                timeout: 2.0
-            )
+            externalRenderer.sendCommandFireAndForget(.resume(screen: nil))
             externalPausedScreenIDs.subtract(
                 screens.map(\.wallpaperScreenIdentifier)
             )
@@ -1872,11 +1884,7 @@ final class VideoWallpaperManager: ObservableObject {
         for screen in screens {
             let screenID = screen.wallpaperScreenIdentifier
             if targetScreen != nil, let screenIndex = externalScreenIndex(for: screen) {
-                _ = externalRenderer.sendCommandSync(
-                    .resume(screen: screenIndex),
-                    screen: screenIndex,
-                    timeout: 2.0
-                )
+                externalRenderer.sendCommandFireAndForget(.resume(screen: screenIndex))
                 externalPausedScreenIDs.remove(screenID)
             }
             hidePosterImage(for: screenID)
@@ -1940,7 +1948,29 @@ final class VideoWallpaperManager: ObservableObject {
         usesSharedVideoDecoder: Bool,
         animatedTransition: Bool,
         forceRebuild: Bool
-    ) throws {
+    ) async throws {
+        try await withExternalRendererTransaction {
+            try await self.applyVideoWallpaperViaExternalRendererLocked(
+                from: localFileURL,
+                posterURL: posterURL,
+                muted: muted,
+                targetScreen: targetScreen,
+                usesSharedVideoDecoder: usesSharedVideoDecoder,
+                animatedTransition: animatedTransition,
+                forceRebuild: forceRebuild
+            )
+        }
+    }
+
+    private func applyVideoWallpaperViaExternalRendererLocked(
+        from localFileURL: URL,
+        posterURL: URL?,
+        muted: Bool,
+        targetScreen: NSScreen?,
+        usesSharedVideoDecoder: Bool,
+        animatedTransition: Bool,
+        forceRebuild: Bool
+    ) async throws {
         AppLogger.info(.wallpaper, "applyVideoWallpaperViaExternalRenderer", metadata: [
             "video": localFileURL.lastPathComponent,
             "targetScreen": targetScreen?.localizedName ?? "nil(全部)"
@@ -2031,7 +2061,7 @@ final class VideoWallpaperManager: ObservableObject {
 
         // 确保子进程已启动
         if !externalRenderer.isRunning {
-            guard externalRenderer.startDaemon() else {
+            guard await externalRenderer.startDaemon() else {
                 restoreExternalTransitionSourceState(externalRollback)
                 releaseExternalDisplaySwitchGate(
                     for: captureScreens,
@@ -2132,7 +2162,11 @@ final class VideoWallpaperManager: ObservableObject {
                 globalPaused: false,
                 screenPaused: false
             )
-            let response = externalRenderer.sendCommandSync(cmd, screen: screenIndex, timeout: 10.0)
+            let response = await externalRenderer.sendCommand(
+                cmd,
+                screen: screenIndex,
+                timeout: 10.0
+            )
             if response?.hasPrefix("OK") != true {
                 AppLogger.error(.wallpaper, "子进程 set 命令失败: \(response ?? "nil")")
                 if externalRequestIDByScreenID[screenID] == requestID {
@@ -2181,7 +2215,7 @@ final class VideoWallpaperManager: ObservableObject {
             AppLogger.error(.wallpaper, "外部视频至少一块屏幕设置失败", metadata: [
                 "screens": failedScreens.sorted().joined(separator: ",")
             ])
-            rollbackExternalVideoTransaction(
+            await rollbackExternalVideoTransaction(
                 requestID: requestID,
                 rollback: externalRollback,
                 targetScreens: captureScreens,
@@ -2218,17 +2252,9 @@ final class VideoWallpaperManager: ObservableObject {
         let grainIntensity = grainEnabled
             ? ArcBackgroundSettings.shared.grainIntensity
             : 0
-        let grainResponse = externalRenderer.sendCommandSync(
-            .setGrainOverlay(screen: nil, intensity: grainIntensity),
-            screen: nil,
-            timeout: 2.0
+        externalRenderer.sendCommandFireAndForget(
+            .setGrainOverlay(screen: nil, intensity: grainIntensity)
         )
-        if grainResponse?.hasPrefix("OK") != true {
-            AppLogger.error(.wallpaper, "外部视频 setGrainOverlay 失败", metadata: [
-                "response": grainResponse ?? "nil",
-                "intensity": grainIntensity
-            ])
-        }
 
         // 更新持久化状态
         if targetScreen == nil {
@@ -2301,7 +2327,7 @@ final class VideoWallpaperManager: ObservableObject {
                 guard self.externalTransitionGeneration == generation else { return }
 
                 if !uniqueVideoScreens.isEmpty {
-                    let response = self.externalRenderer.sendCommandSync(
+                    let response = await self.externalRenderer.sendCommand(
                         .commitTransition(requestID: requestID),
                         screen: nil,
                         timeout: 2.0
@@ -2363,7 +2389,7 @@ final class VideoWallpaperManager: ObservableObject {
                     )
             } catch {
                 guard self.externalTransitionGeneration == generation else { return }
-                self.rollbackExternalVideoTransaction(
+                await self.rollbackExternalVideoTransaction(
                     requestID: requestID,
                     rollback: rollback,
                     targetScreens: allTargetScreens,
@@ -2396,16 +2422,14 @@ final class VideoWallpaperManager: ObservableObject {
         targetScreens: [NSScreen],
         preservedVideoScreens: [NSScreen],
         reason: String
-    ) {
+    ) async {
         let preservedScreenIDs = Set(
             preservedVideoScreens.map(\.wallpaperScreenIdentifier)
         )
 
         if externalRenderer.isRunning, !preservedScreenIDs.isEmpty {
-            _ = externalRenderer.sendCommandSync(
-                .cancelTransition(requestID: requestID),
-                screen: nil,
-                timeout: 2.0
+            externalRenderer.sendCommandFireAndForget(
+                .cancelTransition(requestID: requestID)
             )
         }
 
@@ -2413,11 +2437,7 @@ final class VideoWallpaperManager: ObservableObject {
             for screen in targetScreens
                 where !preservedScreenIDs.contains(screen.wallpaperScreenIdentifier) {
                 guard let screenIndex = externalScreenIndex(for: screen) else { continue }
-                _ = externalRenderer.sendCommandSync(
-                    .stop(screen: screenIndex),
-                    screen: screenIndex,
-                    timeout: 2.0
-                )
+                externalRenderer.sendCommandFireAndForget(.stop(screen: screenIndex))
             }
         }
 
@@ -2428,11 +2448,7 @@ final class VideoWallpaperManager: ObservableObject {
         restoreExternalTransitionSourceState(rollback)
 
         if externalRenderer.isRunning, rollback.externalRenderingActive {
-            _ = externalRenderer.sendCommandSync(
-                .setMuted(rollback.isMuted),
-                screen: nil,
-                timeout: 2.0
-            )
+            externalRenderer.sendCommandFireAndForget(.setMuted(rollback.isMuted))
             for screen in targetScreens {
                 let screenID = screen.wallpaperScreenIdentifier
                 let hasRestoredVideo =
@@ -2444,28 +2460,18 @@ final class VideoWallpaperManager: ObservableObject {
                       let screenIndex = externalScreenIndex(for: screen) else {
                     continue
                 }
-                _ = externalRenderer.sendCommandSync(
+                externalRenderer.sendCommandFireAndForget(
                     .setVolume(
                         screen: screenIndex,
                         volume: volume(for: screen)
-                    ),
-                    screen: screenIndex,
-                    timeout: 2.0
+                    )
                 )
                 if rollback.isPaused
                     || rollback.externalPausedScreenIDs.contains(screenID) {
-                    _ = externalRenderer.sendCommandSync(
-                        .pause(screen: screenIndex),
-                        screen: screenIndex,
-                        timeout: 2.0
-                    )
+                    externalRenderer.sendCommandFireAndForget(.pause(screen: screenIndex))
                     showPosterImage(for: screenID)
                 } else {
-                    _ = externalRenderer.sendCommandSync(
-                        .resume(screen: screenIndex),
-                        screen: screenIndex,
-                        timeout: 2.0
-                    )
+                    externalRenderer.sendCommandFireAndForget(.resume(screen: screenIndex))
                     hidePosterImage(for: screenID)
                 }
                 applyCropToScreen(screen)
@@ -2625,19 +2631,13 @@ final class VideoWallpaperManager: ObservableObject {
             pendingScreens.compactMap { externalRequestIDByScreenID[$0.wallpaperScreenIdentifier] }
         )
         for requestID in pendingRequestIDs {
-            _ = externalRenderer.sendCommandSync(
-                .cancelTransition(requestID: requestID),
-                screen: nil,
-                timeout: 2.0
+            externalRenderer.sendCommandFireAndForget(
+                .cancelTransition(requestID: requestID)
             )
         }
         for screen in pendingScreens {
             if let screenIndex = externalScreenIndex(for: screen) {
-                _ = externalRenderer.sendCommandSync(
-                    .stop(screen: screenIndex),
-                    screen: screenIndex,
-                    timeout: 2.0
-                )
+                externalRenderer.sendCommandFireAndForget(.stop(screen: screenIndex))
             }
             let screenID = screen.wallpaperScreenIdentifier
             externalRequestIDByScreenID.removeValue(forKey: screenID)
@@ -2683,7 +2683,7 @@ final class VideoWallpaperManager: ObservableObject {
         isMuted = muted
         UserDefaults.standard.set(muted, forKey: "wallpaper_is_muted")
         if externalRenderingActive {
-            externalRenderer.sendCommandSync(.setMuted(muted), screen: nil)
+            externalRenderer.sendCommandFireAndForget(.setMuted(muted))
             persistState()
             return
         }
@@ -2703,9 +2703,8 @@ final class VideoWallpaperManager: ObservableObject {
             if targetScreen == nil {
                 volume = clamped
             }
-            externalRenderer.sendCommandSync(
+            externalRenderer.sendCommandFireAndForget(
                 .setVolume(screen: screenIndex, volume: clamped),
-                screen: screenIndex
             )
         }
         if let targetScreen = targetScreen {
@@ -2729,21 +2728,12 @@ final class VideoWallpaperManager: ObservableObject {
         let grainIntensity = ArcBackgroundSettings.shared.grainIntensity
 
         if externalRenderingActive {
-            let response = externalRenderer.sendCommandSync(
+            externalRenderer.sendCommandFireAndForget(
                 .setGrainOverlay(
                     screen: nil,
                     intensity: grainEnabled ? grainIntensity : 0
-                ),
-                screen: nil,
-                timeout: 2.0
+                )
             )
-            if response?.hasPrefix("OK") != true {
-                AppLogger.error(.wallpaper, "外部视频 setGrainOverlay 失败", metadata: [
-                    "response": response ?? "nil",
-                    "enabled": grainEnabled,
-                    "intensity": grainIntensity
-                ])
-            }
             return
         }
 
@@ -2766,7 +2756,7 @@ final class VideoWallpaperManager: ObservableObject {
     func pauseWallpaper(for targetScreen: NSScreen? = nil) {
         if externalRenderingActive {
             let screenIdx = targetScreen.flatMap(externalScreenIndex(for:))
-            externalRenderer.sendCommandSync(.pause(screen: screenIdx), screen: screenIdx)
+            externalRenderer.sendCommandFireAndForget(.pause(screen: screenIdx))
             if let targetScreen {
                 externalPausedScreenIDs.insert(targetScreen.wallpaperScreenIdentifier)
                 isPaused = videoTargetScreenIDs.allSatisfy(externalPausedScreenIDs.contains)
@@ -2809,7 +2799,7 @@ final class VideoWallpaperManager: ObservableObject {
 
         if externalRenderingActive {
             let screenIdx = targetScreen.flatMap(externalScreenIndex(for:))
-            externalRenderer.sendCommandSync(.resume(screen: screenIdx), screen: screenIdx)
+            externalRenderer.sendCommandFireAndForget(.resume(screen: screenIdx))
             if let targetScreen {
                 externalPausedScreenIDs.remove(targetScreen.wallpaperScreenIdentifier)
                 isPaused = false
@@ -2848,15 +2838,11 @@ final class VideoWallpaperManager: ObservableObject {
         if externalRenderingActive {
             guard let screenIndex = externalScreenIndex(for: targetScreen) else { return }
             showPosterImage(for: targetScreen.wallpaperScreenIdentifier)
-            _ = externalRenderer.sendCommandSync(
-                .seek(screen: screenIndex, time: 0),
-                screen: screenIndex
+            externalRenderer.sendCommandFireAndForget(
+                .seek(screen: screenIndex, time: 0)
             )
             guard !isPaused else { return }
-            _ = externalRenderer.sendCommandSync(
-                .resume(screen: screenIndex),
-                screen: screenIndex
-            )
+            externalRenderer.sendCommandFireAndForget(.resume(screen: screenIndex))
             externalPausedScreenIDs.remove(targetScreen.wallpaperScreenIdentifier)
             hidePosterImage(for: targetScreen.wallpaperScreenIdentifier)
             return
@@ -3485,13 +3471,15 @@ final class VideoWallpaperManager: ObservableObject {
 
             let playbackURL = URL(fileURLWithPath: record.videoPath)
             guard FileManager.default.fileExists(atPath: playbackURL.path) else { continue }
-            reloadExternalPlayback(
-                on: screen,
-                sourceURL: sourceURL,
-                playbackURL: playbackURL,
-                markAsInterpolated: true,
-                requestID: requestID
-            )
+            Task { @MainActor [weak self] in
+                await self?.reloadExternalPlayback(
+                    on: screen,
+                    sourceURL: sourceURL,
+                    playbackURL: playbackURL,
+                    markAsInterpolated: true,
+                    requestID: requestID
+                )
+            }
         }
     }
 
@@ -3501,7 +3489,7 @@ final class VideoWallpaperManager: ObservableObject {
         playbackURL: URL,
         markAsInterpolated: Bool,
         requestID: String? = nil
-    ) {
+    ) async {
         guard externalRenderingActive,
               externalRenderer.isRunning,
               FileManager.default.fileExists(atPath: sourceURL.path) else {
@@ -3528,7 +3516,7 @@ final class VideoWallpaperManager: ObservableObject {
             // transaction as a normal video switch. Directly replacing the
             // child player would discard the old drawable and reintroduce a
             // black flash exactly when the interpolation artifact is loaded.
-            try applyVideoWallpaperViaExternalRenderer(
+            try await applyVideoWallpaperViaExternalRenderer(
                 from: sourceURL,
                 posterURL: posterURL(for: screen),
                 muted: isMuted,
@@ -3542,10 +3530,8 @@ final class VideoWallpaperManager: ObservableObject {
                 isPaused = wasGloballyPaused
                 externalPausedScreenIDs.insert(screenID)
                 if let screenIndex = externalScreenIndex(for: screen) {
-                    _ = externalRenderer.sendCommandSync(
-                        .pause(screen: screenIndex),
-                        screen: screenIndex,
-                        timeout: 2.0
+                    externalRenderer.sendCommandFireAndForget(
+                        .pause(screen: screenIndex)
                     )
                 }
                 showPosterImage(for: screenID)
@@ -3579,13 +3565,15 @@ final class VideoWallpaperManager: ObservableObject {
                 guard currentSourceURL?.standardizedFileURL == videoURL.standardizedFileURL else {
                     continue
                 }
-                reloadExternalPlayback(
-                    on: screen,
-                    sourceURL: videoURL,
-                    playbackURL: videoURL,
-                    markAsInterpolated: markAsInterpolated,
-                    requestID: requestID
-                )
+                Task { @MainActor [weak self] in
+                    await self?.reloadExternalPlayback(
+                        on: screen,
+                        sourceURL: videoURL,
+                        playbackURL: videoURL,
+                        markAsInterpolated: markAsInterpolated,
+                        requestID: requestID
+                    )
+                }
             }
             return
         }
@@ -3720,7 +3708,7 @@ final class VideoWallpaperManager: ObservableObject {
             if let targetScreen {
                 let screenIdx = externalScreenIndex(for: targetScreen)
                 if let screenIdx {
-                    externalRenderer.sendCommandSync(.stop(screen: screenIdx), screen: screenIdx)
+                    externalRenderer.sendCommandFireAndForget(.stop(screen: screenIdx))
                 } else {
                     AppLogger.error(.wallpaper, "外部视频单屏停止时目标屏已离线", metadata: [
                         "screenID": targetScreen.wallpaperScreenIdentifier
@@ -3758,7 +3746,7 @@ final class VideoWallpaperManager: ObservableObject {
                 // 最后一块屏才允许关闭 daemon，避免副屏视频被交接路径误杀。
                 if videoTargetScreenIDs.isEmpty && videoTargetScreenFingerprints.isEmpty {
                     cancelExternalRendererRestart()
-                    externalRenderer.sendCommandSync(.stop(screen: nil), screen: nil)
+                    externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
                     externalRenderer.stopDaemon()
                     externalRenderingActive = false
                     currentVideoURL = nil
@@ -3783,7 +3771,7 @@ final class VideoWallpaperManager: ObservableObject {
                     reason: "stopWallpaper"
                 )
                 cancelExternalRendererRestart()
-                externalRenderer.sendCommandSync(.stop(screen: nil), screen: nil)
+                externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
                 externalRenderer.stopDaemon()
                 externalRenderingActive = false
                 currentVideoURL = nil
@@ -4057,7 +4045,7 @@ final class VideoWallpaperManager: ObservableObject {
             if let targetScreen {
                 let screenIdx = externalScreenIndex(for: targetScreen)
                 if let screenIdx {
-                    externalRenderer.sendCommandSync(.stop(screen: screenIdx), screen: screenIdx)
+                    externalRenderer.sendCommandFireAndForget(.stop(screen: screenIdx))
                 } else {
                     AppLogger.error(.wallpaper, "外部视频 stop-only 目标屏已离线", metadata: [
                         "screenID": targetScreen.wallpaperScreenIdentifier
@@ -4093,7 +4081,7 @@ final class VideoWallpaperManager: ObservableObject {
 
                 if videoTargetScreenIDs.isEmpty && videoTargetScreenFingerprints.isEmpty {
                     cancelExternalRendererRestart()
-                    externalRenderer.sendCommandSync(.stop(screen: nil), screen: nil)
+                    externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
                     externalRenderer.stopDaemon()
                     externalRenderingActive = false
                     currentVideoURL = nil
@@ -4122,7 +4110,7 @@ final class VideoWallpaperManager: ObservableObject {
                     reason: "stopNativeVideoWallpaperOnly"
                 )
                 cancelExternalRendererRestart()
-                externalRenderer.sendCommandSync(.stop(screen: nil), screen: nil)
+                externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
                 externalRenderer.stopDaemon()
                 externalRenderingActive = false
                 currentVideoURL = nil
@@ -4606,25 +4594,31 @@ final class VideoWallpaperManager: ObservableObject {
             "remainingQueue": pendingDisplaySwitches.count
         ])
 
-        do {
-            try applyVideoWallpaper(
-                from: next.videoURL,
-                posterURL: next.posterURL,
-                muted: next.muted,
-                targetScreen: screen,
-                animatedTransition: true
-            )
-        } catch {
-            AppLogger.error(.wallpaper, "Cached video switch failed", metadata: [
-                "screenID": screen.wallpaperScreenIdentifier,
-                "screen": screen.localizedName,
-                "video": next.videoURL.lastPathComponent,
-                "error": error.localizedDescription
-            ])
-            if activeDisplaySwitchScreenID == screen.wallpaperScreenIdentifier {
-                releaseDisplaySwitchGate(screenID: screen.wallpaperScreenIdentifier, reason: "cachedSwitchFailed")
-            } else {
-                applyNextCachedDisplaySwitchIfPossible()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.applyVideoWallpaper(
+                    from: next.videoURL,
+                    posterURL: next.posterURL,
+                    muted: next.muted,
+                    targetScreen: screen,
+                    animatedTransition: true
+                )
+            } catch {
+                AppLogger.error(.wallpaper, "Cached video switch failed", metadata: [
+                    "screenID": screen.wallpaperScreenIdentifier,
+                    "screen": screen.localizedName,
+                    "video": next.videoURL.lastPathComponent,
+                    "error": error.localizedDescription
+                ])
+                if self.activeDisplaySwitchScreenID == screen.wallpaperScreenIdentifier {
+                    self.releaseDisplaySwitchGate(
+                        screenID: screen.wallpaperScreenIdentifier,
+                        reason: "cachedSwitchFailed"
+                    )
+                } else if self.activeDisplaySwitchScreenID == nil {
+                    self.applyNextCachedDisplaySwitchIfPossible()
+                }
             }
         }
     }
@@ -4864,7 +4858,7 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
-    func restoreIfNeeded() {
+    func restoreIfNeeded() async {
         guard
             let data = defaults.data(forKey: stateKey),
             let savedState = try? JSONDecoder().decode(SavedVideoWallpaperState.self, from: data),
@@ -4938,7 +4932,7 @@ final class VideoWallpaperManager: ObservableObject {
                     : NSScreen.screens
                 for screen in targetScreens {
                     let screenURL = videoURL(for: screen) ?? url
-                    try applyVideoWallpaperViaExternalRenderer(
+                    try await applyVideoWallpaperViaExternalRenderer(
                         from: screenURL,
                         posterURL: posterURL(for: screen),
                         muted: savedState.isMuted,
@@ -5142,9 +5136,11 @@ final class VideoWallpaperManager: ObservableObject {
                           self.hasActiveVideoWallpaper else {
                         return
                     }
-                    self.reconfigureExternalRendererForCurrentScreens(
-                        reason: "screenParametersChanged"
-                    )
+                    Task { @MainActor [weak self] in
+                        await self?.reconfigureExternalRendererForCurrentScreens(
+                            reason: "screenParametersChanged"
+                        )
+                    }
                 }
                 self.pendingRebuildWorkItem = workItem
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
@@ -5250,7 +5246,11 @@ final class VideoWallpaperManager: ObservableObject {
                 guard let self = self else { return }
                 if self.hasActiveVideoWallpaper {
                     if self.externalRenderingActive {
-                        self.reconfigureExternalRendererForCurrentScreens(reason: "screensWake")
+                        Task { @MainActor [weak self] in
+                            await self?.reconfigureExternalRendererForCurrentScreens(
+                                reason: "screensWake"
+                            )
+                        }
                         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
                         self.scheduleDelayedExternalRendererReconfigure(
                             reason: "screensWakeDelayed"
@@ -5278,7 +5278,11 @@ final class VideoWallpaperManager: ObservableObject {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                         guard let self = self, self.hasActiveVideoWallpaper else { return }
                         if self.externalRenderingActive {
-                            self.reconfigureExternalRendererForCurrentScreens(reason: "screensWakeDelayed")
+                            Task { @MainActor [weak self] in
+                                await self?.reconfigureExternalRendererForCurrentScreens(
+                                    reason: "screensWakeDelayed"
+                                )
+                            }
                             return
                         }
                         self.relinkDisplayStateForCurrentScreens()
@@ -5328,7 +5332,11 @@ final class VideoWallpaperManager: ObservableObject {
                 guard let self = self else { return }
                 if self.hasActiveVideoWallpaper {
                     if self.externalRenderingActive {
-                        self.reconfigureExternalRendererForCurrentScreens(reason: "systemWake")
+                        Task { @MainActor [weak self] in
+                            await self?.reconfigureExternalRendererForCurrentScreens(
+                                reason: "systemWake"
+                            )
+                        }
                         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
                         self.scheduleDelayedExternalRendererReconfigure(
                             reason: "systemWakeDelayed"
@@ -5473,7 +5481,9 @@ final class VideoWallpaperManager: ObservableObject {
 
     private func repairWindowsForCurrentDisplayConfiguration(reason: String) {
         if externalRenderingActive {
-            reconfigureExternalRendererForCurrentScreens(reason: reason)
+            Task { @MainActor [weak self] in
+                await self?.reconfigureExternalRendererForCurrentScreens(reason: reason)
+            }
             return
         }
 
@@ -5506,7 +5516,19 @@ final class VideoWallpaperManager: ObservableObject {
     private func reconfigureExternalRendererForCurrentScreens(
         reason: String,
         clearExistingRendererState: Bool = true
-    ) {
+    ) async {
+        await withExternalRendererTransaction {
+            await self.reconfigureExternalRendererForCurrentScreensLocked(
+                reason: reason,
+                clearExistingRendererState: clearExistingRendererState
+            )
+        }
+    }
+
+    private func reconfigureExternalRendererForCurrentScreensLocked(
+        reason: String,
+        clearExistingRendererState: Bool
+    ) async {
         guard externalRenderingActive else { return }
         guard externalPendingCommitScreenIDs.isEmpty else {
             AppLogger.info(.wallpaper, "外部视频事务提交中，延后显示器重配置", metadata: [
@@ -5527,7 +5549,7 @@ final class VideoWallpaperManager: ObservableObject {
             return
         }
         if !externalRenderer.isRunning {
-            guard externalRenderer.startDaemon() else {
+            guard await externalRenderer.startDaemon() else {
                 scheduleExternalRendererRestart(afterExitStatus: -1)
                 return
             }
@@ -5547,7 +5569,7 @@ final class VideoWallpaperManager: ObservableObject {
             )
         }
         if clearExistingRendererState {
-            externalRenderer.sendCommandSync(.stop(screen: nil), screen: nil, timeout: 3.0)
+            externalRenderer.sendCommandFireAndForget(.stop(screen: nil))
         }
 
         var reboundIDs = Set<String>()
@@ -5565,7 +5587,7 @@ final class VideoWallpaperManager: ObservableObject {
             let schedulerConfig = WallpaperSchedulerService.shared.config
                 .resolvedDisplayConfig(for: screenID)
             let looping = !(schedulerConfig.isEnabled && schedulerConfig.isOnEndMode)
-            let response = externalRenderer.sendCommandSync(
+            let response = await externalRenderer.sendCommand(
                 .set(
                     screen: screenIndex,
                     screenID: screenID,
@@ -5622,15 +5644,13 @@ final class VideoWallpaperManager: ObservableObject {
         videoTargetScreenFingerprints = desiredFingerprints.union(reboundFingerprints)
         externalPausedScreenIDs = pausedIDs.intersection(videoTargetScreenIDs)
         if wasPaused {
-            externalRenderer.sendCommandSync(.pause(screen: nil), screen: nil)
+            externalRenderer.sendCommandFireAndForget(.pause(screen: nil))
         }
         let grainIntensity = ArcBackgroundSettings.shared.grainTextureEnabled
             ? ArcBackgroundSettings.shared.grainIntensity
             : 0
-        _ = externalRenderer.sendCommandSync(
-            .setGrainOverlay(screen: nil, intensity: grainIntensity),
-            screen: nil,
-            timeout: 2.0
+        externalRenderer.sendCommandFireAndForget(
+            .setGrainOverlay(screen: nil, intensity: grainIntensity)
         )
         lastAppliedScreenConfigurations = currentTargetScreenConfigurations()
         persistState()
@@ -5640,6 +5660,29 @@ final class VideoWallpaperManager: ObservableObject {
         }
     }
 
+    private func withExternalRendererTransaction<T>(
+        _ operation: () async throws -> T
+    ) async rethrows -> T {
+        await acquireExternalRendererTransaction()
+        defer { releaseExternalRendererTransaction() }
+        return try await operation()
+    }
+
+    private func acquireExternalRendererTransaction() async {
+        while externalRendererTransactionActive {
+            await withCheckedContinuation { continuation in
+                externalRendererTransactionWaiters.append(continuation)
+            }
+        }
+        externalRendererTransactionActive = true
+    }
+
+    private func releaseExternalRendererTransaction() {
+        externalRendererTransactionActive = false
+        guard !externalRendererTransactionWaiters.isEmpty else { return }
+        externalRendererTransactionWaiters.removeFirst().resume()
+    }
+
     private func scheduleDelayedExternalRendererReconfigure(reason: String) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             guard let self,
@@ -5647,7 +5690,9 @@ final class VideoWallpaperManager: ObservableObject {
                   self.hasActiveVideoWallpaper else {
                 return
             }
-            self.reconfigureExternalRendererForCurrentScreens(reason: reason)
+            Task { @MainActor [weak self] in
+                await self?.reconfigureExternalRendererForCurrentScreens(reason: reason)
+            }
         }
     }
 
@@ -7645,18 +7690,9 @@ final class VideoWallpaperManager: ObservableObject {
                       let currentIndex = self.externalScreenIndex(for: currentScreen) else {
                     return
                 }
-                let response = self.externalRenderer.sendCommandSync(
+                self.externalRenderer.sendCommandFireAndForget(
                     .showPoster(screen: currentIndex, path: localURL.path),
-                    screen: currentIndex,
-                    timeout: 2.0
                 )
-                if response?.hasPrefix("OK") != true {
-                    AppLogger.error(.wallpaper, "外部视频 showPoster 失败", metadata: [
-                        "screenID": screenID,
-                        "path": localURL.path,
-                        "response": response ?? "nil"
-                    ])
-                }
             }
 
             if posterURL.isFileURL, FileManager.default.fileExists(atPath: posterURL.path) {
@@ -7714,17 +7750,9 @@ final class VideoWallpaperManager: ObservableObject {
             let screenIndex = externalScreenIndex(for: screen) else {
                 return
             }
-            let response = externalRenderer.sendCommandSync(
-                .hidePoster(screen: screenIndex),
-                screen: screenIndex,
-                timeout: 2.0
+            externalRenderer.sendCommandFireAndForget(
+                .hidePoster(screen: screenIndex)
             )
-            if response?.hasPrefix("OK") != true {
-                AppLogger.error(.wallpaper, "外部视频 hidePoster 失败", metadata: [
-                    "screenID": screenID,
-                    "response": response ?? "nil"
-                ])
-            }
             return
         }
 

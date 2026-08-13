@@ -71,6 +71,10 @@ final class VideoRendererAudioRouting {
     /// 与 VideoWallpaperManager.findBuiltInOutputDeviceUID() 保持相同的选择顺序：
     /// 优先 Built-in/Speaker，其次第一个有输出能力且不是蓝牙类的设备。
     private func findBuiltInOutputDeviceUID() -> String? {
+        if let cachedBuiltInOutputDeviceUID {
+            return cachedBuiltInOutputDeviceUID
+        }
+
         var propertySize: UInt32 = 0
         var devicesProperty = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
@@ -206,6 +210,10 @@ final class VideoRendererProcessController {
     private var stderrBuffer = Data()
     private var lastAudioMuted = true
     private var lastAudioVolume = 1.0
+    /// Crop 更新可能在拖动和显示器布局变更时密集产生。只保留每屏最新值，
+    /// 防止大量无响应 IPC 排队到 renderer 的主线程，阻塞后续 set/stop。
+    private var pendingCropCommands: [Int: Command] = [:]
+    private var cropFlushScheduled = false
 
     /// 事件回调（主线程）
     var eventHandler: ((VideoRendererEvent) -> Void)?
@@ -221,10 +229,10 @@ final class VideoRendererProcessController {
     /// 启动 wallpaper-video-renderer 子进程。
     /// - Returns: true 表示启动成功且子进程已就绪
     @discardableResult
-    func startDaemon() -> Bool {
+    func startDaemon() async -> Bool {
         if isRunning {
             AppLogger.info(.wallpaper, "video-renderer 子进程已在运行，跳过启动")
-            return waitForSocket(timeout: 2.0)
+            return await waitForSocket(timeout: 2.0)
         }
 
         guard let executableURL = resolvedExecutableURL() else {
@@ -301,12 +309,12 @@ final class VideoRendererProcessController {
             process = proc
             processPID = proc.processIdentifier
             AppLogger.info(.wallpaper, "video-renderer 子进程已启动 pid=\(processPID) socket=\(socketPath)")
-            guard waitForSocket(timeout: 2.0) else {
+            guard await waitForSocket(timeout: 2.0) else {
                 AppLogger.error(.wallpaper, "video-renderer 子进程启动后未监听 socket")
                 terminateFailedLaunch(proc)
                 return false
             }
-            guard sendCommandSync(.ping, screen: nil, timeout: 1.0) == "OK" else {
+            guard await sendCommand(.ping, screen: nil, timeout: 1.0) == "OK" else {
                 AppLogger.error(.wallpaper, "video-renderer socket 已出现但 ping 未通过")
                 terminateFailedLaunch(proc)
                 return false
@@ -323,20 +331,16 @@ final class VideoRendererProcessController {
         guard isRunning else { return }
         AppLogger.info(.wallpaper, "停止 video-renderer 子进程 pid=\(processPID)")
         expectedTerminationGeneration = generation
+        pendingCropCommands.removeAll()
+        cropFlushScheduled = false
 
-        // 先发 shutdown 命令（优雅退出），失败再 SIGTERM
-        _ = sendCommandSync(.shutdown, screen: nil, timeout: 1.0)
-
-        // 等待 0.5s
-        Thread.sleep(forTimeInterval: 0.5)
-
-        // 若仍存活，SIGTERM
-        if isRunning {
-            kill(processPID, SIGTERM)
-        }
+        // 不能在 MainActor 上等待 helper 的回包或退出。helper 会自行处理 shutdown；
+        // SIGTERM 作为立即兜底，watchdog 仍会在它卡死时收尾。
+        sendCommandFireAndForget(.shutdown)
+        let pid = processPID
+        kill(pid, SIGTERM)
 
         // watchdog: 2s 后 SIGKILL
-        let pid = processPID
         DispatchQueue.global().async {
             Thread.sleep(forTimeInterval: 2.0)
             if kill(pid, 0) == 0 {
@@ -392,9 +396,10 @@ final class VideoRendererProcessController {
         case shutdown
     }
 
-    /// 发送命令并等待响应（同步，带超时）
+    /// 发送命令并等待响应。socket I/O 始终在 worker queue 上执行，因此在
+    /// `@MainActor` 调用时会让出 AppKit 事件循环，不会把 HID 事件卡在 recv()。
     @discardableResult
-    func sendCommandSync(_ cmd: Command, screen: Int?, timeout: TimeInterval = 5.0) -> String? {
+    func sendCommand(_ cmd: Command, screen: Int?, timeout: TimeInterval = 5.0) async -> String? {
         guard isRunning else {
             AppLogger.error(.wallpaper, "video-renderer 子进程未运行，无法发送命令")
             return nil
@@ -402,19 +407,61 @@ final class VideoRendererProcessController {
 
         let msg = encodeCommand(cmd)
         guard let body = try? JSONEncoder().encode(msg) else { return nil }
+        let startedAt = Date()
 
-        // The API is synchronous by design. Execute the socket operation on a
-        // worker queue and wait for its return value without sharing mutable
-        // captured state across concurrency domains.
-        return DispatchQueue.global(qos: .userInitiated).sync { [socketPath] in
-            Self.sendOverSocket(socketPath: socketPath, body: body, timeout: timeout)
+        let response: String? = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [socketPath] in
+                continuation.resume(
+                    returning: Self.sendOverSocket(
+                        socketPath: socketPath,
+                        body: body,
+                        timeout: timeout
+                    )
+                )
+            }
         }
+        if response == nil {
+            AppLogger.error(.wallpaper, "video-renderer IPC 超时或连接失败", metadata: [
+                "command": msg.command,
+                "screen": screen.map(String.init) ?? "all",
+                "timeout": String(format: "%.2f", timeout),
+                "elapsed": String(format: "%.3f", Date().timeIntervalSince(startedAt))
+            ])
+        }
+        return response
     }
 
     /// 发送命令但不等待响应（fire-and-forget，用于高频命令）
     func sendCommandFireAndForget(_ cmd: Command) {
         guard isRunning else { return }
-        let msg = encodeCommand(cmd)
+        if case .setCrop(let screen, _, _, _, _) = cmd {
+            pendingCropCommands[screen] = cmd
+            guard !cropFlushScheduled else { return }
+            cropFlushScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(33)) { [weak self] in
+                self?.flushPendingCropCommands()
+            }
+            return
+        }
+
+        sendCommandFireAndForgetImmediately(cmd)
+    }
+
+    private func flushPendingCropCommands() {
+        cropFlushScheduled = false
+        let commands = pendingCropCommands
+            .sorted { $0.key < $1.key }
+            .map(\.value)
+        pendingCropCommands.removeAll()
+
+        for command in commands {
+            sendCommandFireAndForgetImmediately(command)
+        }
+    }
+
+    private func sendCommandFireAndForgetImmediately(_ cmd: Command) {
+        guard isRunning else { return }
+        let msg = encodeCommand(cmd, expectsResponse: false)
         guard let body = try? JSONEncoder().encode(msg) else { return }
 
         DispatchQueue.global(qos: .userInitiated).async { [socketPath] in
@@ -426,19 +473,26 @@ final class VideoRendererProcessController {
 
     /// `Process.run()` 只代表 fork/exec 成功，不代表 daemon 已完成 bind/listen。
     /// 等待 socket 出现，避免首条 set 命令撞在子进程初始化窗口上。
-    private func waitForSocket(timeout: TimeInterval) -> Bool {
+    private func waitForSocket(timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if socketIsReachable() {
+            if await socketIsReachable() {
                 return true
             }
             guard isRunning else { return false }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        return socketIsReachable() && isRunning
+        return await socketIsReachable() && isRunning
     }
 
-    private func socketIsReachable() -> Bool {
+    private func socketIsReachable() async -> Bool {
+        let currentSocketPath = socketPath
+        return await Task.detached(priority: .userInitiated) {
+            Self.socketIsReachable(socketPath: currentSocketPath)
+        }.value
+    }
+
+    private nonisolated static func socketIsReachable(socketPath: String) -> Bool {
         guard FileManager.default.fileExists(atPath: socketPath) else { return false }
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -500,6 +554,7 @@ final class VideoRendererProcessController {
 
     private struct IPCMessageDTO: Codable {
         var command: String
+        var expectsResponse: Bool?
         var screen: Int?
         var screenID: String?
         var requestID: String?
@@ -537,9 +592,13 @@ final class VideoRendererProcessController {
         var message: String?
     }
 
-    private func encodeCommand(_ cmd: Command) -> IPCMessageDTO {
+    private func encodeCommand(
+        _ cmd: Command,
+        expectsResponse: Bool = true
+    ) -> IPCMessageDTO {
         var msg = IPCMessageDTO(
             command: "",
+            expectsResponse: expectsResponse,
             screen: nil,
             screenID: nil,
             requestID: nil,
@@ -751,9 +810,20 @@ final class VideoRendererProcessController {
         guard fd >= 0 else { return nil }
         defer { close(fd) }
 
-        // 设置接收超时
+        var noSigPipe: Int32 = 1
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+
+        // 给发送和接收都设限，避免 helper 的 accept 队列、主线程或 socket
+        // 缓冲区异常时 worker 长时间挂在内核调用里。
         var tv = timeval(tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout.truncatingRemainder(dividingBy: 1)) * 1_000_000))
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -793,6 +863,15 @@ final class VideoRendererProcessController {
     private nonisolated static func sendOverSocketFireAndForget(socketPath: String, body: Data) {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
+
+        var noSigPipe: Int32 = 1
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -865,6 +944,18 @@ final class VideoRendererProcessController {
 
         for line in lines.dropLast(str.hasSuffix("\n") ? 0 : 1) {
             if line.isEmpty { continue }
+            if line.hasPrefix("WAIFUX_FATAL_EXCEPTION:") {
+                AppLogger.error(.wallpaper, "wallpaper-video-renderer 未捕获异常", metadata: [
+                    "diagnostic": String(line)
+                ])
+                continue
+            }
+            if line.hasPrefix("WAIFUX_OBSERVED_EXCEPTION:") {
+                AppLogger.error(.wallpaper, "wallpaper-video-renderer 捕获到 Objective-C 异常", metadata: [
+                    "diagnostic": String(line)
+                ])
+                continue
+            }
             guard line.hasPrefix("WAIFUX_EVENT:") else { continue }
             let jsonStr = String(line.dropFirst("WAIFUX_EVENT:".count))
             guard let jsonData = jsonStr.data(using: .utf8),

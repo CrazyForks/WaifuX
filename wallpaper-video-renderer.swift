@@ -18,6 +18,7 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreImage
+import ExceptionHandling
 import Foundation
 import os
 
@@ -83,6 +84,9 @@ private enum IPCEvent: String, Codable {
 /// IPC 消息体（扁平 Codable struct，命令字段决定哪些参数有效）
 private struct IPCMessage: Codable {
     var command: IPCCommand
+    /// Fire-and-forget 命令不需要服务端回包。高频 crop/前台调整不再因为
+    /// 客户端已关闭写端而挤占 renderer 主线程或产生无意义的 EPIPE。
+    var expectsResponse: Bool?
     // 通用
     var screen: Int?            // 目标屏索引（NSScreen.screens 的稳定排序索引）
     var screenID: String?       // 主进程稳定屏幕标识，事件回传优先使用
@@ -179,6 +183,7 @@ private final class VideoRendererDaemon {
     private nonisolated(unsafe) var keepRunning = true
     private var signalSources: [DispatchSourceSignal] = []
     private var parentWatchdog: DispatchSourceTimer?
+    private var commandSequence: UInt64 = 0
 
     // 播放结束观察者
     private var playbackEndObservers: [Int: NSObjectProtocol] = [:]
@@ -233,6 +238,7 @@ private final class VideoRendererDaemon {
     func run(socketPath: String, parentPID: pid_t?) {
         self.socketPath = socketPath
         AppLogger.info(.wallpaper, "video-renderer daemon 启动", metadata: ["socket": socketPath])
+        installExceptionDiagnostics()
 
         // 写 PID 文件（主进程用于存活检测）
         let pidPath = ProcessInfo.processInfo.environment[DAEMON_PID_ENV]
@@ -381,6 +387,17 @@ private final class VideoRendererDaemon {
     }
 
     private nonisolated func handleClient(_ fd: Int32) {
+        // The client may time out and close before the main-thread command
+        // finishes. Never let a late response terminate the renderer via SIGPIPE.
+        var noSigPipe: Int32 = 1
+        setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &noSigPipe,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+
         // 读取 4 字节长度（host byte order）
         var length: UInt32 = 0
         let headerSize = MemoryLayout<UInt32>.size
@@ -425,8 +442,22 @@ private final class VideoRendererDaemon {
 
         // 派发到主线程处理（AVPlayer / NSWindow 必须主线程）
         Task { @MainActor in
+            let commandID = self.nextCommandID()
+            let startedAt = Date()
             let result = await self.handleCommand(msg)
-            self.sendResponse(fd, result)
+            let elapsed = Date().timeIntervalSince(startedAt)
+            if elapsed >= 0.25 || result.hasPrefix("ERROR") {
+                AppLogger.info(.wallpaper, "video-renderer IPC 完成", metadata: [
+                    "id": String(commandID),
+                    "command": msg.command.rawValue,
+                    "screen": msg.screen.map(String.init) ?? "all",
+                    "elapsed": String(format: "%.3f", elapsed),
+                    "result": result
+                ])
+            }
+            if msg.expectsResponse ?? true {
+                self.sendResponse(fd, result)
+            }
             close(fd)
         }
     }
@@ -434,8 +465,32 @@ private final class VideoRendererDaemon {
     private nonisolated func sendResponse(_ fd: Int32, _ text: String) {
         let data = text.data(using: .utf8) ?? Data()
         _ = data.withUnsafeBytes { buf in
-            write(fd, buf.baseAddress, buf.count)
+            send(fd, buf.baseAddress, buf.count, 0)
         }
+    }
+
+    private func nextCommandID() -> UInt64 {
+        commandSequence &+= 1
+        return commandSequence
+    }
+
+    private func installExceptionDiagnostics() {
+        NSSetUncaughtExceptionHandler { exception in
+            let reason = exception.reason ?? "nil"
+            let trace = exception.callStackSymbols.prefix(12).joined(separator: " | ")
+            FileHandle.standardError.write(Data(
+                "WAIFUX_FATAL_EXCEPTION:name=\(exception.name.rawValue) reason=\(reason) trace=\(trace)\n"
+                    .utf8
+            ))
+        }
+
+        guard let handler = NSExceptionHandler.default() else { return }
+        handler.setDelegate(VideoRendererExceptionHandler.shared)
+        handler.setExceptionHandlingMask(
+            NSLogOtherExceptionMask
+                | NSLogUncaughtExceptionMask
+                | NSHandleUncaughtSystemExceptionMask
+        )
     }
 
     // MARK: 命令处理
@@ -1954,6 +2009,24 @@ private final class VideoRendererDaemon {
         if let playbackStateObserver {
             DistributedNotificationCenter.default.removeObserver(playbackStateObserver)
         }
+    }
+}
+
+private final class VideoRendererExceptionHandler: NSObject, @unchecked Sendable {
+    static let shared = VideoRendererExceptionHandler()
+
+    @objc override func exceptionHandler(
+        _ sender: NSExceptionHandler,
+        shouldLogException exception: NSException,
+        mask: Int
+    ) -> Bool {
+        let reason = exception.reason ?? "nil"
+        let trace = exception.callStackSymbols.prefix(12).joined(separator: " | ")
+        FileHandle.standardError.write(Data(
+            "WAIFUX_OBSERVED_EXCEPTION:name=\(exception.name.rawValue) reason=\(reason) trace=\(trace)\n"
+                .utf8
+        ))
+        return true
     }
 }
 

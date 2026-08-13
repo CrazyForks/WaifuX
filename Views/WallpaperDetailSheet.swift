@@ -1367,7 +1367,7 @@ struct WallpaperDetailSheet: View {
                 errorMessage = ""
                 Task { @MainActor in
                     do {
-                        let imageURL = try await getWallpaperImageURL()
+                        let imageURL = try await getWallpaperImageURLForSetting()
                         // selectedScreen == nil → 所有显示器；非 nil → 仅指定显示器
                         // viewModel 内部会按需停止对应屏幕的动态壁纸
                         try await viewModel.setWallpaper(from: imageURL, option: .desktop, for: selectedScreen)
@@ -1387,7 +1387,7 @@ struct WallpaperDetailSheet: View {
             errorMessage = ""
             Task { @MainActor in
                 do {
-                    let imageURL = try await getWallpaperImageURL()
+                    let imageURL = try await getWallpaperImageURLForSetting()
                     // viewModel 内部会按需停止动态壁纸
                     try await viewModel.setWallpaper(from: imageURL, option: .desktop)
                     WallpaperSchedulerService.shared.notifyManualWallpaperChange(
@@ -1401,6 +1401,11 @@ struct WallpaperDetailSheet: View {
                 isSettingWallpaper = false
             }
         }
+    }
+
+    /// 设为壁纸必须使用资料库中的本地文件；预览流程仍使用下方的临时文件路径。
+    private func getWallpaperImageURLForSetting() async throws -> URL {
+        try await viewModel.localWallpaperFileURLForApplication(wallpaper)
     }
 
     /// 获取壁纸图片 URL（本地/已下载文件直接返回，未下载的网络壁纸才下载到临时目录）

@@ -1226,7 +1226,7 @@ class WallpaperSchedulerService: ObservableObject {
         let posterURL = VideoWallpaperManager.shared.currentPosterURL
         Task { @MainActor in
             do {
-                try VideoWallpaperManager.shared.applyVideoWallpaper(
+                try await VideoWallpaperManager.shared.applyVideoWallpaper(
                     from: videoURL,
                     posterURL: posterURL,
                     muted: VideoWallpaperManager.shared.isMuted,
@@ -1261,7 +1261,7 @@ class WallpaperSchedulerService: ObservableObject {
             if hasVideo, let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                 let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
                 print("\(logTag) Reapplying video wallpaper with forceRebuild to disable looping: \(videoURL.lastPathComponent)")
-                try? VideoWallpaperManager.shared.applyVideoWallpaper(
+                try? await VideoWallpaperManager.shared.applyVideoWallpaper(
                     from: videoURL,
                     posterURL: posterURL,
                     muted: VideoWallpaperManager.shared.isMuted,
@@ -1319,7 +1319,7 @@ class WallpaperSchedulerService: ObservableObject {
                     // 让视频继续播放而不是直接停掉整个动态壁纸
                     Task { @MainActor in
                         let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
-                        try? VideoWallpaperManager.shared.applyVideoWallpaper(
+                        try? await VideoWallpaperManager.shared.applyVideoWallpaper(
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
@@ -1365,7 +1365,7 @@ class WallpaperSchedulerService: ObservableObject {
                 Task { @MainActor in
                     if let videoURL = VideoWallpaperManager.shared.videoURL(for: screen) {
                         let posterURL = VideoWallpaperManager.shared.posterURL(for: screen)
-                        try? VideoWallpaperManager.shared.applyVideoWallpaper(
+                        try? await VideoWallpaperManager.shared.applyVideoWallpaper(
                             from: videoURL,
                             posterURL: posterURL,
                             muted: VideoWallpaperManager.shared.isMuted,
