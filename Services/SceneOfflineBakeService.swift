@@ -960,16 +960,23 @@ enum SceneOfflineBakeService {
             .allowClipping: true
         ]
         var appliedScreens = 0
+        var appliedTargetScreens: [NSScreen] = []
         for screen in targetScreens {
             do {
                 try NSWorkspace.shared.setDesktopImageURLForAllSpaces(posterURL, for: screen, options: fillOptions)
                 DesktopWallpaperSyncManager.shared.registerWallpaperSet(posterURL, for: screen, options: fillOptions)
                 appliedScreens += 1
+                appliedTargetScreens.append(screen)
             } catch {
                 print("[SceneOfflineBake] failed to set desktop poster (\(reason)) on \(screen.localizedName): \(error.localizedDescription)")
             }
         }
         print("[SceneOfflineBake] set desktop static poster (\(reason)) on \(appliedScreens)/\(targetScreens.count) screen(s) display=\(displayIDs): \(posterURL.path)")
+        if !appliedTargetScreens.isEmpty {
+            // Scene 窗口在 wgpu 进程（宿主无法 orderOut）：暂无可靠的菜单栏
+            // 重采样触发手段（Finder update / 通知 / 私有 API 均已实测无效）。
+            // 菜单栏 backdrop 有 ~10s 懒重采样兜底，或用户切换 App 时自然更新。
+        }
     }
 
     @MainActor

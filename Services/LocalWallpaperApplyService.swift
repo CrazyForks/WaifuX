@@ -79,6 +79,7 @@ enum LocalWallpaperApplyService {
         let ext = localURL.pathExtension.lowercased()
         var isDirectory: ObjCBool = false
         FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory)
+        print("[LocalWallpaperApply] apply 入口 path=\(localURL.lastPathComponent) ext=\(ext) isDir=\(isDirectory.boolValue) screens=\(screens.count) reason=\(options.reason)")
 
         let videoExts: Set<String> = ["mp4", "mov", "webm", "m4v", "mkv", "avi", "flv"]
         let imageExts: Set<String> = ["jpg", "jpeg", "png", "bmp", "gif", "webp", "tga", "tif", "tiff"]
@@ -226,6 +227,7 @@ enum LocalWallpaperApplyService {
         )
         // 没有 HD 缓存时不写 fallback：immediate 为 nil 时视频先起播、系统壁纸保持旧图
         let immediatePosterURL = hdPosterURL
+        print("[LocalWallpaperApply] applyVideo hdPoster=\(hdPosterURL?.lastPathComponent ?? "nil") needsBackgroundPoster=\(hdPosterURL == nil && options.generatePosterFromVideoIfNeeded)")
         // 无 HD 缓存时后台补静帧（异步、不阻塞切换），生成后回写系统桌面/锁屏底图。
         // 调度器必须允许补帧，否则无预生成 poster 的视频会「偶尔设置不到静态帧」。
         let needsBackgroundPoster = (hdPosterURL == nil && options.generatePosterFromVideoIfNeeded)
