@@ -1911,17 +1911,17 @@ private final class VideoRendererDaemon {
     private func installParentWatchdog(parentPID: pid_t?) {
         guard let parentPID, parentPID > 1 else { return }
 
-        let watchdog = DispatchSource.makeTimerSource(queue: .main)
+        // Must stay independent of AppKit/IPC work: a blocked main actor must
+        // not leave an orphaned desktop window behind after the parent exits.
+        let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
         watchdog.schedule(deadline: .now() + 0.5, repeating: 0.5, leeway: .milliseconds(100))
-        watchdog.setEventHandler { [weak self] in
-            guard let self else { return }
+        watchdog.setEventHandler {
             guard getppid() == parentPID, kill(parentPID, 0) == 0 else {
                 AppLogger.info(
                     .wallpaper,
                     "video-renderer 检测到主进程退出，自动关闭"
                 )
-                self.shutdownForParentLoss()
-                return
+                _exit(0)
             }
         }
         watchdog.resume()
