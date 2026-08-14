@@ -183,6 +183,14 @@ private final class VideoRendererDaemon {
     private nonisolated(unsafe) var keepRunning = true
     private var signalSources: [DispatchSourceSignal] = []
     private var parentWatchdog: DispatchSourceTimer?
+    private var parentExitSource: DispatchSourceProcess?
+    /// Commands arrive over short-lived Unix sockets. Process each fully before
+    /// accepting the next one so fire-and-forget maintenance commands cannot
+    /// overtake a later `set` and freeze its newly-created player.
+    private let commandIngressQueue = DispatchQueue(
+        label: "com.waifux.video-renderer.command-ingress",
+        qos: .userInitiated
+    )
     private var commandSequence: UInt64 = 0
 
     // 播放结束观察者
@@ -378,7 +386,7 @@ private final class VideoRendererDaemon {
                     if errno == EINTR { continue }
                     break
                 }
-                DispatchQueue.global(qos: .userInitiated).async {
+                self.commandIngressQueue.async {
                     self.handleClient(clientFd)
                 }
             }
@@ -440,8 +448,16 @@ private final class VideoRendererDaemon {
             return
         }
 
-        // 派发到主线程处理（AVPlayer / NSWindow 必须主线程）
+        // Keep this socket open until the main-actor command has completed.
+        // The ingress queue waits here, which gives all IPC commands one
+        // deterministic order instead of relying on concurrent Task scheduling.
+        let completion = DispatchSemaphore(value: 0)
         Task { @MainActor in
+            defer {
+                close(fd)
+                completion.signal()
+            }
+            guard self.keepRunning else { return }
             let commandID = self.nextCommandID()
             let startedAt = Date()
             let result = await self.handleCommand(msg)
@@ -458,8 +474,8 @@ private final class VideoRendererDaemon {
             if msg.expectsResponse ?? true {
                 self.sendResponse(fd, result)
             }
-            close(fd)
         }
+        completion.wait()
     }
 
     private nonisolated func sendResponse(_ fd: Int32, _ text: String) {
@@ -1911,6 +1927,19 @@ private final class VideoRendererDaemon {
     private func installParentWatchdog(parentPID: pid_t?) {
         guard let parentPID, parentPID > 1 else { return }
 
+        // The process source receives the kernel exit event even when the
+        // AppKit main actor is busy tearing down AVFoundation objects.
+        let exitSource = DispatchSource.makeProcessSource(
+            identifier: parentPID,
+            eventMask: .exit,
+            queue: .global(qos: .utility)
+        )
+        exitSource.setEventHandler {
+            _exit(0)
+        }
+        exitSource.resume()
+        parentExitSource = exitSource
+
         // Must stay independent of AppKit/IPC work: a blocked main actor must
         // not leave an orphaned desktop window behind after the parent exits.
         let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
@@ -1934,6 +1963,8 @@ private final class VideoRendererDaemon {
         keepRunning = false
         parentWatchdog?.cancel()
         parentWatchdog = nil
+        parentExitSource?.cancel()
+        parentExitSource = nil
         stopAll()
 
         // 清理 socket
@@ -1959,6 +1990,8 @@ private final class VideoRendererDaemon {
         keepRunning = false
         parentWatchdog?.cancel()
         parentWatchdog = nil
+        parentExitSource?.cancel()
+        parentExitSource = nil
 
         if serverSocket >= 0 {
             close(serverSocket)

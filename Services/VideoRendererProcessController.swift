@@ -232,8 +232,14 @@ final class VideoRendererProcessController {
     func startDaemon() async -> Bool {
         if isRunning {
             AppLogger.info(.wallpaper, "video-renderer 子进程已在运行，跳过启动")
-            return await waitForSocket(timeout: 2.0)
+            if await waitForSocket(timeout: 2.0) {
+                return true
+            }
+            AppLogger.error(.wallpaper, "video-renderer 进程仍存活但 socket 不可用，重启渲染器")
+            stopDaemon()
         }
+
+        await terminateOrphanedRenderers()
 
         guard let executableURL = resolvedExecutableURL() else {
             AppLogger.error(.wallpaper, "未找到 wallpaper-video-renderer 二进制")
@@ -527,6 +533,79 @@ final class VideoRendererProcessController {
         processPID = 0
         try? FileManager.default.removeItem(atPath: socketPath)
         try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    /// A renderer normally dies with its App parent. If Xcode terminates the
+    /// host abruptly, a stale helper can remain at desktop level and keep
+    /// showing a frozen old frame above the new renderer. Only processes
+    /// reparented to launchd are eligible, so a live WaifuX session is untouched.
+    private func terminateOrphanedRenderers() async {
+        let stalePIDs = Self.orphanedRendererPIDs()
+        guard !stalePIDs.isEmpty else { return }
+
+        AppLogger.error(.wallpaper, "清理孤儿 video-renderer 进程", metadata: [
+            "pids": stalePIDs.map(String.init).joined(separator: ",")
+        ])
+        for pid in stalePIDs {
+            kill(pid, SIGTERM)
+        }
+
+        let gracefulDeadline = Date().addingTimeInterval(0.4)
+        while Date() < gracefulDeadline,
+              stalePIDs.contains(where: Self.isProcessAlive) {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        for pid in stalePIDs where Self.isProcessAlive(pid) {
+            kill(pid, SIGKILL)
+        }
+    }
+
+    private static func orphanedRendererPIDs() -> [pid_t] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid=,command="]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let text = String(data: data, encoding: .utf8) else {
+                return []
+            }
+            return text
+                .split(separator: "\n")
+                .compactMap { line -> pid_t? in
+                    let fields = line.split(
+                        maxSplits: 2,
+                        whereSeparator: { $0 == " " || $0 == "\t" }
+                    )
+                    guard fields.count == 3,
+                          let pid = pid_t(fields[0]),
+                          let parentPID = pid_t(fields[1]),
+                          parentPID == 1,
+                          pid > 1 else {
+                        return nil
+                    }
+                    let command = String(fields[2])
+                    guard command.contains("wallpaper-video-renderer"),
+                          command.contains("--socket"),
+                          command.contains("/tmp/waifux-video-renderer-") else {
+                        return nil
+                    }
+                    return pid
+                }
+        } catch {
+            return []
+        }
+    }
+
+    private static func isProcessAlive(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0
     }
 
     private func resolvedExecutableURL() -> URL? {
