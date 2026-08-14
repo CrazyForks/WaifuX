@@ -47,7 +47,8 @@ final class MenuBarQuickSwitcherController: NSObject {
         relativeTo anchorView: NSView,
         targetScreen: NSScreen?,
         currentWallpaperURL: URL?,
-        onOpenSettings: @escaping () -> Void
+        onOpenSettings: @escaping () -> Void,
+        onOpenDetail: @escaping (MainWallpaperDetailRequest) -> Void
     ) {
         if panel.isVisible {
             dismiss()
@@ -58,6 +59,10 @@ final class MenuBarQuickSwitcherController: NSObject {
         viewModel.onOpenSettings = { [weak self] in
             self?.dismiss()
             onOpenSettings()
+        }
+        viewModel.onOpenDetail = { [weak self] request in
+            self?.dismiss()
+            onOpenDetail(request)
         }
         viewModel.prepare(
             targetScreen: targetScreen,
@@ -180,6 +185,7 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
 
     var onOpenSettings: (() -> Void)?
     var onApplied: (() -> Void)?
+    var onOpenDetail: ((MainWallpaperDetailRequest) -> Void)?
 
     private var targetScreenID: String?
     private var targetScreenFingerprint: String?
@@ -194,6 +200,18 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
         case .media(let item):
             return MediaLibraryService.shared.isFavorite(item)
         }
+    }
+
+    func openDetail() {
+        guard let selectedItem else { return }
+        let request: MainWallpaperDetailRequest
+        switch selectedItem.source {
+        case .wallpaper(let wallpaper):
+            request = .wallpaper(wallpaper)
+        case .media(let item):
+            request = .media(item)
+        }
+        onOpenDetail?(request)
     }
 
     func prepare(targetScreen: NSScreen?, currentWallpaperURL: URL?) {

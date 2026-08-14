@@ -151,9 +151,9 @@ struct MenuBarQuickSwitcherView: View {
                     }
 
                 Button {
-                    viewModel.toggleFavorite()
+                    viewModel.openDetail()
                 } label: {
-                    Image(systemName: viewModel.isSelectedItemFavorite ? "heart.fill" : "heart")
+                    Image(systemName: "arrow.up.right.square")
                         .font(.system(size: 14, weight: .semibold))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.white)
@@ -166,7 +166,7 @@ struct MenuBarQuickSwitcherView: View {
                         }
                 }
                 .buttonStyle(QuickSwitcherPressButtonStyle())
-                .help(viewModel.isSelectedItemFavorite ? t("player.unfavorite") : t("player.favorite"))
+                .help(t("statusbar.openCurrentWallpaper"))
                 .padding(10)
                 .disabled(viewModel.isApplying)
             } else {

@@ -2632,6 +2632,19 @@ final class MediaExploreViewModel: ObservableObject {
 
         mediaLibrary.removeDownloadRecord(withID: item.id)
         try await downloadWorkshopWallpaper(itemToDownload, folderID: folderID)
+
+        // 双保险：下载记录复活时若队列 Job 路径未写回归属（并发路径可能以 nil 复活
+        // 软删记录），按删前捕获的 folderID 强制恢复，与「重新下载」流程保持一致；
+        // 根目录（nil）也照此处理，不误改用户已手动移动的归属。
+        if let record = mediaLibrary.downloadRecord(for: item.id),
+           MediaLibraryService.normalizedFolderID(record.folderID)
+               != MediaLibraryService.normalizedFolderID(folderID) {
+            mediaLibrary.moveMediaToFolder(
+                mediaID: item.id,
+                folderID: MediaLibraryService.normalizedFolderID(folderID),
+                scope: .downloads
+            )
+        }
     }
 
     private func mediaItemByUpdatingRemoteMetadata(

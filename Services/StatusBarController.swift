@@ -305,6 +305,10 @@ final class StatusBarController: NSObject {
                 currentWallpaperURL: targetScreen.flatMap { currentWallpaperURL(for: $0) },
                 onOpenSettings: { [weak self] in
                     self?.openAppSettingsPanel()
+                },
+                onOpenDetail: { [weak self] request in
+                    MainNavigationRequestStore.requestWallpaperDetail(request)
+                    self?.showWindowHandler?()
                 }
             )
         } else if event.type == .leftMouseUp || event.type == .rightMouseUp {
