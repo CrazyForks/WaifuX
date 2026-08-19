@@ -738,6 +738,9 @@ final class VideoWallpaperManager: ObservableObject {
     private var pendingWakeRebuildWorkItem: DispatchWorkItem?
     private var externalWakeRecoveryTask: Task<Void, Never>?
     private var externalWakeRecoveryGeneration: UInt64 = 0
+    private var externalPlaybackSuspendedAt: Date?
+    private var externalWakeNeedsDisplayReconfigure = false
+    private var externalWakeNeedsPipelineRecovery = false
     private var lastAppliedScreenConfigurations: [ScreenConfigurationSignature] = []
     /// Pause/resume commands used to be fire-and-forget. A rapid "pause, then
     /// next" could let the old pause arrive after the next renderer `set`,
@@ -2191,6 +2194,12 @@ final class VideoWallpaperManager: ObservableObject {
                 throw NSError(domain: "VideoWallpaper", code: 2001,
                               userInfo: [NSLocalizedDescriptionKey: "视频渲染子进程启动失败"])
             }
+        } else {
+            // Setting a new video normally reuses the healthy daemon, so the
+            // launch path is not entered. Reconcile here as well: an older
+            // child from a raced stop/restart can otherwise keep rendering
+            // the previous wallpaper underneath the current one.
+            await externalRenderer.reconcileChildRenderers()
         }
 
         // 停掉主进程内可能残留的旧视频窗口（从旧路径切换过来的场景）。
@@ -2215,6 +2224,7 @@ final class VideoWallpaperManager: ObservableObject {
         let keepPausedScreenIDs = keepPaused ? externalPausedScreenIDs : []
         self.usesSharedVideoDecoder = usesSharedVideoDecoder
         externalRenderingActive = true
+        resetExternalWakeRecoveryTracking(suspended: isScreenLocked)
         deactivateAudioSession()
         invalidateExternalPlaybackControl(reason: "applyVideoWallpaper")
         externalFallbackAttemptedScreenIDs.removeAll()
@@ -4286,6 +4296,7 @@ final class VideoWallpaperManager: ObservableObject {
             if self.externalRenderingActive {
                 // 外部 renderer 直接订阅统一的锁屏状态文件/分布式通知。
                 // 主进程不得再发全局 pause，否则会覆盖 helper 的每屏手动暂停状态。
+                self.markExternalRendererSuspended()
                 return
             }
             // 锁屏时暂停视频，显示预览图（预览图已设为桌面壁纸）
@@ -4312,7 +4323,10 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             if #available(macOS 26.0, *), self.externalRenderingActive {
-                self.scheduleExternalRendererWakeRecovery(reason: "screenUnlocked")
+                self.scheduleExternalRendererWakeRecovery(
+                    reason: "screenUnlocked",
+                    reconfigureDisplays: false
+                )
             }
             // 解锁时恢复播放（如果不是手动暂停）
             guard !self.isPaused else {
@@ -4555,6 +4569,9 @@ final class VideoWallpaperManager: ObservableObject {
     /// 应用退出前调用：只清理视频窗口和播放器，不回退到旧静态壁纸。
     /// 与 `stopWallpaper()` 不同，此方法不清理保存的状态（`stateKey`），下次启动仍可恢复视频壁纸。
     func prepareForAppTermination() {
+        // Do this before checking manager state. A stale/untracked helper can
+        // still be visible even when the in-memory wallpaper state is empty.
+        externalRenderer.terminateAllChildRenderersForAppTermination()
         guard hasActiveVideoWallpaper else { return }
 
         // 子进程渲染路径：停止子进程并保留持久化状态
@@ -5570,6 +5587,7 @@ final class VideoWallpaperManager: ObservableObject {
                 volumeByScreenFingerprint = savedState.volumeByScreenFingerprint ?? [:]
                 currentPosterURL = globalPosterURL
                 externalRenderingActive = true
+                resetExternalWakeRecoveryTracking(suspended: isScreenLocked)
                 isPaused = savedState.isPaused
                 userRequestedPause = savedState.isPaused
                 let savedScreenIDs = Set(savedState.videoScreenIDs ?? [])
@@ -5886,6 +5904,7 @@ final class VideoWallpaperManager: ObservableObject {
             guard let self = self else { return }
             if self.externalRenderingActive {
                 // helper 直接消费 LockScreenWallpaperService 的统一状态。
+                self.markExternalRendererSuspended()
                 return
             }
             for player in self.players.values {
@@ -5906,7 +5925,10 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             if #available(macOS 26.0, *), self.externalRenderingActive {
-                self.scheduleExternalRendererWakeRecovery(reason: "screensWake")
+                self.scheduleExternalRendererWakeRecovery(
+                    reason: "screensWake",
+                    reconfigureDisplays: true
+                )
             }
 
             // 屏幕唤醒时防抖重建
@@ -5915,15 +5937,17 @@ final class VideoWallpaperManager: ObservableObject {
                 guard let self = self else { return }
                 if self.hasActiveVideoWallpaper {
                     if self.externalRenderingActive {
+                        DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+                        if #available(macOS 26.0, *) {
+                            // The serialized wake recovery task owns external
+                            // renderer health checks and reconfiguration.
+                            return
+                        }
                         Task { @MainActor [weak self] in
                             await self?.reconfigureExternalRendererForCurrentScreens(
                                 reason: "screensWake"
                             )
                         }
-                        DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
-                        self.scheduleDelayedExternalRendererReconfigure(
-                            reason: "screensWakeDelayed"
-                        )
                         return
                     }
                     self.repairWindowsForCurrentDisplayConfiguration(reason: "screensWake")
@@ -5979,6 +6003,7 @@ final class VideoWallpaperManager: ObservableObject {
             guard let self = self else { return }
             if self.externalRenderingActive {
                 // helper 直接消费 LockScreenWallpaperService 的统一状态。
+                self.markExternalRendererSuspended()
                 return
             }
             for player in self.players.values {
@@ -5999,7 +6024,10 @@ final class VideoWallpaperManager: ObservableObject {
                 )
             }
             if #available(macOS 26.0, *), self.externalRenderingActive {
-                self.scheduleExternalRendererWakeRecovery(reason: "systemWake")
+                self.scheduleExternalRendererWakeRecovery(
+                    reason: "systemWake",
+                    reconfigureDisplays: true
+                )
             }
 
             self.pendingWakeRebuildWorkItem?.cancel()
@@ -6007,15 +6035,17 @@ final class VideoWallpaperManager: ObservableObject {
                 guard let self = self else { return }
                 if self.hasActiveVideoWallpaper {
                     if self.externalRenderingActive {
+                        DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+                        if #available(macOS 26.0, *) {
+                            // The serialized wake recovery task owns external
+                            // renderer health checks and reconfiguration.
+                            return
+                        }
                         Task { @MainActor [weak self] in
                             await self?.reconfigureExternalRendererForCurrentScreens(
                                 reason: "systemWake"
                             )
                         }
-                        DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
-                        self.scheduleDelayedExternalRendererReconfigure(
-                            reason: "systemWakeDelayed"
-                        )
                         return
                     }
                     self.repairWindowsForCurrentDisplayConfiguration(reason: "systemWake")
@@ -6230,19 +6260,25 @@ final class VideoWallpaperManager: ObservableObject {
     /// change. The parent process never calls `rebuildWindows()` in this mode.
     private func reconfigureExternalRendererForCurrentScreens(
         reason: String,
-        clearExistingRendererState: Bool = true
+        clearExistingRendererState: Bool = true,
+        forceNewPipeline: Bool = false,
+        recoverUnresponsiveRenderer: Bool = false
     ) async {
         await withExternalRendererTransaction {
             await self.reconfigureExternalRendererForCurrentScreensLocked(
                 reason: reason,
-                clearExistingRendererState: clearExistingRendererState
+                clearExistingRendererState: clearExistingRendererState,
+                forceNewPipeline: forceNewPipeline,
+                recoverUnresponsiveRenderer: recoverUnresponsiveRenderer
             )
         }
     }
 
     private func reconfigureExternalRendererForCurrentScreensLocked(
         reason: String,
-        clearExistingRendererState: Bool
+        clearExistingRendererState: Bool,
+        forceNewPipeline: Bool,
+        recoverUnresponsiveRenderer: Bool
     ) async {
         guard externalRenderingActive else { return }
         guard externalPendingCommitScreenIDs.isEmpty else {
@@ -6268,11 +6304,24 @@ final class VideoWallpaperManager: ObservableObject {
                 scheduleExternalRendererRestart(afterExitStatus: -1)
                 return
             }
+        } else {
+            await externalRenderer.reconcileChildRenderers()
+            if recoverUnresponsiveRenderer,
+               !(await externalRenderer.isDaemonResponsive(
+                   timeout: Self.externalRendererHealthCheckTimeout
+               )) {
+                AppLogger.error(.wallpaper, "唤醒时 video-renderer 探活失败，准备换代", metadata: [
+                    "reason": reason
+                ])
+                guard await forceRecycleExternalRenderer(reason: "\(reason)-unresponsive") else {
+                    scheduleExternalRendererRestart(afterExitStatus: -1)
+                    return
+                }
+            }
         }
 
         let wasPaused = isPaused
         let pausedIDs = externalPausedScreenIDs
-        let requestID = UUID().uuidString
         let desiredScreenIDs = videoTargetScreenIDs
         let desiredFingerprints = videoTargetScreenFingerprints
         externalFirstFrameReadyScreenIDs.subtract(
@@ -6281,29 +6330,31 @@ final class VideoWallpaperManager: ObservableObject {
         if clearExistingRendererState {
             // Keep owned + presented IDs so the following set can freeze the
             // last frame and host still treats this as a live video replacement.
-            // Clearing presented here is what made wake/hot-plug send
-            // deferredPresentation=false and flash black.
+            // Reconfigure itself is auto-committed by the helper when the fresh
+            // pipeline produces a drawable.
             externalFirstFrameReadyScreenIDs.subtract(
                 targets.map(\.wallpaperScreenIdentifier)
             )
         }
         var reboundIDs = Set<String>()
         var reboundFingerprints = Set<String>()
-        for screen in targets {
-            let screenID = screen.wallpaperScreenIdentifier
-            externalRequestIDByScreenID[screenID] = requestID
-            guard let sourceURL = videoURL(for: screen) ?? currentVideoURL,
-                  FileManager.default.fileExists(atPath: sourceURL.path),
-                  let screenIndex = externalScreenIndex(for: screen) else {
-                continue
-            }
-            let playbackURL = frameInterpolatedPlaybackURLByScreen[screenID]
-                ?? resolvedExternalPlaybackURL(for: sourceURL, screen: screen)
-            let schedulerConfig = WallpaperSchedulerService.shared.config
-                .resolvedDisplayConfig(for: screenID)
-            let looping = !(schedulerConfig.isEnabled && schedulerConfig.isOnEndMode)
-            let response = await externalRenderer.sendCommand(
-                .set(
+        let maximumAttempts = recoverUnresponsiveRenderer ? 2 : 1
+        reconfigureAttempts: for attempt in 0..<maximumAttempts {
+            let requestID = UUID().uuidString
+            for screen in targets {
+                let screenID = screen.wallpaperScreenIdentifier
+                externalRequestIDByScreenID[screenID] = requestID
+                guard let sourceURL = videoURL(for: screen) ?? currentVideoURL,
+                      FileManager.default.fileExists(atPath: sourceURL.path),
+                      let screenIndex = externalScreenIndex(for: screen) else {
+                    continue
+                }
+                let playbackURL = frameInterpolatedPlaybackURLByScreen[screenID]
+                    ?? resolvedExternalPlaybackURL(for: sourceURL, screen: screen)
+                let schedulerConfig = WallpaperSchedulerService.shared.config
+                    .resolvedDisplayConfig(for: screenID)
+                let looping = !(schedulerConfig.isEnabled && schedulerConfig.isOnEndMode)
+                let command = VideoRendererProcessController.Command.set(
                     screen: screenIndex,
                     screenID: screenID,
                     requestID: requestID,
@@ -6316,45 +6367,83 @@ final class VideoWallpaperManager: ObservableObject {
                     volume: volume(for: screen),
                     looping: looping,
                     shared: usesSharedVideoDecoder,
-                    forceNewPipeline: false,
-                    hdrMetadataEnabled: UserDefaults.standard.object(forKey: "hdr_enabled") as? Bool ?? false,
-                    deferredPresentation: externalLiveVideoScreenIDs.contains(screenID),
+                    forceNewPipeline: forceNewPipeline,
+                    hdrMetadataEnabled: UserDefaults.standard.object(
+                        forKey: "hdr_enabled"
+                    ) as? Bool ?? false,
+                    // Reconfigure has no host-side transition commit. The
+                    // helper preserves the old drawable itself and commits
+                    // the replacement when the fresh pipeline has a frame.
+                    deferredPresentation: false,
                     transitionDuration: 0,
                     globalPaused: wasPaused,
                     screenPaused: pausedIDs.contains(screenID),
-                    globalDisplaySyncEnabled: WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled
-                ),
-                screen: screenIndex,
-                timeout: Self.externalRendererSetCommandTimeout
-            )
-            guard response?.hasPrefix("OK") == true else {
-                AppLogger.error(.wallpaper, "外部视频显示器重连 set 失败", metadata: [
-                    "screenID": screenID,
-                    "reason": reason,
-                    "response": response ?? "nil"
-                ])
-                continue
-            }
+                    globalDisplaySyncEnabled: WallpaperSchedulerService.shared
+                        .isGlobalDisplaySyncEnabled
+                )
+                var response = await externalRenderer.sendCommand(
+                    command,
+                    screen: screenIndex,
+                    timeout: Self.externalRendererSetCommandTimeout
+                )
+                if response?.hasPrefix("OK") != true, recoverUnresponsiveRenderer {
+                    let responsive = await externalRenderer.isDaemonResponsive(
+                        timeout: Self.externalRendererHealthCheckTimeout
+                    )
+                    if !responsive {
+                        guard attempt + 1 < maximumAttempts,
+                              await forceRecycleExternalRenderer(
+                                  reason: "\(reason)-setUnresponsive"
+                              ) else {
+                            scheduleExternalRendererRestart(afterExitStatus: -1)
+                            return
+                        }
+                        // Recycling drops every child-owned window, including
+                        // screens already rebound in this attempt. Restart the
+                        // complete target set instead of resuming mid-list.
+                        reboundIDs.removeAll()
+                        reboundFingerprints.removeAll()
+                        continue reconfigureAttempts
+                    }
+                    // The set can race display enumeration or a just-finished
+                    // decoder teardown. A healthy daemon gets one direct
+                    // retry before the screen is marked failed.
+                    response = await externalRenderer.sendCommand(
+                        command,
+                        screen: screenIndex,
+                        timeout: Self.externalRendererSetCommandTimeout
+                    )
+                }
+                guard response?.hasPrefix("OK") == true else {
+                    AppLogger.error(.wallpaper, "外部视频显示器重连 set 失败", metadata: [
+                        "screenID": screenID,
+                        "reason": reason,
+                        "response": response ?? "nil"
+                    ])
+                    continue
+                }
 
-            reboundIDs.insert(screenID)
-            reboundFingerprints.insert(screen.wallpaperScreenFingerprint)
-            rememberExternalOwnedScreen(screen)
-            syncExternalPosterPath(
-                for: screen,
-                posterURL: posterURL(for: screen)
-            )
-            if wasPaused || pausedIDs.contains(screenID) {
-                showPosterImage(for: screenID)
+                reboundIDs.insert(screenID)
+                reboundFingerprints.insert(screen.wallpaperScreenFingerprint)
+                rememberExternalOwnedScreen(screen)
+                syncExternalPosterPath(
+                    for: screen,
+                    posterURL: posterURL(for: screen)
+                )
+                if wasPaused || pausedIDs.contains(screenID) {
+                    showPosterImage(for: screenID)
+                }
+                if !externalLiveVideoScreenIDs.contains(screenID) {
+                    applyCropToScreen(screen)
+                }
+                scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: playbackURL)
+                prepareExternalFrameInterpolation(
+                    screenID: screenID,
+                    screen: screen,
+                    videoURL: sourceURL
+                )
             }
-            if !externalLiveVideoScreenIDs.contains(screenID) {
-                applyCropToScreen(screen)
-            }
-            scheduleVideoLetterboxAnalysis(screenID: screenID, videoURL: playbackURL)
-            prepareExternalFrameInterpolation(
-                screenID: screenID,
-                screen: screen,
-                videoURL: sourceURL
-            )
+            break
         }
 
         // Keep matching child-owned windows alive while displays reconfigure.
@@ -6401,9 +6490,59 @@ final class VideoWallpaperManager: ObservableObject {
     /// 健康 daemon 毫秒级响应；楔死时必须快速失败让上层触发换代自愈，
     /// 不能让一次点击串行阻塞 15-30s（旧值 15s 曾让菜单暂停"点了没反应"）。
     private static let externalRendererPlaybackControlTimeout: TimeInterval = 2.5
+    /// 唤醒探活只发送 ping，不应被解码/窗口初始化拖到 2.5s 以上。
+    private static let externalRendererHealthCheckTimeout: TimeInterval = 1.5
+    private func resetExternalWakeRecoveryTracking(suspended: Bool) {
+        externalWakeRecoveryGeneration &+= 1
+        externalWakeRecoveryTask?.cancel()
+        externalWakeRecoveryTask = nil
+        externalWakeNeedsDisplayReconfigure = false
+        externalWakeNeedsPipelineRecovery = false
+        externalPlaybackSuspendedAt = suspended ? Date() : nil
+    }
 
-    private func refreshExternalRendererPlaybackState(reason: String) async {
-        guard externalRenderingActive, externalRenderer.isRunning else { return }
+    private func markExternalRendererSuspended() {
+        guard externalRenderingActive, externalPlaybackSuspendedAt == nil else {
+            return
+        }
+        externalPlaybackSuspendedAt = Date()
+        // A healthy renderer process can still hold an invalid AVPlayer /
+        // VideoToolbox session after clamshell sleep. Treat every sleep as a
+        // pipeline boundary; a later play/seek is not a reliable recovery.
+        externalWakeNeedsPipelineRecovery = true
+    }
+
+    /// Refreshes the helper's shared lock state.
+    /// - Returns: true when the helper was recycled and needs a full rebind.
+    @discardableResult
+    private func refreshExternalRendererPlaybackState(reason: String) async -> Bool {
+        guard externalRenderingActive else { return false }
+        guard externalRenderer.isRunning else {
+            AppLogger.error(.wallpaper, "外部视频唤醒时 renderer 已退出", metadata: [
+                "reason": reason
+            ])
+            if await externalRenderer.startDaemon() {
+                return true
+            }
+            scheduleExternalRendererRestart(afterExitStatus: -1)
+            return false
+        }
+        guard await externalRenderer.isDaemonResponsive(
+            timeout: Self.externalRendererHealthCheckTimeout
+        ) else {
+            AppLogger.error(.wallpaper, "外部视频唤醒探活失败，回收 renderer", metadata: [
+                "reason": reason
+            ])
+            if await forceRecycleExternalRenderer(reason: "\(reason)-unresponsive") {
+                AppLogger.info(.wallpaper, "外部视频 renderer 已换代，等待唤醒重配置", metadata: [
+                    "reason": reason
+                ])
+                return true
+            } else {
+                scheduleExternalRendererRestart(afterExitStatus: -1)
+            }
+            return false
+        }
         let response = await externalRenderer.sendCommand(
             .refreshPlaybackState,
             screen: nil,
@@ -6414,26 +6553,49 @@ final class VideoWallpaperManager: ObservableObject {
                 "reason": reason,
                 "response": response ?? "nil"
             ])
-            return
+            return false
         }
         AppLogger.debug(.wallpaper, "外部视频唤醒状态已刷新", metadata: [
             "reason": reason
         ])
+        return false
     }
 
-    private func scheduleExternalRendererWakeRecovery(reason: String) {
+    private func scheduleExternalRendererWakeRecovery(
+        reason: String,
+        reconfigureDisplays: Bool
+    ) {
         guard externalRenderingActive else { return }
+        externalWakeNeedsDisplayReconfigure =
+            externalWakeNeedsDisplayReconfigure || reconfigureDisplays
+        // `screensDidWake`/`didWake` can arrive without a matching sleep
+        // notification on a notebook lid cycle. The display wake itself is
+        // enough evidence that the old decoder must not be reused.
+        if reconfigureDisplays {
+            externalWakeNeedsPipelineRecovery = true
+        }
+        if let suspendedAt = externalPlaybackSuspendedAt {
+            let suspendedDuration = Date().timeIntervalSince(suspendedAt)
+            externalPlaybackSuspendedAt = nil
+            externalWakeNeedsPipelineRecovery = true
+            AppLogger.info(.wallpaper, "锁屏/睡眠后启用视频解码管线重建", metadata: [
+                "reason": reason,
+                "duration": String(format: "%.1f", suspendedDuration)
+            ])
+        }
         externalWakeRecoveryGeneration &+= 1
         let generation = externalWakeRecoveryGeneration
         externalWakeRecoveryTask?.cancel()
         externalWakeRecoveryTask = Task { @MainActor [weak self] in
+            var didRebuildPipeline = false
             let delays: [UInt64] = [
                 0,
                 350_000_000,
                 900_000_000,
-                1_500_000_000
+                1_500_000_000,
+                3_000_000_000
             ]
-            for delay in delays {
+            for (pass, delay) in delays.enumerated() {
                 if delay > 0 {
                     try? await Task.sleep(nanoseconds: delay)
                 }
@@ -6443,9 +6605,61 @@ final class VideoWallpaperManager: ObservableObject {
                       self.externalRenderingActive else {
                     return
                 }
-                await self.refreshExternalRendererPlaybackState(
-                    reason: "\(reason)-pass"
-                )
+                if pass == 2,
+                   !didRebuildPipeline,
+                   (
+                       self.externalWakeNeedsDisplayReconfigure
+                        || self.externalWakeNeedsPipelineRecovery
+                   ) {
+                    let forceNewPipeline = self.externalWakeNeedsPipelineRecovery
+                    await self.reconfigureExternalRendererForCurrentScreens(
+                        reason: "\(reason)-pipelineRecovery",
+                        forceNewPipeline: forceNewPipeline,
+                        recoverUnresponsiveRenderer: true
+                    )
+                    guard self.externalWakeRecoveryGeneration == generation else {
+                        return
+                    }
+                    self.externalWakeNeedsDisplayReconfigure = false
+                    self.externalWakeNeedsPipelineRecovery = false
+                    didRebuildPipeline = true
+                } else if (pass == 3 || pass == 4),
+                          self.currentTargetScreenConfigurations()
+                            != self.lastAppliedScreenConfigurations {
+                    // External displays can be enumerated a few seconds after
+                    // wake. Only rebind again when the target topology really
+                    // changed; do not cancel a healthy replacement pipeline.
+                    await self.reconfigureExternalRendererForCurrentScreens(
+                        reason: "\(reason)-lateDisplayRecovery",
+                        recoverUnresponsiveRenderer: true
+                    )
+                    didRebuildPipeline = true
+                } else {
+                    let didRecycle = await self.withExternalRendererTransaction {
+                        guard self.externalWakeRecoveryGeneration == generation,
+                              self.externalRenderingActive else {
+                            return false
+                        }
+                        return await self.refreshExternalRendererPlaybackState(
+                            reason: "\(reason)-pass\(pass)"
+                        )
+                    }
+                    if didRecycle,
+                       self.externalWakeRecoveryGeneration == generation,
+                       self.externalRenderingActive {
+                        await self.reconfigureExternalRendererForCurrentScreens(
+                            reason: "\(reason)-rebindAfterRecycle",
+                            forceNewPipeline: true,
+                            recoverUnresponsiveRenderer: true
+                        )
+                        guard self.externalWakeRecoveryGeneration == generation else {
+                            return
+                        }
+                        self.externalWakeNeedsDisplayReconfigure = false
+                        self.externalWakeNeedsPipelineRecovery = false
+                        didRebuildPipeline = true
+                    }
+                }
             }
             if self?.externalWakeRecoveryGeneration == generation {
                 self?.externalWakeRecoveryTask = nil

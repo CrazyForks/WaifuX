@@ -313,6 +313,10 @@ private final class VideoRendererDaemon {
 
     struct ScreenState {
         var screenID: String
+        /// Stable physical-display fingerprint captured when this state was
+        /// bound. NSScreenNumber can change after sleep/reconnect, so the
+        /// renderer must not treat a changed numeric ID as a new window.
+        var screenFingerprint: String?
         var requestID: String
         var window: NSWindow?
         var containerView: VideoContainerView?
@@ -640,12 +644,14 @@ private final class VideoRendererDaemon {
         if let stableScreenID = msg.screenID,
            let existingKey = screenStates.first(where: {
                $0.value.screenID == stableScreenID
+                   || $0.value.screenFingerprint == stableScreenID
            })?.key {
             return existingKey
         }
         if let fingerprint = currentFingerprint(matching: msg.screenID),
            let existingKey = screenStates.first(where: {
-               currentFingerprint(matching: $0.value.screenID) == fingerprint
+               $0.value.screenFingerprint == fingerprint
+                   || currentFingerprint(matching: $0.value.screenID) == fingerprint
            })?.key {
             return existingKey
         }
@@ -714,6 +720,39 @@ private final class VideoRendererDaemon {
                     ]
                 )
             }
+            let frame = CGRect(x: x, y: y, width: w, height: h)
+            let screenFingerprint = currentScreenFingerprint(at: screen)
+            guard FileManager.default.fileExists(atPath: path) else {
+                return "ERROR: video file unavailable"
+            }
+            guard frame.width > 0, frame.height > 0 else {
+                return "ERROR: invalid screen frame"
+            }
+
+            // A display reconnect can change NSScreenNumber while an old
+            // state is still held under the previous local index. Rebinding
+            // that display must leave exactly one desktop window behind;
+            // otherwise the stale AVPlayer window can remain alive underneath
+            // the new one and both timelines continue to advance.
+            let duplicateScreens = screenStates.compactMap { key, state -> Int? in
+                guard key != screen else { return nil }
+                let sameID = state.screenID == stableScreenID
+                    || state.screenFingerprint == stableScreenID
+                let sameFingerprint = screenFingerprint != nil
+                    && state.screenFingerprint == screenFingerprint
+                guard sameID || sameFingerprint else { return nil }
+                return key
+            }.sorted()
+            for duplicateScreen in duplicateScreens {
+                AppLogger.info(.wallpaper, "video-renderer 清理同一显示器重复窗口", metadata: [
+                    "screen": String(duplicateScreen),
+                    "replacementScreen": String(screen),
+                    "screenID": stableScreenID,
+                    "fingerprint": screenFingerprint ?? "nil"
+                ])
+                teardownScreen(duplicateScreen)
+            }
+
             if let staleState = screenStates[screen],
                staleState.screenID != stableScreenID {
                 let newIDAlreadyOwned = screenStates.contains {
@@ -743,6 +782,7 @@ private final class VideoRendererDaemon {
                         ]
                     )
                     screenStates[screen]?.screenID = stableScreenID
+                    screenStates[screen]?.screenFingerprint = screenFingerprint
                 }
             } else if let existing = screenStates[screen],
                       existing.screenID != stableScreenID,
@@ -750,15 +790,9 @@ private final class VideoRendererDaemon {
                       currentFingerprint(matching: existing.screenID)
                         == currentFingerprint(matching: stableScreenID) {
                 screenStates[screen]?.screenID = stableScreenID
-            }
-            guard FileManager.default.fileExists(atPath: path) else {
-                return "ERROR: video file unavailable"
-            }
-            guard w > 0, h > 0 else {
-                return "ERROR: invalid screen frame"
+                screenStates[screen]?.screenFingerprint = screenFingerprint
             }
             let videoURL = URL(fileURLWithPath: path)
-            let frame = CGRect(x: x, y: y, width: w, height: h)
             let muted = msg.muted ?? self.isMuted
             let vol = msg.volume ?? Double(self.volume)
             let looping = msg.enableLooping ?? true
@@ -1080,6 +1114,7 @@ private final class VideoRendererDaemon {
         screenGenerations[screen] = generation
         screenStates[screen] = ScreenState(
             screenID: screenID,
+            screenFingerprint: currentScreenFingerprint(at: screen),
             requestID: requestID,
             window: window,
             containerView: containerView,
@@ -2229,7 +2264,9 @@ private final class VideoRendererDaemon {
         let liveFingerprints = Set(activeScreenIDs.compactMap(currentFingerprint(matching:)))
         let staleScreens = screenStates
             .filter { _, state in
-                if activeScreenIDs.contains(state.screenID) {
+                if activeScreenIDs.contains(state.screenID)
+                    || (state.screenFingerprint.map(activeScreenIDs.contains) == true)
+                    || (state.screenFingerprint.map(liveFingerprints.contains) == true) {
                     return false
                 }
                 if let fingerprint = currentFingerprint(matching: state.screenID),
@@ -2242,6 +2279,46 @@ private final class VideoRendererDaemon {
             .sorted()
         for screen in staleScreens {
             teardownScreen(screen)
+        }
+        deduplicateScreenStates()
+    }
+
+    private func currentScreenFingerprint(at index: Int) -> String? {
+        let orderedScreens = RendererScreenIdentity.orderedScreens(NSScreen.screens)
+        guard orderedScreens.indices.contains(index) else { return nil }
+        return RendererScreenIdentity.fingerprint(for: orderedScreens[index])
+    }
+
+    /// Repairs duplicate state left by a display-index reshuffle. Keep the
+    /// newest state because its generation/request belongs to the latest host
+    /// bind, and tear down the older window/player completely.
+    private func deduplicateScreenStates() {
+        var ownerByFingerprint: [String: Int] = [:]
+        for screen in screenStates.keys.sorted() {
+            guard let state = screenStates[screen],
+                  let fingerprint = state.screenFingerprint
+                    ?? currentFingerprint(matching: state.screenID) else {
+                continue
+            }
+            guard let owner = ownerByFingerprint[fingerprint],
+                  let ownerState = screenStates[owner] else {
+                ownerByFingerprint[fingerprint] = screen
+                continue
+            }
+
+            let removeScreen: Int
+            if state.generation > ownerState.generation {
+                removeScreen = owner
+                ownerByFingerprint[fingerprint] = screen
+            } else {
+                removeScreen = screen
+            }
+            AppLogger.info(.wallpaper, "video-renderer 去重物理显示器窗口", metadata: [
+                "removeScreen": String(removeScreen),
+                "keepScreen": String(removeScreen == screen ? owner : screen),
+                "fingerprint": fingerprint
+            ])
+            teardownScreen(removeScreen)
         }
     }
 
@@ -2660,6 +2737,11 @@ private final class VideoWallpaperWindow: NSWindow {
 
 private final class VideoContainerView: NSView {
     private(set) var playerLayer = AVPlayerLayer()
+    /// Keeps the live/freeze/poster layers clipped to the requested viewport
+    /// without clipping the outer letterbox background. The old implementation
+    /// masked the root layer, which made crop margins transparent and exposed
+    /// the system wallpaper underneath.
+    private let videoContentLayer = CALayer()
     private var transitionPlayerLayer: AVPlayerLayer?
     private let freezeFrameLayer = CALayer()
     private var posterLayer: CALayer?
@@ -2679,19 +2761,24 @@ private final class VideoContainerView: NSView {
         wantsLayer = true
         let container = CALayer()
         container.masksToBounds = true
+        container.backgroundColor = CGColor(gray: 0, alpha: 1)
         layer = container
+
+        videoContentLayer.frame = bounds
+        videoContentLayer.masksToBounds = true
+        container.addSublayer(videoContentLayer)
 
         freezeFrameLayer.contentsGravity = .resizeAspectFill
         freezeFrameLayer.backgroundColor = CGColor(gray: 0, alpha: 1)
         freezeFrameLayer.frame = bounds
         freezeFrameLayer.isHidden = false
-        container.addSublayer(freezeFrameLayer)
+        videoContentLayer.addSublayer(freezeFrameLayer)
 
         playerLayer.needsDisplayOnBoundsChange = true
         playerLayer.frame = bounds
         playerLayer.videoGravity = .resizeAspectFill
         playerLayer.backgroundColor = CGColor(gray: 0, alpha: 0)
-        container.addSublayer(playerLayer)
+        videoContentLayer.addSublayer(playerLayer)
 
         startReadyForDisplayObservation()
     }
@@ -2707,6 +2794,7 @@ private final class VideoContainerView: NSView {
 
     override func layout() {
         super.layout()
+        videoContentLayer.frame = bounds
         let videoFrame = currentLayerFrame ?? bounds
         if currentViewportRect == nil {
             playerLayer.frame = bounds
@@ -2717,6 +2805,9 @@ private final class VideoContainerView: NSView {
         posterLayer?.frame = videoFrame
         transitionPlayerLayer?.frame = videoFrame
         grainOverlayView?.frame = currentViewportRect ?? bounds
+        if let currentViewportRect {
+            videoContentLayer.mask?.frame = currentViewportRect
+        }
     }
 
     func attachPlayer(_ player: AVQueuePlayer?) {
@@ -2737,7 +2828,7 @@ private final class VideoContainerView: NSView {
         incoming.needsDisplayOnBoundsChange = true
         incoming.frame = playerLayer.frame
         incoming.opacity = 0.001
-        layer?.addSublayer(incoming)
+        videoContentLayer.addSublayer(incoming)
         transitionPlayerLayer = incoming
         return incoming
     }
@@ -3061,7 +3152,7 @@ private final class VideoContainerView: NSView {
         poster.contents = cgImage
         poster.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
         poster.frame = currentLayerFrame ?? bounds
-        layer?.addSublayer(poster)
+        videoContentLayer.addSublayer(poster)
         posterLayer = poster
 
         // Keep the last valid static image under the live player as a second
@@ -3131,7 +3222,7 @@ private final class VideoContainerView: NSView {
             }
             currentViewportRect = nil
             currentLayerFrame = nil
-            layer?.mask = nil
+            videoContentLayer.mask = nil
             layer?.backgroundColor = parseColor(letterboxColorHex) ?? CGColor(gray: 0, alpha: 1)
             playerLayer.videoGravity = .resizeAspectFill
             playerLayer.frame = bounds
@@ -3191,12 +3282,12 @@ private final class VideoContainerView: NSView {
             && abs(viewportRect.width - bounds.width) < 0.5
             && abs(viewportRect.height - bounds.height) < 0.5
         if fullViewport {
-            layer?.mask = nil
+            videoContentLayer.mask = nil
         } else {
-            let mask = (layer?.mask as? CALayer) ?? CALayer()
+            let mask = videoContentLayer.mask ?? CALayer()
             mask.backgroundColor = CGColor(gray: 1, alpha: 1)
             mask.frame = viewportRect
-            layer?.mask = mask
+            videoContentLayer.mask = mask
         }
     }
 
