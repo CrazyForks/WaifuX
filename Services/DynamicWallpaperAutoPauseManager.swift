@@ -411,7 +411,7 @@ final class DynamicWallpaperAutoPauseManager {
                let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }) {
                 // 即使 rate 已是 0 也再 pause 一次无害；唤醒后常见 rate 已被 play 拉起。
                 if !videoManager.isPaused(on: screen) {
-                    videoManager.pauseWallpaper(for: screen)
+                    videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
                 }
             }
 
@@ -429,6 +429,14 @@ final class DynamicWallpaperAutoPauseManager {
     /// 新启动的 wallpaper-wgpu 进程不应被旧的前台暂停状态误杀（SIGSTOP）。
     /// 当用户之后切走应用时，NSWorkspace app activation 通知会重新施加前台暂停。
     func clearForegroundPauseForWallpaperSwitch() {
+        // The video manager resets its renderer pause state while replacing a
+        // video. Allow a battery-triggered global pause to snapshot the new
+        // player again; otherwise the old non-empty bookkeeping makes
+        // applyGlobalPauseIfNeeded() return early and the new renderer plays
+        // on battery until the next power-source transition.
+        globalAutoPausedNativePlayingScreenIDs.removeAll()
+        globalAutoPausedNativeManuallyPausedScreenIDs.removeAll()
+
         let pausedIDs = foregroundPausedScreenIDs.union(inactiveDisplayPausedScreenIDs)
         foregroundPausedScreenIDs.removeAll()
         inactiveDisplayPausedScreenIDs.removeAll()
@@ -454,10 +462,12 @@ final class DynamicWallpaperAutoPauseManager {
         }
 
         let videoManager = VideoWallpaperManager.shared
-        if videoManager.isVideoWallpaperActive {
+        // 用户点过「暂停动态壁纸」后换片必须继续停。这里只清前台/覆盖自动暂停，
+        // 不能把状态栏手动暂停冲掉。
+        if videoManager.isVideoWallpaperActive, !videoManager.isPaused {
             for screen in NSScreen.screens where pausedIDs.contains(screen.wallpaperScreenIdentifier) {
                 if !fullscreenAutoPausedScreenIDs.contains(screen.wallpaperScreenIdentifier) {
-                    videoManager.resumeWallpaper(for: screen)
+                    videoManager.resumeWallpaper(for: screen, persistAsUserRequest: false)
                 }
             }
         }
@@ -467,7 +477,8 @@ final class DynamicWallpaperAutoPauseManager {
         let needsPollingForFullscreenOrForeground = pauseWhenFullscreenCovers
             || pauseWhenOtherAppForeground
             || pauseInactiveDisplays
-        let needsPollingForWindowCoverage = pauseWhenWindowCoverage && !AXIsProcessTrusted()
+        // AX 事件在长期空闲后可能停更。遮挡暂停必须保留慢轮询，否则窗口关掉后永远不恢复。
+        let needsPollingForWindowCoverage = pauseWhenWindowCoverage
         let needsTimer = needsPollingForFullscreenOrForeground || needsPollingForWindowCoverage
         if needsTimer {
             // 共用一个 3s 轮询，覆盖两类无法仅靠通知捕获的状态变化：
@@ -608,9 +619,9 @@ final class DynamicWallpaperAutoPauseManager {
             reevaluateInactiveDisplayPause()
         }
 
-        // 窗口覆盖比例检测（按屏）
-        // 有 AX 权限时由 AXObserver 事件驱动，不走 timer 轮询
-        if pauseWhenWindowCoverage && !AXIsProcessTrusted() {
+        // 窗口覆盖比例检测（按屏）。AX 事件为主，timer 兜底：观察者挂掉或
+        // 覆盖窗口无 AX 通知时，长期暂停后仍能恢复。
+        if pauseWhenWindowCoverage {
             checkWindowCoverage()
         }
 
@@ -859,7 +870,7 @@ final class DynamicWallpaperAutoPauseManager {
                     if !videoManager.isPaused(on: screen) &&
                         !fullscreenAutoPausedScreenIDs.contains(screenID) &&
                         !windowCoveragePausedScreenIDs.contains(screenID) {
-                        videoManager.pauseWallpaper(for: screen)
+                        videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
                     }
                     break
                 }
@@ -884,7 +895,7 @@ final class DynamicWallpaperAutoPauseManager {
                     if !fullscreenAutoPausedScreenIDs.contains(screenID) &&
                         !inactiveDisplayPausedScreenIDs.contains(screenID) &&
                         !windowCoveragePausedScreenIDs.contains(screenID) {
-                        videoManager.resumeWallpaper(for: screen)
+                        videoManager.resumeWallpaper(for: screen, persistAsUserRequest: false)
                     }
                     break
                 }
@@ -1308,7 +1319,7 @@ final class DynamicWallpaperAutoPauseManager {
             if videoManager.isVideoWallpaperActive,
                let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
                !videoManager.isPaused(on: screen) {
-                videoManager.pauseWallpaper(for: screen)
+                videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
                 didPause = true
             }
 
@@ -1334,7 +1345,7 @@ final class DynamicWallpaperAutoPauseManager {
 
         if videoManager.isVideoWallpaperActive {
             for screen in NSScreen.screens where screenIDs.contains(screen.wallpaperScreenIdentifier) {
-                videoManager.resumeWallpaper(for: screen)
+                videoManager.resumeWallpaper(for: screen, persistAsUserRequest: false)
             }
         }
 
@@ -1490,7 +1501,7 @@ final class DynamicWallpaperAutoPauseManager {
                         inactiveDisplayManuallyPausedScreenIDs.insert(screenID)
                     }
                 } else {
-                    videoManager.pauseWallpaper(for: screen)
+                    videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
                 }
             }
 
@@ -1564,7 +1575,7 @@ final class DynamicWallpaperAutoPauseManager {
             .union(inactiveDisplayManuallyPausedScreenIDs.intersection(managedScreenIDs))
 
         if !videoManager.isPaused {
-            videoManager.pauseWallpaper()
+            videoManager.pauseWallpaper(persistAsUserRequest: false)
         }
     }
 
@@ -1624,12 +1635,12 @@ final class DynamicWallpaperAutoPauseManager {
             .union(currentWindowCoverageNativePausedIDs)
 
         if videoManager.isPaused {
-            videoManager.resumeWallpaper()
+            videoManager.resumeWallpaper(persistAsUserRequest: false)
         }
 
         // 重新暂停需要保持暂停的屏幕
         for screen in NSScreen.screens where screenIDsToKeepPaused.contains(screen.wallpaperScreenIdentifier) {
-            videoManager.pauseWallpaper(for: screen)
+            videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
         }
 
         fullscreenAutoPausedScreenIDs = coveredManagedScreenIDs
@@ -1812,7 +1823,7 @@ final class DynamicWallpaperAutoPauseManager {
         if videoManager.isVideoWallpaperActive,
            let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
            !videoManager.isPaused(on: screen) {
-            videoManager.pauseWallpaper(for: screen)
+            videoManager.pauseWallpaper(for: screen, persistAsUserRequest: false)
         }
 
         if weBridge.isControllingExternalEngine, weBridge.isManaging(screenID: screenID) {

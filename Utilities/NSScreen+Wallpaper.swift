@@ -29,11 +29,20 @@ enum WallpaperScreenIdentity {
 
     /// `NSScreen.screens` 的系统顺序在睡眠/唤醒、重插、分辨率协商后可能打乱。
     /// 用「主屏优先 + 从左到右 + 从上到下 + 稳定 id」生成跨进程一致的展示/CLI 索引顺序。
+    static func identifier(for screen: NSScreen) -> String {
+        if let screenNumber = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber {
+            return screenNumber.stringValue
+        }
+        return "\(screen.localizedName):\(screen.frame.origin.x):\(screen.frame.origin.y)"
+    }
+
     static func orderedScreens(_ screens: [NSScreen]) -> [NSScreen] {
-        let mainID = NSScreen.main?.wallpaperScreenIdentifier
+        let mainID = NSScreen.main.map(identifier(for:))
         return screens.sorted { lhs, rhs in
-            let lhsIsMain = lhs.wallpaperScreenIdentifier == mainID
-            let rhsIsMain = rhs.wallpaperScreenIdentifier == mainID
+            let lhsIsMain = identifier(for: lhs) == mainID
+            let rhsIsMain = identifier(for: rhs) == mainID
             if lhsIsMain != rhsIsMain {
                 return lhsIsMain
             }
@@ -51,14 +60,14 @@ enum WallpaperScreenIdentity {
                 return lhs.frame.maxY > rhs.frame.maxY
             }
 
-            return lhs.wallpaperScreenIdentifier < rhs.wallpaperScreenIdentifier
+            return identifier(for: lhs) < identifier(for: rhs)
         }
     }
 
     static func stableIndex(of screen: NSScreen, in screens: [NSScreen]? = nil) -> Int? {
         let ordered = orderedScreens(screens ?? NSScreen.screens)
         return ordered.firstIndex {
-            $0.wallpaperScreenIdentifier == screen.wallpaperScreenIdentifier
+            identifier(for: $0) == identifier(for: screen)
         }
     }
 }
@@ -78,10 +87,7 @@ extension NSScreen {
     /// 回退到 `localizedName + 原点坐标`，比单纯的 localizedName 更能区分
     /// 同型号的多块显示器。
     var wallpaperScreenIdentifier: String {
-        if let screenNumber = deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
-            return screenNumber.stringValue
-        }
-        return localizedName + ":\(frame.origin.x):\(frame.origin.y)"
+        WallpaperScreenIdentity.identifier(for: self)
     }
 
     var isBuiltInDisplay: Bool {

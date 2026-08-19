@@ -906,18 +906,34 @@ final class StatusBarController: NSObject {
             return
         }
 
+        // 每屏暂停/恢复路由诊断：记录点击瞬间的全部门控标志，
+        // 定位「点击无反应」被哪个分支吞掉。
+        AppLogger.debug(.wallpaper, "菜单每屏播放控制点击", metadata: [
+            "screen": screen.localizedName,
+            "globalSync": String(WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled),
+            "weControl": String(weBridge.isControllingExternalEngine),
+            "weManaging": String(weBridge.isManaging(screen: screen)),
+            "lockMirror": String(videoWallpaperManager.isLockScreenMirroringActive),
+            "isPausedOn": String(videoWallpaperManager.isPaused(on: screen)),
+            "extRendering": String(videoWallpaperManager.externalRenderingActiveForDiagnostics)
+        ])
+
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
             if weBridge.isControllingExternalEngine {
                 if weBridge.isExternalPaused {
+                    AppLogger.debug(.wallpaper, "每屏控制路由 → 全局WE恢复")
                     weBridge.resumeWallpaper()
                     DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
                 } else {
+                    AppLogger.debug(.wallpaper, "每屏控制路由 → 全局WE暂停")
                     weBridge.pauseWallpaper()
                 }
             } else if videoWallpaperManager.isPaused {
+                AppLogger.debug(.wallpaper, "每屏控制路由 → 全局视频恢复")
                 videoWallpaperManager.resumeWallpaper()
                 DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             } else {
+                AppLogger.debug(.wallpaper, "每屏控制路由 → 全局视频暂停")
                 videoWallpaperManager.pauseWallpaper()
             }
             return
@@ -926,8 +942,10 @@ final class StatusBarController: NSObject {
         if weBridge.isControllingExternalEngine {
             // CLI 壁纸暂不支持单屏暂停，走全局
             if weBridge.isExternalPaused {
+                AppLogger.debug(.wallpaper, "每屏控制路由 → WE全局恢复")
                 weBridge.resumeWallpaper()
             } else {
+                AppLogger.debug(.wallpaper, "每屏控制路由 → WE全局暂停")
                 weBridge.pauseWallpaper()
             }
             return
@@ -935,6 +953,7 @@ final class StatusBarController: NSObject {
 
         // macOS 26+：扩展控制模式下通过共享 prefs 控制 per-display 暂停
         if #available(macOS 26.0, *), videoWallpaperManager.isLockScreenMirroringActive {
+            AppLogger.debug(.wallpaper, "每屏控制路由 → 锁屏扩展prefs（若此刻无锁屏镜像在跑即误路由）")
             if let displayID = Self.cgDisplayID(for: screen) {
                 let isPaused = LockScreenWallpaperService.shared.isDisplayPaused(displayID)
                 LockScreenWallpaperService.shared.setDisplayPaused(!isPaused, forDisplayID: displayID)
@@ -943,9 +962,11 @@ final class StatusBarController: NSObject {
         }
 
         if videoWallpaperManager.isPaused(on: screen) {
+            AppLogger.debug(.wallpaper, "每屏控制路由 → 单屏视频恢复")
             videoWallpaperManager.resumeWallpaper(for: screen)
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
         } else {
+            AppLogger.debug(.wallpaper, "每屏控制路由 → 单屏视频暂停")
             videoWallpaperManager.pauseWallpaper(for: screen)
         }
     }

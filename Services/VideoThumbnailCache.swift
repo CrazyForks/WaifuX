@@ -172,6 +172,31 @@ final class VideoThumbnailCache {
         return poster
     }
 
+    /// 自动烘焙关闭时实时渲染抽帧的 item 级最新静帧（`scene_realtime_<itemID>_*.jpg`）。
+    /// 供详情页等没有 variantKey 上下文的调用方回退：不区分目标尺寸，取修改时间最新的一张。
+    func latestSceneRealtimePosterFileURLIfExists(itemID: String) -> URL? {
+        let prefix = "scene_realtime_\(itemID.md5)_"
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        var latest: (url: URL, date: Date)?
+        for file in files
+        where file.lastPathComponent.hasPrefix(prefix)
+            && file.pathExtension.lowercased() == "jpg" {
+            guard isUsableCachedImage(at: file),
+                  let date = (try? fileManager.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date else {
+                continue
+            }
+            if latest == nil || date > latest!.date {
+                latest = (file, date)
+            }
+        }
+        return latest?.url
+    }
+
     /// 仅返回已缓存的**高清**动态壁纸 poster，不触发 AVFoundation 抽帧。
     /// 调度器切换下一张时优先走这里，避免串行抽帧把切换卡住。
     ///

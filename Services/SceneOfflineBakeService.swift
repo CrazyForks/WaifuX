@@ -794,6 +794,13 @@ enum SceneOfflineBakeService {
         if let itemID,
            let primarySize,
            let primaryPoster = postersBySize[primarySize] {
+            // 同路径覆盖写入后必须清 Kingfisher 缓存，否则详情页/列表继续命中旧帧。
+            let processor = DownsamplingImageProcessor(size: CGSize(width: 512, height: 512))
+            try? await ImageCache.default.removeImage(forKey: primaryPoster.cacheKey)
+            try? await ImageCache.default.removeImage(
+                forKey: primaryPoster.cacheKey,
+                processorIdentifier: processor.identifier
+            )
             NotificationCenter.default.post(
                 name: .sceneOfflineBakeThumbnailDidUpdate,
                 object: itemID,

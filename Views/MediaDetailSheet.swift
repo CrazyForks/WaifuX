@@ -531,6 +531,11 @@ struct MediaDetailSheet: View {
             if let posterURL = cachedSceneBakePosterURL {
                 return posterURL
             }
+            // 自动烘焙关闭时实时渲染只写 scene_realtime_*；不读它会让详情页
+            // 一直停留在 Workshop 旧预览图。
+            if let realtimePosterURL = cachedSceneRealtimePosterURL {
+                return realtimePosterURL
+            }
             if let posterURL = cachedLocalVideoPosterURL {
                 return posterURL
             }
@@ -550,6 +555,16 @@ struct MediaDetailSheet: View {
             return nil
         }
         return VideoThumbnailCache.shared.cachedSceneBakePosterFileURLIfExists(itemID: itemID)
+    }
+
+    /// 自动烘焙关闭时实时渲染的临时抽帧静帧（`scene_realtime_*`）。
+    /// 正式烘焙封面 `scene_bake_*` 缺席时的次级回退。
+    private var cachedSceneRealtimePosterURL: URL? {
+        guard cachedSceneBakeVideoURL == nil,
+              let itemID = currentDownloadRecord?.item.id else {
+            return nil
+        }
+        return VideoThumbnailCache.shared.latestSceneRealtimePosterFileURLIfExists(itemID: itemID)
     }
 
     /// 普通本地视频抽出的高清 poster。Scene 未烘焙时可作为详情页背景兜底，

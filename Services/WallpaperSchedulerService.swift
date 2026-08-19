@@ -292,7 +292,34 @@ class WallpaperSchedulerService: ObservableObject {
         let lastChangedItemID = lastChangedItemIDs[screenID]
 
         let order = overrideOrder ?? displayConfig.order
-        guard let item = selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: order) else {
+        // 优先消费预热时定下的粘性预约：保证子进程预热管线命中，
+        // 播完→新视频首帧可见间隔从 ~1.3s 压到 ~0.4s。
+        // 预约失效（已被手动切走 / 已从图库移除）则回落常规选择。
+        let reservationKey = config.isGlobalDisplaySyncEnabled
+            ? globalSchedulerStateKey
+            : screenID
+        var reservedItem: SchedulableItem?
+        if let reserved = reservedNextOnEndItems.removeValue(forKey: reservationKey) {
+            if reserved.id == lastChangedItemID {
+                AppLogger.debug(.wallpaper, "onEnd 预约弃用：与当前项相同", metadata: ["item": reserved.fileURL.lastPathComponent])
+            } else if !items.contains(where: { $0.id == reserved.id }) {
+                AppLogger.debug(.wallpaper, "onEnd 预约弃用：已不在候选池", metadata: ["item": reserved.fileURL.lastPathComponent])
+            } else {
+                AppLogger.debug(.wallpaper, "onEnd 预约消费 ✓", metadata: [
+                    "stateKey": reservationKey,
+                    "item": reserved.fileURL.lastPathComponent
+                ])
+                reservedItem = reserved
+                if order == .random {
+                    var used = usedItemIDs[screenID] ?? Set()
+                    used.insert(reserved.id)
+                    usedItemIDs[screenID] = used
+                    persistSchedulerState()
+                }
+            }
+        }
+        guard let item = reservedItem
+            ?? selectNextItem(from: items, lastID: lastChangedItemID, screenID: screenID, order: order) else {
             print("\(logTag) Screen \(screenID): item selection returned nil for on-end mode")
             finishOnEndSwitch(for: screenID, requiredMode: requiredMode, applied: false)
             recoverCurrentVideoAfterFailedOnEndSwitch(for: screenID, requiredMode: requiredMode)
@@ -1931,16 +1958,21 @@ class WallpaperSchedulerService: ObservableObject {
                     reason: preferImmediatePresentation ? "scheduler-manual-next" : "scheduler"
                 )
             )
-            if ok {
-                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: [screen])
+            if !ok {
+                AppLogger.error(.wallpaper, "onEnd apply 返回 false（类型不支持或条件不满足，将走重试）", metadata: [
+                    "item": item.fileURL.lastPathComponent
+                ])
             }
             return ok
         } catch LocalWallpaperApplyService.ApplyError.missingFile {
             unavailableSchedulableItemIDs.insert(item.id)
-            print("\(logTag) Removed missing item '\(item.title)' from this session's rotation pool")
+            AppLogger.error(.wallpaper, "onEnd 项文件缺失，移出本轮换池", metadata: ["item": item.fileURL.lastPathComponent])
             return false
         } catch {
-            print("\(logTag) applyItem failed for '\(item.title)' (\(item.fileURL.lastPathComponent)): \(error)")
+            AppLogger.error(.wallpaper, "onEnd applyItem 失败（将走重试）", metadata: [
+                "item": item.fileURL.lastPathComponent,
+                "error": String(describing: error)
+            ])
             return false
         }
     }
@@ -2002,9 +2034,6 @@ class WallpaperSchedulerService: ObservableObject {
                     reason: preferImmediatePresentation ? "globalScheduler-manual-next" : "globalScheduler"
                 )
             )
-            if ok {
-                VideoWallpaperManager.shared.forceCommitDesktopPresentation(on: screens)
-            }
             return ok
         } catch LocalWallpaperApplyService.ApplyError.missingFile {
             unavailableSchedulableItemIDs.insert(item.id)
@@ -2146,6 +2175,73 @@ class WallpaperSchedulerService: ObservableObject {
         case .random:
             return selectRandom(from: items, lastID: lastID, screenID: screenID)
         }
+    }
+
+    /// 播完即换「下一张」的粘性预约（stateKey → item）。
+    /// 预热（peek）时提前定好下一张并缓存；实际切换时优先消费预约，
+    /// 保证预热管线必然命中（否则随机顺序下预演与实际是两次独立随机
+    /// 抽取，命中率仅 1/(N-1)，预热形同虚设）。
+    private var reservedNextOnEndItems: [String: SchedulableItem] = [:]
+
+    /// 预演「播完即换」的下一张：按与实际切换相同的候选池与顺序规则
+    /// 选出下一项并缓存为粘性预约（仅限直接视频文件，保证与 applyItem
+    /// 的视频路由严格一致），返回实际会被播放的文件 URL。
+
+    func peekNextOnEndPlaybackURL(for screenID: String) -> URL? {
+        guard let screen = NSScreen.screens.first(where: {
+            $0.wallpaperScreenIdentifier == screenID
+        }) else { return nil }
+        let displayConfig = resolvedDisplayConfig(for: screen)
+        guard displayConfig.isEnabled, displayConfig.isOnEndMode else { return nil }
+        guard isManagedLibraryAvailable() else { return nil }
+        let items = getSchedulableItems(for: displayConfig)
+        guard !items.isEmpty else { return nil }
+
+        let stateKey = config.isGlobalDisplaySyncEnabled
+            ? globalSchedulerStateKey
+            : screenID
+        let lastID = lastChangedItemIDs[stateKey]
+
+        // 只预热「applyItem 确定会走外部视频管线」的项。
+        // Workshop 目录在 requirePlaybackEndSupport 模式下可能被
+        // LocalWallpaperApplyService 判为不可播（scene/web 实时渲染、
+        // bake 不可用等）而 apply 失败走重试——预热这种项必然 MISS，
+        // 还会把实际选择挤向别的项（曾致 8/8 全 MISS）。直接视频文件
+        // 的 apply 路径与 peek 返回的 URL 严格一致。
+        let videoExts: Set<String> = ["mp4", "mov", "m4v", "webm", "mkv", "avi"]
+        var prewarmable = items.filter {
+            videoExts.contains($0.fileURL.pathExtension.lowercased())
+        }
+        if prewarmable.isEmpty {
+            reservedNextOnEndItems.removeValue(forKey: stateKey)
+            return nil
+        }
+
+        let candidate: SchedulableItem?
+        switch displayConfig.order {
+        case .sequential:
+            candidate = selectSequential(from: prewarmable, lastID: lastID)
+        case .random:
+            // 与 selectRandom 同口径但不写 usedItemIDs / 不持久化，
+            // 避免预演污染实际轮换的随机去重池。
+            var pool = prewarmable
+            if let lastID,
+               pool.count > 1,
+               let index = pool.firstIndex(where: { $0.id == lastID }) {
+                pool.remove(at: index)
+            }
+            candidate = pool.randomElement()
+        }
+        guard let item = candidate else {
+            reservedNextOnEndItems.removeValue(forKey: stateKey)
+            return nil
+        }
+        reservedNextOnEndItems[stateKey] = item
+        AppLogger.debug(.wallpaper, "onEnd 预热预约", metadata: [
+            "stateKey": stateKey,
+            "item": item.fileURL.lastPathComponent
+        ])
+        return item.fileURL
     }
 
     /// Builds candidates from persisted library records only. Imported content is

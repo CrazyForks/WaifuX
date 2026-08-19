@@ -207,9 +207,19 @@ final class VideoRendererProcessController {
     private var pidPath: String = ""
     private var generation: UInt64 = 0  // 防止旧进程的退出事件污染新进程状态
     private var expectedTerminationGeneration: UInt64?
-    private var stderrBuffer = Data()
+    /// `stopDaemon()` cannot block the main actor. Keep stopping PIDs until
+    /// their desktop-level windows have actually exited so a following launch
+    /// cannot briefly overlap the old renderer.
+    private var stoppingPIDs = Set<pid_t>()
+    private var eventBuffer = Data()
     private var lastAudioMuted = true
     private var lastAudioVolume = 1.0
+    /// All IPC writes share one queue so fire-and-forget maintenance commands
+    /// cannot overtake a subsequent `set` or `stop` request.
+    private let ipcCommandQueue = DispatchQueue(
+        label: "com.waifux.video-renderer.ipc-client",
+        qos: .userInitiated
+    )
     /// Crop 更新可能在拖动和显示器布局变更时密集产生。只保留每屏最新值，
     /// 防止大量无响应 IPC 排队到 renderer 的主线程，阻塞后续 set/stop。
     private var pendingCropCommands: [Int: Command] = [:]
@@ -231,14 +241,20 @@ final class VideoRendererProcessController {
     @discardableResult
     func startDaemon() async -> Bool {
         if isRunning {
-            AppLogger.info(.wallpaper, "video-renderer 子进程已在运行，跳过启动")
-            if await waitForSocket(timeout: 2.0) {
+            // 存活 ≠ 健康：socket 可连只代表内核 accept 队列在工作，daemon
+            // 主线程卡死时连接照样成功但任何命令都无响应。必须 ping 通过才
+            // 算可用，否则「活而不答」的 daemon 会永远挡住新启动（即用户
+            // 反馈的「只能手动杀进程」楔死点）。
+            if await waitForSocket(timeout: 2.0),
+               await sendCommand(.ping, screen: nil, timeout: 1.5) == "OK" {
+                AppLogger.info(.wallpaper, "video-renderer 子进程已在运行，跳过启动")
                 return true
             }
-            AppLogger.error(.wallpaper, "video-renderer 进程仍存活但 socket 不可用，重启渲染器")
+            AppLogger.error(.wallpaper, "video-renderer 进程仍存活但不响应 IPC，强制重启渲染器")
             stopDaemon()
         }
 
+        await waitForStoppingRenderers()
         await terminateOrphanedRenderers()
 
         guard let executableURL = resolvedExecutableURL() else {
@@ -271,24 +287,34 @@ final class VideoRendererProcessController {
             proc.environment?["WAIFUX_VIDEO_RENDERER_LOCK_STATE_PATH"] = lockStateURL.path
         }
 
-        // stdout/stderr 用 Pipe 接收事件（子进程通过 stderr 的 WAIFUX_EVENT: 前缀上报）
+        // Events go to stdout so diagnostic vlog on stderr cannot glue/split
+        // firstFrameReady lines during rapid switches.
+        let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
-        proc.standardOutput = FileHandle.nullDevice
 
-        // 异步读取 stderr，解析事件
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let copy = data
+            Task { @MainActor in
+                self?.handleEventStreamData(copy)
+            }
+        }
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let copy = data
             Task { @MainActor in
-                self?.handleStderrData(copy)
+                self?.handleDiagnosticStreamData(copy)
             }
         }
 
         proc.terminationHandler = { [weak self] terminatedProcess in
             Task { @MainActor in
                 guard let self else { return }
+                self.stoppingPIDs.remove(terminatedProcess.processIdentifier)
                 // 只有当前 generation 的进程退出才处理，防止旧进程退出污染新进程
                 guard self.generation == currentGen else { return }
                 let expected = self.expectedTerminationGeneration == currentGen
@@ -344,6 +370,7 @@ final class VideoRendererProcessController {
         // SIGTERM 作为立即兜底，watchdog 仍会在它卡死时收尾。
         sendCommandFireAndForget(.shutdown)
         let pid = processPID
+        stoppingPIDs.insert(pid)
         kill(pid, SIGTERM)
 
         // watchdog: 2s 后 SIGKILL
@@ -358,6 +385,22 @@ final class VideoRendererProcessController {
         processPID = 0
         try? FileManager.default.removeItem(atPath: socketPath)
         try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    /// daemon 是否仍在响应 IPC（短超时 ping 探测，用于区分「活而不答」）。
+    /// 进程存活但主线程/IPC 卡死时 connect 依旧成功，只有 ping 能鉴别。
+    func isDaemonResponsive(timeout: TimeInterval = 1.5) async -> Bool {
+        guard isRunning else { return false }
+        return await sendCommand(.ping, screen: nil, timeout: timeout) == "OK"
+    }
+
+    /// 强制换代重启：处理进程存活但 IPC 无响应的卡死态
+    @discardableResult
+    func restartDaemon() async -> Bool {
+        if isRunning {
+            stopDaemon()
+        }
+        return await startDaemon()
     }
 
     // MARK: - IPC 客户端
@@ -380,7 +423,8 @@ final class VideoRendererProcessController {
             deferredPresentation: Bool,
             transitionDuration: Double,
             globalPaused: Bool,
-            screenPaused: Bool
+            screenPaused: Bool,
+            globalDisplaySyncEnabled: Bool
         )
         case pause(screen: Int?)
         case resume(screen: Int?)
@@ -398,6 +442,8 @@ final class VideoRendererProcessController {
         case commitTransition(requestID: String)
         case cancelTransition(requestID: String)
         case forceCommit(screen: Int?)
+        case pruneInactiveScreens(screenIDs: [String])
+        case prewarm(screen: Int, path: String, volume: Double, hdrMetadataEnabled: Bool)
         case ping
         case shutdown
     }
@@ -414,12 +460,13 @@ final class VideoRendererProcessController {
         let msg = encodeCommand(cmd)
         guard let body = try? JSONEncoder().encode(msg) else { return nil }
         let startedAt = Date()
+        let currentSocketPath = socketPath
 
         let response: String? = await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [socketPath] in
+            ipcCommandQueue.async {
                 continuation.resume(
                     returning: Self.sendOverSocket(
-                        socketPath: socketPath,
+                        socketPath: currentSocketPath,
                         body: body,
                         timeout: timeout
                     )
@@ -469,9 +516,13 @@ final class VideoRendererProcessController {
         guard isRunning else { return }
         let msg = encodeCommand(cmd, expectsResponse: false)
         guard let body = try? JSONEncoder().encode(msg) else { return }
+        let currentSocketPath = socketPath
 
-        DispatchQueue.global(qos: .userInitiated).async { [socketPath] in
-            Self.sendOverSocketFireAndForget(socketPath: socketPath, body: body)
+        ipcCommandQueue.async {
+            Self.sendOverSocketFireAndForget(
+                socketPath: currentSocketPath,
+                body: body
+            )
         }
     }
 
@@ -527,12 +578,43 @@ final class VideoRendererProcessController {
     private func terminateFailedLaunch(_ proc: Process) {
         expectedTerminationGeneration = generation
         if proc.isRunning {
+            stoppingPIDs.insert(proc.processIdentifier)
             kill(proc.processIdentifier, SIGTERM)
         }
         process = nil
         processPID = 0
         try? FileManager.default.removeItem(atPath: socketPath)
         try? FileManager.default.removeItem(atPath: pidPath)
+    }
+
+    /// Wait only when a replacement is about to launch. Normal stop paths
+    /// remain non-blocking on the main actor, while restart paths guarantee
+    /// the old renderer's desktop windows are gone before the next process is
+    /// allowed to create its own windows.
+    private func waitForStoppingRenderers() async {
+        stoppingPIDs = stoppingPIDs.filter(Self.isProcessAlive)
+        guard !stoppingPIDs.isEmpty else { return }
+
+        let gracefulDeadline = Date().addingTimeInterval(0.6)
+        while Date() < gracefulDeadline, !stoppingPIDs.isEmpty {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+            stoppingPIDs = stoppingPIDs.filter(Self.isProcessAlive)
+        }
+
+        guard !stoppingPIDs.isEmpty else { return }
+        let stuckPIDs = stoppingPIDs
+        AppLogger.error(.wallpaper, "video-renderer 停止超时，强制清理后再启动", metadata: [
+            "pids": stuckPIDs.map(String.init).sorted().joined(separator: ",")
+        ])
+        for pid in stuckPIDs {
+            kill(pid, SIGKILL)
+        }
+
+        let forceDeadline = Date().addingTimeInterval(0.2)
+        while Date() < forceDeadline, !stoppingPIDs.isEmpty {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+            stoppingPIDs = stoppingPIDs.filter(Self.isProcessAlive)
+        }
     }
 
     /// A renderer normally dies with its App parent. If Xcode terminates the
@@ -655,6 +737,7 @@ final class VideoRendererProcessController {
         var transitionDuration: Double?
         var globalPaused: Bool?
         var screenPaused: Bool?
+        var globalDisplaySyncEnabled: Bool?
         var time: Double?
         var cropX: Double?
         var cropY: Double?
@@ -668,6 +751,7 @@ final class VideoRendererProcessController {
         var cropRevision: UInt64?
         var posterPath: String?
         var grainIntensity: Double?
+        var activeScreenIDs: [String]?
         var message: String?
     }
 
@@ -699,6 +783,7 @@ final class VideoRendererProcessController {
             transitionDuration: nil,
             globalPaused: nil,
             screenPaused: nil,
+            globalDisplaySyncEnabled: nil,
             time: nil,
             cropX: nil,
             cropY: nil,
@@ -712,6 +797,7 @@ final class VideoRendererProcessController {
             cropRevision: nil,
             posterPath: nil,
             grainIntensity: nil,
+            activeScreenIDs: nil,
             message: nil
         )
 
@@ -732,7 +818,8 @@ final class VideoRendererProcessController {
             let deferredPresentation,
             let transitionDuration,
             let globalPaused,
-            let screenPaused
+            let screenPaused,
+            let globalDisplaySyncEnabled
         ):
             msg.command = "set"
             msg.screen = screen
@@ -754,6 +841,7 @@ final class VideoRendererProcessController {
             msg.transitionDuration = transitionDuration
             msg.globalPaused = globalPaused
             msg.screenPaused = screenPaused
+            msg.globalDisplaySyncEnabled = globalDisplaySyncEnabled
             lastAudioMuted = muted
             lastAudioVolume = max(0, min(1, volume))
             updateAudioPolicyFields(
@@ -765,23 +853,28 @@ final class VideoRendererProcessController {
         case .pause(let screen):
             msg.command = "pause"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
 
         case .resume(let screen):
             msg.command = "resume"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
 
         case .stop(let screen):
             msg.command = "stop"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
 
         case .seek(let screen, let time):
             msg.command = "seek"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
             msg.time = time
 
         case .setVolume(let screen, let vol):
             msg.command = "setVolume"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
             lastAudioVolume = max(0, min(1, vol))
             msg.volume = lastAudioVolume
             // Carry the complete snapshot so the renderer can preserve the
@@ -807,6 +900,7 @@ final class VideoRendererProcessController {
         case .setCrop(let screen, let crop, let viewport, let letterboxColor, let revision):
             msg.command = "setCrop"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
             if let crop {
                 msg.cropX = crop.origin.x
                 msg.cropY = crop.origin.y
@@ -825,29 +919,35 @@ final class VideoRendererProcessController {
         case .updatePoster(let screen, let path):
             msg.command = "updatePoster"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
             msg.posterPath = path
 
         case .showPoster(let screen, let path):
             msg.command = "showPoster"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
             msg.posterPath = path
 
         case .hidePoster(let screen):
             msg.command = "hidePoster"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
 
         case .setGrainOverlay(let screen, let intensity):
             msg.command = "setGrainOverlay"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
             msg.grainIntensity = max(0, min(1, intensity))
 
         case .bringToFront(let screen):
             msg.command = "bringToFront"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
 
         case .revealPreparedWindow(let screen):
             msg.command = "revealPreparedWindow"
             msg.screen = screen
+            msg.screenID = stableScreenID(for: screen)
 
         case .commitTransition(let requestID):
             msg.command = "commitTransition"
@@ -860,6 +960,18 @@ final class VideoRendererProcessController {
         case .forceCommit(let screen):
             msg.command = "forceCommit"
             msg.screen = screen
+            msg.screenID = screen.flatMap(stableScreenID(for:))
+
+        case .pruneInactiveScreens(let screenIDs):
+            msg.command = "pruneInactiveScreens"
+            msg.activeScreenIDs = screenIDs
+
+        case .prewarm(let screen, let path, let volume, let hdrMetadataEnabled):
+            msg.command = "prewarm"
+            msg.screen = screen
+            msg.path = path
+            msg.volume = volume
+            msg.hdrMetadataEnabled = hdrMetadataEnabled
 
         case .ping:
             msg.command = "ping"
@@ -869,6 +981,13 @@ final class VideoRendererProcessController {
         }
 
         return msg
+    }
+
+    private func stableScreenID(for screen: Int?) -> String? {
+        guard let screen else { return nil }
+        let orderedScreens = NSScreen.screensOrderedForDisplay
+        guard orderedScreens.indices.contains(screen) else { return nil }
+        return orderedScreens[screen].wallpaperScreenIdentifier
     }
 
     private func updateAudioPolicyFields(
@@ -1008,33 +1127,21 @@ final class VideoRendererProcessController {
         }
     }
 
-    // MARK: stderr 事件解析
+    // MARK: stdout 事件解析
 
-    private func handleStderrData(_ data: Data) {
-        stderrBuffer.append(data)
-        guard let str = String(data: stderrBuffer, encoding: .utf8) else { return }
+    private func handleEventStreamData(_ data: Data) {
+        eventBuffer.append(data)
+        guard let str = String(data: eventBuffer, encoding: .utf8) else { return }
         let lines = str.split(separator: "\n", omittingEmptySubsequences: false)
         guard !lines.isEmpty else { return }
         if !str.hasSuffix("\n") {
-            stderrBuffer = Data(lines.last!.utf8)
+            eventBuffer = Data(lines.last!.utf8)
         } else {
-            stderrBuffer.removeAll(keepingCapacity: true)
+            eventBuffer.removeAll(keepingCapacity: true)
         }
 
         for line in lines.dropLast(str.hasSuffix("\n") ? 0 : 1) {
             if line.isEmpty { continue }
-            if line.hasPrefix("WAIFUX_FATAL_EXCEPTION:") {
-                AppLogger.error(.wallpaper, "wallpaper-video-renderer 未捕获异常", metadata: [
-                    "diagnostic": String(line)
-                ])
-                continue
-            }
-            if line.hasPrefix("WAIFUX_OBSERVED_EXCEPTION:") {
-                AppLogger.error(.wallpaper, "wallpaper-video-renderer 捕获到 Objective-C 异常", metadata: [
-                    "diagnostic": String(line)
-                ])
-                continue
-            }
             guard line.hasPrefix("WAIFUX_EVENT:") else { continue }
             let jsonStr = String(line.dropFirst("WAIFUX_EVENT:".count))
             guard let jsonData = jsonStr.data(using: .utf8),
@@ -1083,6 +1190,26 @@ final class VideoRendererProcessController {
 
             Task { @MainActor in
                 self.eventHandler?(event)
+            }
+        }
+    }
+
+    private func handleDiagnosticStreamData(_ data: Data) {
+        guard let str = String(data: data, encoding: .utf8) else { return }
+        for rawLine in str.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(rawLine)
+            if line.hasPrefix("WAIFUX_FATAL_EXCEPTION:") {
+                AppLogger.error(.wallpaper, "wallpaper-video-renderer 未捕获异常", metadata: [
+                    "diagnostic": line
+                ])
+            } else if line.hasPrefix("WAIFUX_OBSERVED_EXCEPTION:") {
+                AppLogger.error(.wallpaper, "wallpaper-video-renderer 捕获到 Objective-C 异常", metadata: [
+                    "diagnostic": line
+                ])
+            } else if line.hasPrefix("WAIFUX_DIAG:") {
+                AppLogger.debug(.wallpaper, "video-renderer 诊断", metadata: [
+                    "d": String(line.dropFirst("WAIFUX_DIAG:".count))
+                ])
             }
         }
     }

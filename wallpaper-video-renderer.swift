@@ -46,6 +46,87 @@ private let DAEMON_PID_ENV = "WAIFUX_VIDEO_RENDERER_PID_PATH"
 /// 单帧 IPC body 上限（8MB，与 wallpaperengine-cli 一致，预留 poster base64 等大 payload）
 private let MAX_FRAME_BYTES = 8 * 1024 * 1024
 
+/// The host and the standalone renderer do not necessarily receive
+/// `NSScreen.screens` in the same raw order. Resolve each `set` by the stable
+/// display identifier first, then use this deterministic order for renderer
+/// local screen bookkeeping.
+private enum RendererScreenIdentity {
+    static func identifier(for screen: NSScreen) -> String {
+        if let screenNumber = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber {
+            return screenNumber.stringValue
+        }
+        return "\(screen.localizedName):\(screen.frame.origin.x):\(screen.frame.origin.y)"
+    }
+
+    static func fingerprint(for screen: NSScreen) -> String {
+        guard let screenNumber = screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber else {
+            return "fallback:\(screen.localizedName):\(Int(screen.frame.width))x\(Int(screen.frame.height)):position:\(Int(screen.frame.origin.x.rounded()))x\(Int(screen.frame.origin.y.rounded()))"
+        }
+
+        let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+        let vendor = CGDisplayVendorNumber(displayID)
+        let model = CGDisplayModelNumber(displayID)
+        let serial = CGDisplaySerialNumber(displayID)
+        let builtin = CGDisplayIsBuiltin(displayID) != 0 ? "builtin" : "external"
+        if serial != 0 {
+            return "cg:\(vendor):\(model):\(serial):\(builtin)"
+        }
+        let pixelWidth = Int(screen.frame.width * screen.backingScaleFactor)
+        let pixelHeight = Int(screen.frame.height * screen.backingScaleFactor)
+        return "cg:\(vendor):\(model):noserial:\(screen.localizedName):\(pixelWidth)x\(pixelHeight):\(builtin):position:\(Int(screen.frame.origin.x.rounded()))x\(Int(screen.frame.origin.y.rounded()))"
+    }
+
+    static func orderedScreens(_ screens: [NSScreen]) -> [NSScreen] {
+        let mainID = NSScreen.main.map(identifier(for:))
+        return screens.sorted { lhs, rhs in
+            let lhsIsMain = identifier(for: lhs) == mainID
+            let rhsIsMain = identifier(for: rhs) == mainID
+            if lhsIsMain != rhsIsMain {
+                return lhsIsMain
+            }
+
+            let lx = lhs.frame.origin.x
+            let rx = rhs.frame.origin.x
+            if abs(lx - rx) > 0.5 {
+                return lx < rx
+            }
+
+            let ly = lhs.frame.origin.y
+            let ry = rhs.frame.origin.y
+            if abs(ly - ry) > 0.5 {
+                return lhs.frame.maxY > rhs.frame.maxY
+            }
+
+            return identifier(for: lhs) < identifier(for: rhs)
+        }
+    }
+
+    static func resolvedIndex(
+        proposedIndex: Int,
+        stableID: String
+    ) -> Int {
+        let ordered = orderedScreens(NSScreen.screens)
+        if let index = ordered.firstIndex(where: {
+            identifier(for: $0) == stableID
+        }) {
+            return index
+        }
+        if let index = ordered.firstIndex(where: {
+            fingerprint(for: $0) == stableID
+        }) {
+            return index
+        }
+        if ordered.indices.contains(proposedIndex) {
+            return proposedIndex
+        }
+        return proposedIndex
+    }
+}
+
 // MARK: - IPC 协议
 
 /// 主进程 → 子进程的命令枚举
@@ -67,6 +148,8 @@ private enum IPCCommand: String, Codable {
     case commitTransition
     case cancelTransition
     case forceCommit
+    case pruneInactiveScreens
+    case prewarm        // 预建下一张播完即换视频的解码管线（preroll 暖机，不挂窗口）
     case ping           // 存活探测
     case shutdown       // 优雅退出
 }
@@ -82,6 +165,14 @@ private enum IPCEvent: String, Codable {
 }
 
 /// IPC 消息体（扁平 Codable struct，命令字段决定哪些参数有效）
+// MARK: - 切换路径诊断打点（定位黑闪用，问题解决后移除）
+
+private let vrLogStart = Date()
+private func vlog(_ msg: String) {
+    let ms = Int(Date().timeIntervalSince(vrLogStart) * 1000)
+    FileHandle.standardError.write(Data("WAIFUX_DIAG:+\(ms)ms \(msg)\n".utf8))
+}
+
 private struct IPCMessage: Codable {
     var command: IPCCommand
     /// Fire-and-forget 命令不需要服务端回包。高频 crop/前台调整不再因为
@@ -110,6 +201,7 @@ private struct IPCMessage: Codable {
     var transitionDuration: Double?
     var globalPaused: Bool?
     var screenPaused: Bool?
+    var globalDisplaySyncEnabled: Bool?
     // seek
     var time: Double?
     // setCrop
@@ -127,6 +219,8 @@ private struct IPCMessage: Codable {
     var posterPath: String?
     // setGrainOverlay
     var grainIntensity: Double?
+    // pruneInactiveScreens
+    var activeScreenIDs: [String]?
     // error
     var message: String?
 }
@@ -158,9 +252,19 @@ private final class VideoRendererDaemon {
     private var loopers: [Int: AVPlayerLooper] = [:]
     /// 每屏的 AVPlayerItem
     private var items: [Int: AVPlayerItem] = [:]
+    /// 播完即换预热管线（每屏至多一条）：播放当前视频期间预建下一条的
+    /// 解码器并 preroll，下一次 set 命中时直接复用，首帧无需现场解码。
+    private var prewarmedPipelines: [Int: PrewarmedPipeline] = [:]
+    /// 预热管线的 player.status 观察：status 就绪前调用 preroll 会抛
+    /// NSInvalidArgumentException 并楔死 IPC 处理循环（实测事故），
+    /// 必须由 KVO 门控到 .readyToPlay 之后才允许 preroll。
+    private var prewarmStatusObservers: [Int: NSKeyValueObservation] = [:]
 
     // 共享解码
     private var usesSharedVideoDecoder = false
+    /// The host scheduler decides whether an end event advances all displays
+    /// as one group or advances each display independently.
+    private var isGlobalDisplaySyncEnabled = false
     /// 机会式共享上限（同刷新率屏共享超过 2 块时新建独立 player，避免 VSync 对齐压力）
     private let maxOpportunisticShareScreenCount = 2
 
@@ -239,6 +343,7 @@ private final class VideoRendererDaemon {
         let newLooper: AVPlayerLooper?
         let newItem: AVPlayerItem
         let transitionDuration: TimeInterval
+        let autoCommitOnReady: Bool
     }
 
     // MARK: 启动
@@ -511,10 +616,46 @@ private final class VideoRendererDaemon {
 
     // MARK: 命令处理
 
+    private func resolvedScreenIndex(for msg: IPCMessage) -> Int? {
+        guard let requestedScreen = msg.screen else { return nil }
+        if let stableScreenID = msg.screenID,
+           let existingKey = screenStates.first(where: {
+               $0.value.screenID == stableScreenID
+           })?.key {
+            return existingKey
+        }
+        if let fingerprint = currentFingerprint(matching: msg.screenID),
+           let existingKey = screenStates.first(where: {
+               currentFingerprint(matching: $0.value.screenID) == fingerprint
+           })?.key {
+            return existingKey
+        }
+        guard let stableScreenID = msg.screenID else {
+            return requestedScreen
+        }
+        return RendererScreenIdentity.resolvedIndex(
+            proposedIndex: requestedScreen,
+            stableID: stableScreenID
+        )
+    }
+
+    private func currentFingerprint(matching screenID: String?) -> String? {
+        guard let screenID else { return nil }
+        let ordered = RendererScreenIdentity.orderedScreens(NSScreen.screens)
+        if let screen = ordered.first(where: {
+            RendererScreenIdentity.identifier(for: $0) == screenID
+                || RendererScreenIdentity.fingerprint(for: $0) == screenID
+        }) {
+            return RendererScreenIdentity.fingerprint(for: screen)
+        }
+        return nil
+    }
+
     private func handleCommand(_ msg: IPCMessage) async -> String {
         // seek 命令需要 await，单独处理
         if msg.command == .seek {
-            guard let screen = msg.screen, let time = msg.time,
+            guard let screen = resolvedScreenIndex(for: msg),
+                  let time = msg.time,
                   let player = players[screen] else {
                 return "ERROR: missing seek params"
             }
@@ -530,11 +671,67 @@ private final class VideoRendererDaemon {
             return "OK"
 
         case .set:
-            guard let screen = msg.screen,
+            guard let requestedScreen = msg.screen,
                   let path = msg.path,
                   let x = msg.screenFrameX, let y = msg.screenFrameY,
                   let w = msg.screenFrameW, let h = msg.screenFrameH else {
                 return "ERROR: missing set params"
+            }
+            let stableScreenID = msg.screenID ?? "screen-index-\(requestedScreen)"
+            let screen = resolvedScreenIndex(for: msg) ?? requestedScreen
+            if screen != requestedScreen {
+                AppLogger.info(
+                    .wallpaper,
+                    "video-renderer 校正跨进程屏幕索引",
+                    metadata: [
+                        "requested": String(requestedScreen),
+                        "resolved": String(screen),
+                        "screenID": stableScreenID
+                    ]
+                )
+            }
+            if let staleState = screenStates[screen],
+               staleState.screenID != stableScreenID {
+                let newIDAlreadyOwned = screenStates.contains {
+                    $0.key != screen && $0.value.screenID == stableScreenID
+                }
+                if newIDAlreadyOwned {
+                    AppLogger.info(
+                        .wallpaper,
+                        "video-renderer 清理被新显示器占用的旧管线",
+                        metadata: [
+                            "screen": String(screen),
+                            "oldScreenID": staleState.screenID,
+                            "newScreenID": stableScreenID
+                        ]
+                    )
+                    teardownScreen(screen)
+                } else {
+                    // 睡眠/重插后 NSScreenNumber 会变，但有序槽位通常还是同一块屏。
+                    // 这时拆窗会露出黑底；只重绑稳定 ID，保住现有桌面窗。
+                    AppLogger.info(
+                        .wallpaper,
+                        "video-renderer 重绑显示器稳定 ID",
+                        metadata: [
+                            "screen": String(screen),
+                            "oldScreenID": staleState.screenID,
+                            "newScreenID": stableScreenID
+                        ]
+                    )
+                    screenStates[screen]?.screenID = stableScreenID
+                }
+            } else if let existing = screenStates[screen],
+                      existing.screenID != stableScreenID,
+                      currentFingerprint(matching: existing.screenID) != nil,
+                      currentFingerprint(matching: existing.screenID)
+                        == currentFingerprint(matching: stableScreenID) {
+                screenStates[screen]?.screenID = stableScreenID
+            }
+            guard FileManager.default.fileExists(atPath: path) else {
+                return "ERROR: video file unavailable"
+            }
+            guard w > 0, h > 0 else {
+                return "ERROR: invalid screen frame"
             }
             let videoURL = URL(fileURLWithPath: path)
             let frame = CGRect(x: x, y: y, width: w, height: h)
@@ -548,8 +745,12 @@ private final class VideoRendererDaemon {
             let transitionDuration = msg.transitionDuration ?? 0.28
             let globalPaused = msg.globalPaused ?? false
             let screenPaused = msg.screenPaused ?? false
-            let stableScreenID = msg.screenID ?? "screen-index-\(screen)"
+            let globalDisplaySyncEnabled = msg.globalDisplaySyncEnabled ?? false
             let requestID = msg.requestID ?? UUID().uuidString
+            // 唤醒/解锁的分布式通知可能丢失或晚于主进程 reconfigure 的 set
+            // 到达；每次 set 前重读共享状态文件对齐 systemPlaybackPaused，
+            // 否则唤醒后新管线只 preroll 不播。
+            refreshPlaybackStateFromSharedSource()
             updateAudioPolicy(
                 muted: muted,
                 volume: vol,
@@ -565,37 +766,62 @@ private final class VideoRendererDaemon {
                                       transitionDuration: transitionDuration,
                                       globalPaused: globalPaused,
                                       screenPaused: screenPaused,
+                                      globalDisplaySyncEnabled: globalDisplaySyncEnabled,
                                       screenID: stableScreenID,
                                       requestID: requestID,
                                       posterPath: msg.posterPath)
 
-        case .pause:
-            if let screen = msg.screen {
-                pauseScreen(screen)
-            } else {
-                pauseAll()
+        case .prewarm:
+            guard let screen = resolvedScreenIndex(for: msg),
+                  let path = msg.path else {
+                return "ERROR: missing screen/path"
             }
-            return "OK"
+            return prewarmPipeline(
+                screen: screen,
+                videoURL: URL(fileURLWithPath: path),
+                volume: msg.volume ?? Double(volume),
+                hdrMetadataEnabled: msg.hdrMetadataEnabled ?? false
+            )
+
+        case .pause:
+            if let screen = resolvedScreenIndex(for: msg) {
+                return pauseScreen(screen)
+                    ? "OK"
+                    : "ERROR: screen not found"
+            } else {
+                return pauseAll()
+                    ? "OK"
+                    : "ERROR: no active screens"
+            }
 
         case .resume:
-            if let screen = msg.screen {
-                resumeScreen(screen)
+            if let screen = resolvedScreenIndex(for: msg) {
+                return resumeScreen(screen)
+                    ? "OK"
+                    : "ERROR: screen not found"
             } else {
-                resumeAll()
+                return resumeAll()
+                    ? "OK"
+                    : "ERROR: no active screens"
             }
-            return "OK"
 
         case .stop:
-            if let screen = msg.screen {
-                stopScreen(screen)
+            if let screen = resolvedScreenIndex(for: msg) {
+                return stopScreen(screen)
+                    ? "OK"
+                    : "ERROR: screen not found"
             } else {
-                stopAll()
+                return stopAll()
+                    ? "OK"
+                    : "ERROR: no active screens"
             }
-            return "OK"
 
         case .setVolume:
             let vol = msg.volume.map { max(0, min(1, $0)) } ?? Double(volume)
-            if let screen = msg.screen, let player = players[screen] {
+            if let screen = resolvedScreenIndex(for: msg) {
+                guard let player = players[screen] else {
+                    return "ERROR: screen not found"
+                }
                 volumeByScreen[screen] = Float(vol)
                 player.volume = (msg.muted ?? isMuted) ? 0 : Float(vol)
                 player.isMuted = msg.muted ?? isMuted
@@ -626,18 +852,24 @@ private final class VideoRendererDaemon {
             return "OK"
 
         case .setCrop:
-            guard let screen = msg.screen else { return "ERROR: missing screen" }
-            applyCrop(screen: screen, msg: msg)
-            return "OK"
+            guard let screen = resolvedScreenIndex(for: msg) else {
+                return "ERROR: missing screen"
+            }
+            return applyCrop(screen: screen, msg: msg)
+                ? "OK"
+                : "ERROR: screen not found"
 
         case .updatePoster:
-            guard let screen = msg.screen else { return "ERROR: missing screen" }
+            guard let screen = resolvedScreenIndex(for: msg) else {
+                return "ERROR: missing screen"
+            }
             return updatePosterPath(screen: screen, path: msg.posterPath)
                 ? "OK"
                 : "ERROR: screen or poster unavailable"
 
         case .showPoster:
-            guard let screen = msg.screen, let path = msg.posterPath else {
+            guard let screen = resolvedScreenIndex(for: msg),
+                  let path = msg.posterPath else {
                 return "ERROR: missing poster params"
             }
             return showPoster(screen: screen, path: path)
@@ -645,14 +877,16 @@ private final class VideoRendererDaemon {
                 : "ERROR: poster unavailable"
 
         case .hidePoster:
-            guard let screen = msg.screen else { return "ERROR: missing screen" }
+            guard let screen = resolvedScreenIndex(for: msg) else {
+                return "ERROR: missing screen"
+            }
             return hidePoster(screen: screen)
                 ? "OK"
                 : "ERROR: screen not found"
 
         case .setGrainOverlay:
             let intensity = msg.grainIntensity ?? 0
-            if let screen = msg.screen {
+            if let screen = resolvedScreenIndex(for: msg) {
                 guard setGrainOverlay(screen: screen, intensity: intensity) else {
                     return "ERROR: screen not found"
                 }
@@ -667,7 +901,7 @@ private final class VideoRendererDaemon {
             return "OK"
 
         case .bringToFront:
-            guard let screen = msg.screen,
+            guard let screen = resolvedScreenIndex(for: msg),
                   let window = screenStates[screen]?.window else {
                 return "ERROR: screen not found"
             }
@@ -676,7 +910,9 @@ private final class VideoRendererDaemon {
             return "OK"
 
         case .revealPreparedWindow:
-            return revealPreparedWindow(screen: msg.screen) ? "OK" : "ERROR: screen not found"
+            return revealPreparedWindow(screen: resolvedScreenIndex(for: msg))
+                ? "OK"
+                : "ERROR: screen not found"
 
         case .commitTransition:
             guard let requestID = msg.requestID else {
@@ -692,7 +928,14 @@ private final class VideoRendererDaemon {
             return "OK"
 
         case .forceCommit:
-            forceCommit(screen: msg.screen)
+            forceCommit(screen: resolvedScreenIndex(for: msg))
+            return "OK"
+
+        case .pruneInactiveScreens:
+            guard let activeScreenIDs = msg.activeScreenIDs else {
+                return "ERROR: missing active screens"
+            }
+            pruneInactiveScreens(keeping: Set(activeScreenIDs))
             return "OK"
 
         case .shutdown:
@@ -710,6 +953,7 @@ private final class VideoRendererDaemon {
                               deferredPresentation: Bool,
                               transitionDuration: TimeInterval,
                               globalPaused: Bool, screenPaused: Bool,
+                              globalDisplaySyncEnabled: Bool,
                               screenID: String,
                               requestID: String,
                               posterPath: String?) async -> String {
@@ -717,6 +961,7 @@ private final class VideoRendererDaemon {
         self.volume = Float(volume)
         volumeByScreen[screen] = Float(max(0, min(1, volume)))
         self.usesSharedVideoDecoder = usesSharedDecoder
+        self.isGlobalDisplaySyncEnabled = globalDisplaySyncEnabled
         self.isPaused = globalPaused
         if screenPaused {
             manualPausedScreens.insert(screen)
@@ -727,14 +972,13 @@ private final class VideoRendererDaemon {
         if pendingReplacements[screen] != nil {
             cancelPendingReplacement(screen: screen)
         }
-        // `deferredPresentation` has two separate meanings:
-        // - existing renderer state: keep the old video pipeline alive for an
-        //   in-window crossfade;
-        // - no renderer state: preroll a new window behind Scene/Web/static,
-        //   then let the host reveal it only after the old presentation has
-        //   been snapshotted and retired.
-        let preserveExistingPipeline = deferredPresentation && screenStates[screen] != nil
+        // Keep any live desktop window's old pipeline until the incoming layer
+        // has a drawable. Host `deferredPresentation` only decides who commits:
+        // the host after a staged apply, or this process immediately on first
+        // frame (wake/reconfigure/timeout retry).
+        let preserveExistingPipeline = screenStates[screen] != nil
         let deferWindowReveal = deferredPresentation && !preserveExistingPipeline
+        let autoCommitOnReady = preserveExistingPipeline && !deferredPresentation
         let replacementSource = prepareScreenForReplacement(
             screen,
             preserveOldPipeline: preserveExistingPipeline
@@ -771,7 +1015,9 @@ private final class VideoRendererDaemon {
             // 更新——实测验证）。0.99 与 1 视觉无差别。
             window.isOpaque = false
             window.backgroundColor = .black
-            window.alphaValue = 0.99
+            // Stay nearly invisible until the first drawable exists. Flashing
+            // 0.99 here exposes the black window background before play().
+            window.alphaValue = 0.02
             window.hasShadow = false
             window.isReleasedWhenClosed = false
             window.ignoresMouseEvents = true
@@ -827,6 +1073,9 @@ private final class VideoRendererDaemon {
                                                   requestID: requestID,
                                                   forceNewPipeline: forceNewPipeline,
                                                   hdrMetadataEnabled: hdrMetadataEnabled)
+        // 本轮 set 之后不再保留该屏的预热管线：命中已被 resolve 消费分支取走，
+        // 未命中（换片 / 共享复用 / 循环模式）立即丢弃，防止陈旧解码管线驻留。
+        releasePrewarmedPipeline(screen)
         let isSharedWarmupFollower = !screenIDsReferencingPlayer(components.player).isEmpty
         players[screen] = components.player
         if let looper = components.looper {
@@ -852,7 +1101,8 @@ private final class VideoRendererDaemon {
                 newPlayer: components.player,
                 newLooper: components.looper,
                 newItem: components.item,
-                transitionDuration: max(0, transitionDuration)
+                transitionDuration: max(0, transitionDuration),
+                autoCommitOnReady: autoCommitOnReady
             )
             if isSharedWarmupFollower {
                 // 共享解码 follower：transition layer 延迟到串行挂载调度时创建。
@@ -863,6 +1113,12 @@ private final class VideoRendererDaemon {
             } else {
                 let transitionLayer = containerView.preparePlayerForCrossfade(components.player)
                 observeFirstFrameReadiness(
+                    on: transitionLayer,
+                    screen: screen,
+                    generation: generation,
+                    player: components.player
+                )
+                notifyFirstFrameIfAlreadyReady(
                     on: transitionLayer,
                     screen: screen,
                     generation: generation,
@@ -882,6 +1138,14 @@ private final class VideoRendererDaemon {
                 generation: generation,
                 player: components.player
             )
+            if !isSharedWarmupFollower {
+                notifyFirstFrameIfAlreadyReady(
+                    on: containerView.playerLayer,
+                    screen: screen,
+                    generation: generation,
+                    player: components.player
+                )
+            }
         }
 
         // A replacement keeps the old freeze frame fully visible in the same
@@ -889,6 +1153,7 @@ private final class VideoRendererDaemon {
         // its first drawable; the host reveals it only once the outgoing
         // Scene/Web/static presentation is protected by a snapshot.
         window.alphaValue = isReplacement ? 0.99 : 0.02
+        vlog("set: screen=\(screen) req=\(requestID.prefix(6)) isReplacement=\(isReplacement) alpha=\(isReplacement ? 0.99 : 0.02) deferred=\(deferredPresentation) transition=\(transitionDuration)")
         window.orderFrontRegardless()
         window.orderBack(nil)
         window.displayIfNeeded()
@@ -983,6 +1248,35 @@ private final class VideoRendererDaemon {
             )
         }
 
+        // 播完即换预热命中：直接取用已 preroll 的管线，首帧无需现场解码。
+        // 仅限非循环模式（预热管线只插入一次 item，没有 AVPlayerLooper）。
+        if !forceNewPipeline, !enableLooping,
+           let prewarmed = prewarmedPipelines.removeValue(forKey: screen) {
+            if prewarmed.videoURL.standardizedFileURL == videoURL.standardizedFileURL,
+               prewarmed.item.status != .failed {
+                vlog("prewarm: HIT screen=\(screen) video=\(videoURL.lastPathComponent)")
+                // 消费即摘除 status 观察员：管线已交给正式播放路径，
+                // 不允许迟到的 readyToPlay 再对已上屏 player 补 preroll。
+                prewarmStatusObservers[screen]?.invalidate()
+                prewarmStatusObservers.removeValue(forKey: screen)
+                expandPreferredMaximumResolutionIfNeeded(
+                    for: prewarmed.item,
+                    screen: screen
+                )
+                return PlayerComponents(
+                    player: prewarmed.player,
+                    looper: prewarmed.looper,
+                    item: prewarmed.item
+                )
+            }
+            // 未命中：管线弃用，同步清掉残留的 status 观察员防泄漏
+            vlog("prewarm: MISS screen=\(screen) expected=\(videoURL.lastPathComponent) got=\(prewarmed.videoURL.lastPathComponent) itemStatus=\(prewarmed.item.status.rawValue)")
+            prewarmStatusObservers[screen]?.invalidate()
+            prewarmStatusObservers.removeValue(forKey: screen)
+            prewarmed.player.pause()
+            prewarmed.player.replaceCurrentItem(with: nil)
+        }
+
         // 新建独立 player
         let item = AVPlayerItem(url: videoURL)
         configurePlayerItem(
@@ -1011,6 +1305,84 @@ private final class VideoRendererDaemon {
             looper = nil
         }
         return PlayerComponents(player: player, looper: looper, item: item)
+    }
+
+    /// 预热管线载荷：独立 player（on-end 语义，item 只插入一次）
+    private struct PrewarmedPipeline {
+        let player: AVQueuePlayer
+        let looper: AVPlayerLooper?
+        let item: AVPlayerItem
+        let videoURL: URL
+    }
+
+    // MARK: 播完即换预热
+
+    /// 预建下一条视频的独立解码管线并 preroll。不挂任何窗口，纯后台暖机；
+    /// 音频在建链前即被静音，预热本身不会唤醒蓝牙音频设备。
+    private func prewarmPipeline(
+        screen: Int,
+        videoURL: URL,
+        volume: Double,
+        hdrMetadataEnabled: Bool
+    ) -> String {
+        guard screenStates[screen] != nil else { return "OK no-screen" }
+        if let existing = prewarmedPipelines[screen] {
+            if existing.videoURL.standardizedFileURL == videoURL.standardizedFileURL,
+               existing.item.status != .failed {
+                return "OK already-warm"
+            }
+            releasePrewarmedPipeline(screen)
+        }
+
+        let item = AVPlayerItem(url: videoURL)
+        configurePlayerItem(
+            item,
+            videoURL: videoURL,
+            screen: screen,
+            hdrMetadataEnabled: hdrMetadataEnabled
+        )
+        let player = AVQueuePlayer()
+        player.actionAtItemEnd = .none
+        applyPlayerAudioPolicy(player, volume: Float(volume))
+        applyPlayerItemAudioPolicy(item)
+        player.automaticallyWaitsToMinimizeStalling = !videoURL.isFileURL
+            || Self.isExternalVolume(videoURL)
+        player.preventsDisplaySleepDuringVideoPlayback = false
+        player.insert(item, after: nil)
+        prewarmedPipelines[screen] = PrewarmedPipeline(
+            player: player,
+            looper: nil,
+            item: item,
+            videoURL: videoURL
+        )
+        // preroll 门控：player.status 尚为 .unknown 时调用 preroll 会抛
+        // NSInvalidArgumentException，异常在 IPC 处理路径上 unwind 会楔死
+        // daemon 的命令循环。KVO 等 .readyToPlay 后再暖机；若 item 准备
+        // 失败（player .failed）则不 preroll，消费侧按 item.status 丢弃。
+        prewarmStatusObservers[screen] = player.observe(
+            \.status,
+            options: [.initial, .new]
+        ) { [weak self] observedPlayer, _ in
+            let isReady = observedPlayer.status == .readyToPlay
+            guard isReady else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.prewarmStatusObservers[screen]?.invalidate()
+                self.prewarmStatusObservers.removeValue(forKey: screen)
+                observedPlayer.preroll(atRate: 1) { _ in }
+            }
+        }
+        return "OK"
+    }
+
+    /// 释放某屏的预热管线（消费未命中 / 换片 / 销屏时调用，防陈旧驻留）
+    private func releasePrewarmedPipeline(_ screen: Int) {
+        prewarmStatusObservers[screen]?.invalidate()
+        prewarmStatusObservers.removeValue(forKey: screen)
+        guard let pipeline = prewarmedPipelines.removeValue(forKey: screen) else { return }
+        pipeline.player.pause()
+        pipeline.looper?.disableLooping()
+        pipeline.player.replaceCurrentItem(with: nil)
     }
 
     /// 查找同 URL、同 loop 模式的 player。显式共享模式不受机会式屏数上限约束。
@@ -1101,13 +1473,27 @@ private final class VideoRendererDaemon {
     }
 
     private func backingScaleFactor(for screen: Int) -> CGFloat {
-        guard NSScreen.screens.indices.contains(screen) else { return 2 }
-        return NSScreen.screens[screen].backingScaleFactor
+        let orderedScreens = RendererScreenIdentity.orderedScreens(NSScreen.screens)
+        if let screenID = screenStates[screen]?.screenID,
+           let matchingScreen = orderedScreens.first(where: {
+               RendererScreenIdentity.identifier(for: $0) == screenID
+           }) {
+            return matchingScreen.backingScaleFactor
+        }
+        guard orderedScreens.indices.contains(screen) else { return 2 }
+        return orderedScreens[screen].backingScaleFactor
     }
 
     private func maximumFramesPerSecond(for screen: Int) -> Int {
-        guard NSScreen.screens.indices.contains(screen) else { return 60 }
-        return NSScreen.screens[screen].maximumFramesPerSecond
+        let orderedScreens = RendererScreenIdentity.orderedScreens(NSScreen.screens)
+        if let screenID = screenStates[screen]?.screenID,
+           let matchingScreen = orderedScreens.first(where: {
+               RendererScreenIdentity.identifier(for: $0) == screenID
+           }) {
+            return matchingScreen.maximumFramesPerSecond
+        }
+        guard orderedScreens.indices.contains(screen) else { return 60 }
+        return orderedScreens[screen].maximumFramesPerSecond
     }
 
     /// 返回引用指定 player 的所有屏 ID
@@ -1126,8 +1512,9 @@ private final class VideoRendererDaemon {
         player: AVQueuePlayer
     ) {
         firstFrameObservers[screen]?.invalidate()
-        let observer = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player] _, change in
-            guard change.newValue == true else { return }
+        let observer = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self, weak player] observedLayer, change in
+            let isReady = change.newValue ?? observedLayer.isReadyForDisplay
+            guard isReady else { return }
             Task { @MainActor in
                 guard let self, let player else { return }
                 self.onFirstFrameReady(
@@ -1138,6 +1525,16 @@ private final class VideoRendererDaemon {
             }
         }
         firstFrameObservers[screen] = observer
+    }
+
+    private func notifyFirstFrameIfAlreadyReady(
+        on layer: AVPlayerLayer,
+        screen: Int,
+        generation: UInt64,
+        player: AVQueuePlayer
+    ) {
+        guard layer.isReadyForDisplay else { return }
+        onFirstFrameReady(screen: screen, generation: generation, player: player)
     }
 
     private func onFirstFrameReady(
@@ -1183,6 +1580,11 @@ private final class VideoRendererDaemon {
             message: nil
         )
 
+        if pendingReplacements[screen]?.autoCommitOnReady == true,
+           pendingReplacements[screen]?.newPlayer === player {
+            commitPendingReplacement(screen: screen, requestID: state.requestID)
+        }
+
         AppLogger.info(.wallpaper, "video-renderer 首帧就绪 screen=\(screen)")
     }
 
@@ -1198,6 +1600,7 @@ private final class VideoRendererDaemon {
               let container = state.containerView else {
             return false
         }
+        vlog("reveal: screen=\(screen) freezeActive=\(container.isFreezeFrameActive) posterShown=\(container.isShowingPoster) sysPaused=\(systemPlaybackPaused) isPaused=\(isPaused)")
 
         state.deferWindowReveal = false
         screenStates[screen] = state
@@ -1227,6 +1630,7 @@ private final class VideoRendererDaemon {
             players[owner] === player
         }
         guard !alreadyObserved else { return }
+        guard let observedItem = items[screen] ?? player.currentItem else { return }
 
         // 移除旧观察者
         if let old = playbackEndObservers[screen] {
@@ -1234,18 +1638,61 @@ private final class VideoRendererDaemon {
         }
         let observer = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
-            object: player.currentItem,
+            object: observedItem,
             queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.sendEvent(
-                    .playbackEnded,
-                    screen: screen,
-                    screenID: self.screenStates[screen]?.screenID,
-                    requestID: self.screenStates[screen]?.requestID,
-                    message: nil
-                )
+        ) { [weak self, weak player] notification in
+            guard notification.object as? AVPlayerItem === observedItem else { return }
+            Task { @MainActor [weak self, weak player] in
+                guard let self,
+                      let player,
+                      self.players[screen] === player,
+                      self.onEndModeScreens.contains(screen),
+                      self.items[screen] === observedItem else {
+                    return
+                }
+                let attachedOnEndScreens = self.screenIDsReferencingPlayer(player)
+                    .filter(self.onEndModeScreens.contains)
+                    .sorted()
+                guard !attachedOnEndScreens.isEmpty else { return }
+                // 先冻结最后一帧作为过渡底图：视觉上呈现「最后一帧 → 新视频
+                // 淡入」的自然续接，消除 poster 静态图闪烁与结束瞬间的黑帧。
+                for attachedScreen in attachedOnEndScreens {
+                    self.screenStates[attachedScreen]?.containerView?
+                        .freezeForPausePreservingFrame()
+                }
+                // 冻结失败（无可捕获 drawable）时退回 poster 兜底
+                for attachedScreen in attachedOnEndScreens {
+                    guard let state = self.screenStates[attachedScreen],
+                          state.containerView?.isFreezeFrameActive != true,
+                          let posterPath = state.posterPath else { continue }
+                    vlog("end: screen=\(attachedScreen) 冻结失败→poster兜底")
+                    _ = self.showPoster(screen: attachedScreen, path: posterPath)
+                }
+                for attachedScreen in attachedOnEndScreens {
+                    vlog("end: screen=\(attachedScreen) freezeActive=\(self.screenStates[attachedScreen]?.containerView?.isFreezeFrameActive == true)")
+                }
+                // Keep the ended player in a deterministic state before the
+                // host starts a replacement. This mirrors the in-process
+                // renderer and prevents a short clip's stale end position
+                // from racing the next set/seek command.
+                player.pause()
+                // Do not seek(0) here. That briefly publishes a black or first
+                // IOSurface and overwrites the last-frame freeze used by the
+                // next video->video handoff. The incoming `set` replaces this
+                // player; leftover end-time is discarded with it.
+                let liveOnEndScreens = attachedOnEndScreens
+                let eventScreens = self.isGlobalDisplaySyncEnabled
+                    ? Array(liveOnEndScreens.prefix(1))
+                    : liveOnEndScreens
+                for eventScreen in eventScreens {
+                    self.sendEvent(
+                        .playbackEnded,
+                        screen: eventScreen,
+                        screenID: self.screenStates[eventScreen]?.screenID,
+                        requestID: self.screenStates[eventScreen]?.requestID,
+                        message: nil
+                    )
+                }
             }
         }
         playbackEndObservers[screen] = observer
@@ -1253,55 +1700,110 @@ private final class VideoRendererDaemon {
 
     // MARK: 暂停 / 恢复 / 停止
 
-    private func pauseScreen(_ screen: Int) {
-        guard let player = players[screen] else { return }
+    @discardableResult
+    private func pauseScreen(_ screen: Int) -> Bool {
+        guard let player = players[screen],
+              screenStates[screen] != nil else {
+            return false
+        }
         manualPausedScreens.insert(screen)
+        if let posterPath = screenStates[screen]?.posterPath {
+            _ = screenStates[screen]?.containerView?.showPoster(path: posterPath)
+        }
         screenStates[screen]?.containerView?.freezeForPause()
         // 共享 player：只有唯一引用者才真正 pause
         let refCount = screenIDsReferencingPlayer(player).count
         if refCount <= 1 {
             player.pause()
         }
+        return true
     }
 
-    private func pauseAll() {
+    @discardableResult
+    private func pauseAll() -> Bool {
+        guard !players.isEmpty else { return false }
         isPaused = true
         manualPausedScreens = Set(players.keys)
         // 去重：多个屏可能共享同一 player
         var seen = Set<ObjectIdentifier>()
         for (screen, player) in players {
+            if let posterPath = screenStates[screen]?.posterPath {
+                _ = screenStates[screen]?.containerView?.showPoster(path: posterPath)
+            }
             screenStates[screen]?.containerView?.freezeForPause()
             let id = ObjectIdentifier(player)
             guard !seen.contains(id) else { continue }
             seen.insert(id)
             player.pause()
         }
+        return true
     }
 
-    private func resumeScreen(_ screen: Int) {
-        guard let player = players[screen] else { return }
+    @discardableResult
+    private func resumeScreen(_ screen: Int) -> Bool {
+        guard let player = players[screen],
+              screenStates[screen] != nil else {
+            return false
+        }
         manualPausedScreens.remove(screen)
-        guard !systemPlaybackPaused else { return }
+        guard !systemPlaybackPaused else { return true }
+        screenStates[screen]?.containerView?.hidePoster()
         screenStates[screen]?.containerView?.resumeFromFreeze()
         player.play()
+        kickStalledPlayback(screen: screen, player: player)
+        return true
     }
 
-    private func resumeAll() {
+    @discardableResult
+    private func resumeAll() -> Bool {
+        guard !players.isEmpty else { return false }
         isPaused = false
         manualPausedScreens.removeAll()
-        guard !systemPlaybackPaused else { return }
+        guard !systemPlaybackPaused else { return true }
         var seen = Set<ObjectIdentifier>()
         for (screen, player) in players {
+            screenStates[screen]?.containerView?.hidePoster()
             screenStates[screen]?.containerView?.resumeFromFreeze()
             let id = ObjectIdentifier(player)
             guard !seen.contains(id) else { continue }
             seen.insert(id)
             player.play()
+            kickStalledPlayback(screen: screen, player: player)
+        }
+        return true
+    }
+
+    /// 长期 pause 后解码会话常被系统回收，单纯 play() 不会再出帧，冻帧/封面会一直盖着。
+    /// 用当前时间 seek 踢醒管线；仍无帧则再 play 一次。
+    private func kickStalledPlayback(screen: Int, player: AVQueuePlayer) {
+        let current = player.currentTime()
+        player.seek(to: current, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] _ in
+            Task { @MainActor in
+                guard let self, let player, self.players[screen] === player else { return }
+                guard !self.systemPlaybackPaused,
+                      !self.isPaused,
+                      !self.manualPausedScreens.contains(screen) else { return }
+                player.play()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self, weak player] in
+            guard let self, let player, self.players[screen] === player else { return }
+            guard !self.systemPlaybackPaused,
+                  !self.isPaused,
+                  !self.manualPausedScreens.contains(screen) else { return }
+            let layer = self.screenStates[screen]?.containerView?.playerLayer
+            if layer?.isReadyForDisplay != true || player.rate == 0 {
+                player.play()
+                self.screenStates[screen]?.containerView?.resumeFromFreeze()
+            }
         }
     }
 
-    private func stopScreen(_ screen: Int) {
-        let screenID = screenStates[screen]?.screenID
+    @discardableResult
+    private func stopScreen(_ screen: Int) -> Bool {
+        guard let screenID = screenStates[screen]?.screenID else {
+            return false
+        }
         teardownScreen(screen)
         sendEvent(
             .stopped,
@@ -1310,10 +1812,13 @@ private final class VideoRendererDaemon {
             requestID: nil,
             message: nil
         )
+        return true
     }
 
-    private func stopAll() {
+    @discardableResult
+    private func stopAll() -> Bool {
         let screens = Array(screenStates.keys)
+        guard !screens.isEmpty else { return false }
         for screen in screens {
             let screenID = screenStates[screen]?.screenID
             teardownScreen(screen)
@@ -1325,6 +1830,7 @@ private final class VideoRendererDaemon {
                 message: nil
             )
         }
+        return true
     }
 
     /// Detaches only the old playback pipeline while preserving the desktop
@@ -1345,7 +1851,9 @@ private final class VideoRendererDaemon {
         }
         onEndModeScreens.remove(screen)
 
-        state.containerView?.freezeForPause()
+        // 已有冻结帧（播完即换的最后一帧）时保留不覆盖
+        vlog("prepareReplace: screen=\(screen) freezeActive=\(state.containerView?.isFreezeFrameActive == true) posterShown=\(state.containerView?.isShowingPoster == true) preserveOld=\(preserveOldPipeline)")
+        state.containerView?.freezeForPausePreservingFrame()
         let oldPlayer = players.removeValue(forKey: screen)
         let oldLooper = loopers.removeValue(forKey: screen)
         let oldItem = items.removeValue(forKey: screen)
@@ -1388,6 +1896,7 @@ private final class VideoRendererDaemon {
             return
         }
 
+        vlog("commit: screen=\(screen) req=\(requestID.prefix(6)) fade=\(pending.transitionDuration) freezeActive=\(container.isFreezeFrameActive) posterShown=\(container.isShowingPoster)")
         container.crossfadePreparedPlayer(
             pending.newPlayer,
             duration: pending.transitionDuration
@@ -1400,6 +1909,14 @@ private final class VideoRendererDaemon {
             }
             self.pendingReplacements.removeValue(forKey: screen)
             container?.resumeFromFreeze()
+            // 播完即换的结束路径已对全屏盖 poster；视频→视频替换提交后，
+            // 若该屏仍在播放必须揭开 poster，否则新视频被旧 poster 永久
+            // 遮挡（表现为“切换后根本不会播放”，底层 AVPlayer 实际在播）。
+            if !self.systemPlaybackPaused,
+               !self.isPaused,
+               !self.manualPausedScreens.contains(screen) {
+                container?.hidePoster()
+            }
             state.window?.alphaValue = 0.99
             state.window?.orderFrontRegardless()
             state.window?.orderBack(nil)
@@ -1505,7 +2022,16 @@ private final class VideoRendererDaemon {
             guard let self, let player else { return }
             var anchorSeconds = player.currentTime().seconds
             let deadline = Date().addingTimeInterval(30)
-            var playbackAdvanced = self.isPaused
+            let hasLiveAttachment = self.screenIDsReferencingPlayer(player)
+                .contains { !self.manualPausedScreens.contains($0) }
+                && !self.systemPlaybackPaused
+                && !self.isPaused
+            // All screens can be intentionally paused while their pipelines
+            // are built (for example an auto-pause rule active at launch).
+            // Do not wait 30 seconds for a timebase that we deliberately
+            // stopped; attach the follower and let its ready observer handle
+            // the first frame once playback resumes.
+            var playbackAdvanced = !hasLiveAttachment
             AppLogger.info(.wallpaper, "video-renderer follower 任务启动 initial=\(anchorSeconds) rate=\(player.rate) pending=\(self.pendingSharedFollowerScreensByPlayerID[playerID]?.sorted() ?? [])")
 
             while !playbackAdvanced, Date() < deadline {
@@ -1573,6 +2099,14 @@ private final class VideoRendererDaemon {
                     AppLogger.info(.wallpaper, "video-renderer follower attach(deferred) screen=\(screen)")
                 } else {
                     container.attachPlayer(player)
+                    if self.firstFrameObservers[screen] == nil {
+                        self.observeFirstFrameReadiness(
+                            on: container.playerLayer,
+                            screen: screen,
+                            generation: state.generation,
+                            player: player
+                        )
+                    }
                     readyLayer = container.playerLayer
                     AppLogger.info(.wallpaper, "video-renderer follower attach screen=\(screen)")
                 }
@@ -1586,6 +2120,14 @@ private final class VideoRendererDaemon {
                 }
                 if !readyLayer.isReadyForDisplay {
                     AppLogger.error(.wallpaper, "video-renderer follower 首帧等待超时 screen=\(screen)")
+                    // Shared followers can sit on a live player whose layer never
+                    // flips isReadyForDisplay. Force the host/commit path so the
+                    // window does not stay at alpha 0.02 forever.
+                    self.onFirstFrameReady(
+                        screen: screen,
+                        generation: state.generation,
+                        player: player
+                    )
                 } else {
                     // KVO 会错过「attach 时已经 ready」的情况：replacement 下 layer
                     // 换绑到已起播的共享 player 时 isReadyForDisplay 保持 true 无跳变，
@@ -1625,6 +2167,7 @@ private final class VideoRendererDaemon {
             playbackEndObservers.removeValue(forKey: screen)
         }
         onEndModeScreens.remove(screen)
+        releasePrewarmedPipeline(screen)
 
         // 清理 player 引用（共享 player 不释放，仅移除本屏引用）
         let pending = pendingReplacements.removeValue(forKey: screen)
@@ -1655,6 +2198,26 @@ private final class VideoRendererDaemon {
         if let pending {
             pending.oldState.containerView?.discardPreparedPlayerTransition()
             releasePlayerIfUnused(pending.oldPlayer, looper: pending.oldLooper)
+        }
+    }
+
+    private func pruneInactiveScreens(keeping activeScreenIDs: Set<String>) {
+        let liveFingerprints = Set(activeScreenIDs.compactMap(currentFingerprint(matching:)))
+        let staleScreens = screenStates
+            .filter { _, state in
+                if activeScreenIDs.contains(state.screenID) {
+                    return false
+                }
+                if let fingerprint = currentFingerprint(matching: state.screenID),
+                   liveFingerprints.contains(fingerprint) {
+                    return false
+                }
+                return true
+            }
+            .map(\.key)
+            .sorted()
+        for screen in staleScreens {
+            teardownScreen(screen)
         }
     }
 
@@ -1694,19 +2257,21 @@ private final class VideoRendererDaemon {
             // A deferred replacement keeps the old player attached while the
             // incoming player warms up in a separate transition layer. The
             // host may issue forceCommit immediately after `set` returns; do
-            // not let that maintenance command bypass the pending crossfade.
-            if pendingReplacements[screen] == nil {
-                if let player = players[screen],
-                   container.playerLayer.player !== player {
-                    container.attachPlayer(player)
-                }
-                if let player = players[screen],
-                   !systemPlaybackPaused,
-                   !isPaused,
-                   !manualPausedScreens.contains(screen),
-                   player.rate == 0 {
-                    player.play()
-                }
+            // not let that maintenance command bypass the pending crossfade
+            // or flush an empty incoming main layer.
+            if pendingReplacements[screen] != nil {
+                continue
+            }
+            if let player = players[screen],
+               container.playerLayer.player !== player {
+                container.attachPlayer(player)
+            }
+            if let player = players[screen],
+               !systemPlaybackPaused,
+               !isPaused,
+               !manualPausedScreens.contains(screen),
+               player.rate == 0 {
+                player.play()
             }
             container.playerLayer.setNeedsDisplay()
             container.needsDisplay = true
@@ -1785,11 +2350,14 @@ private final class VideoRendererDaemon {
 
     // MARK: Crop（P2 完整实现，P1 仅 resizeAspectFill）
 
-    private func applyCrop(screen: Int, msg: IPCMessage) {
-        guard let container = screenStates[screen]?.containerView else { return }
+    @discardableResult
+    private func applyCrop(screen: Int, msg: IPCMessage) -> Bool {
+        guard let container = screenStates[screen]?.containerView else {
+            return false
+        }
         if let revision = msg.cropRevision {
             guard revision >= (screenStates[screen]?.lastCropRevision ?? 0) else {
-                return
+                return true
             }
             screenStates[screen]?.lastCropRevision = revision
         }
@@ -1809,8 +2377,17 @@ private final class VideoRendererDaemon {
             viewport = nil
         }
 
-        container.applyCrop(crop: crop, viewport: viewport,
-                            letterboxColorHex: msg.letterboxColorHex)
+        // Incoming crop belongs to the replacement clip. Applying it during a
+        // pending handoff would reshape the outgoing freeze frame and flash
+        // black letterbox around A.
+        let incomingOnly = pendingReplacements[screen] != nil
+        container.applyCrop(
+            crop: crop,
+            viewport: viewport,
+            letterboxColorHex: msg.letterboxColorHex,
+            incomingLayerOnly: incomingOnly
+        )
+        return true
     }
 
     // MARK: Poster（P2 完整实现）
@@ -1845,7 +2422,11 @@ private final class VideoRendererDaemon {
 
     @discardableResult
     private func hidePoster(screen: Int) -> Bool {
-        guard let container = screenStates[screen]?.containerView else { return false }
+        guard pendingReplacements[screen] == nil,
+              screenStates[screen]?.deferWindowReveal != true,
+              let container = screenStates[screen]?.containerView else {
+            return true
+        }
         container.hidePoster()
         return true
     }
@@ -1884,7 +2465,7 @@ private final class VideoRendererDaemon {
         // 简化 P1：写到 stderr 的特殊前缀，主进程解析
         let prefix = "WAIFUX_EVENT:"
         if let str = String(data: data, encoding: .utf8) {
-            FileHandle.standardError.write(Data((prefix + str + "\n").utf8))
+            FileHandle.standardOutput.write(Data((prefix + str + "\n").utf8))
         }
     }
 
@@ -2150,6 +2731,7 @@ private final class VideoContainerView: NSView {
     ) {
         guard let incoming = transitionPlayerLayer,
               incoming.player === newPlayer else {
+            vlog("crossfade: 无过渡层→硬挂载 ⚠️ freezeActive=\(freezeFrameLayer.contents != nil)")
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             attachPlayer(newPlayer)
@@ -2158,13 +2740,19 @@ private final class VideoContainerView: NSView {
             return
         }
 
-        captureFreezeFrameIfNeeded(force: true)
+        // 已有有效冻结帧（播完即换的最后一帧）时保留不覆盖，
+        // 避免被 seek 复位后的第 0 帧或瞬时黑帧顶掉过渡底图。
+        if freezeFrameLayer.contents == nil {
+            captureFreezeFrameIfNeeded(force: true)
+        }
         let fadeDuration = max(0.12, duration)
+        vlog("crossfade: 开始 fade=\(fadeDuration) freezeActive=\(freezeFrameLayer.contents != nil)")
         var didComplete = false
 
         let finish: () -> Void = { [weak self, weak incoming] in
             guard let self, let incoming, !didComplete else { return }
             didComplete = true
+            vlog("crossfade: 完成 freezeActive=\(self.freezeFrameLayer.contents != nil)")
             let outgoing = self.playerLayer
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -2223,18 +2811,45 @@ private final class VideoContainerView: NSView {
         }
     }
 
+    /// 当前是否持有有效的冻结帧
+    var isFreezeFrameActive: Bool {
+        freezeFrameLayer.contents != nil
+    }
+
+    /// 仅保留「当前可见」的冻结帧（播完即换刚冻住的最后一帧）。
+    /// 上一轮交接留下的隐藏冻帧必须丢掉再重捕，否则 A→B 会闪出更早的 C。
+    func freezeForPausePreservingFrame() {
+        let keepVisibleFreeze = freezeFrameLayer.contents != nil
+            && freezeFrameLayer.isHidden == false
+        if !keepVisibleFreeze {
+            clearFreezeFrame()
+            captureFreezeFrameIfNeeded(force: true)
+        }
+        freezeFrameLayer.isHidden = freezeFrameLayer.contents == nil
+        if freezeFrameLayer.contents != nil {
+            playerLayer.opacity = 0
+        }
+    }
+
     /// Resume the live layer without exposing the window background while it
     /// waits for the first drawable after a pause.
     func resumeFromFreeze() {
         playerLayer.opacity = 1
         if playerLayer.isReadyForDisplay {
+            vlog("resume: layerReady→延迟藏冻结帧")
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.playerLayer.isReadyForDisplay else { return }
-                self.freezeFrameLayer.isHidden = true
+                self.clearFreezeFrame()
             }
         } else {
+            vlog("resume: layer未就绪→保持冻结帧可见")
             freezeFrameLayer.isHidden = false
         }
+    }
+
+    private func clearFreezeFrame() {
+        freezeFrameLayer.contents = nil
+        freezeFrameLayer.isHidden = true
     }
 
     // MARK: Freeze frame
@@ -2277,7 +2892,10 @@ private final class VideoContainerView: NSView {
     }
 
     private func captureFreezeFrameIfNeeded(force: Bool) {
-        guard playerLayer.isReadyForDisplay else { return }
+        guard playerLayer.isReadyForDisplay else {
+            vlog("freeze: SKIP layerNotReady force=\(force)")
+            return
+        }
         let now = CACurrentMediaTime()
         if !force, now - lastFreezeCaptureTime < freezeCaptureMinInterval {
             return
@@ -2291,14 +2909,30 @@ private final class VideoContainerView: NSView {
         // Reuse it first because this path is cheap and preserves the layer's
         // exact aspect-fill presentation.
         if let contents = sourceLayer.contents {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            freezeFrameLayer.contents = contents
-            freezeFrameLayer.contentsScale = sourceLayer.contentsScale > 0 ? sourceLayer.contentsScale : scale
-            freezeFrameLayer.contentsGravity = sourceLayer.contentsGravity
-            freezeFrameLayer.frame = currentLayerFrame ?? bounds
-            CATransaction.commit()
-            return
+            // A paused AVPlayerLayer can briefly publish an all-black
+            // IOSurface/CGImage while its timebase is settling. Only accept a
+            // static CGImage after a black-frame check; live IOSurface contents
+            // can go black after seek/pause and would then become the handoff
+            // backdrop.
+            if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
+                let image = contents as! CGImage
+                if !isMostlyBlack(image) {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    freezeFrameLayer.contents = image
+                    freezeFrameLayer.contentsScale = sourceLayer.contentsScale > 0 ? sourceLayer.contentsScale : scale
+                    freezeFrameLayer.contentsGravity = sourceLayer.contentsGravity
+                    freezeFrameLayer.frame = currentLayerFrame ?? bounds
+                    CATransaction.commit()
+                    vlog("freeze: contentsDirect OK")
+                    return
+                }
+                vlog("freeze: contentsDirect BLACK-rejected → render fallback")
+            } else {
+                vlog("freeze: contentsDirect rejected → render fallback")
+            }
+        } else {
+            vlog("freeze: contents=nil → render fallback")
         }
 
         // Fallback for systems where AVPlayerLayer.contents is not exposed.
@@ -2334,7 +2968,10 @@ private final class VideoContainerView: NSView {
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        guard let image = rep.cgImage, !isMostlyBlack(image) else { return }
+        guard let image = rep.cgImage, !isMostlyBlack(image) else {
+            vlog("freeze: renderPath BLACK-rejected ⚠️ 无冻结帧可用")
+            return
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -2343,6 +2980,7 @@ private final class VideoContainerView: NSView {
         freezeFrameLayer.contentsGravity = .resizeAspectFill
         freezeFrameLayer.frame = currentLayerFrame ?? bounds
         CATransaction.commit()
+        vlog("freeze: renderPath OK")
     }
 
     private func isMostlyBlack(_ image: CGImage) -> Bool {
@@ -2403,15 +3041,15 @@ private final class VideoContainerView: NSView {
         posterLayer = poster
 
         // Keep the last valid static image under the live player as a second
-        // fallback. Hiding the explicit poster must never expose a black layer.
-        if freezeFrameLayer.contents == nil {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            freezeFrameLayer.contents = cgImage
-            freezeFrameLayer.contentsGravity = .resizeAspectFill
-            freezeFrameLayer.frame = currentLayerFrame ?? bounds
-            CATransaction.commit()
-        }
+        // fallback. Always replace a leftover freeze from an older clip so
+        // A→B cannot flash wallpaper C.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        freezeFrameLayer.contents = cgImage
+        freezeFrameLayer.contentsGravity = .resizeAspectFill
+        freezeFrameLayer.frame = currentLayerFrame ?? bounds
+        freezeFrameLayer.isHidden = true
+        CATransaction.commit()
     }
 
     func hidePoster() {
@@ -2453,11 +3091,20 @@ private final class VideoContainerView: NSView {
     /// Applies normalized crop and viewport rectangles to both the live video
     /// and its fallback layers. The container mask clips the result so
     /// letterbox pixels remain the configured background color.
-    func applyCrop(crop: CGRect?, viewport: CGRect?, letterboxColorHex: String?) {
+    func applyCrop(
+        crop: CGRect?,
+        viewport: CGRect?,
+        letterboxColorHex: String?,
+        incomingLayerOnly: Bool = false
+    ) {
         guard let crop, let viewport,
               bounds.width > 0, bounds.height > 0,
               crop.width > 0, crop.height > 0,
               viewport.width > 0, viewport.height > 0 else {
+            if incomingLayerOnly {
+                transitionPlayerLayer?.frame = bounds
+                return
+            }
             currentViewportRect = nil
             currentLayerFrame = nil
             layer?.mask = nil
@@ -2500,6 +3147,10 @@ private final class VideoContainerView: NSView {
             height: videoHeight
         )
 
+        if incomingLayerOnly {
+            transitionPlayerLayer?.frame = videoFrame
+            return
+        }
         currentViewportRect = viewportRect
         currentLayerFrame = videoFrame
         playerLayer.videoGravity = .resizeAspectFill

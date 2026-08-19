@@ -153,10 +153,30 @@ final class AppLogger: @unchecked Sendable {
 
     // MARK: - 文件写入（带大小限制）
 
+    /// 文件写入队列积压上限；日志 IO 异常卡住时丢弃新行，防止队列无限堆积
+    /// 并把主线程日志调用拖死（实测出现过日志器整段停摆 15 分钟）。
+    private let writeBacklogLimit = 2000
+    private let writeBacklogLock = NSLock()
+    private var pendingFileWrites = 0
+
     private func writeToFile(_ line: String) {
         guard let url = logFileURL else { return }
+        writeBacklogLock.lock()
+        guard pendingFileWrites < writeBacklogLimit else {
+            writeBacklogLock.unlock()
+            return
+        }
+        pendingFileWrites += 1
+        writeBacklogLock.unlock()
         queue.async { [weak self] in
-            guard let self = self else { return }
+            defer {
+                if let self {
+                    self.writeBacklogLock.lock()
+                    self.pendingFileWrites -= 1
+                    self.writeBacklogLock.unlock()
+                }
+            }
+            guard let self else { return }
 
             if !FileManager.default.fileExists(atPath: url.path) {
                 // 新建文件，写 UTF-8 BOM 方便文本编辑器识别

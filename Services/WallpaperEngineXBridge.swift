@@ -3613,8 +3613,14 @@ final class WallpaperEngineXBridge: ObservableObject {
         let screenID = screen.wallpaperScreenIdentifier
         let processInfo = screenProcesses[screenID]
             ?? state.flatMap { screenProcesses[$0.screenID] }
+            ?? screenProcesses.values.first(where: { $0.screenID == screenID })
+            ?? screenProcesses.values.first(where: {
+                $0.screenID == state?.screenID
+            })
         guard let processInfo else { return false }
-        return processInfo.process.isRunning && kill(processInfo.pid, 0) == 0
+        // SIGSTOP'd Scene processes still own a desktop window. `isRunning`
+        // can briefly lie after a stop/restart race; the pid check is enough.
+        return kill(processInfo.pid, 0) == 0
     }
 
     /// Web 的管理状态会持久化用于启动恢复，不能单靠它判断桌面上是否仍有窗口。
