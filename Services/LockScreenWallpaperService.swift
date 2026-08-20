@@ -92,6 +92,12 @@ final class LockScreenWallpaperService: ObservableObject {
         source: "initial"
     )
     private var playbackStateReconciliationTask: Task<Void, Never>?
+    /// The unlock notification can arrive before CGSessionCopyCurrentDictionary()
+    /// reflects the new session state. Keep the explicit notification authoritative
+    /// for a short grace period so a stale `locked=true` read cannot re-pause video
+    /// immediately after the user unlocks the Mac.
+    private var explicitUnlockObservedAt: Date?
+    private let staleSessionLockGracePeriod: TimeInterval = 3.0
 
     private let appGroupID = "group.com.waifux.app"
     private let prefsFileName = "waifux-wallpaper-prefs.json"
@@ -184,10 +190,12 @@ final class LockScreenWallpaperService: ObservableObject {
     }
 
     @objc private func handleSystemScreenLocked() {
+        explicitUnlockObservedAt = nil
         updatePlaybackVisibility(isScreenLocked: true, source: "screenLocked")
     }
 
     @objc private func handleSystemScreenUnlocked() {
+        explicitUnlockObservedAt = Date()
         updatePlaybackVisibility(isScreenLocked: false, source: "screenUnlocked")
         schedulePlaybackStateReconciliation(source: "screenUnlocked")
     }
@@ -214,7 +222,16 @@ final class LockScreenWallpaperService: ObservableObject {
     /// macOS can deliver the notification before the login session has
     /// finished changing, or occasionally drop one of the wake notifications.
     func reconcilePlaybackStateAfterWake(source: String) {
-        reconcilePlaybackStateWithCurrentSession(source: source)
+        if source.localizedCaseInsensitiveContains("unlock") {
+            explicitUnlockObservedAt = Date()
+            // Do not synchronously consult CGSession here. On a lid unlock the
+            // session dictionary can still report the old locked state.
+            updatePlaybackVisibility(isScreenLocked: false, source: source)
+        } else {
+            // A display wake only clears the sleep component; preserve the
+            // explicit lock state until the delayed session reconciliation.
+            updatePlaybackVisibility(isDisplayAsleep: false, source: source)
+        }
         schedulePlaybackStateReconciliation(source: source)
     }
 
@@ -241,6 +258,17 @@ final class LockScreenWallpaperService: ObservableObject {
         guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
               let isScreenLocked = session["CGSSessionScreenIsLocked"] as? Bool else {
             return
+        }
+
+        if isScreenLocked,
+           !playbackState.isScreenLocked,
+           let explicitUnlockObservedAt,
+           Date().timeIntervalSince(explicitUnlockObservedAt) < staleSessionLockGracePeriod {
+            print("[LockScreenWallpaper] defer stale locked session result after unlock")
+            return
+        }
+        if !isScreenLocked {
+            explicitUnlockObservedAt = nil
         }
 
         updatePlaybackVisibility(
