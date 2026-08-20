@@ -306,6 +306,11 @@ private final class VideoRendererDaemon {
 
     // 首帧就绪 KVO
     private var firstFrameObservers: [Int: NSKeyValueObservation] = [:]
+    /// `AVPlayer.preroll` throws an Objective-C exception while the player is
+    /// still loading. Wake recovery can rebuild a pipeline before
+    /// `AVPlayerStatusReadyToPlay`, so defer the initial preroll/play decision
+    /// until the player reports a usable status.
+    private var playbackStatusObservers: [Int: NSKeyValueObservation] = [:]
     private var screenGenerations: [Int: UInt64] = [:]
     private var pendingReplacements: [Int: PendingReplacement] = [:]
     private var pendingSharedFollowerScreensByPlayerID: [ObjectIdentifier: Set<Int>] = [:]
@@ -1229,17 +1234,18 @@ private final class VideoRendererDaemon {
 
         // 启动播放（首帧 reveal 会在 isReadyForDisplay 回调中处理）
         applyAudioPolicy()
-        if !systemPlaybackPaused && !globalPaused && !screenPaused {
-            components.player.play()
-        } else {
-            components.player.preroll(atRate: 1) { _ in }
-        }
+        scheduleInitialPlayback(
+            screen: screen,
+            player: components.player,
+            shouldPlay: !systemPlaybackPaused && !globalPaused && !screenPaused
+        )
 
         // A timeout is an error, not a first frame. Reporting readiness here
         // would let the host tear down Scene/Web while this window still has no
         // drawable, recreating the exact black flash the subprocess migration
         // is meant to eliminate.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+        let firstFrameTimeout: TimeInterval = forceNewPipeline ? 3.0 : 10.0
+        DispatchQueue.main.asyncAfter(deadline: .now() + firstFrameTimeout) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 let layerReady = self.pendingReplacements[screen]?.newPlayer === components.player
@@ -1271,6 +1277,98 @@ private final class VideoRendererDaemon {
         }
 
         return "OK"
+    }
+
+    /// Starts a newly bound player without ever calling `preroll` before its
+    /// status is ready. The old code did that during wake recovery when the
+    /// shared lock state still said "paused", which raised
+    /// `NSInvalidArgumentException` on the renderer's main actor and left the
+    /// IPC server unresponsive until the host's 30s command timeout expired.
+    private func scheduleInitialPlayback(
+        screen: Int,
+        player: AVQueuePlayer,
+        shouldPlay: Bool
+    ) {
+        playbackStatusObservers[screen]?.invalidate()
+        playbackStatusObservers.removeValue(forKey: screen)
+
+        if player.status == .readyToPlay {
+            finishInitialPlayback(
+                screen: screen,
+                player: player,
+                shouldPlay: shouldPlay
+            )
+            return
+        }
+
+        guard player.status != .failed else {
+            AppLogger.error(
+                .wallpaper,
+                "video-renderer 新播放器创建失败 screen=\(screen) error=\(player.error?.localizedDescription ?? "unknown")"
+            )
+            return
+        }
+
+        playbackStatusObservers[screen] = player.observe(
+            \.status,
+            options: [.initial, .new]
+        ) { [weak self, weak player] observedPlayer, _ in
+            guard observedPlayer.status == .readyToPlay
+                || observedPlayer.status == .failed else {
+                return
+            }
+            Task { @MainActor [weak self, weak player] in
+                guard let self, let player else { return }
+                guard self.players[screen] === player else { return }
+                self.playbackStatusObservers[screen]?.invalidate()
+                self.playbackStatusObservers.removeValue(forKey: screen)
+                if player.status == .readyToPlay {
+                    self.finishInitialPlayback(
+                        screen: screen,
+                        player: player,
+                        shouldPlay: shouldPlay
+                    )
+                } else {
+                    AppLogger.error(
+                        .wallpaper,
+                        "video-renderer 新播放器加载失败 screen=\(screen) error=\(player.error?.localizedDescription ?? "unknown")"
+                    )
+                }
+            }
+        }
+    }
+
+    private func finishInitialPlayback(
+        screen: Int,
+        player: AVQueuePlayer,
+        shouldPlay: Bool
+    ) {
+        guard players[screen] === player else { return }
+        guard player.status == .readyToPlay else { return }
+
+        let canPlay = shouldPlay
+            && !systemPlaybackPaused
+            && !isPaused
+            && !manualPausedScreens.contains(screen)
+        if canPlay {
+            player.play()
+            return
+        }
+
+        // Only call preroll after status becomes ready. Keep the player paused;
+        // a later lock/unlock or auto-pause transition owns the actual play().
+        player.preroll(atRate: 1) { [weak self, weak player] _ in
+            Task { @MainActor [weak self, weak player] in
+                guard let self, let player, self.players[screen] === player else {
+                    return
+                }
+                if !self.systemPlaybackPaused,
+                   !self.isPaused,
+                   !self.manualPausedScreens.contains(screen) {
+                    player.play()
+                }
+            }
+        }
     }
 
     // MARK: Player 组件解析（含共享解码逻辑）
@@ -2000,6 +2098,8 @@ private final class VideoRendererDaemon {
             return
         }
 
+        playbackStatusObservers[screen]?.invalidate()
+        playbackStatusObservers.removeValue(forKey: screen)
         firstFrameObservers[screen]?.invalidate()
         firstFrameObservers.removeValue(forKey: screen)
         if let observer = playbackEndObservers.removeValue(forKey: screen) {
@@ -2219,6 +2319,8 @@ private final class VideoRendererDaemon {
 
     private func teardownScreen(_ screen: Int) {
         // 移除观察者
+        playbackStatusObservers[screen]?.invalidate()
+        playbackStatusObservers.removeValue(forKey: screen)
         firstFrameObservers[screen]?.invalidate()
         firstFrameObservers.removeValue(forKey: screen)
         if let observer = playbackEndObservers[screen] {

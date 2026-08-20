@@ -6381,10 +6381,13 @@ final class VideoWallpaperManager: ObservableObject {
                     globalDisplaySyncEnabled: WallpaperSchedulerService.shared
                         .isGlobalDisplaySyncEnabled
                 )
+                let setCommandTimeout = recoverUnresponsiveRenderer
+                    ? Self.externalRendererWakeSetCommandTimeout
+                    : Self.externalRendererSetCommandTimeout
                 var response = await externalRenderer.sendCommand(
                     command,
                     screen: screenIndex,
-                    timeout: Self.externalRendererSetCommandTimeout
+                    timeout: setCommandTimeout
                 )
                 if response?.hasPrefix("OK") != true, recoverUnresponsiveRenderer {
                     let responsive = await externalRenderer.isDaemonResponsive(
@@ -6411,7 +6414,7 @@ final class VideoWallpaperManager: ObservableObject {
                     response = await externalRenderer.sendCommand(
                         command,
                         screen: screenIndex,
-                        timeout: Self.externalRendererSetCommandTimeout
+                        timeout: setCommandTimeout
                     )
                 }
                 guard response?.hasPrefix("OK") == true else {
@@ -6486,6 +6489,9 @@ final class VideoWallpaperManager: ObservableObject {
     /// Player/AVPlayerLooper 的创建在高分辨率外接盘和多屏共享模式下可能
     /// 阻塞 renderer 主线程数秒；set 只等待窗口/player 建立，不等待首帧。
     private static let externalRendererSetCommandTimeout: TimeInterval = 30
+    /// 唤醒恢复不允许被一个失效的 AVFoundation 管线拖住。健康 renderer 的
+    /// `set` 通常几十毫秒返回；超过 3 秒直接探活并换代，比等待通用 30 秒可靠。
+    private static let externalRendererWakeSetCommandTimeout: TimeInterval = 3
     /// 播放控制类命令（pause/resume/poster）的超时。
     /// 健康 daemon 毫秒级响应；楔死时必须快速失败让上层触发换代自愈，
     /// 不能让一次点击串行阻塞 15-30s（旧值 15s 曾让菜单暂停"点了没反应"）。
