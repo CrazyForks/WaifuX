@@ -33,14 +33,16 @@ enum FrameInterpolationTargetFPSResolver {
 @MainActor
 final class VideoWallpaperManager: ObservableObject {
     static let shared = VideoWallpaperManager()
+    static let externalVideoRendererDefaultsKey = "external_video_renderer_enabled"
 
     // MARK: - 子进程渲染开关（P1：验证 Screen Time 隔离）
     //
     // 开启时，视频壁纸渲染走独立子进程 wallpaper-video-renderer，
     // 主进程不再持有可见窗口，从而不被 Screen Time 计入使用时长。
     // 关闭时，走原有的主进程内渲染路径（VideoWallpaperManager.createWindow 等）。
-    // 开发期默认开启验证；稳定后可移除开关，固定走子进程。
-    var useExternalVideoRenderer: Bool = true
+    // 默认使用主进程内置播放器；用户可在设置中切换到独立子进程。
+    private(set) var useExternalVideoRenderer: Bool =
+        UserDefaults.standard.object(forKey: externalVideoRendererDefaultsKey) as? Bool ?? false
 
     /// 子进程控制器（仅 useExternalVideoRenderer=true 时使用）
     private let externalRenderer = VideoRendererProcessController.shared
@@ -80,6 +82,74 @@ final class VideoWallpaperManager: ObservableObject {
     private var externalRendererTransactionWaiters: [CheckedContinuation<Void, Never>] = []
     /// 事务代际：watchdog 强制释放或卡死持有者晚到释放时递增，防止误放新事务。
     private var externalRendererTransactionEpoch: UInt64 = 0
+
+    /// 切换视频渲染后端，并重建当前视频壁纸。
+    /// 设置变化发生在运行中时，先保存每屏视频映射，再停掉旧路径，最后逐屏恢复。
+    func setExternalVideoRendererEnabled(_ enabled: Bool) {
+        guard useExternalVideoRenderer != enabled else { return }
+
+        useExternalVideoRenderer = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.externalVideoRendererDefaultsKey)
+
+        guard hasActiveVideoWallpaper else {
+            if !enabled, externalRenderer.isRunning {
+                externalRenderer.stopDaemon()
+            }
+            externalRenderingActive = false
+            return
+        }
+
+        let targetScreens = screensForVideoWallpaperTargets()
+        let snapshots = targetScreens.compactMap { screen -> (
+            screen: NSScreen,
+            videoURL: URL,
+            posterURL: URL?,
+            muted: Bool
+        )? in
+            guard let videoURL = videoURL(for: screen),
+                  FileManager.default.fileExists(atPath: videoURL.path) else {
+                return nil
+            }
+            return (
+                screen: screen,
+                videoURL: videoURL,
+                posterURL: posterURL(for: screen),
+                muted: isMuted
+            )
+        }
+        let wasPaused = isPaused
+
+        // stopWallpaper clears the old renderer state and leaves the selected
+        // source files available in this local snapshot for reapplication.
+        stopWallpaper()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for snapshot in snapshots {
+                do {
+                    try await self.applyVideoWallpaper(
+                        from: snapshot.videoURL,
+                        posterURL: snapshot.posterURL,
+                        muted: snapshot.muted,
+                        targetScreen: snapshot.screen,
+                        animatedTransition: false,
+                        usesSharedVideoDecoder: false,
+                        forceRebuild: true
+                    )
+                } catch {
+                    AppLogger.error(.wallpaper, "切换视频渲染后端时恢复壁纸失败", metadata: [
+                        "screen": snapshot.screen.localizedName,
+                        "video": snapshot.videoURL.lastPathComponent,
+                        "enabled": enabled,
+                        "error": error.localizedDescription
+                    ])
+                }
+            }
+            if wasPaused, self.hasActiveVideoWallpaper {
+                self.pauseWallpaper()
+            }
+        }
+    }
 
     /// 记录最近一次成功挂载视频壁纸时的目标显示器配置。
     /// 某些窗口激活/隐藏路径会误触发 `didChangeScreenParametersNotification`，
