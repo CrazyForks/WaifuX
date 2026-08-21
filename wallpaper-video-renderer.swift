@@ -1072,14 +1072,14 @@ private final class VideoRendererDaemon {
                 .fullScreenAuxiliary,
                 .ignoresCycle
             ]
-            // isOpaque=false + alpha=0.99（常驻半透明）：窗口按半透明层合成，
+            // isOpaque=false + alpha=0.999（常驻近乎不透明）：窗口按半透明层合成，
             // 必须与壁纸层混合 → 壁纸层不被视频层挂起 → 菜单栏 backdrop
             // 懒采样能跟随 poster 更新（alpha=1 时壁纸层被挂起，菜单栏永不
-            // 更新——实测验证）。0.99 与 1 视觉无差别。
+            // 更新——实测验证）。0.999 与 1 视觉无差别。
             window.isOpaque = false
             window.backgroundColor = .black
             // Stay nearly invisible until the first drawable exists. Flashing
-            // 0.99 here exposes the black window background before play().
+            // A fully revealed window here exposes the black background before play().
             window.alphaValue = 0.02
             window.hasShadow = false
             window.isReleasedWhenClosed = false
@@ -1216,8 +1216,8 @@ private final class VideoRendererDaemon {
         // window. A cross-type warmup remains nearly transparent even after
         // its first drawable; the host reveals it only once the outgoing
         // Scene/Web/static presentation is protected by a snapshot.
-        window.alphaValue = isReplacement ? 0.99 : 0.02
-        vlog("set: screen=\(screen) req=\(requestID.prefix(6)) isReplacement=\(isReplacement) alpha=\(isReplacement ? 0.99 : 0.02) deferred=\(deferredPresentation) transition=\(transitionDuration)")
+        window.alphaValue = isReplacement ? 0.999 : 0.02
+        vlog("set: screen=\(screen) req=\(requestID.prefix(6)) isReplacement=\(isReplacement) alpha=\(isReplacement ? 0.999 : 0.02) deferred=\(deferredPresentation) transition=\(transitionDuration)")
         window.orderFrontRegardless()
         window.orderBack(nil)
         window.displayIfNeeded()
@@ -1723,7 +1723,7 @@ private final class VideoRendererDaemon {
             // layer owns a drawable. Deferred replacements remain on the old
             // layer until the host commits the request.
             containerView.resumeFromFreeze()
-            window.alphaValue = 0.99
+            window.alphaValue = 0.999
             window.orderFrontRegardless()
             window.orderBack(nil)
         }
@@ -1765,7 +1765,7 @@ private final class VideoRendererDaemon {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         container.resumeFromFreeze()
-        window.alphaValue = 0.99
+        window.alphaValue = 0.999
         window.orderFrontRegardless()
         window.orderBack(nil)
         window.displayIfNeeded()
@@ -2074,7 +2074,7 @@ private final class VideoRendererDaemon {
                !self.manualPausedScreens.contains(screen) {
                 container?.hidePoster()
             }
-            state.window?.alphaValue = 0.99
+            state.window?.alphaValue = 0.999
             state.window?.orderFrontRegardless()
             state.window?.orderBack(nil)
             self.releasePlayerIfUnused(
@@ -2139,7 +2139,7 @@ private final class VideoRendererDaemon {
             pending.oldState.containerView?.resumeFromFreeze()
             pending.oldPlayer.play()
         }
-        pending.oldState.window?.alphaValue = 0.99
+        pending.oldState.window?.alphaValue = 0.999
         pending.oldState.window?.orderFrontRegardless()
         pending.oldState.window?.orderBack(nil)
 
