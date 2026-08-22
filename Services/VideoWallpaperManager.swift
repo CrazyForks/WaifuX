@@ -462,11 +462,11 @@ final class VideoWallpaperManager: ObservableObject {
     private static func revealDesktopWallpaperWindow(_ window: NSWindow) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        // alpha 固定 0.999（近乎不透明）+ isOpaque=false：窗口按半透明层合成，
+        // alpha 固定 0.99999（近乎不透明）+ isOpaque=false：窗口按半透明层合成，
         // 必须与壁纸层混合 → 壁纸层不被视频层遮挡挂起 → 菜单栏 backdrop
         // 懒采样能采到新 poster（alpha=1 时壁纸层被挂起，菜单栏永不更新，
-        // 实测验证）。0.999 与 1 视觉无差别。
-        window.alphaValue = 0.999
+        // 实测验证）。0.99999 与 1 视觉无差别。
+        window.alphaValue = 0.99999
         // desktop 层不能只 orderBack：菜单栏/非 key 时 WindowServer 可能推迟合帧，
         // 表现为“逻辑上已切换，要点一下别的 App 画面才更新”。
         window.orderFrontRegardless()
@@ -485,7 +485,7 @@ final class VideoWallpaperManager: ObservableObject {
         // 再跑一圈 runloop，让桌面层在后台 timer 触发路径上也能立刻合帧。
         CFRunLoopWakeUp(CFRunLoopGetMain())
         // 注意：不要在这里触发任何菜单栏刷新。reveal 会被 forceCommit / 首帧 /
-        // 重排频繁调用；菜单栏 backdrop 采样依赖窗口 alpha=0.999 半透明（壁纸层
+        // 重排频繁调用；菜单栏 backdrop 采样依赖窗口 alpha=0.99999 半透明（壁纸层
         // 不被视频层挂起）+ poster 写入后的系统懒重采样（~10s）。
     }
 
@@ -8265,7 +8265,7 @@ final class VideoWallpaperManager: ObservableObject {
 
     private func createWindow(for screen: NSScreen, videoURL: URL, muted: Bool) throws {
         let screenID = screen.wallpaperScreenIdentifier
-        // 全屏覆盖（含菜单栏条带下方）。窗口 alpha=0.999 近乎不透明（reveal 时设置），
+        // 全屏覆盖（含菜单栏条带下方）。窗口 alpha=0.99999 近乎不透明（reveal 时设置），
         // 壁纸层不被视频层挂起，菜单栏 backdrop 懒采样能跟随 poster 更新。
         let frame = screen.frame
 
@@ -8278,10 +8278,10 @@ final class VideoWallpaperManager: ObservableObject {
         window.setFrame(frame, display: true)
         window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        // isOpaque=false + alpha=0.999（reveal 时设置，常驻近乎不透明）：窗口按
+        // isOpaque=false + alpha=0.99999（reveal 时设置，常驻近乎不透明）：窗口按
         // 半透明层合成，必须与壁纸层混合 → 壁纸层不被视频层挂起 → 菜单栏
         // backdrop 懒采样能跟随 poster 更新（alpha=1 时壁纸层被挂起，菜单栏
-        // 永不更新——实测验证）。0.999 与 1 视觉无差别。
+        // 永不更新——实测验证）。0.99999 与 1 视觉无差别。
         window.isOpaque = false
         window.backgroundColor = .black
         window.hasShadow = false

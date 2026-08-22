@@ -802,7 +802,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         for screen in effectiveScreens {
             guard wallpaperSwitchGeneration == switchGeneration else { return }
             // 全屏覆盖（含菜单栏条带下方）。wgpu 窗口 setOpaque=false +
-            // alpha=0.999 常驻近乎不透明（Rust 侧），壁纸层不被挂起，菜单栏
+            // alpha=0.99999 常驻近乎不透明（Rust 侧），壁纸层不被挂起，菜单栏
             // backdrop 懒采样能跟随 poster 更新。
             let f = screen.frame
             let scale = screen.backingScaleFactor
@@ -4351,7 +4351,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         if didApply {
             // Scene/Web 的 poster 已写入系统壁纸：wgpu / engine-cli 窗口
-            // 常驻近乎不透明（alpha=0.999，各自进程内设置），壁纸层不被挂起，
+            // 常驻近乎不透明（alpha=0.99999，各自进程内设置），壁纸层不被挂起，
             // 菜单栏 backdrop 懒采样（~10s）自动采到新 poster。
         }
         return didApply

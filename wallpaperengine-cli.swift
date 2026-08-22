@@ -2135,7 +2135,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             w.setFrame(frame, display: false)
             w.alphaValue = 1
         } else {
-            // 全屏覆盖（含菜单栏条带下方）。alpha=0.999 常驻近乎不透明
+            // 全屏覆盖（含菜单栏条带下方）。alpha=0.99999 常驻近乎不透明
             // （+ isOpaque=false 已有）：壁纸层不被挂起，菜单栏 backdrop
             // 懒采样能跟随 poster 更新。
             w.setFrame(targetScreen.frame, display: true)
@@ -2206,11 +2206,11 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             // `desktopWindow` 层本身低于普通 App 窗口；在该层内前置不会盖住应用，
             // 却能避免 WindowServer 将完整遮挡的 WKWebView/WebGL canvas 停止合成。
             w.orderFront(nil)
-            // 常驻近乎不透明 alpha=0.999（+ isOpaque=false 已有）：窗口按半透明层
+            // 常驻近乎不透明 alpha=0.99999（+ isOpaque=false 已有）：窗口按半透明层
             // 合成，必须与壁纸层混合 → 壁纸层不被挂起 → 菜单栏 backdrop
             // 懒采样能跟随 poster 更新（alpha=1 时壁纸层被挂起，菜单栏永不
-            // 更新——实测验证）。0.999 与 1 视觉无差别。
-            w.alphaValue = 0.999
+            // 更新——实测验证）。0.99999 与 1 视觉无差别。
+            w.alphaValue = 0.99999
         }
 
         let destination = offscreen ? "offscreen bake surface" : "screen \(screenIdx) (\(targetScreen.localizedName))"
