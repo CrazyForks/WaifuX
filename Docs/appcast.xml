@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.144</title>
-      <sparkle:version>38.0.144</sparkle:version>
-      <sparkle:shortVersionString>38.0.144</sparkle:shortVersionString>
-      <pubDate>Wed, 19 Aug 2026 20:29:54 +0800</pubDate>
+      <title>Version 38.0.145</title>
+      <sparkle:version>38.0.145</sparkle:version>
+      <sparkle:shortVersionString>38.0.145</sparkle:shortVersionString>
+      <pubDate>Sat, 22 Aug 2026 13:59:45 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.144</h3><ul><li><strong>refactor: 完善屏幕唤醒/解锁后的播放状态同步逻辑 (7171d7f)</strong><ul><li>新增refreshPlaybackState IPC命令用于同步播放状态</li><li>为锁屏服务添加延迟重试的状态 reconcile 机制</li><li>优化预渲染预热的判断逻辑</li><li>为外部渲染器添加唤醒恢复重试策略</li></ul></li><li><strong>refactor &amp; fix &amp; feat: 大量功能迭代与稳定性优化 (f50486c)</strong><ul><li>修复自动烘焙关闭时详情页无法加载实时渲染静帧的问题，新增实时静帧缓存回退逻辑</li><li>优化屏幕进程匹配逻辑，修复进程状态误判问题，简化进程存活检查</li><li>新增日志写入队列积压保护，防止日志阻塞主线程</li><li>重构屏幕标识生成逻辑，统一多场景下的屏幕识别</li><li>新增状态栏菜单每屏控制的诊断日志，方便排查点击无响应问题</li><li>实现播完即换的粘性预约机制，大幅降低视频切换间隔</li><li>优化自动暂停管理器的状态重置与恢复逻辑，修复进程切换误暂停问题</li><li>重构渲染器进程管理：新增IPC队列、存活检测、重启逻辑与停止等待机制，修复进程卡死楔死问题</li><li>拆分日志与事件流处理，修复日志行拼接错误</li></ul></li><li><strong>refactor(wallpaper-video-renderer): 优化命令处理与孤儿进程清理 (dfc7757)</strong><ul><li>重构命令入队逻辑，使用串行队列保证IPC命令执行顺序；新增孤儿渲染进程清理机制，修复异常退出后残留进程导致的画面冻结问题，同时优化父进程退出监听逻辑</li></ul></li></ul>
+<h3>WaifuX 38.0.145</h3><ul><li><strong>fix: 将窗口 alpha 值从 0.999 调整为 0.99999 (f07d972)</strong><ul><li>统一所有代码处的窗口透明度配置，保持视觉无差别的同时确保壁纸层不会被挂起，让菜单栏 backdrop 可以正确跟随海报更新</li></ul></li><li><strong>fix: 将窗口alpha值从0.99改为0.999以修复菜单栏采样问题 (9fa0e75)</strong><ul><li>将所有代码中的窗口透明度0.99调整为0.999，保持视觉效果不变的同时，确保菜单栏backdrop懒采样能正确获取新壁纸海报，解决alpha=1时壁纸层被挂起导致菜单栏无法更新的问题。</li></ul></li><li><strong>feat: 新增独立视频渲染器设置与自动填充裁剪优化 (95a6e36)</strong><ul><li>新增设置项允许用户开启独立视频渲染进程以优化Screen Time统计</li><li>重构裁剪布局逻辑，autoFill模式现在使用屏幕比例作为默认目标</li><li>修复自定义裁剪比例无效的边界情况判断</li><li>为Web壁纸添加真实媒体内容尺寸识别，优化跨比例屏幕显示效果</li><li>新增触摸板捏合缩放裁剪交互</li><li>完善相关本地化字符串与单元测试</li></ul></li><li><strong>fix(lockscreen): 修复解锁后瞬间重新锁屏的问题 (23a48cf)</strong><ul><li>添加解锁状态缓冲期，避免系统会话状态更新滞后导致的视频意外暂停，区分解锁和唤醒事件的不同处理逻辑</li></ul></li><li><strong>fix: 修复唤醒恢复时的播放器崩溃和超时问题 (1187c29)</strong><ul><li>新增专用超时配置用于唤醒恢复场景，将超时从30秒缩短到3秒</li><li>延迟初始播放/预加载直到播放器状态就绪，避免调用preroll时抛出异常导致守护进程卡死</li><li>新增播放状态观察者管理，正确清理相关资源</li></ul></li><li><strong>fix: 修复多显示器场景下的壁纸渲染异常与进程泄漏问题 (4c508f0)</strong><ul><li>添加旧版本遗留孤儿渲染进程清理逻辑，解决进程泄漏问题</li><li>新增屏幕指纹标识，避免显示器重连后误判为新屏幕导致重复窗口</li><li>优化渲染进程启动的并发安全，防止同时启动多个子进程</li><li>修复图层裁剪逻辑，避免露出底层系统壁纸</li><li>增强屏幕唤醒与锁屏后的恢复逻辑，处理解码器卡死与显示拓扑变化</li><li>完善应用退出时的进程清理流程，确保所有子进程被正确终止</li></ul></li><li><strong>docs: 修复 README 中失效的 Star 历史图表 (#91) (33359a2)</strong><ul><li>GitHub Star API 限制导致当前 Star 历史图表无法正常展示，现将 README.md、README.en.md 与 README.ja.md 中的图表地址切换到可用的新服务 star-history.dera.page，确保图表恢复正常。</li></ul></li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.144/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.145/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
