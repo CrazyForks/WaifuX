@@ -145,46 +145,27 @@ struct AuthorWallpaperSheet: View {
     private var downloadActions: some View {
         VStack(spacing: 5) {
             if let onDownloadLoaded {
-                authorDownloadButton(title: t("downloadLoadedByAuthor")) {
+                AuthorDownloadIconButton(
+                    systemImage: "square.stack.3d.down.forward",
+                    title: t("downloadLoadedByAuthor.tooltip"),
+                    isDisabled: isDownloadingAll
+                ) {
                     isDownloadingAll = true
                     onDownloadLoaded(wallpapers)
                 }
-                .help(t("downloadLoadedByAuthor"))
             }
 
             if let onDownloadAll {
-                authorDownloadButton(title: t("downloadAllByAuthor")) {
+                AuthorDownloadIconButton(
+                    systemImage: "tray.and.arrow.down.fill",
+                    title: t("downloadAllByAuthor.tooltip"),
+                    isDisabled: isDownloadingAll
+                ) {
                     isDownloadingAll = true
                     onDownloadAll(wallpapers)
                 }
-                .help(t("downloadAllByAuthor"))
             }
         }
-    }
-
-    private func authorDownloadButton(
-        title: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.78)
-                .foregroundStyle(isDownloadingAll ? Color.accentColor : LiquidGlassColors.textSecondary)
-                .frame(width: 94, height: 24)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(
-                            isDownloadingAll
-                                ? Color.accentColor.opacity(0.55)
-                                : LiquidGlassColors.borderSubtle,
-                            lineWidth: 1
-                        )
-                )
-        }
-        .buttonStyle(.plain)
-        .disabled(isDownloadingAll)
     }
 
     // MARK: - 作者头像

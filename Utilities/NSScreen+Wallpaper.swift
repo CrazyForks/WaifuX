@@ -27,6 +27,54 @@ enum WallpaperScreenIdentity {
         return "\(legacyFingerprint):position:\(Int(position.x.rounded()))x\(Int(position.y.rounded()))"
     }
 
+    /// Removes the desktop-position suffix used for displays without a
+    /// hardware serial number. The position is useful for distinguishing two
+    /// identical displays while they are online, but it can change after a
+    /// reconnect or a desktop rearrangement.
+    static func stableFingerprintPart(_ fingerprint: String) -> String {
+        guard let range = fingerprint.range(of: ":position:") else {
+            return fingerprint
+        }
+        return String(fingerprint[..<range.lowerBound])
+    }
+
+    /// Matches a physical display fingerprint while tolerating a changed
+    /// desktop position. Callers that have multiple identical no-serial
+    /// displays must still require a unique candidate before using this match.
+    static func fingerprintsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs == rhs || stableFingerprintPart(lhs) == stableFingerprintPart(rhs)
+    }
+
+    /// Resolve a fingerprint-keyed value. Exact matches win; position-tolerant
+    /// matching is accepted only when there is one unambiguous candidate.
+    static func value<Value>(
+        in values: [String: Value],
+        forFingerprint fingerprint: String
+    ) -> Value? {
+        if let exact = values[fingerprint] {
+            return exact
+        }
+        let matches = values.filter { key, _ in
+            fingerprintsMatch(key, fingerprint)
+        }
+        guard matches.count == 1 else {
+            return nil
+        }
+        return matches.first?.value
+    }
+
+    /// Whether a fingerprint set contains an exact or unique position-tolerant
+    /// match for the current display.
+    static func containsFingerprint(
+        _ fingerprints: Set<String>,
+        matching fingerprint: String
+    ) -> Bool {
+        if fingerprints.contains(fingerprint) {
+            return true
+        }
+        return fingerprints.filter { fingerprintsMatch($0, fingerprint) }.count == 1
+    }
+
     /// `NSScreen.screens` 的系统顺序在睡眠/唤醒、重插、分辨率协商后可能打乱。
     /// 用「主屏优先 + 从左到右 + 从上到下 + 稳定 id」生成跨进程一致的展示/CLI 索引顺序。
     static func identifier(for screen: NSScreen) -> String {

@@ -16,8 +16,8 @@ import WebKit
 /// 轮询方案通过 Task.sleep 等待，取消时正确抛出 CancellationError，
 /// 不存在延续泄露的风险。
 private actor SteamCMDDownloadLimiter {
-    /// 最大同时下载数
-    private let maxConcurrent = 2
+    /// 最大同时下载数（与内嵌 SteamKit2 服务的 maxConcurrentDownloads=3 对齐）
+    private let maxConcurrent = 3
     /// 当前活跃下载数
     private var activeCount = 0
     /// 当前正在轮询等待的任务数（近似排队深度）
@@ -1645,6 +1645,26 @@ class WorkshopService: ObservableObject {
         workshopID: String,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
+        if SteamServiceManager.shared.canUseEmbeddedService {
+            do {
+                return try await downloadWorkshopItemViaSteamService(
+                    workshopID: workshopID,
+                    progressHandler: progressHandler
+                )
+            } catch let error as SteamServiceError {
+                // Keep the old path available for source builds that do not
+                // have the embedded helper yet. Authentication/download errors
+                // from the new service must not silently fall back.
+                if case .unavailable = error {
+                    AppLogger.error(.download, "Embedded Steam service unavailable; falling back to SteamCMD")
+                } else if case .cancelled = error {
+                    throw CancellationError()
+                } else {
+                    throw Self.workshopError(for: error)
+                }
+            }
+        }
+
         // 获取并发下载槽位（超出上限则排队等待）
         try await downloadLimiter.acquire()
         // 更新排队计数
@@ -1683,6 +1703,30 @@ class WorkshopService: ObservableObject {
             )
             return await VideoTranscodeService.ensureAppleCompatibleContainer(downloadedURL)
         }
+    }
+
+    private func downloadWorkshopItemViaSteamService(
+        workshopID: String,
+        progressHandler: (@Sendable (Double) -> Void)?
+    ) async throws -> URL {
+        try await downloadLimiter.acquire()
+        let queued = await downloadLimiter.queuedCount()
+        await MainActor.run { steamCMDQueuedCount = queued }
+        defer {
+            Task {
+                await downloadLimiter.release()
+                let remaining = await downloadLimiter.queuedCount()
+                await MainActor.run { steamCMDQueuedCount = remaining }
+            }
+        }
+
+        let downloadedURL = try await SteamServiceManager.shared.downloadItem(
+            workshopID: workshopID,
+            outputRoot: DownloadPathManager.shared.mediaFolderURL
+                .appendingPathComponent("workshop_\(workshopID)", isDirectory: true),
+            progressHandler: progressHandler
+        )
+        return await VideoTranscodeService.ensureAppleCompatibleContainer(downloadedURL)
     }
 
     private func recoverWorkshopDownloadFailure(
@@ -2904,7 +2948,42 @@ class WorkshopService: ObservableObject {
 
     // MARK: - App Availability
 
-    func verifySteamLogin(username: String, password: String, guardCode: String? = nil, retryCount: Int = 0) async throws {
+    func verifySteamLogin(
+        username: String,
+        password: String,
+        guardCode: String? = nil,
+        retryCount: Int = 0
+    ) async throws {
+        if SteamServiceManager.shared.canUseEmbeddedService {
+            do {
+                try await SteamServiceManager.shared.login(
+                    username: username,
+                    password: password,
+                    guardCode: guardCode
+                )
+                return
+            } catch let error as SteamServiceError {
+                if case .unavailable = error {
+                    AppLogger.error(.media, "Embedded Steam service unavailable; falling back to SteamCMD")
+                } else {
+                    throw Self.workshopError(for: error)
+                }
+            }
+        }
+        try await verifySteamLoginViaSteamCMD(
+            username: username,
+            password: password,
+            guardCode: guardCode,
+            retryCount: retryCount
+        )
+    }
+
+    private func verifySteamLoginViaSteamCMD(
+        username: String,
+        password: String,
+        guardCode: String? = nil,
+        retryCount: Int = 0
+    ) async throws {
         guard let steamcmdPath = WorkshopSourceManager.shared.steamCMDExecutableURL() else {
             throw WorkshopError.steamcmdNotFound
         }
@@ -3187,6 +3266,37 @@ class WorkshopService: ObservableObject {
             } catch {
                 resumeBox.resume(throwing: WorkshopError.executionFailed(error.localizedDescription))
             }
+        }
+    }
+
+    nonisolated private static func workshopError(for error: SteamServiceError) -> WorkshopError {
+        switch error {
+        case .unavailable(let message):
+            return .executionFailed(message)
+        case .busy:
+            return .executionFailed(error.localizedDescription)
+        case .notAuthenticated:
+            return .sessionExpired
+        case .authenticationFailed(let message, let code):
+            switch code {
+            case "GUARD_CODE_REQUIRED", "MOBILE_CONFIRMATION_REQUIRED":
+                return .guardCodeRequired(message)
+            case "AUTH_SERVICE_TEMPORARY", "CONNECTION_LOST":
+                return .loginTimeout
+            default:
+                return .steamLoginFailed(message)
+            }
+        case .downloadFailed(let message, let code):
+            switch code {
+            case "NOT_AUTHENTICATED":
+                return .sessionExpired
+            case "CONNECTION_LOST", "NO_CONTENT_SERVER":
+                return .downloadIncomplete(message)
+            default:
+                return .downloadFailed(message)
+            }
+        case .cancelled:
+            return .timeout
         }
     }
 

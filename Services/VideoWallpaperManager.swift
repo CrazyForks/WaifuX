@@ -650,7 +650,11 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// 获取指定屏幕的 poster URL（多屏场景下的正确入口）
     func posterURL(for screen: NSScreen) -> URL? {
-        posterURLByScreen[screen.wallpaperScreenIdentifier] ?? posterURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
+        posterURLByScreen[screen.wallpaperScreenIdentifier]
+            ?? WallpaperScreenIdentity.value(
+                in: posterURLByScreenFingerprint,
+                forFingerprint: screen.wallpaperScreenFingerprint
+            )
     }
 
     /// 仅更新指定屏幕的静态 poster（不重建播放器）。
@@ -761,7 +765,10 @@ final class VideoWallpaperManager: ObservableObject {
     /// 用于需要严格按屏聚合状态的调用方，避免某一屏的视频被误判到其它屏幕。
     func assignedVideoURL(for screen: NSScreen) -> URL? {
         videoURLByScreen[screen.wallpaperScreenIdentifier] ??
-        videoURLByScreenFingerprint[screen.wallpaperScreenFingerprint]
+        WallpaperScreenIdentity.value(
+            in: videoURLByScreenFingerprint,
+            forFingerprint: screen.wallpaperScreenFingerprint
+        )
     }
 
     /// 获取指定屏幕应播放的视频 URL。
@@ -775,9 +782,15 @@ final class VideoWallpaperManager: ObservableObject {
         let screenID = screen.wallpaperScreenIdentifier
         let fingerprint = screen.wallpaperScreenFingerprint
         let hasPreviousState = videoTargetScreenIDs.contains(screenID)
-            || videoTargetScreenFingerprints.contains(fingerprint)
+            || WallpaperScreenIdentity.containsFingerprint(
+                videoTargetScreenFingerprints,
+                matching: fingerprint
+            )
             || videoURLByScreen[screenID] != nil
-            || videoURLByScreenFingerprint[fingerprint] != nil
+            || WallpaperScreenIdentity.value(
+                in: videoURLByScreenFingerprint,
+                forFingerprint: fingerprint
+            ) != nil
         guard hasPreviousState else { return false }
 
         relinkDisplayStateForCurrentScreens()
@@ -6046,9 +6059,12 @@ final class VideoWallpaperManager: ObservableObject {
                 let savedScreenIDs = Set(savedState.videoScreenIDs ?? [])
                 let savedFingerprints = Set(savedState.videoScreenFingerprints ?? [])
                 let targetScreens = savedState.hasExplicitScreenTargets
-                    ? NSScreen.screens.filter {
-                        savedScreenIDs.contains($0.wallpaperScreenIdentifier)
-                            || savedFingerprints.contains($0.wallpaperScreenFingerprint)
+                    ? NSScreen.screens.filter { screen in
+                        savedScreenIDs.contains(screen.wallpaperScreenIdentifier)
+                            || WallpaperScreenIdentity.containsFingerprint(
+                                savedFingerprints,
+                                matching: screen.wallpaperScreenFingerprint
+                            )
                     }
                     : NSScreen.screens
                 if !targetScreens.isEmpty {
@@ -6631,16 +6647,28 @@ final class VideoWallpaperManager: ObservableObject {
             let screenID = screen.wallpaperScreenIdentifier
             let fingerprint = screen.wallpaperScreenFingerprint
 
-            if videoTargetScreenFingerprints.contains(fingerprint) {
+            if WallpaperScreenIdentity.containsFingerprint(
+                videoTargetScreenFingerprints,
+                matching: fingerprint
+            ) {
                 videoTargetScreenIDs.insert(screenID)
             }
-            if let videoURL = videoURLByScreenFingerprint[fingerprint] {
+            if let videoURL = WallpaperScreenIdentity.value(
+                in: videoURLByScreenFingerprint,
+                forFingerprint: fingerprint
+            ) {
                 videoURLByScreen[screenID] = videoURL
             }
-            if let posterURL = posterURLByScreenFingerprint[fingerprint] {
+            if let posterURL = WallpaperScreenIdentity.value(
+                in: posterURLByScreenFingerprint,
+                forFingerprint: fingerprint
+            ) {
                 posterURLByScreen[screenID] = posterURL
             }
-            if let screenVolume = volumeByScreenFingerprint[fingerprint] {
+            if let screenVolume = WallpaperScreenIdentity.value(
+                in: volumeByScreenFingerprint,
+                forFingerprint: fingerprint
+            ) {
                 volumeByScreen[screenID] = screenVolume
             }
         }

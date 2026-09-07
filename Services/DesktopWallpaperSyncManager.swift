@@ -199,7 +199,11 @@ final class DesktopWallpaperSyncManager {
     func imageURL(for screen: NSScreen) -> URL? {
         let screenID = screen.wallpaperScreenIdentifier
         let fingerprint = screen.wallpaperScreenFingerprint
-        return lastSetImageURLByScreen[screenID] ?? lastSetImageURLByFingerprint[fingerprint]
+        return lastSetImageURLByScreen[screenID]
+            ?? WallpaperScreenIdentity.value(
+                in: lastSetImageURLByFingerprint,
+                forFingerprint: fingerprint
+            )
     }
 
     /// 清除静态壁纸注册（例如用户手动在系统设置里改了壁纸）
@@ -343,12 +347,18 @@ final class DesktopWallpaperSyncManager {
             let fingerprint = screen.wallpaperScreenFingerprint
 
             if lastSetImageURLByScreen[screenID] == nil,
-               let url = lastSetImageURLByFingerprint[fingerprint] {
+               let url = WallpaperScreenIdentity.value(
+                   in: lastSetImageURLByFingerprint,
+                   forFingerprint: fingerprint
+               ) {
                 lastSetImageURLByScreen[screenID] = url
                 relinkedCount += 1
             }
             if lastOptionsByScreen[screenID] == nil,
-               let options = lastOptionsByFingerprint[fingerprint] {
+               let options = WallpaperScreenIdentity.value(
+                   in: lastOptionsByFingerprint,
+                   forFingerprint: fingerprint
+               ) {
                 lastOptionsByScreen[screenID] = options
             }
         }
@@ -362,7 +372,10 @@ final class DesktopWallpaperSyncManager {
     /// 查询某块外接屏（按物理指纹）是否曾由 App 设过壁纸，用于外接屏重连时抑制"显示器接入"弹窗。
     /// 校验持久化的壁纸文件仍存在于磁盘，并跳过运行时临时 capture 路径。
     func hasPersistedWallpaperForFingerprint(_ fingerprint: String) -> Bool {
-        guard let url = lastSetImageURLByFingerprint[fingerprint] else { return false }
+        guard let url = WallpaperScreenIdentity.value(
+            in: lastSetImageURLByFingerprint,
+            forFingerprint: fingerprint
+        ) else { return false }
         let path = url.path
         // 跳过 wallpaper-wgpu / wallpaperengine-cli 运行时 capture 路径，应用重启后不存在
         if path.contains("wallpaper-wgpu-capture") || path.contains("wallpaperengine-cli-capture") {
@@ -542,7 +555,11 @@ final class DesktopWallpaperSyncManager {
             }
 
             // 否则同步该屏幕最后注册的静态壁纸
-            guard let url = lastSetImageURLByScreen[screenID] ?? lastSetImageURLByFingerprint[fingerprint] else {
+            guard let url = lastSetImageURLByScreen[screenID]
+                    ?? WallpaperScreenIdentity.value(
+                        in: lastSetImageURLByFingerprint,
+                        forFingerprint: fingerprint
+                    ) else {
                 continue
             }
 
@@ -561,7 +578,12 @@ final class DesktopWallpaperSyncManager {
                 let writeStart = Date()
                 // 使用 setDesktopImageURLForAllSpaces 确保所有 Spaces 同步，
                 // 该方法内部已发送 com.apple.desktop 通知，无需额外触发
-                let options = lastOptionsByScreen[screenID] ?? lastOptionsByFingerprint[fingerprint] ?? [:]
+                let options = lastOptionsByScreen[screenID]
+                    ?? WallpaperScreenIdentity.value(
+                        in: lastOptionsByFingerprint,
+                        forFingerprint: fingerprint
+                    )
+                    ?? [:]
                 try workspace.setDesktopImageURLForAllSpaces(url, for: screen, options: options)
                 syncWrites += 1
                 let elapsedMS = Date().timeIntervalSince(writeStart) * 1000

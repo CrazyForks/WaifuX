@@ -137,6 +137,66 @@ struct LiquidGlassNavButton: View {
     }
 }
 
+// MARK: - 作者壁纸下载图标按钮
+struct AuthorDownloadIconButton: View {
+    let systemImage: String
+    let title: String
+    let isDisabled: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+    @State private var isPressed = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(
+                    isDisabled
+                        ? Color.accentColor
+                        : (isHovered ? LiquidGlassColors.textPrimary : LiquidGlassColors.textSecondary)
+                )
+                .frame(width: 32, height: 28)
+                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(
+                            isHovered
+                                ? Color.white.opacity(0.12)
+                                : LiquidGlassColors.glassTint.opacity(0.72)
+                        )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(
+                            isDisabled
+                                ? Color.accentColor.opacity(0.55)
+                                : (isHovered
+                                    ? LiquidGlassColors.borderSubtle.opacity(1.35)
+                                    : LiquidGlassColors.borderSubtle),
+                            lineWidth: 1
+                        )
+                )
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.82 : 1)
+        .scaleEffect(isPressed ? 0.92 : 1)
+        .animation(.easeOut(duration: 0.14), value: isHovered)
+        .animation(.easeOut(duration: 0.1), value: isPressed)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in isPressed = true }
+                .onEnded { _ in isPressed = false }
+        )
+    }
+}
+
 // MARK: - 玻璃加载视图
 struct LiquidGlassLoadingView: View {
     var message: String = t("loading")

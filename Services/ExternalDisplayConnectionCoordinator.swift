@@ -93,10 +93,15 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
                 return
             }
 
+            // Try persisted renderer/image state first, even if the older
+            // "known display" marker is missing. This makes upgrades and
+            // restored UserDefaults behave the same as a normal reconnect.
+            if await restorePreviousDisplayStateIfAvailable(for: screen) {
+                markDisplayAsKnown(screen.externalConnectionFingerprint)
+                return
+            }
+
             if knownDisplayFingerprints.contains(screen.externalConnectionFingerprint) {
-                if await restorePreviousDisplayStateIfAvailable(for: screen) {
-                    return
-                }
                 if WallpaperSchedulerService.shared.resolvedDisplayConfig(for: screen).isEnabled,
                    WallpaperSchedulerService.shared.hasSchedulableItems(for: screen.wallpaperScreenIdentifier) {
                     WallpaperSchedulerService.shared.triggerNextWallpaperNow(for: screen.wallpaperScreenIdentifier)

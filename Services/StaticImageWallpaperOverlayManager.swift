@@ -288,7 +288,11 @@ final class StaticImageWallpaperOverlayManager {
         var restored = 0
         for screen in currentScreens {
             let screenID = screen.wallpaperScreenIdentifier
-            let urlString = saved[screenID] ?? savedByFingerprint[screen.wallpaperScreenFingerprint]
+            let urlString = saved[screenID]
+                ?? WallpaperScreenIdentity.value(
+                    in: savedByFingerprint,
+                    forFingerprint: screen.wallpaperScreenFingerprint
+                )
             guard let urlString, let url = URL(string: urlString) else { continue }
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             Task { @MainActor in
@@ -313,9 +317,14 @@ final class StaticImageWallpaperOverlayManager {
         let screenID = screen.wallpaperScreenIdentifier
         let fingerprint = screen.wallpaperScreenFingerprint
         let url = imageByScreen[screenID]
-            ?? imageByScreenFingerprint[fingerprint]
+            ?? WallpaperScreenIdentity.value(
+                in: imageByScreenFingerprint,
+                forFingerprint: fingerprint
+            )
             ?? loadState().flatMap { $0[screenID] }.flatMap(URL.init(string:))
-            ?? loadFingerprintState().flatMap { $0[fingerprint] }.flatMap(URL.init(string:))
+            ?? loadFingerprintState().flatMap {
+                WallpaperScreenIdentity.value(in: $0, forFingerprint: fingerprint)
+            }.flatMap(URL.init(string:))
         guard let url, FileManager.default.fileExists(atPath: url.path) else {
             return false
         }
@@ -488,7 +497,10 @@ final class StaticImageWallpaperOverlayManager {
                 Task { @MainActor in
                     await showPrepared(imageURL: imageURL, for: screen)
                 }
-            } else if let imageURL = imageByScreenFingerprint[screen.wallpaperScreenFingerprint] {
+            } else if let imageURL = WallpaperScreenIdentity.value(
+                in: imageByScreenFingerprint,
+                forFingerprint: screen.wallpaperScreenFingerprint
+            ) {
                 guard !Self.isDynamicWallpaperLive(on: screen) else {
                     AppLogger.error(.wallpaper, "Static overlay rebuild suppressed: dynamic wallpaper live", metadata: [
                         "screenID": screenID,

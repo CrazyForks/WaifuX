@@ -66,4 +66,36 @@ final class WallpaperScreenIdentityTests: XCTestCase {
         )
         XCTAssertEqual(fp, "legacy:position:101x0")
     }
+
+    func testPositionTolerantFingerprintMatch() {
+        let old = "cg:1:2:noserial:Dell:external:position:-1920x0"
+        let moved = "cg:1:2:noserial:Dell:external:position:0x0"
+
+        XCTAssertTrue(WallpaperScreenIdentity.fingerprintsMatch(old, moved))
+        XCTAssertEqual(
+            WallpaperScreenIdentity.stableFingerprintPart(old),
+            "cg:1:2:noserial:Dell:external"
+        )
+    }
+
+    func testFingerprintValueResolutionRequiresUniqueCandidate() {
+        let values = [
+            "cg:1:2:noserial:Dell:external:position:-1920x0": "left",
+            "cg:1:2:noserial:Dell:external:position:1920x0": "right"
+        ]
+
+        XCTAssertNil(
+            WallpaperScreenIdentity.value(
+                in: values,
+                forFingerprint: "cg:1:2:noserial:Dell:external:position:0x0"
+            )
+        )
+        XCTAssertEqual(
+            WallpaperScreenIdentity.value(
+                in: ["old:position:0x0": "wallpaper"],
+                forFingerprint: "old:position:1920x0"
+            ),
+            "wallpaper"
+        )
+    }
 }

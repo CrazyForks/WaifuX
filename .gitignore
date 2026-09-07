@@ -88,6 +88,11 @@ Resources/assets/
 # wallpaperengine-cli.swift
 # Resources/wallpaperengine-cli
 
+# Embedded SteamKit2 service build output
+/build/SteamService/
+SteamService/bin/
+SteamService/obj/
+
 # Node (root level) — playwright 临时测试，不提交
 node_modules/
 package-lock.json

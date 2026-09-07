@@ -43,6 +43,11 @@ jobs:
             - name: Check XcodeGen
               run: which xcodegen || brew install xcodegen
 
+            - name: Set up .NET 10
+              uses: actions/setup-dotnet@v5
+              with:
+                  dotnet-version: 10.0.x
+
             - name: Install create-dmg
               run: brew install create-dmg || true
 
@@ -383,6 +388,10 @@ jobs:
                     SIGN_ARGS=(--force --sign "${{ vars.APPLE_SIGNING_IDENTITY }}" --options=runtime --timestamp)
                     if [[ "$(basename "$f")" == "wallpaper-wgpu" && -f "WallpaperRenderer.entitlements" ]]; then
                       SIGN_ARGS+=(--entitlements "WallpaperRenderer.entitlements")
+                    fi
+                    # .NET host（内嵌 SteamKit2 服务）在 hardened runtime 下需要 JIT entitlement
+                    if [[ "$(basename "$f")" == "dotnet" && -f "SteamService.entitlements" ]]; then
+                      SIGN_ARGS+=(--entitlements "SteamService.entitlements")
                     fi
                     if codesign "${SIGN_ARGS[@]}" "$f" 2>&1; then
                       echo "  ✅ $(basename "$f")"

@@ -144,6 +144,15 @@ for f in "$PROJECT_DIR"/Resources/wallpaper-wgpu \
     fi
   fi
 done
+
+# 内嵌 SteamKit2 服务的 .NET host 在 hardened runtime 下需要 JIT entitlement
+STEAM_SERVICE_ENTITLEMENTS="$PROJECT_DIR/SteamService.entitlements"
+if [[ -f "$STEAM_SERVICE_ENTITLEMENTS" && -d "$PROJECT_DIR/SteamService/prebuilt" ]]; then
+  find "$PROJECT_DIR/SteamService/prebuilt" -type f -name "dotnet" 2>/dev/null | while read -r host; do
+    codesign --force --options runtime --entitlements "$STEAM_SERVICE_ENTITLEMENTS" -s - "$host" 2>/dev/null || \
+      codesign --force -s - "$host" 2>/dev/null || true
+  done
+fi
 echo "✅ 签名完成"
 
 # 清理旧构建

@@ -1,0 +1,6 @@
+DepotDownloader
+Developed by the SteamRE Team and contributors.
+Licensed under the GNU General Public License version 2.0.
+Source: https://github.com/SteamRE/DepotDownloader
+
+Mirage does not bundle or execute the DepotDownloader application. Mirage's Workshop manifest resolution, CDN server selection, chunk download, validation, and resumable-reuse design is informed by DepotDownloader.

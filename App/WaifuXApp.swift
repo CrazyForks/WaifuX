@@ -606,6 +606,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 DownloadPathManager.shared.migrateLegacyCustomFolderPreferenceIfNeeded()
                 WorkshopSourceManager.shared.refreshStoredSteamIdentity()
                 WorkshopSourceManager.shared.loadSteamProfileID()
+                SteamServiceManager.shared.start()
                 WallpaperLibraryService.shared.restoreSavedData()
                 LibraryFolderStore.shared.restoreSavedData()
 

@@ -253,6 +253,25 @@ targets:
             "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/Resources/lib/libdxcompiler.dylib"; do
             sign_file_if_present "$DXC_LIB"
           done
+      - basedOnDependencyAnalysis: false
+        script: |
+          # SteamKit2 service is built outside SwiftPM and copied after the
+          # folder-reference resources have been staged by Xcode.
+          STEAM_SERVICE_DEST="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/WaifuXSteamService"
+          "${SRCROOT}/scripts/build-steam-service.sh" "$STEAM_SERVICE_DEST" "${ARCHS:-$(uname -m)}"
+          # The .NET host needs the JIT entitlement to survive hardened runtime
+          # re-signing in the release pipeline; keep it on the ad-hoc signature.
+          find "$STEAM_SERVICE_DEST" -type f -name "dotnet" -print0 2>/dev/null \
+            | while IFS= read -r -d '' host; do
+                if [[ -f "${SRCROOT}/SteamService.entitlements" ]]; then
+                  codesign --force --options runtime --entitlements "${SRCROOT}/SteamService.entitlements" -s - "$host" 2>/dev/null || \
+                    codesign --force -s - "$host" 2>/dev/null || true
+                fi
+              done
+          find "$STEAM_SERVICE_DEST" -type f \( -perm -111 -o -name "*.dylib" \) -print0 2>/dev/null \
+            | while IFS= read -r -d '' file; do
+                codesign --force -s - "$file" 2>/dev/null || true
+              done
     entitlements:
       path: WaifuX.entitlements
       properties:

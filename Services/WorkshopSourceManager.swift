@@ -768,9 +768,10 @@ class WorkshopSourceManager: ObservableObject {
         return FileManager.default.fileExists(atPath: dir.appendingPathComponent("steamcmd.sh").path)
     }
 
-    /// 是否已保存 SteamCMD 用户名。真实会话状态由 session probe 判断。
+    /// 已恢复的 SteamKit2 会话优先；在启动恢复完成前保留本地账号标识，
+    /// 以便设置页仍能展示账户并允许用户主动重新登录。
     var isSteamAuthenticated: Bool {
-        hasStoredSteamIdentity
+        SteamServiceManager.shared.isLoggedIn || hasStoredSteamIdentity
     }
 }
 

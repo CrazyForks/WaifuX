@@ -3576,7 +3576,15 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     private func renderState(for screen: NSScreen) -> ScreenRenderState? {
         screenRenderStates[screen.wallpaperScreenIdentifier]
-            ?? screenRenderStates.values.first { $0.screenFingerprint == screen.wallpaperScreenFingerprint }
+            ?? {
+                let matches = screenRenderStates.values.filter {
+                    WallpaperScreenIdentity.fingerprintsMatch(
+                        $0.screenFingerprint,
+                        screen.wallpaperScreenFingerprint
+                    )
+                }
+                return matches.count == 1 ? matches.first : nil
+            }()
     }
 
     private func preserveRestoreState(_ states: [ScreenRenderState]) {
@@ -3992,7 +4000,15 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     private func screenForPersistedState(_ state: ScreenRenderState) -> NSScreen? {
         NSScreen.screens.first { $0.wallpaperScreenIdentifier == state.screenID }
-            ?? NSScreen.screens.first { $0.wallpaperScreenFingerprint == state.screenFingerprint }
+            ?? {
+                let matches = NSScreen.screens.filter {
+                    WallpaperScreenIdentity.fingerprintsMatch(
+                        $0.wallpaperScreenFingerprint,
+                        state.screenFingerprint
+                    )
+                }
+                return matches.count == 1 ? matches.first : nil
+            }()
     }
 
     private func persistState() {
@@ -4027,9 +4043,20 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 检查 wallpaper-wgpu 是否正在管理指定屏幕
     func isManaging(screen: NSScreen) -> Bool {
         screenRenderStates[screen.wallpaperScreenIdentifier] != nil ||
-        screenRenderStates.values.contains { $0.screenFingerprint == screen.wallpaperScreenFingerprint } ||
+        {
+            let matches = screenRenderStates.values.filter {
+                WallpaperScreenIdentity.fingerprintsMatch(
+                    $0.screenFingerprint,
+                    screen.wallpaperScreenFingerprint
+                )
+            }
+            return matches.count == 1
+        }() ||
         targetScreenIDs.contains(screen.wallpaperScreenIdentifier) ||
-        targetScreenFingerprints.contains(screen.wallpaperScreenFingerprint)
+        WallpaperScreenIdentity.containsFingerprint(
+            targetScreenFingerprints,
+            matching: screen.wallpaperScreenFingerprint
+        )
     }
 
     /// 过渡预热只应保留当前真正可见的 renderer，不能把用于重启恢复的持久化
@@ -4129,7 +4156,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         let fingerprint = screen.wallpaperScreenFingerprint
         if let data = UserDefaults.standard.data(forKey: screenRenderStatesKey),
            let states = try? JSONDecoder().decode([ScreenRenderState].self, from: data),
-           states.contains(where: { $0.screenID == screenID || $0.screenFingerprint == fingerprint }) {
+           states.contains(where: {
+               $0.screenID == screenID
+                   || WallpaperScreenIdentity.fingerprintsMatch(
+                       $0.screenFingerprint,
+                       fingerprint
+                   )
+           }) {
             return true
         }
 
@@ -4139,7 +4172,11 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         let targetIDs = Set(UserDefaults.standard.stringArray(forKey: targetScreenIDsKey) ?? [])
         let targetFingerprints = Set(UserDefaults.standard.stringArray(forKey: targetScreenFingerprintsKey) ?? [])
-        return targetIDs.contains(screenID) || targetFingerprints.contains(fingerprint)
+        return targetIDs.contains(screenID)
+            || WallpaperScreenIdentity.containsFingerprint(
+                targetFingerprints,
+                matching: fingerprint
+            )
     }
 
     func restorePreviousWallpaperIfAvailable(for screen: NSScreen) async -> Bool {
@@ -4153,10 +4190,19 @@ final class WallpaperEngineXBridge: ObservableObject {
         // 断线清理会停掉运行时但保留 restore state；重插时必须真正重新 setWallpaper，
         // 不能仅因 isManaging（state 仍在）就当作已恢复。
         let existingState = screenRenderStates[screenID]
-            ?? screenRenderStates.values.first { $0.screenFingerprint == fingerprint }
-            ?? persistedScreenRenderStates()?.first {
-                $0.screenID == screenID || $0.screenFingerprint == fingerprint
-            }
+            ?? {
+                let matches = screenRenderStates.values.filter {
+                    WallpaperScreenIdentity.fingerprintsMatch($0.screenFingerprint, fingerprint)
+                }
+                return matches.count == 1 ? matches.first : nil
+            }()
+            ?? {
+                let matches = (persistedScreenRenderStates() ?? []).filter {
+                    $0.screenID == screenID
+                        || WallpaperScreenIdentity.fingerprintsMatch($0.screenFingerprint, fingerprint)
+                }
+                return matches.count == 1 ? matches.first : nil
+            }()
 
         if let state = existingState, FileManager.default.fileExists(atPath: state.path) {
             let hasLiveRuntime: Bool = {

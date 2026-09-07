@@ -1812,6 +1812,7 @@ private struct WorkshopSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var sourceManager = WorkshopSourceManager.shared
     @ObservedObject private var workshopService = WorkshopService.shared
+    @ObservedObject private var steamService = SteamServiceManager.shared
     @ObservedObject private var clockSettings = LiquidGlassClockSettings.shared
     @State private var steamUsername = ""
     @State private var steamPassword = ""
@@ -1822,7 +1823,6 @@ private struct WorkshopSettingsTab: View {
     @State private var steamLoginStatusText: String?
     @State private var cleanupResult: (count: Int, bytesFreed: Int64)?
     @State private var isCleaningUp = false
-    @State private var steamCMDStatus: SteamCMDStatus = .downloading
 
     /// 所有已连接显示器的最高刷新率，作为 FPS 滑块的上限
     private var maxSliderFPS: Double {
@@ -1843,10 +1843,8 @@ private struct WorkshopSettingsTab: View {
 
                 Divider()
 
-                // SteamCMD 状态
-                steamCMDStatusSection
+                steamServiceStatusSection
 
-                // SteamCMD 登录
                 steamCMDLoginSection
 
                 // 场景壁纸实时渲染模式
@@ -2008,7 +2006,7 @@ private struct WorkshopSettingsTab: View {
             .padding(24)
         }
         .onAppear {
-            refreshSteamCMDStatus()
+            steamService.start()
             sourceManager.refreshStoredSteamIdentity()
             syncCredentialPresentation()
         }
@@ -2039,7 +2037,7 @@ private struct WorkshopSettingsTab: View {
                         Text(String(format: t("accountSaved"), username))
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
-                        Text("下载会复用 SteamCMD 的本地会话。密码和 Guard 验证码不会保存。")
+                        Text("下载会复用 WaifuX 的 Steam 会话。密码和 Guard 验证码不会保存。")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary.opacity(0.85))
                     }
@@ -2053,6 +2051,7 @@ private struct WorkshopSettingsTab: View {
                     }
                     .controlSize(.small)
                     Button(t("logout")) {
+                        SteamServiceManager.shared.logout()
                         sourceManager.clearSteamIdentity()
                         steamUsername = ""
                         steamPassword = ""
@@ -2092,10 +2091,12 @@ private struct WorkshopSettingsTab: View {
                             ProgressView()
                                 .scaleEffect(0.8)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("正在验证账号并连接 SteamCMD…")
+                                Text(isWaitingForSteamGuardCode ? "Steam 正在等待验证码…" : "正在验证账号并连接 Steam…")
                                     .font(.system(size: 11))
                                     .foregroundStyle(.secondary)
-                                Text(t("steamLoginMobileConfirmHint"))
+                                Text(isWaitingForSteamGuardCode
+                                     ? "输入收到的 Steam Guard 验证码后提交。"
+                                     : t("steamLoginMobileConfirmHint"))
                                     .font(.system(size: 10))
                                     .foregroundStyle(.tertiary)
                             }
@@ -2107,7 +2108,12 @@ private struct WorkshopSettingsTab: View {
 
                         Spacer()
 
-                        if case .available = sourceManager.steamCredentialState {
+                        if isVerifyingSteamLogin {
+                            Button("取消") {
+                                SteamServiceManager.shared.cancelLogin()
+                            }
+                            .controlSize(.small)
+                        } else if case .available = sourceManager.steamCredentialState {
                             Button("取消") {
                                 showLoginForm = false
                                 steamPassword = ""
@@ -2117,7 +2123,14 @@ private struct WorkshopSettingsTab: View {
                             .controlSize(.small)
                         }
 
-                        Button("验证并保存") {
+                        Button(isWaitingForSteamGuardCode ? "提交验证码" : "验证并保存") {
+                            if isWaitingForSteamGuardCode {
+                                SteamServiceManager.shared.submitGuardCode(steamGuardCode)
+                                steamGuardCode = ""
+                                steamLoginStatusText = "验证码已提交，正在等待 Steam 验证。"
+                                return
+                            }
+
                             guard !steamUsername.isEmpty, !steamPassword.isEmpty else { return }
                             isVerifyingSteamLogin = true
                             steamLoginStatusText = nil
@@ -2128,13 +2141,16 @@ private struct WorkshopSettingsTab: View {
                                         password: steamPassword,
                                         guardCode: steamGuardCode
                                     )
-                                    sourceManager.setSteamIdentity(username: steamUsername)
                                     PersistentDownloadQueueService.shared.resumeWaitingForSteamLogin()
                                     await MainActor.run {
+                                        sourceManager.setSteamIdentity(username: steamUsername)
+                                        if !steamService.steamID.isEmpty {
+                                            sourceManager.steamProfileID = steamService.steamID
+                                        }
                                         steamPassword = ""
                                         steamGuardCode = ""
                                         if case .available = sourceManager.steamCredentialState {
-                                            steamLoginStatusText = "Steam 会话验证成功。已保存用户名，密码和验证码未保存。"
+                                            steamLoginStatusText = "Steam 会话验证成功。会话令牌已保存到 macOS 钥匙串，密码和验证码未保存。"
                                             showLoginForm = false
                                         } else {
                                             steamLoginStatusText = "账号验证成功，但本机保存状态未更新。可以先尝试下载，如仍提示需要登录，再重新保存一次。"
@@ -2147,7 +2163,7 @@ private struct WorkshopSettingsTab: View {
                                         case .guardCodeRequired(let msg):
                                             steamLoginStatusText = msg
                                         case .timeout:
-                                            steamLoginStatusText = "连接 SteamCMD 超时，请稍后重试。"
+                                            steamLoginStatusText = "连接 Steam 服务超时，请稍后重试。"
                                         case .loginTimeout:
                                             steamLoginStatusText = "Steam 登录超时，请检查网络或代理设置后重试。"
                                         case .sessionExpired:
@@ -2157,11 +2173,11 @@ private struct WorkshopSettingsTab: View {
                                         case .steamLoginFailed(let msg):
                                             steamLoginStatusText = msg
                                         case .steamcmdNotFound:
-                                            steamLoginStatusText = "SteamCMD 组件不可用，请先检查安装状态。"
+                                            steamLoginStatusText = "Steam 服务组件不可用，请重新构建或安装应用。"
                                         case .downloadFailed(let msg):
                                             steamLoginStatusText = msg
                                         case .executionFailed(let msg):
-                                            steamLoginStatusText = "SteamCMD 执行失败：\(msg)"
+                                            steamLoginStatusText = "Steam 服务执行失败：\(msg)"
                                         default:
                                             steamLoginStatusText = error.localizedDescription
                                         }
@@ -2176,7 +2192,11 @@ private struct WorkshopSettingsTab: View {
                             }
                         }
                         .controlSize(.small)
-                        .disabled(steamUsername.isEmpty || steamPassword.isEmpty || isVerifyingSteamLogin)
+                        .disabled(
+                            isWaitingForSteamGuardCode
+                            ? steamGuardCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            : steamUsername.isEmpty || steamPassword.isEmpty || isVerifyingSteamLogin
+                        )
                     }
                 }
                 .padding(12)
@@ -2184,7 +2204,7 @@ private struct WorkshopSettingsTab: View {
                 .cornerRadius(8)
             }
 
-            Text("SteamCMD 下载只保存用户名并复用本机会话。密码与 Guard 验证码仅用于当前登录，不会写入本地。")
+            Text("Steam 下载只保存会话令牌到 macOS 钥匙串。密码与 Guard 验证码仅用于当前登录，不会写入本地。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
@@ -2193,34 +2213,36 @@ private struct WorkshopSettingsTab: View {
 
 
 
-    // MARK: - SteamCMD 状态
-    private var steamCMDStatusSection: some View {
+    private var steamServiceStatusSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Image(systemName: "terminal.fill")
+                Image(systemName: "network")
                     .font(.system(size: 14))
                     .foregroundStyle(.cyan)
                 Text(t("steamCMDStatus"))
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("刷新") {
-                    refreshSteamCMDStatus()
+                    steamService.start()
                 }
                 .controlSize(.small)
             }
 
             HStack(spacing: 12) {
                 Circle()
-                    .fill(steamCMDStatusColor(steamCMDStatus))
+                    .fill(steamServiceStatusColor)
                     .frame(width: 8, height: 8)
 
-                Text(steamCMDStatusText(steamCMDStatus))
+                Text(steamServiceStatusText)
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
-                steamCMDStatusTrailingLabel(steamCMDStatus)
+                Label(steamServiceStatusLabel, systemImage: steamServiceStatusIcon)
+                    .font(.system(size: 12))
+                    .foregroundStyle(steamServiceStatusColor)
+                    .lineLimit(2)
             }
             .padding(12)
             .background(Color.white.opacity(0.03))
@@ -2309,45 +2331,53 @@ private struct WorkshopSettingsTab: View {
         }
     }
 
-    private func steamCMDStatusColor(_ status: SteamCMDStatus) -> Color {
-        switch status {
-        case .ready: return .green
-        case .notInstalled: return .orange
-        case .error: return .red
-        case .downloading: return .blue
+    private var isWaitingForSteamGuardCode: Bool {
+        if case .waitingForCode = steamService.loginState {
+            return true
         }
+        return false
     }
 
-    private func steamCMDStatusText(_ status: SteamCMDStatus) -> String {
-        switch status {
-        case .ready: return t("steamCMDReady")
-        case .notInstalled: return t("steamCMDNotInstalled")
-        case .error(let msg): return String(format: t("steamCMDError"), msg)
-        case .downloading: return t("downloading")
+    private var steamServiceStatusColor: Color {
+        if steamService.isAvailable {
+            return .green
         }
+        if case .failed = steamService.loginState {
+            return .red
+        }
+        return .blue
     }
 
-    @ViewBuilder
-    private func steamCMDStatusTrailingLabel(_ status: SteamCMDStatus) -> some View {
-        switch status {
-        case .ready:
-            Label(t("steamCMDReady"), systemImage: "checkmark.circle")
-                .font(.system(size: 12))
-                .foregroundStyle(.green)
-        case .notInstalled:
-            Label(t("steamCMDNotInstalled"), systemImage: "exclamationmark.triangle")
-                .font(.system(size: 12))
-                .foregroundStyle(.orange)
-        case .error(let msg):
-            Label(String(format: t("steamCMDError"), msg), systemImage: "exclamationmark.triangle")
-                .font(.system(size: 12))
-                .foregroundStyle(.red)
-                .lineLimit(2)
-        case .downloading:
-            Label(t("downloading"), systemImage: "arrow.down.circle")
-                .font(.system(size: 12))
-                .foregroundStyle(.blue)
+    private var steamServiceStatusText: String {
+        if steamService.isAvailable {
+            return steamService.isLoggedIn
+                ? "Steam 会话已连接，将在后续下载中复用。"
+                : "Steam 服务已就绪，登录后会自动恢复会话。"
         }
+        if case .failed(let message) = steamService.loginState {
+            return String(format: t("steamCMDError"), message)
+        }
+        return "正在启动 Steam 服务…"
+    }
+
+    private var steamServiceStatusLabel: String {
+        if steamService.isAvailable {
+            return steamService.isLoggedIn ? "已登录" : t("steamCMDReady")
+        }
+        if case .failed = steamService.loginState {
+            return "不可用"
+        }
+        return t("downloading")
+    }
+
+    private var steamServiceStatusIcon: String {
+        if steamService.isAvailable {
+            return steamService.isLoggedIn ? "person.crop.circle.badge.checkmark" : "checkmark.circle"
+        }
+        if case .failed = steamService.loginState {
+            return "exclamationmark.triangle"
+        }
+        return "arrow.down.circle"
     }
 
     private var loginStatusColor: Color {
@@ -2383,7 +2413,7 @@ private struct WorkshopSettingsTab: View {
         case .failure(let message):
             return "读取本地已保存账号时发生错误：\(message)"
         case .available:
-            return "本机已记录 Steam 用户名。真实登录状态会由 SteamCMD session probe 验证。"
+            return "本机已记录 Steam 账号。启动时会从 macOS 钥匙串恢复会话。"
         }
     }
 
@@ -2403,10 +2433,6 @@ private struct WorkshopSettingsTab: View {
         case .missing: return .orange
         case .failure: return .red
         }
-    }
-
-    private func refreshSteamCMDStatus() {
-        steamCMDStatus = workshopService.checkSteamCMDStatus()
     }
 
     private func syncCredentialPresentation() {

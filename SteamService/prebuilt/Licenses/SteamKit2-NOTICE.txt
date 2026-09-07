@@ -1,0 +1,10 @@
+SteamKit2
+Version used by Mirage: 3.4.0
+Copyright (C) 2018 Ryan Stecker & SteamRE Team
+Licensed under the GNU Lesser General Public License version 2.1.
+Source: https://github.com/SteamRE/SteamKit
+
+Mirage links SteamKit2 directly in its embedded Steam service for authentication, session management, manifest access, and CDN communication.
+
+SteamKit2 uses protobuf-net by Marc Gravell under the Apache License 2.0.
+Source: https://github.com/protobuf-net/protobuf-net
