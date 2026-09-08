@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.147</title>
-      <sparkle:version>38.0.147</sparkle:version>
-      <sparkle:shortVersionString>38.0.147</sparkle:shortVersionString>
-      <pubDate>Tue, 08 Sep 2026 14:46:17 +0800</pubDate>
+      <title>Version 38.0.148</title>
+      <sparkle:version>38.0.148</sparkle:version>
+      <sparkle:shortVersionString>38.0.148</sparkle:shortVersionString>
+      <pubDate>Tue, 08 Sep 2026 16:47:10 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.147</h3><ul><li><strong>feat: 新增场景静态检测与实时渲染优化 (af806b7)</strong><ul><li>新增Scene静态检测能力，通过wallpaper-wgpu检测纯静态场景，跳过无效烘焙</li><li>新增静态场景抽帧缓存逻辑，替代无效的视频烘焙流程</li><li>优化详情页壁纸应用逻辑，静态场景直接使用实时渲染而非烘焙</li><li>重构下载按钮hover提示，替换原生help为自定义气泡弹窗</li></ul></li><li><strong>Migrate casks to current Homebrew DSL (#109) (e00be1e)</strong><ul><li>fix Warning: Calling `postflight` is deprecated! Use `postflight_steps` instead.</li></ul></li><li><strong>feat: 引入内嵌 SteamKit2 服务以优化 Steam 工坊下载流程 (533014e)</strong><ul><li>新增基于 SteamKit2 的内嵌 Steam 服务，替换部分 SteamCMD 操作：</li><li>配置 .NET 10 CI/CD 构建环境与项目文件</li><li>实现跨架构的 Steam 会话认证与工坊下载逻辑</li><li>新增屏幕指纹位置容忍匹配逻辑，优化多屏适配</li><li>重构作者下载按钮UI组件与壁纸状态恢复逻辑</li><li>更新.gitignore与构建脚本，支持服务预编译与嵌入</li><li>调整并发下载限制与认证流程，优先使用内嵌服务</li></ul></li><li><strong>refactor: 批量修复与优化，覆盖UI、缓存、调度与内存管理 (4de506f)</strong><ul><li>修复macOS26下borderlessButton Menu被拉满问题，为两处菜单添加fixedSize</li><li>优化库页首次加载逻辑，避免详情返回时整网格重载</li><li>新增状态栏启停壁纸本地化字符串与菜单功能</li><li>重构Scene分析并发闸门，限制并发数防止内存爆仓</li><li>新增壁纸渲染进程内存看门狗，防止进程无限膨胀</li><li>重构显示裁剪配置重链逻辑，修复重启后双屏设置串台问题</li><li>新增库封面专用缓存，隔离详情页大图与网格封面缓存</li><li>新增自动切换抑制功能，防止手动关闭壁纸后自动拉起</li><li>优化视频壁纸窗口收敛逻辑，修复睡眠唤醒后壁纸叠加问题</li></ul></li><li><strong>refactor: 完成多模块代码优化与功能迭代 (289b502)</strong><ul><li>本次提交涵盖了多项核心改进：</li><li>重构壁纸缩略图加载逻辑，优化竖屏卡片显示效果</li><li>重构动态壁纸排序规则，新增基于文件名的最新排序键</li><li>重写扩展端裁切逻辑，修复跨平台渲染不一致问题</li><li>重构下载队列管理逻辑，修复批量下载弹窗闪烁问题</li><li>新增状态栏批量取消下载功能</li><li>重构探索网格组件，支持混排单元格、拖拽排序与固定尺寸卡片</li><li>重构猜你喜欢模块，改用NSCollectionView实现更流畅的动画与滚动</li><li>修复响应性监视器在后台应用下的误报问题</li><li>重构Wallsflow解析逻辑，统一标题提取与清理规则</li><li>修复伴生烘焙调度逻辑，移除重复烘焙调用</li><li>优化图片URL规范化方法，新增详细注释与合法性校验</li><li>新增作者详情页下载已加载壁纸的本地化字符串</li></ul></li><li><strong>feat: 新增多项功能并优化体验 (7bfc684)</strong><ul><li>新增Wallhaven默认筛选设置，支持隐藏竖图和人物分类</li><li>新增系统壁纸缓存自动清理功能</li><li>新增日志导出到桌面功能</li><li>优化下载进度动画和状态栏下载队列</li><li>修复动态壁纸覆盖问题和SteamCMD下载取消逻辑</li><li>调整顶部导航栏样式和下载进度条UI</li><li>补充多语言本地化文案</li></ul></li><li><strong>refactor: 完善壁纸调度与播放逻辑，修复多屏暂停与内存管理问题 (1a3cc02)</strong><ul><li>为各ViewModel添加内存压力观察者并在deinit中移除，修复内存泄漏</li><li>重构VideoWallpaperManager，新增按屏暂停状态管理，修复多屏暂停异常</li><li>新增WallpaperScheduler手动应用生命周期管理，避免自动切换覆盖手动操作</li><li>优化LocalWallpaperApplyService，复用WallpaperViewModel减少内存开销</li><li>修复多处壁纸应用流程的错误处理与状态同步问题</li></ul></li></ul>
+<h3>WaifuX 38.0.148</h3><ul><li>fix: gitignore *.app 误吞 .NET shared 框架致生产包 Steam 服务不可用 (e79697c)</li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.147/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.148/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
