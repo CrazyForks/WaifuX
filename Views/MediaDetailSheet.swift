@@ -3455,11 +3455,13 @@ struct MediaDetailSheet: View {
     /// 核心设置统一走 `LocalWallpaperApplyService`（与调度器同一方法）；本处只负责 UI（多屏选择/转圈/错误）。
     private func applyWorkshopWallpaperFromLocalURL(_ localURL: URL) {
         // 非实时 scene 且尚无烘焙产物：保留详情页「先烘再设」流程（会阻塞生成 MP4）
+        // 纯静态 scene（渲染器 detect-static 判定）烘焙无意义，跳过 prefer-bake 直接实时应用
         let contentRoot = sceneEngineContentRoot(for: localURL)
         let isRealtime = UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
         let hasUsableBake = SceneOfflineBakeService.usableArtifact(from: currentDownloadRecord) != nil
         let projectType = Self.projectTypeString(at: contentRoot)
-        if projectType == "scene", !isRealtime, !hasUsableBake {
+        if projectType == "scene", !isRealtime, !hasUsableBake,
+           currentDownloadRecord?.sceneBakeEligibility?.isStaticScene != true {
             applySceneWallpaperPreferringBake(sceneContentRoot: contentRoot, cliPath: localURL.path)
             return
         }
@@ -3594,6 +3596,40 @@ struct MediaDetailSheet: View {
                             snapshot: eligibility,
                             triggerAutoBake: false
                         )
+                    }
+                }
+
+                // 纯静态壁纸（渲染器 detect-static 判定）：画面永不变化，烘焙视频无意义，
+                // 直接走实时应用；静态抽帧封面由 auto-bake / companion 路径负责生成。
+                if eligibility.isStaticScene == true {
+                    print("[MediaDetailSheet] 纯静态 scene → 跳过烘焙直接实时应用 \(sceneContentRoot.lastPathComponent)")
+                    WallpaperSchedulerService.shared.completeManualWallpaperApply(
+                        success: true,
+                        screenIDs: targetScreenIDs
+                    )
+                    isBakingScene = false
+                    isSettingWallpaper = false
+                    applyWorkshopWallpaperFromLocalURL(sceneContentRoot)
+                    return
+                }
+                if eligibility.isStaticScene == nil {
+                    // 首次遇到：先让渲染器判定，避免把静态壁纸烘成无用视频
+                    let detection = await SceneOfflineBakeService.detectStaticScene(
+                        contentRoot: sceneContentRoot,
+                        eligibility: eligibility,
+                        itemID: itemID,
+                        reason: "detail-apply"
+                    )
+                    if detection.isStatic {
+                        print("[MediaDetailSheet] 渲染器判定纯静态 → 跳过烘焙直接实时应用 \(sceneContentRoot.lastPathComponent)")
+                        WallpaperSchedulerService.shared.completeManualWallpaperApply(
+                            success: true,
+                            screenIDs: targetScreenIDs
+                        )
+                        isBakingScene = false
+                        isSettingWallpaper = false
+                        applyWorkshopWallpaperFromLocalURL(sceneContentRoot)
+                        return
                     }
                 }
 
@@ -3900,7 +3936,7 @@ struct MediaDetailSheet: View {
         return nil
     }
 
-    /// 预览设为壁纸的内容：优先已烘焙 MP4 → 本地视频文件 → 静态封面图
+    /// 预览设为壁纸的内容：优先已烘焙 MP4 → 场景无烘焙时渲染器实时预览 → 本地视频文件 → 静态封面图
     private func previewWallpaper() async {
         let targetURL: URL?
         var isWebPreview = false
@@ -3908,6 +3944,11 @@ struct MediaDetailSheet: View {
         // 1. 已烘焙的 Scene MP4
         if let cachedSceneBakeVideoURL {
             targetURL = cachedSceneBakeVideoURL
+        }
+        // 1.5 已下载的场景项目但无烘焙成片：直接调用渲染器开窗实时预览
+        // （与「重新烘焙」弹窗里的眼睛按钮同一条 `SceneOfflineBakeService.preview` 路径）
+        else if currentDownloadRecord?.sceneBakeEligibility != nil, tryPreviewSceneWithRenderer() {
+            return
         }
         // 2. 本地 Workshop 文件/目录
         else if let localURL = findLocalWorkshopFile() {
@@ -3949,6 +3990,25 @@ struct MediaDetailSheet: View {
         // Web壁纸传递背景图URL作为占位符
         let posterForPreview: URL? = isWebPreview ? preferredWorkshopPosterForVideo : nil
         PreviewWindowManager.shared.openPreview(url: url, aspectRatio: aspectRatio, isWeb: isWebPreview, posterURL: posterForPreview)
+    }
+
+    /// 场景项目未烘焙时的预览：直接调用 wallpaper-wgpu 渲染器开窗实时预览
+    /// （与「重新烘焙」渲染器弹窗里的眼睛按钮同一条 `SceneOfflineBakeService.preview` 路径）。
+    /// 返回 true 表示已启动渲染器预览；false 表示记录/资格缺失或渲染器不可用，调用方回退静态图预览。
+    private func tryPreviewSceneWithRenderer() -> Bool {
+        guard let record = currentDownloadRecord,
+              record.sceneBakeEligibility != nil,
+              SceneOfflineBakeService.isRendererAvailable(.wallpaperWgpu) else {
+            return false
+        }
+        do {
+            try SceneOfflineBakeService.preview(record: record, renderer: .wallpaperWgpu)
+            activeScenePreviewRenderer = .wallpaperWgpu
+            return true
+        } catch {
+            print("[MediaDetailSheet] previewWallpaper: scene renderer preview failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     /// 从 "1920x1080" / "1920 x 1080" / "1080X1920" 这类分辨率字符串解析宽高比

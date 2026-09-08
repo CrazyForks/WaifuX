@@ -373,6 +373,44 @@ final class VideoThumbnailCache {
         )
     }
 
+    /// 将渲染器 `detect-static` 输出的单帧 PNG 写入实时 poster 缓存。
+    ///
+    /// 纯静态 scene 走"抽帧"路径时没有 1 秒 MP4 可供 AVAssetImageGenerator 抽帧，
+    /// 渲染器直接产出整屏 PNG；这里按与临时抽帧一致的 `scene_realtime_` 键空间
+    /// 落盘 JPEG，所有 UI/锁屏消费方无感。`variantKey` 语义与视频抽帧完全一致。
+    func sceneRealtimePosterJPEGFileURL(
+        forImageFile imageURL: URL,
+        itemID: String,
+        variantKey: String,
+        targetWidth: Int,
+        targetHeight: Int,
+        forceRegenerate: Bool = false
+    ) async -> URL? {
+        guard imageURL.isFileURL else { return nil }
+        let pathKey = imageURL.standardizedFileURL.path
+        guard fileManager.fileExists(atPath: pathKey) else { return nil }
+
+        let outURL = sceneRealtimePosterCacheURL(itemID: itemID, variantKey: variantKey)
+        if !forceRegenerate,
+           let existing = cachedSceneRealtimePosterFileURLIfExists(
+               itemID: itemID,
+               variantKey: variantKey
+           ) {
+            scheduleCropExistingPosterIfNeeded(existing)
+            return existing
+        }
+
+        try? fileManager.removeItem(at: outURL)
+        return await generatePosterJPEGFile(
+            fromImageFile: imageURL,
+            outputURL: outURL,
+            maximumSize: CGSize(
+                width: max(1, targetWidth),
+                height: max(1, targetHeight)
+            )
+        )
+    }
+
     /// 将 Wallpaper Engine Web renderer 的直接截图写入稳定 poster 缓存。
     ///
     /// 截图源通常在 `/tmp`，不能直接作为详情页或锁屏长期引用；这里编码为与离线烘焙
@@ -538,7 +576,11 @@ final class VideoThumbnailCache {
         }
     }
 
-    private func generatePosterJPEGFile(fromImageFile imageURL: URL, outputURL: URL) async -> URL? {
+    private func generatePosterJPEGFile(
+        fromImageFile imageURL: URL,
+        outputURL: URL,
+        maximumSize: CGSize = CGSize(width: 3840, height: 2160)
+    ) async -> URL? {
         await VideoPosterGenerationCoordinator.shared.generate(key: outputURL.path) {
             await Task.detached(priority: .userInitiated) {
                 let startedAt = CFAbsoluteTimeGetCurrent()
@@ -547,10 +589,11 @@ final class VideoThumbnailCache {
                     return nil
                 }
 
+                let maxPixel = max(maximumSize.width, maximumSize.height)
                 let options: [CFString: Any] = [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: 3840,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixel,
                     kCGImageSourceShouldCacheImmediately: false
                 ]
                 guard let image = CGImageSourceCreateThumbnailAtIndex(

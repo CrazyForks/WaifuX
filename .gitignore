@@ -73,6 +73,8 @@ landing/node_modules/
 
 # Trae
 .trae/
+# Zcode
+.zcode/
 
 # SteamCMD：随仓库提供 `Resources/steamcmd/`（见该目录 README），以便克隆/CI 可打包；勿将用户 Application Support 下的自更新缓存提交进来。
 /steamcmd/

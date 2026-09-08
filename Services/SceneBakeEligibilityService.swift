@@ -89,12 +89,26 @@ struct SceneBakeEligibilitySnapshot: Codable, Hashable, Sendable {
     var flags: SceneBakeEligibilityFlags
     /// 分析时使用的内容根目录（Steam workshop content 路径）
     var contentRootPath: String
+    /// 渲染器 `detect-static` 判定的纯静态标记。
+    /// `nil` = 尚未检测（未知）；`true` = 画面永不变化，可跳过烘焙直接抽帧。
+    /// 由 wallpaper-wgpu 在 materialize 后判定，比 JSON 关键词启发式准确。
+    var isStaticScene: Bool?
+    /// 静态检测发现的动态来源清单（`isStaticScene == false` 时用于诊断日志）。
+    var staticSceneReasons: [String]?
 
     /// 是否值得走「预烘焙视频」策略。当前策略：所有 Scene 都允许烘焙，
     /// 动态元素（时钟、日期、音频可视化等）在烘焙前会被预处理排除，仅保留背景；
     /// 被排除的元素不写入离线 MP4。
     var isEligibleForOfflineBake: Bool {
         true
+    }
+
+    /// 返回带纯静态标记的副本（用于渲染器检测后回写，不改变 analysisId）。
+    func withStaticScene(_ isStatic: Bool, reasons: [String] = []) -> SceneBakeEligibilitySnapshot {
+        var copy = self
+        copy.isStaticScene = isStatic
+        copy.staticSceneReasons = reasons
+        return copy
     }
 }
 

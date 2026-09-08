@@ -138,6 +138,9 @@ struct LiquidGlassNavButton: View {
 }
 
 // MARK: - 作者壁纸下载图标按钮
+/// hover 提示为自定义气泡（系统 .help 在该窗口环境下不弹出，故完全自绘）：
+/// onHover 触发 → 延时 0.55s（模拟系统 tooltip 停留节奏）→ 按钮左侧浮出气泡。
+/// 气泡用 overlay + fixedSize 绘制，向左展开时以 alignment: .trailing 锚定不超出面板。
 struct AuthorDownloadIconButton: View {
     let systemImage: String
     let title: String
@@ -145,7 +148,8 @@ struct AuthorDownloadIconButton: View {
     let action: () -> Void
 
     @State private var isHovered = false
-    @State private var isPressed = false
+    @State private var showTooltip = false
+    @State private var tooltipTask: Task<Void, Never>?
 
     var body: some View {
         Button(action: action) {
@@ -178,22 +182,75 @@ struct AuthorDownloadIconButton: View {
                         )
                 )
         }
-        .buttonStyle(.plain)
-        .help(title)
-        .accessibilityLabel(title)
+        .buttonStyle(AuthorDownloadIconButtonStyle())
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.82 : 1)
-        .scaleEffect(isPressed ? 0.92 : 1)
         .animation(.easeOut(duration: 0.14), value: isHovered)
-        .animation(.easeOut(duration: 0.1), value: isPressed)
         .onHover { hovering in
-            isHovered = hovering
+            handleHover(hovering)
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in isPressed = true }
-                .onEnded { _ in isPressed = false }
-        )
+        .overlay(alignment: .trailing) {
+            if showTooltip {
+                AuthorTooltipBubble(text: title)
+                    .fixedSize()
+                    // 锚定后整体左移（按钮宽 32 + 间距 8），气泡完整落在按钮左侧的面板内
+                    .offset(x: -40)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .trailing)))
+                    .allowsHitTesting(false)
+                    .zIndex(999)
+            }
+        }
+        .accessibilityLabel(title)
+    }
+
+    private func handleHover(_ hovering: Bool) {
+        tooltipTask?.cancel()
+        tooltipTask = nil
+
+        if hovering {
+            // 与系统 tooltip 一致的停留延时，避免滑过时闪现
+            tooltipTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 550_000_000)
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 0.16)) {
+                    showTooltip = true
+                }
+            }
+        } else {
+            guard showTooltip else { return }
+            withAnimation(.easeIn(duration: 0.12)) {
+                showTooltip = false
+            }
+        }
+    }
+}
+
+/// 自定义 hover 气泡：深色胶囊 + 小箭头，样式贴近系统 tooltip。
+private struct AuthorTooltipBubble: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(0.82))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.28), radius: 8, y: 3)
+            )
+    }
+}
+
+/// 按压缩放走 ButtonStyle 的 isPressed。
+private struct AuthorDownloadIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.92 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 

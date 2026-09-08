@@ -874,6 +874,67 @@ enum SceneOfflineBakeService {
                 }
 
                 guard generation == companionBakeGeneration else { return }
+
+                // 纯静态壁纸：跳过烘焙，改走渲染器抽帧封面
+                if eligibility.isStaticScene == true {
+                    print("[ScenePosterDiag] 自动烘焙=on 但场景纯静态 → 静态抽帧路径 reason=\(reason)")
+                    await generateStaticScenePosters(
+                        contentRoot: contentRoot,
+                        eligibility: eligibility,
+                        record: record,
+                        targets: posterTargets,
+                        reason: reason,
+                        generation: generation,
+                        syncToDisplays: true
+                    )
+                    return
+                }
+                if eligibility.isStaticScene == nil {
+                    // 首次遇到该内容：先让渲染器判定是否纯静态，静态则抽帧并回写标记
+                    let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
+                        userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(
+                            for: contentRoot.path
+                        ),
+                        for: contentRoot.path
+                    )
+                    let detectSize = posterTargets.map(\.size).max {
+                        $0.width * $0.height < $1.width * $1.height
+                    } ?? WallpaperPosterPixelSize(width: 1280, height: 720)
+                    let detection = await runStaticDetection(
+                        contentRoot: contentRoot,
+                        size: detectSize,
+                        userProperties: userProperties,
+                        reason: reason
+                    )
+                    if detection.isStatic {
+                        print("[ScenePosterDiag] 渲染器判定纯静态 → 静态抽帧路径 reason=\(reason)")
+                        if let itemID = record?.item.id {
+                            await MainActor.run {
+                                MediaLibraryService.shared.attachSceneBakeEligibility(
+                                    itemID: itemID,
+                                    snapshot: eligibility.withStaticScene(
+                                        true,
+                                        reasons: Array(detection.reasons.prefix(8))
+                                    ),
+                                    triggerAutoBake: false
+                                )
+                            }
+                        }
+                        await generateStaticScenePosters(
+                            contentRoot: contentRoot,
+                            eligibility: eligibility,
+                            record: record,
+                            targets: posterTargets,
+                            reason: reason,
+                            generation: generation,
+                            syncToDisplays: true,
+                            detection: detection
+                        )
+                        return
+                    }
+                    print("[ScenePosterDiag] 渲染器判定动态 → 继续常规烘焙 reason=\(reason)")
+                }
+
                 let itemID = record?.item.id
                 let displayTitle = record?.item.title
                 let cacheItemID = itemID ?? stableOrphanCacheItemID(contentRootPath: contentRoot.path)
@@ -1194,6 +1255,434 @@ enum SceneOfflineBakeService {
             return nil
         }
         return posterURL
+    }
+
+    // MARK: - 纯静态 scene 检测（detect-static）与静态抽帧
+
+    /// `wallpaper-wgpu detect-static` 的解析结果。
+    struct SceneStaticDetectionResult: Sendable {
+        let isStatic: Bool
+        /// 渲染器发现的动态来源（isStatic == false 时用于诊断日志）。
+        let reasons: [String]
+        /// 静态时渲染器输出的整屏 PNG（临时文件）。**调用方负责用完后删除。**
+        let frameURL: URL?
+    }
+
+    /// 静态检测使用的渲染尺寸：主屏像素尺寸（影响单帧输出分辨率与检测开销）。
+    static func preferredStaticDetectionSize() -> WallpaperPosterPixelSize {
+        let (width, height) = mainDisplayPixelSize()
+        return WallpaperPosterPixelSize(width: width, height: height)
+    }
+
+    /// 调用渲染器 `detect-static` 判断 scene 是否纯静态。
+    ///
+    /// 检测在 wallpaper-wgpu materialize 之后进行（shader uniform/动画/粒子分析 +
+    /// 两帧像素验证），比 App 侧 JSON 关键词启发式准确。子进程失败或超时一律按
+    /// 「非静态」保守回退，保证最坏情况只是退化为现有烘焙路径。
+    static func runStaticDetection(
+        contentRoot: URL,
+        size: WallpaperPosterPixelSize,
+        userProperties: String?,
+        reason: String
+    ) async -> SceneStaticDetectionResult {
+        guard let wgpuBinary = WallpaperEngineXBridge.resolvedCLIExecutableURL() else {
+            print("[SceneStaticDetect] 跳过 (\(reason)): 未找到 wallpaper-wgpu")
+            return SceneStaticDetectionResult(isStatic: false, reasons: [], frameURL: nil)
+        }
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WaifuX", isDirectory: true)
+            .appendingPathComponent("StaticSceneDetection", isDirectory: true)
+        let frameOutURL = temporaryDirectory.appendingPathComponent("\(UUID().uuidString).png")
+        try? FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+
+        var args = [
+            "detect-static",
+            contentRoot.path,
+            "--size", "\(size.width)x\(size.height)",
+            "--clean",
+            "--frame-out", frameOutURL.path,
+        ]
+        if let assets = await WallpaperEngineEmbeddedAssets.awaitAssetsReady(), !assets.isEmpty {
+            args += ["--assets", assets]
+        }
+        if let userProperties, !userProperties.isEmpty {
+            args += ["--user-properties", userProperties]
+        }
+
+        // 检测与烘焙共用 GPU 串行队列，避免与 in-flight bake 并发抢 GPU
+        let queueJobID = UUID()
+        await OfflineBakeSerialQueue.shared.waitForTurn(jobID: queueJobID)
+        let result = await runDetectStaticProcess(
+            wgpuBinary: wgpuBinary,
+            args: args,
+            frameOutURL: frameOutURL,
+            reason: reason
+        )
+        await OfflineBakeSerialQueue.shared.leave(jobID: queueJobID)
+        return result
+    }
+
+    /// 静态检测判定 + 结果回写 + 抽帧封面的组合入口（详情页等非伴生上下文使用）。
+    /// 返回检测结果；静态时已回写 `isStaticScene` 标记。
+    @MainActor
+    static func detectStaticScene(
+        contentRoot: URL,
+        eligibility: SceneBakeEligibilitySnapshot,
+        itemID: String?,
+        reason: String
+    ) async -> SceneStaticDetectionResult {
+        let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
+            userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(
+                for: contentRoot.path
+            ),
+            for: contentRoot.path
+        )
+        let detection = await runStaticDetection(
+            contentRoot: contentRoot,
+            size: preferredStaticDetectionSize(),
+            userProperties: userProperties,
+            reason: reason
+        )
+        if detection.isStatic, let itemID {
+            persistStaticSceneFlag(itemID: itemID, eligibility: eligibility, reasons: detection.reasons)
+        }
+        return detection
+    }
+
+    @MainActor
+    private static func persistStaticSceneFlag(
+        itemID: String,
+        eligibility: SceneBakeEligibilitySnapshot,
+        reasons: [String]
+    ) {
+        MediaLibraryService.shared.attachSceneBakeEligibility(
+            itemID: itemID,
+            snapshot: eligibility.withStaticScene(true, reasons: Array(reasons.prefix(8))),
+            triggerAutoBake: false
+        )
+        print("[SceneStaticDetect] 已回写 isStaticScene=true item=\(itemID)")
+    }
+
+    /// 纯静态 scene 的抽帧封面路径：渲染器 `detect-static` 直接产出整屏 PNG，
+    /// 不烘 1 秒 MP4。缓存键与临时抽帧一致（`scene_realtime_<id>_<analysisId_尺寸>`），
+    /// UI/锁屏消费方无感。
+    ///
+    /// - Parameters:
+    ///   - generation: 伴生代数；`nil` 表示非伴生上下文（下载后自动抽帧），不做代数失效检查。
+    ///   - syncToDisplays: 是否把静帧推送回系统桌面/锁屏（仅伴生上下文为 true）。
+    ///   - detection: 调用方已持有的检测结果；为 nil 且存在缺失尺寸时现场检测并回写标记。
+    @MainActor
+    private static func generateStaticScenePosters(
+        contentRoot: URL,
+        eligibility: SceneBakeEligibilitySnapshot,
+        record: MediaDownloadRecord?,
+        targets: [RealtimePosterTarget],
+        reason: String,
+        generation: UInt?,
+        syncToDisplays: Bool,
+        detection precomputed: SceneStaticDetectionResult? = nil
+    ) async {
+        guard generation.map({ $0 == companionBakeGeneration }) ?? true else {
+            print("[ScenePosterDiag] 中止(stale): 静态抽帧启动前被新应用取代 reason=\(reason)")
+            return
+        }
+        guard !targets.isEmpty else {
+            print("[SceneOfflineBake] static poster skipped (\(reason)): no target display geometry")
+            return
+        }
+
+        let itemID = record?.item.id
+        let posterCacheID = itemID ?? stableOrphanCacheItemID(contentRootPath: contentRoot.path)
+        print(
+            "[ScenePosterDiag] 静态抽帧开始: itemID=\(itemID ?? "nil") posterCacheID=\(posterCacheID) "
+                + "targets=\(targets.count) reason=\(reason)"
+        )
+
+        let groupedTargets = Dictionary(grouping: targets, by: \.size)
+        let orderedSizes = groupedTargets.keys.sorted {
+            if $0.width != $1.width { return $0.width < $1.width }
+            return $0.height < $1.height
+        }
+        let primarySize = targets.first?.size
+        var postersBySize: [WallpaperPosterPixelSize: URL] = [:]
+        var missingSizes: [WallpaperPosterPixelSize] = []
+
+        for size in orderedSizes {
+            guard generation.map({ $0 == companionBakeGeneration }) ?? true else { return }
+            let variantKey = realtimePosterVariantKey(eligibility: eligibility, size: size)
+            if let cachedPoster = VideoThumbnailCache.shared
+                .cachedSceneRealtimePosterFileURLIfExists(
+                    itemID: posterCacheID,
+                    variantKey: variantKey
+                ) {
+                print("[ScenePosterDiag] 静态抽帧缓存命中 size=\(size.width)x\(size.height): \(cachedPoster.lastPathComponent)")
+                postersBySize[size] = cachedPoster
+                if syncToDisplays {
+                    await syncRealtimeStaticPoster(
+                        cachedPoster,
+                        displayIDs: groupedTargets[size, default: []].map(\.displayID),
+                        reason: "\(reason), cached \(size.width)x\(size.height) static poster",
+                        generation: generation ?? 0
+                    )
+                }
+            } else {
+                missingSizes.append(size)
+            }
+        }
+
+        guard !missingSizes.isEmpty else {
+            finishStaticScenePosters(
+                itemID: itemID,
+                postersBySize: postersBySize,
+                primarySize: primarySize,
+                reason: reason,
+                generation: generation
+            )
+            return
+        }
+
+        // 需要产出单帧：优先复用调用方检测结果，否则现场检测（largest 尺寸一次成型）
+        var detection = precomputed
+        if detection == nil {
+            let detectSize = missingSizes.last ?? preferredStaticDetectionSize()
+            let userProperties = SceneConfigOverrideService.mergedPropertiesJSON(
+                userPropertiesJSON: SceneWallpaperPropertiesService.propertiesOverrideJSON(
+                    for: contentRoot.path
+                ),
+                for: contentRoot.path
+            )
+            let result = await runStaticDetection(
+                contentRoot: contentRoot,
+                size: detectSize,
+                userProperties: userProperties,
+                reason: reason
+            )
+            detection = result
+            if result.isStatic, let itemID {
+                persistStaticSceneFlag(itemID: itemID, eligibility: eligibility, reasons: result.reasons)
+            }
+        }
+        guard let detection, detection.isStatic, let frameURL = detection.frameURL else {
+            print("[ScenePosterDiag] ⚠️ 静态抽帧中止 (\(reason)): 检测结果非静态或缺少单帧（标记与实际不一致，回退常规路径）")
+            return
+        }
+        defer { try? FileManager.default.removeItem(at: frameURL) }
+
+        for size in missingSizes {
+            guard generation.map({ $0 == companionBakeGeneration }) ?? true else { return }
+            let variantKey = realtimePosterVariantKey(eligibility: eligibility, size: size)
+
+            // 排队/检测期间，另一个同场景请求可能已经写好了同尺寸 poster
+            if let cachedPoster = VideoThumbnailCache.shared
+                .cachedSceneRealtimePosterFileURLIfExists(
+                    itemID: posterCacheID,
+                    variantKey: variantKey
+                ) {
+                print("[ScenePosterDiag] 检测期间他请求已写好同尺寸 poster size=\(size.width)x\(size.height)")
+                postersBySize[size] = cachedPoster
+                if syncToDisplays {
+                    await syncRealtimeStaticPoster(
+                        cachedPoster,
+                        displayIDs: groupedTargets[size, default: []].map(\.displayID),
+                        reason: "\(reason), shared \(size.width)x\(size.height) static poster",
+                        generation: generation ?? 0
+                    )
+                }
+                continue
+            }
+
+            guard let posterURL = await VideoThumbnailCache.shared.sceneRealtimePosterJPEGFileURL(
+                forImageFile: frameURL,
+                itemID: posterCacheID,
+                variantKey: variantKey,
+                targetWidth: size.width,
+                targetHeight: size.height
+            ) else {
+                print("[ScenePosterDiag] ⚠️ 静态单帧 JPEG 落盘失败 size=\(size.width)x\(size.height) (\(reason))")
+                continue
+            }
+            postersBySize[size] = posterURL
+            if syncToDisplays {
+                await syncRealtimeStaticPoster(
+                    posterURL,
+                    displayIDs: groupedTargets[size, default: []].map(\.displayID),
+                    reason: "\(reason), renderer static frame \(size.width)x\(size.height)",
+                    generation: generation ?? 0
+                )
+            }
+            print("[SceneOfflineBake] static poster finished (\(reason)) size=\(size.width)x\(size.height): \(posterURL.path)")
+        }
+
+        finishStaticScenePosters(
+            itemID: itemID,
+            postersBySize: postersBySize,
+            primarySize: primarySize,
+            reason: reason,
+            generation: generation
+        )
+    }
+
+    /// 静态抽帧收尾：清 Kingfisher 缓存并发送封面更新通知（与临时抽帧一致）。
+    @MainActor
+    private static func finishStaticScenePosters(
+        itemID: String?,
+        postersBySize: [WallpaperPosterPixelSize: URL],
+        primarySize: WallpaperPosterPixelSize?,
+        reason: String,
+        generation: UInt?
+    ) {
+        guard generation.map({ $0 == companionBakeGeneration }) ?? true else {
+            print("[ScenePosterDiag] 中止(stale): poster 全部就绪但被新应用取代，跳过 UI 封面通知 reason=\(reason)")
+            return
+        }
+        if let itemID,
+           let primarySize,
+           let primaryPoster = postersBySize[primarySize] {
+            // 同路径覆盖写入后必须清 Kingfisher 缓存，否则详情页/列表继续命中旧帧。
+            let processor = DownsamplingImageProcessor(size: CGSize(width: 512, height: 512))
+            Task {
+                try? await ImageCache.default.removeImage(forKey: primaryPoster.cacheKey)
+                try? await ImageCache.default.removeImage(
+                    forKey: primaryPoster.cacheKey,
+                    processorIdentifier: processor.identifier
+                )
+                NotificationCenter.default.post(
+                    name: .sceneOfflineBakeThumbnailDidUpdate,
+                    object: itemID,
+                    userInfo: ["thumbnailURL": primaryPoster]
+                )
+            }
+            print("[ScenePosterDiag] ✅ 静态抽帧完成 item=\(itemID) poster=\(primaryPoster.lastPathComponent)")
+        } else {
+            print(
+                "[ScenePosterDiag] ⚠️ 静态抽帧完成但未发送 UI 通知: itemID=\(itemID ?? "nil") "
+                    + "primarySize=\(primarySize.map { "\($0.width)x\($0.height)" } ?? "nil") (\(reason))"
+            )
+        }
+    }
+
+    /// 运行 detect-static 子进程并解析 stdout 的 `STATIC_SCENE:` 结果行。
+    private static func runDetectStaticProcess(
+        wgpuBinary: URL,
+        args: [String],
+        frameOutURL: URL,
+        reason: String
+    ) async -> SceneStaticDetectionResult {
+        final class BufferBox: @unchecked Sendable {
+            var data = Data()
+        }
+        let stdoutBox = BufferBox()
+        let stderrBox = BufferBox()
+
+        let process = Process()
+        process.executableURL = wgpuBinary
+        process.currentDirectoryURL = wgpuBinary.deletingLastPathComponent()
+        process.arguments = args
+        var env = rendererLaunchEnvironment(for: wgpuBinary)
+        env["RUST_LOG"] = env["RUST_LOG"] ?? "warn"
+        process.environment = env
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            stdoutBox.data.append(handle.availableData)
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            stderrBox.data.append(handle.availableData)
+            if stderrBox.data.count > 256 * 1024 {
+                stderrBox.data.removeFirst(stderrBox.data.count - 256 * 1024)
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            print("[SceneStaticDetect] 启动失败 (\(reason)): \(error.localizedDescription)")
+            return SceneStaticDetectionResult(isStatic: false, reasons: [], frameURL: nil)
+        }
+        let processID = process.processIdentifier
+        let detectFootprint = SceneBakeProcessController.footprintLimitBytes(width: 1920, height: 1080)
+        await MainActor.run {
+            SceneBakeProcessController.shared.attach(
+                process: process,
+                isCompanion: true,
+                footprintLimitBytes: detectFootprint
+            )
+        }
+        print("[SceneOfflineBake] 启动 wallpaper-wgpu detect-static (\(reason)): \(args.joined(separator: " "))")
+
+        // 轮询等待退出（与 bake 相同模式，规避 waitUntilExit 阻塞协作线程），180s 超时
+        let deadline = Date().addingTimeInterval(180)
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if process.isRunning {
+            print("[SceneStaticDetect] 检测超时 (180s)，终止 (\(reason))")
+            process.terminate()
+            var gracefulDeadline = Date().addingTimeInterval(10)
+            while process.isRunning && Date() < gracefulDeadline {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if process.isRunning { process.interrupt() }
+        }
+        while process.isRunning {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        await MainActor.run { SceneBakeProcessController.shared.finish(pid: processID) }
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        let exitStatus = process.terminationStatus
+        let conservativeFailure = SceneStaticDetectionResult(isStatic: false, reasons: [], frameURL: nil)
+        guard exitStatus == 0 else {
+            let tail = String(data: stderrBox.data.suffix(400), encoding: .utf8) ?? ""
+            print("[SceneStaticDetect] 检测失败 exit=\(exitStatus) (\(reason)) stderr=\(tail)")
+            return conservativeFailure
+        }
+        guard let text = String(data: stdoutBox.data, encoding: .utf8) else {
+            print("[SceneStaticDetect] stdout 非 UTF-8 (\(reason))，按非静态处理")
+            return conservativeFailure
+        }
+
+        var isStatic: Bool?
+        var reasons: [String] = []
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("STATIC_SCENE:") else { continue }
+            let jsonStr = String(trimmed.dropFirst("STATIC_SCENE:".count))
+            guard let jsonData = jsonStr.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let staticFlag = dict["static"] as? Bool else {
+                continue
+            }
+            isStatic = staticFlag
+            reasons = (dict["reasons"] as? [String]) ?? []
+            break
+        }
+        guard let staticFlag = isStatic else {
+            print("[SceneStaticDetect] 未找到 STATIC_SCENE 结果行 (\(reason))，按非静态处理")
+            return conservativeFailure
+        }
+
+        if staticFlag {
+            let hasFrame = FileManager.default.fileExists(atPath: frameOutURL.path)
+            if !hasFrame {
+                print("[SceneStaticDetect] ⚠️ 判定静态但未产出单帧 (\(reason))，按非静态处理")
+                return conservativeFailure
+            }
+            print("[SceneStaticDetect] 结果 (\(reason)): 纯静态 ✓ frame=\(frameOutURL.lastPathComponent)")
+            return SceneStaticDetectionResult(isStatic: true, reasons: [], frameURL: frameOutURL)
+        }
+        print(
+            "[SceneStaticDetect] 结果 (\(reason)): 动态（\(reasons.count) 项来源） "
+                + "\(reasons.prefix(6).joined(separator: " | "))"
+        )
+        return SceneStaticDetectionResult(isStatic: false, reasons: reasons, frameURL: nil)
     }
 
     @MainActor
@@ -2510,6 +2999,46 @@ enum SceneOfflineBakeService {
                (art.renderer == nil || art.renderer == .wallpaperWgpu),
                isUsableBakedVideo(at: URL(fileURLWithPath: art.videoPath)) {
                 return
+            }
+            // 纯静态壁纸（渲染器 detect-static 已判定）：不烘焙视频，改走抽帧封面
+            if eligibility.isStaticScene == true {
+                print("[SceneOfflineBake] auto-bake skipped (static scene) \(itemID) → 静态抽帧")
+                let targets = await MainActor.run { realtimePosterTargets(for: nil) }
+                await generateStaticScenePosters(
+                    contentRoot: URL(fileURLWithPath: eligibility.contentRootPath),
+                    eligibility: eligibility,
+                    record: record,
+                    targets: targets,
+                    reason: "auto-bake static",
+                    generation: nil,
+                    syncToDisplays: false
+                )
+                return
+            }
+            if eligibility.isStaticScene == nil {
+                // 首次遇到该内容：先让渲染器判定是否纯静态，静态则抽帧并回写标记
+                let detection = await detectStaticScene(
+                    contentRoot: URL(fileURLWithPath: eligibility.contentRootPath),
+                    eligibility: eligibility,
+                    itemID: itemID,
+                    reason: "auto-bake detect"
+                )
+                if detection.isStatic {
+                    print("[SceneOfflineBake] 渲染器判定纯静态 \(itemID) → 静态抽帧")
+                    let targets = await MainActor.run { realtimePosterTargets(for: nil) }
+                    await generateStaticScenePosters(
+                        contentRoot: URL(fileURLWithPath: eligibility.contentRootPath),
+                        eligibility: eligibility,
+                        record: record,
+                        targets: targets,
+                        reason: "auto-bake static",
+                        generation: nil,
+                        syncToDisplays: false,
+                        detection: detection
+                    )
+                    return
+                }
+                print("[SceneOfflineBake] 渲染器判定动态 \(itemID) → 继续常规烘焙")
             }
             do {
                 // 进度由 SceneOfflineBakeProgressTracker 统一广播
