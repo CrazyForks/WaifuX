@@ -99,3 +99,11 @@ SteamService/obj/
 node_modules/
 package-lock.json
 package.json
+
+# .NET shared framework：目录名 Microsoft.NETCore.App 以 .app 结尾，
+# 会被上方 `*.app` 规则误伤 → 整个 shared/ 不进 git，CI 产物缺 .NET 框架
+# （表现为生产包 Steam 服务「正在启动」后静默失败）。
+# 必须放在 *.app 之后；negation 重新包含目录与其全部内容。
+!SteamService/prebuilt/*/runtime/shared/
+!SteamService/prebuilt/*/runtime/shared/**
+# 仅排除构建产物目录，框架本身的 .o/.a 等中间文件属于运行时必需，一并保留

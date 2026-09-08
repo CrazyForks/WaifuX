@@ -44,8 +44,10 @@ if use_prebuilt; then
         case "$architecture" in
             arm64|x86_64)
                 if [ ! -d "$PREBUILT_ROOT/$architecture/app" ] || \
-                   [ ! -x "$PREBUILT_ROOT/$architecture/runtime/dotnet" ]; then
-                    echo "[steam-service] No prebuilt $architecture service in $PREBUILT_ROOT." >&2
+                   [ ! -x "$PREBUILT_ROOT/$architecture/runtime/dotnet" ] || \
+                   ! ls "$PREBUILT_ROOT/$architecture/runtime/shared/Microsoft.NETCore.App"/*/libcoreclr.dylib >/dev/null 2>&1; then
+                    echo "[steam-service] No complete prebuilt $architecture service in $PREBUILT_ROOT." >&2
+                    echo "[steam-service] (runtime/shared/Microsoft.NETCore.App/*/libcoreclr.dylib is required — a missing shared/ usually means the .gitignore *.app rule swallowed the Microsoft.NETCore.App directory.)" >&2
                     prebuilt_missing=1
                 fi
                 ;;
