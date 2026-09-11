@@ -167,7 +167,7 @@ WaifuX 本身**不存储、不托管任何内容**，仅作为第三方内容的
 - 所有内容的版权归原网站及原作者所有
 
 ### 2. Wallpaper Engine 兼容性声明（实验性 / Beta）
-WaifuX **并非 Wallpaper Engine 官方产品**，与 Valve Corporation、Kristjan Skutta / Wallpaper Engine 及其关联方**不存在任何官方合作、赞助或隶属关系**。应用内集成的 Wallpaper Engine 场景渲染功能属于**实验性第三方兼容实现**，基于用户自行拥有的 Workshop 内容或本地文件进行 OpenGL 渲染，仅供个人学习、研究与 interoperability（互操作性）目的使用。
+WaifuX **并非 Wallpaper Engine 官方产品**，与 Valve Corporation、Kristjan Skutta / Wallpaper Engine 及其关联方**不存在任何官方合作、赞助或隶属关系**。应用内集成的 Wallpaper Engine 场景渲染功能属于**实验性第三方兼容实现**，基于用户自行拥有的 Workshop 内容或本地文件，通过自研 Rust + Metal（wgpu）原生渲染管线进行 GPU 渲染，仅供个人学习、研究与 interoperability（互操作性）目的使用。
 - 用户**必须自行合法拥有** Wallpaper Engine 软件许可及相关 Workshop 内容的合法使用权
 - 本应用不会、也无法验证用户是否拥有相应内容的合法授权
 - 若用户未购买 Wallpaper Engine 或未获得内容授权，请**不要**使用本功能
@@ -187,7 +187,7 @@ WaifuX **并非 Wallpaper Engine 官方产品**，与 Valve Corporation、Kristj
 ### 5. 责任限制
 本应用按「**原样（AS IS）**」提供，开发者不对以下情形承担任何责任：
 - 因网络波动、第三方服务变更、源站屏蔽等原因导致的内容无法加载
-- 因用户设备配置、系统更新、驱动兼容性（特别是 OpenGL / GPU 驱动）导致的渲染异常、崩溃或硬件损坏
+- 因用户设备配置、系统更新、GPU / 图形驱动兼容性（特别是 Metal 图形栈相关组件）导致的渲染异常、崩溃或硬件损坏
 - 因用户违反当地法律法规或第三方服务条款而产生的任何法律纠纷、行政处罚或经济损失
 - 因用户误操作、数据丢失或其他不可抗力导致的任何直接或间接损失
 

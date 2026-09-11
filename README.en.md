@@ -74,7 +74,7 @@
 | ⚡️ **One-click Apply** | ✅ | Set as desktop wallpaper or dynamic desktop directly while browsing |
 | 🖥️ **Multi-display Support** | ✅ | Set different wallpapers for each display — perfect for multi-monitor setups |
 | 📥 **Local Data Import** | ✅ | Import local wallpaper folders for unified management of personal collections |
-| 🧊 **Wallpaper Engine Rendering (Beta)** | ✅ | Experimental Wallpaper Engine live wallpapers: **scene** (OpenGL) and **Web** (HTML/JS) types, both via the built-in renderer — not a generic “any website as wallpaper” feature<br>⚠️ **Apple Silicon (arm64) only; Intel chips are not supported** |
+| 🧊 **Wallpaper Engine Rendering (Beta)** | ✅ | Experimental Wallpaper Engine live wallpapers: **scene** (native Rust + Metal/wgpu renderer) and **Web** (HTML/JS) types, both via the built-in renderer — not a generic “any website as wallpaper” feature<br>⚠️ **Apple Silicon (arm64) only; Intel chips are not supported** |
 | 🔄 **Auto-updating Rules** | ✅ | Rule configurations loaded remotely via GitHub — quick adaptation when source sites change |
 | ☁️ **Cross-device Sync** | 🚧 | Cloud sync for favorites (in development) |
 
@@ -176,7 +176,7 @@ WaifuX does **not store or host any content** itself — it acts solely as an ag
 - All content copyrights belong to the original websites and authors
 
 ### 2. Wallpaper Engine Compatibility (Experimental / Beta)
-WaifuX is **NOT an official Wallpaper Engine product** and has **no official partnership, sponsorship, or affiliation** with Valve Corporation, Kristjan Skutta / Wallpaper Engine, or their associated entities. The integrated Wallpaper Engine scene rendering feature is an **experimental third-party compatibility implementation** that performs OpenGL rendering using Workshop content or local files which the user already owns, and is intended solely for personal study, research, and interoperability purposes.
+WaifuX is **NOT an official Wallpaper Engine product** and has **no official partnership, sponsorship, or affiliation** with Valve Corporation, Kristjan Skutta / Wallpaper Engine, or their associated entities. The integrated Wallpaper Engine scene rendering feature is an **experimental third-party compatibility implementation** that renders user-owned Workshop content or local files through an in-house native GPU rendering pipeline built in Rust with Metal (wgpu), and is intended solely for personal study, research, and interoperability purposes.
 - Users **must legally own** a valid Wallpaper Engine software license and the legal right to use any related Workshop content
 - This application does not and cannot verify whether the user holds a legitimate license or authorization for any content
 - If you have not purchased Wallpaper Engine or do not hold the necessary rights, **do not use this feature**
@@ -196,7 +196,7 @@ WaifuX is **NOT an official Wallpaper Engine product** and has **no official par
 ### 5. Limitation of Liability
 This application is provided **"AS IS"**, and the developer assumes no liability for:
 - Content loading failures caused by network fluctuations, third-party service changes, or source-site blocking
-- Rendering anomalies, crashes, or hardware damage caused by user device configurations, system updates, or driver compatibility issues (particularly OpenGL / GPU drivers)
+- Rendering anomalies, crashes, or hardware damage caused by user device configurations, system updates, or GPU / graphics driver compatibility issues (particularly components of the Metal graphics stack)
 - Any legal disputes, administrative penalties, or economic losses arising from the user's violation of local laws, regulations, or third-party terms of service
 - Any direct or indirect losses caused by user error, data loss, or other force majeure events
 
