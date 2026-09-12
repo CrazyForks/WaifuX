@@ -1,8 +1,36 @@
 import SwiftUI
 
 // MARK: - Shimmer 效果（iOS 风格闪光加载动画）
+/// App 没有任何可见窗口（全部被遮挡/隐藏）时返回 false：
+/// 常驻骨架 shimmer 必须暂停，否则 repeatForever 会在后台持续驱动渲染循环空烧 CPU。
+@MainActor
+final class MainWindowVisibility: ObservableObject {
+    static let shared = MainWindowVisibility()
+    @Published private(set) var allowContinuousAnimation = true
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let anyVisible = NSApp.windows.contains {
+                    $0.isVisible && $0.occlusionState.contains(.visible)
+                }
+                if self.allowContinuousAnimation != anyVisible {
+                    self.allowContinuousAnimation = anyVisible
+                    AppLogger.error(.general, "[AnimTracker] continuous animation \(anyVisible ? "resumed" : "paused") (no visible window)")
+                }
+            }
+        }
+    }
+}
+
 struct ShimmerModifier: ViewModifier {
     @State private var isAnimating = false
+    @ObservedObject private var visibility = MainWindowVisibility.shared
 
     func body(content: Content) -> some View {
         content
@@ -23,13 +51,40 @@ struct ShimmerModifier: ViewModifier {
                 .mask(content)
             )
             .onAppear {
-                withAnimation(
-                    .linear(duration: 1.5)
-                    .repeatForever(autoreverses: false)
-                ) {
-                    isAnimating = true
+                guard visibility.allowContinuousAnimation else { return }
+                startAnimating()
+            }
+            .onDisappear {
+                stopAnimating()
+            }
+            .onChange(of: visibility.allowContinuousAnimation) { _, allowed in
+                if allowed {
+                    startAnimating()
+                } else {
+                    stopAnimating()
                 }
             }
+    }
+
+    private func startAnimating() {
+        guard !isAnimating else { return }
+        RepeatForeverAnimationTracker.shared.enter("Shimmer")
+        withAnimation(
+            .linear(duration: 1.5)
+            .repeatForever(autoreverses: false)
+        ) {
+            isAnimating = true
+        }
+    }
+
+    private func stopAnimating() {
+        guard isAnimating else { return }
+        RepeatForeverAnimationTracker.shared.exit("Shimmer")
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isAnimating = false
+        }
     }
 }
 
@@ -747,11 +802,16 @@ struct BottomLoadingCard: View {
                 .foregroundStyle(Color.white.opacity(0.7))
                 .rotationEffect(.degrees(isAnimating ? 360 : 0))
                 .animation(
-                    .linear(duration: 1.0).repeatForever(autoreverses: false),
+                    isAnimating ? .linear(duration: 1.0).repeatForever(autoreverses: false) : .linear(duration: 0.25),
                     value: isAnimating
                 )
                 .onAppear {
+                    RepeatForeverAnimationTracker.shared.enter("BottomLoadingCard")
                     isAnimating = true
+                }
+                .onDisappear {
+                    RepeatForeverAnimationTracker.shared.exit("BottomLoadingCard")
+                    isAnimating = false
                 }
 
             Text(t("loading.simple"))

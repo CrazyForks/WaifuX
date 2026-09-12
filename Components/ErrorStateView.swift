@@ -230,11 +230,20 @@ struct SkeletonPlaceholder: View {
         }
         .clipped()
         .onAppear {
+            RepeatForeverAnimationTracker.shared.enter("Skeleton")
             withAnimation(
                 .linear(duration: 1.5)
                 .repeatForever(autoreverses: false)
             ) {
                 isAnimating = true
+            }
+        }
+        .onDisappear {
+            RepeatForeverAnimationTracker.shared.exit("Skeleton")
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                isAnimating = false
             }
         }
     }

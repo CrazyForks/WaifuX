@@ -5,7 +5,7 @@ struct CustomProgressView: View {
     var tint: Color = .white
     var scale: CGFloat = 1.0
 
-    @State private var rotation: Double = 0
+    @State private var isAnimating = false
 
     var body: some View {
         ZStack {
@@ -17,12 +17,18 @@ struct CustomProgressView: View {
                 .trim(from: 0, to: 0.7)
                 .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                 .frame(width: 20 * scale, height: 20 * scale)
-                .rotationEffect(Angle(degrees: rotation))
+                .rotationEffect(Angle(degrees: isAnimating ? 360 : 0))
         }
+        // repeatForever 永不自然结束；离开层级时用有限动画回落，终结渲染循环
+        .animation(isAnimating ? .linear(duration: 1).repeatForever(autoreverses: false) : .linear(duration: 0.25), value: isAnimating)
         .onAppear {
-            rotation = 360
+            RepeatForeverAnimationTracker.shared.enter("CustomProgressView")
+            isAnimating = true
         }
-        .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: rotation)
+        .onDisappear {
+            RepeatForeverAnimationTracker.shared.exit("CustomProgressView")
+            isAnimating = false
+        }
     }
 }
 
@@ -43,11 +49,20 @@ struct LoadingDots: View {
             }
         }
         .onAppear {
+            RepeatForeverAnimationTracker.shared.enter("LoadingDots")
             withAnimation(
                 .easeInOut(duration: 0.4)
                 .repeatForever(autoreverses: true)
             ) {
                 animatingDot = 2
+            }
+        }
+        .onDisappear {
+            RepeatForeverAnimationTracker.shared.exit("LoadingDots")
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                animatingDot = 0
             }
         }
     }
@@ -62,6 +77,8 @@ struct FixedProgressView: View {
             .progressViewStyle(CircularProgressViewStyle(tint: tint))
             .frame(width: 24, height: 24)
             .fixedSize()
+            .onAppear { RepeatForeverAnimationTracker.shared.enter("FixedProgressView") }
+            .onDisappear { RepeatForeverAnimationTracker.shared.exit("FixedProgressView") }
     }
 }
 
@@ -98,8 +115,8 @@ struct ExploreLoadingStateView: View {
         }
         .padding(.vertical, 26)
         .frame(maxWidth: .infinity, minHeight: 190)
-        .onAppear { isAnimating = true }
-        .onDisappear { isAnimating = false }
+        .onAppear { RepeatForeverAnimationTracker.shared.enter("ExploreLoadingState") ; isAnimating = true }
+        .onDisappear { RepeatForeverAnimationTracker.shared.exit("ExploreLoadingState") ; isAnimating = false }
     }
 }
 
@@ -171,8 +188,8 @@ struct ExploreLoadingGlyph: View {
         }
         .frame(width: glyphSize.width, height: glyphSize.height)
         .contentShape(Rectangle())
-        .onAppear { isAnimating = true }
-        .onDisappear { isAnimating = false }
+        .onAppear { RepeatForeverAnimationTracker.shared.enter("ExploreLoadingGlyph") ; isAnimating = true }
+        .onDisappear { RepeatForeverAnimationTracker.shared.exit("ExploreLoadingGlyph") ; isAnimating = false }
     }
 
     private func lineWidth(for index: Int) -> CGFloat {

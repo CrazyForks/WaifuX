@@ -21,7 +21,13 @@ private struct EdgeToEdgeContainer<Content: View>: View {
 
 @MainActor
 private final class MainContentNavigationState: ObservableObject {
-    @Published var selectedTab: MainTab = .home
+    @Published var selectedTab: MainTab = .home {
+        didSet {
+            if oldValue != selectedTab {
+                AppLogger.error(.general, "[AnimTracker] tab -> \(selectedTab)")
+            }
+        }
+    }
     @Published var isHomeChromeHidden = false
     @Published var selectedWallpaper: Wallpaper?
     @Published var selectedMedia: MediaItem?

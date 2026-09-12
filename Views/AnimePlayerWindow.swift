@@ -1149,11 +1149,24 @@ private struct SourceStatusIndicator: View {
             .frame(width: 6, height: 6)
             .opacity(isBlinking ? 0.3 : 1.0)
             .onAppear {
-                if status == .loading {
-                    withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
-                        isBlinking = true
-                    }
+                guard status == .loading else { return }
+                RepeatForeverAnimationTracker.shared.enter("SourceBlink")
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    isBlinking = true
                 }
+            }
+            .onDisappear {
+                RepeatForeverAnimationTracker.shared.exit("SourceBlink")
+            }
+            .onChange(of: status) { _, newStatus in
+                guard newStatus != .loading, isBlinking else { return }
+                // 用无动画事务摘掉 repeatForever，停止闪烁
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    isBlinking = false
+                }
+                RepeatForeverAnimationTracker.shared.exit("SourceBlink")
             }
     }
 

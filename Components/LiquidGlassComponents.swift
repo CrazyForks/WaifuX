@@ -267,6 +267,8 @@ struct LiquidGlassLoadingView: View {
                 .foregroundStyle(LiquidGlassColors.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { RepeatForeverAnimationTracker.shared.enter("LiquidGlassLoading") }
+        .onDisappear { RepeatForeverAnimationTracker.shared.exit("LiquidGlassLoading") }
     }
 }
 

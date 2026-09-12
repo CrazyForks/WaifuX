@@ -138,6 +138,11 @@ struct HomeContentView: View {
     @State private var initialLoadTask: Task<Void, Never>?
     @State private var wallhavenDefaultFilterRevision = 0
 
+    // 骨架屏超时与重试：数据源（如 wallhaven）不可达时避免 shimmer 永挂空转烧 CPU
+    @State private var homeSkeletonTimedOut = false
+    @State private var homeSkeletonDeadlineTask: Task<Void, Never>?
+    @State private var homeRetryTask: Task<Void, Never>?
+
     // 优化：缓存 heroPalette 避免每次访问都重新计算
     @State private var cachedHeroPalette: HeroDrivenPalette = HeroDrivenPalette(wallpaper: nil)
 
@@ -289,10 +294,17 @@ struct HomeContentView: View {
                 // 独立获取 MotionBG 轮播数据（固定源，不跟随 explore 列表变化）
                 await refreshHeroMediaItems()
             }
+            startHomeSkeletonDeadlineMonitor()
+            startHomeRetryLoop()
         }
         .onDisappear {
             initialLoadTask?.cancel()
             initialLoadTask = nil
+            homeSkeletonDeadlineTask?.cancel()
+            homeSkeletonDeadlineTask = nil
+            homeRetryTask?.cancel()
+            homeRetryTask = nil
+            homeSkeletonTimedOut = false
             ForegroundPrefetchManager.shared.stop(namespace: HomePrefetchNamespace.wallpaperShelf)
             ForegroundPrefetchManager.shared.stop(namespace: HomePrefetchNamespace.mediaShelf)
         }
@@ -334,6 +346,47 @@ struct HomeContentView: View {
         scrollOffset = offset
     }
 
+    // MARK: - 骨架屏超时与重试
+    /// 首页骨架最多展示 6 秒；超时仍未出数据即视为数据源不可达，切静态占位，
+    /// 避免 19 个 shimmer repeatForever 永挂、每帧驱动主窗口全量重排（后台 CPU 空烧根因）。
+    private func startHomeSkeletonDeadlineMonitor() {
+        homeSkeletonDeadlineTask?.cancel()
+        homeSkeletonTimedOut = false
+        homeSkeletonDeadlineTask = Task {
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            if heroItems.isEmpty {
+                homeSkeletonTimedOut = true
+                AppLogger.error(.general, "[AnimTracker] home skeleton timeout: 数据 6s 未到达，骨架切静态占位")
+            }
+        }
+    }
+
+    /// 数据始终为空时（如 wallhaven 不可达），每 5 分钟静默重试；网络/代理恢复后首页自动填充。
+    private func startHomeRetryLoop() {
+        homeRetryTask?.cancel()
+        homeRetryTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000_000)
+                guard !Task.isCancelled else { return }
+                guard heroItems.isEmpty, viewModel.wallpapers.isEmpty, heroMediaItems.isEmpty else { return }
+                AppLogger.error(.general, "[AnimTracker] home retry: 数据仍为空，触发 refresh")
+                await viewModel.refresh()
+            }
+        }
+    }
+
+    private func retryHomeLoad() {
+        startHomeSkeletonDeadlineMonitor()
+        Task { @MainActor in
+            await viewModel.refresh()
+            if ModuleAvailability.shared.mediaEnabled {
+                await mediaViewModel.refreshHomeItems()
+                await refreshHeroMediaItems()
+            }
+        }
+    }
+
     private var isCurrentHeroFavorite: Bool {
         guard let item = currentHeroItem else { return false }
         switch item {
@@ -364,12 +417,16 @@ struct HomeContentView: View {
 
         return ZStack {
             if items.isEmpty {
-                HeroSkeletonView(
-                    height: height,
-                    primary: atmosphereController.primary,
-                    secondary: atmosphereController.secondary,
-                    tertiary: atmosphereController.tertiary
-                )
+                if !homeSkeletonTimedOut {
+                    HeroSkeletonView(
+                        height: height,
+                        primary: atmosphereController.primary,
+                        secondary: atmosphereController.secondary,
+                        tertiary: atmosphereController.tertiary
+                    )
+                } else {
+                    HomeLoadFailedFallback(width: width, height: height, onRetry: { retryHomeLoad() })
+                }
             } else {
                 heroCarousel(width: width, height: height, items: items)
             }
@@ -398,7 +455,7 @@ struct HomeContentView: View {
                 onOpen: { openCurrentHeroItem() },
                 onFavorite: { toggleCurrentHeroFavorite() }
             )
-        } else {
+        } else if !homeSkeletonTimedOut {
             HeroCaptionSkeletonView()
                 .allowsHitTesting(false)
         }
@@ -446,7 +503,8 @@ struct HomeContentView: View {
                     onSelect: { wallpaper in
                         selectedWallpaper = wallpaper
                     },
-                    onSeeAll: onOpenWallpapers
+                    onSeeAll: onOpenWallpapers,
+                    skeletonTimedOut: homeSkeletonTimedOut
                 )
             }
 
@@ -461,7 +519,8 @@ struct HomeContentView: View {
                     onSelect: { item in
                         selectedMedia = item
                     },
-                    onSeeAll: onOpenMedia
+                    onSeeAll: onOpenMedia,
+                    skeletonTimedOut: homeSkeletonTimedOut
                 )
             }
         }
@@ -867,6 +926,8 @@ private struct HeroSlide: View {
     let width: CGFloat
     let height: CGFloat
 
+    @State private var imageLoadFailed = false
+
     private var palette: HeroDrivenPalette {
         switch item {
         case .wallpaper(let w): return HeroDrivenPalette(wallpaper: w)
@@ -880,16 +941,26 @@ private struct HeroSlide: View {
 
     var body: some View {
         ZStack {
-            KFImage(imageURL)
-                .cacheOriginalImage()
-                .fade(duration: 0.25)
-                .placeholder { _ in
-                    heroPlaceholder(showsProgress: true)
-                }
-                .resizable()
-                .scaledToFill()
-                .frame(width: width, height: height)
-                .clipped()
+            if imageLoadFailed {
+                // 加载失败时摘掉转圈占位符，避免 repeatForever 动画常驻空转
+                heroPlaceholder(showsProgress: false)
+            } else {
+                KFImage(imageURL)
+                    .cacheOriginalImage()
+                    .fade(duration: 0.25)
+                    .placeholder { _ in
+                        heroPlaceholder(showsProgress: true)
+                    }
+                    .retry(maxCount: 2, interval: .seconds(2))
+                    .onFailure { err in
+                        AppLogger.error(.general, "[AnimTracker] hero image failed url=\(imageURL?.absoluteString.prefix(120) ?? "nil") err=\(err.localizedDescription)")
+                        imageLoadFailed = true
+                    }
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: width, height: height)
+                    .clipped()
+            }
 
             if isCurrent, let videoURL = item.previewVideoURL {
                 LoopingVideoBackgroundView(
@@ -900,6 +971,7 @@ private struct HeroSlide: View {
                 .frame(width: width, height: height)
             }
         }
+        .onChange(of: imageURL) { _ in imageLoadFailed = false }
     }
 
     private func heroPlaceholder(showsProgress: Bool) -> some View {
@@ -1228,6 +1300,7 @@ private struct HomeShelfSection: View {
     let atmosphereSecondary: Color
     let onSelect: (Wallpaper) -> Void
     let onSeeAll: () -> Void
+    var skeletonTimedOut: Bool = false
     @State private var isSeeAllHovered = false
 
     var body: some View {
@@ -1246,11 +1319,16 @@ private struct HomeShelfSection: View {
             }
 
             if wallpapers.isEmpty {
-                HorizontalScrollSkeleton(
-                    primaryColor: atmospherePrimary.opacity(0.12),
-                    secondaryColor: atmosphereSecondary.opacity(0.08)
-                )
-                .frame(height: 158)
+                if !skeletonTimedOut {
+                    HorizontalScrollSkeleton(
+                        primaryColor: atmospherePrimary.opacity(0.12),
+                        secondaryColor: atmosphereSecondary.opacity(0.08)
+                    )
+                    .frame(height: 158)
+                } else {
+                    HomeShelfEmptyFallback()
+                        .frame(height: 158)
+                }
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 18) {
@@ -1295,7 +1373,9 @@ struct HomeShelfCard: View {
                 KFImage(wallpaper.thumbURL)
                     .fade(duration: 0.3)
                     .placeholder { _ in
-                        SkeletonCard(width: cardSize.width, height: cardSize.height, cornerRadius: 18)
+                        // 静态占位：不用 SkeletonCard（shimmer），缩略图加载失败也不会常驻动画
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
                     }
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -1537,6 +1617,7 @@ private struct HomeMediaSection: View {
     let atmosphereSecondary: Color
     let onSelect: (MediaItem) -> Void
     let onSeeAll: () -> Void
+    var skeletonTimedOut: Bool = false
     @State private var isSeeAllHovered = false
 
     var body: some View {
@@ -1555,11 +1636,16 @@ private struct HomeMediaSection: View {
             }
 
             if mediaItems.isEmpty {
-                HorizontalScrollSkeleton(
-                    primaryColor: atmospherePrimary.opacity(0.12),
-                    secondaryColor: atmosphereSecondary.opacity(0.08)
-                )
-                .frame(height: 158)
+                if !skeletonTimedOut {
+                    HorizontalScrollSkeleton(
+                        primaryColor: atmospherePrimary.opacity(0.12),
+                        secondaryColor: atmosphereSecondary.opacity(0.08)
+                    )
+                    .frame(height: 158)
+                } else {
+                    HomeShelfEmptyFallback()
+                        .frame(height: 158)
+                }
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 18) {
@@ -1788,5 +1874,68 @@ final class HomeAtmosphereController: ObservableObject {
     func pause() {
         loadTask?.cancel()
         loadTask = nil
+    }
+}
+
+// MARK: - 首页加载失败静态占位（无动画）
+/// 数据源不可达（如 wallhaven 直连超时）时替代骨架屏：
+/// shimmer repeatForever 永挂会每帧驱动主窗口全量重排，是后台 CPU 空烧的根因。
+private struct HomeLoadFailedFallback: View {
+    let width: CGFloat
+    let height: CGFloat
+    let onRetry: () -> Void
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(hex: "2a2a4a"),
+                    Color(hex: "1a1a2e"),
+                    Color(hex: "0f0f1a")
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .overlay(
+                LinearGradient(
+                    colors: [Color.clear, Color.black.opacity(0.35)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+
+            VStack(spacing: 12) {
+                Image(systemName: "wifi.exclamationmark")
+                    .font(.system(size: 30, weight: .light))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text("首页内容加载失败，请检查网络")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+                Button(action: onRetry) {
+                    Text("重试")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.white.opacity(0.16)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(width: width, height: height)
+    }
+}
+
+/// shelf 加载失败静态占位（无动画）
+private struct HomeShelfEmptyFallback: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+            Text("暂无内容")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white.opacity(0.45))
+        }
+        .frame(maxWidth: .infinity)
     }
 }

@@ -284,3 +284,42 @@ final class AppLogger: @unchecked Sendable {
         return destination
     }
 }
+
+// MARK: - repeatForever 动画存活追踪器（诊断后台 CPU 空转）
+/// 可常驻的动画组件在 onAppear/onDisappear 进出注册表；
+/// 心跳每 20s 打印仍存活的动画清单，用于对照 sample 定位常驻空转来源。
+final class RepeatForeverAnimationTracker: @unchecked Sendable {
+    static let shared = RepeatForeverAnimationTracker()
+
+    private let lock = NSLock()
+    private var alive: [String: Int] = [:]
+    private var heartbeatTimer: Timer?
+
+    func enter(_ tag: String) {
+        lock.lock()
+        alive[tag, default: 0] += 1
+        let count = alive[tag] ?? 0
+        lock.unlock()
+        AppLogger.error(.general, "[AnimTracker] enter \(tag) | alive=\(count)")
+    }
+
+    func exit(_ tag: String) {
+        lock.lock()
+        let count = max(0, (alive[tag] ?? 1) - 1)
+        if count == 0 { alive[tag] = nil } else { alive[tag] = count }
+        lock.unlock()
+        AppLogger.error(.general, "[AnimTracker] exit \(tag) | alive=\(count)")
+    }
+
+    func startHeartbeat() {
+        guard heartbeatTimer == nil else { return }
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.lock.lock()
+            let snapshot = self.alive
+            self.lock.unlock()
+            let names = snapshot.map { "\($0.key)x\($0.value)" }.sorted().joined(separator: ",")
+            AppLogger.error(.general, "[AnimTracker] heartbeat alive=\(snapshot.isEmpty ? "none" : names)")
+        }
+    }
+}

@@ -910,8 +910,17 @@ private struct LoadingOverlayView: View {
                         .rotationEffect(.degrees(rotationAngle))
                 }
                 .onAppear {
+                    RepeatForeverAnimationTracker.shared.enter("ADS-Spinner")
                     withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) {
                         rotationAngle = 360
+                    }
+                }
+                .onDisappear {
+                    RepeatForeverAnimationTracker.shared.exit("ADS-Spinner")
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        rotationAngle = 0
                     }
                 }
 

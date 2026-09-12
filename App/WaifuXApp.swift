@@ -408,6 +408,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         AppResponsivenessMonitor.startIfNeeded()
         AppResponsivenessMonitor.noteScenePhase("didFinishLaunching")
         AppResponsivenessMonitor.noteAppActive(NSApp.isActive)
+
+        // [AnimTracker] 后台 CPU 诊断：动画存活心跳 + 主窗口遮挡状态
+        RepeatForeverAnimationTracker.shared.startHeartbeat()
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let win = note.object as? NSWindow else { return }
+            let state = win.occlusionState.contains(.visible) ? "visible" : "occluded"
+            let name = win.title.isEmpty ? (win.identifier?.rawValue ?? "?") : win.title
+            AppLogger.error(.general, "[AnimTracker] occlusion \(name) -> \(state)")
+        }
         // ⚠️ ⚠️ 关键：所有 UserDefaults 读取都必须在 applicationDidFinishLaunching 中延迟恢复！
         // 绝对不能在任何单例 init() 中读 UserDefaults，macOS 26+ 会触发 _CFXPreferences
         // 隐式递归导致主线程栈溢出崩溃（EXC_BAD_ACCESS SIGSEGV, 174K 层递归）

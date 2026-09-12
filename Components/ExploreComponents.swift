@@ -16,8 +16,14 @@ public struct LoadingMoreIndicator: View {
                 .foregroundStyle(.white.opacity(0.7))
                 .rotationEffect(.degrees(isAnimating ? 360 : 0))
                 .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: isAnimating)
-                .onAppear { isAnimating = true }
-                .onDisappear { isAnimating = false }
+                .onAppear {
+                    RepeatForeverAnimationTracker.shared.enter("LoadingMore")
+                    isAnimating = true
+                }
+                .onDisappear {
+                    RepeatForeverAnimationTracker.shared.exit("LoadingMore")
+                    isAnimating = false
+                }
             
             Text(t("loading.simple"))
                 .font(.system(size: 12, weight: .medium))

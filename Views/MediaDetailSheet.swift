@@ -4996,8 +4996,17 @@ private struct LoadingOverlayView: View {
                         .rotationEffect(.degrees(rotationAngle))
                 }
                 .onAppear {
+                    RepeatForeverAnimationTracker.shared.enter("MDS-Spinner")
                     withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) {
                         rotationAngle = 360
+                    }
+                }
+                .onDisappear {
+                    RepeatForeverAnimationTracker.shared.exit("MDS-Spinner")
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        rotationAngle = 0
                     }
                 }
 
@@ -5832,8 +5841,17 @@ private struct PulseModifier: ViewModifier {
         content
             .opacity(isPulsing ? 1 : 0.5)
             .onAppear {
+                RepeatForeverAnimationTracker.shared.enter("Pulse")
                 withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
                     isPulsing = true
+                }
+            }
+            .onDisappear {
+                RepeatForeverAnimationTracker.shared.exit("Pulse")
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    isPulsing = false
                 }
             }
     }
