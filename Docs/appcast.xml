@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.149</title>
-      <sparkle:version>38.0.149</sparkle:version>
-      <sparkle:shortVersionString>38.0.149</sparkle:shortVersionString>
-      <pubDate>Thu, 10 Sep 2026 11:38:22 +0800</pubDate>
+      <title>Version 38.0.150</title>
+      <sparkle:version>38.0.150</sparkle:version>
+      <sparkle:shortVersionString>38.0.150</sparkle:shortVersionString>
+      <pubDate>Sat, 12 Sep 2026 19:14:14 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.149</h3><ul><li>fix: 修复部分场景壁纸兼容性问题 (9c6f9f6)</li><li>feat: 修复更新Homebrew Cask的Warning (f45e8d1)</li></ul>
+<h3>WaifuX 38.0.150</h3><ul><li><strong>fix(ci): cask postflight 三步改为非致命，适配 brew 6 cask 沙箱 (b1ce426)</strong><ul><li>Homebrew 6 起 postflight_steps 的 run 在 seatbelt 沙箱内执行，</li><li>pkd 拒绝 pluginkit 的 PKDiscoverAll 全量发现（用户机装机失败），</li><li>lsregister 的 Spotlight 扫描在部分机器也会 -10822 失败，</li><li>killall 在 WallpaperAgent 未运行时 exit 1。</li><li>三步均加 must_succeed: false（尽力而为），扩展注册由 App 启动时</li><li>LaunchServices 自动注册兜底。同步 tap 修复 commit 47916bd，</li><li>避免下次发版 CI 用旧模板覆盖 tap 上的修复。</li></ul></li><li>docs: 更新各语言README中的渲染相关说明 (23ccb74)</li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.149/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.150/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />
