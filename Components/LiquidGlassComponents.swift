@@ -260,7 +260,10 @@ struct LiquidGlassLoadingView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            CustomProgressView(tint: LiquidGlassColors.primaryPink)
+            CustomProgressView(
+                tint: LiquidGlassColors.primaryPink,
+                trackerTag: "LiquidGlassLoadingView"
+            )
 
             Text(message)
                 .font(.system(size: 12, weight: .medium))

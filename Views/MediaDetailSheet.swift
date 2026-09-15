@@ -1749,7 +1749,7 @@ struct MediaDetailSheet: View {
             } label: {
                 HStack(spacing: 10) {
                     if isSettingWallpaper {
-                        CustomProgressView(tint: .white)
+                        CustomProgressView(tint: .white, trackerTag: "MediaDetailSheet.setWallpaper")
                             .scaleEffect(0.8)
                     } else {
                         Image(systemName: "play.fill")
@@ -1791,7 +1791,7 @@ struct MediaDetailSheet: View {
                 } label: {
                     ZStack {
                         if isDownloading {
-                            CustomProgressView(tint: .white)
+                            CustomProgressView(tint: .white, trackerTag: "MediaDetailSheet.download")
                                 .scaleEffect(0.7)
                         }
                         DetailSheetCircleIconLabel(systemName: downloadActionSystemName)

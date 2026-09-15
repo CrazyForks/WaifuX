@@ -466,10 +466,11 @@ struct HomeContentView: View {
 
         return ZStack(alignment: .leading) {
             HStack(spacing: 0) {
-                ForEach(displayItems) { slide in
+                ForEach(Array(displayItems.enumerated()), id: \.element.id) { displayIndex, slide in
                     HeroSlide(
                         item: slide.item,
-                        isCurrent: slide.item.id == currentHeroID && isTabActive,
+                        // 克隆项与真实项共享 HeroItem.id；用 display index 才能保证同一时刻只有一个视频/占位动画。
+                        isCurrent: displayIndex == currentCarouselDisplayIndex && isTabActive,
                         width: width,
                         height: height
                     )
@@ -949,7 +950,7 @@ private struct HeroSlide: View {
                     .cacheOriginalImage()
                     .fade(duration: 0.25)
                     .placeholder { _ in
-                        heroPlaceholder(showsProgress: true)
+                        heroPlaceholder(showsProgress: isCurrent)
                     }
                     .retry(maxCount: 2, interval: .seconds(2))
                     .onFailure { err in
@@ -996,7 +997,7 @@ private struct HeroSlide: View {
 
             Group {
                 if showsProgress {
-                    CustomProgressView(tint: .white)
+                    CustomProgressView(tint: .white, trackerTag: "HomeHeroPlaceholder")
                 } else {
                     Image(systemName: "photo.fill")
                         .font(.system(size: 34, weight: .light))

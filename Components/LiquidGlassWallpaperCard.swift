@@ -22,7 +22,10 @@ struct LiquidGlassWallpaperCard: View {
                             ZStack {
                                 Rectangle()
                                     .fill(LiquidGlassColors.glassWhiteSubtle)
-                                CustomProgressView(tint: LiquidGlassColors.primaryPink)
+                                CustomProgressView(
+                                    tint: LiquidGlassColors.primaryPink,
+                                    trackerTag: "LiquidGlassWallpaperCard"
+                                )
                             }
                         }
                         .resizable()

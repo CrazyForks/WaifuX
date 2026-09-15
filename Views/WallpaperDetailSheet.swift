@@ -738,7 +738,7 @@ struct WallpaperDetailSheet: View {
             } label: {
                 HStack(spacing: 10) {
                     if isSettingWallpaper {
-                        CustomProgressView(tint: .white)
+                        CustomProgressView(tint: .white, trackerTag: "WallpaperDetailSheet.setWallpaper")
                             .scaleEffect(0.8)
                     } else {
                         Image(systemName: "play.fill")

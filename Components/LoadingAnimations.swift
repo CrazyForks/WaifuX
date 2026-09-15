@@ -433,7 +433,10 @@ struct OptimizedLoadingView: View {
     var body: some View {
         if showSkeleton {
             VStack(spacing: 20) {
-                CustomProgressView(tint: LiquidGlassColors.primaryPink)
+                CustomProgressView(
+                    tint: LiquidGlassColors.primaryPink,
+                    trackerTag: "OptimizedLoadingView.skeleton"
+                )
                     .scaleEffect(1.2)
 
                 Text(message)
@@ -444,7 +447,10 @@ struct OptimizedLoadingView: View {
         } else {
             // 简单的 loading spinner
             VStack(spacing: 16) {
-                CustomProgressView(tint: LiquidGlassColors.primaryPink)
+                CustomProgressView(
+                    tint: LiquidGlassColors.primaryPink,
+                    trackerTag: "OptimizedLoadingView.simple"
+                )
 
                 Text(message)
                     .font(.system(size: 12, weight: .medium))
@@ -459,7 +465,10 @@ struct OptimizedLoadingView: View {
 struct PaginationLoadingView: View {
     var body: some View {
         HStack(spacing: 12) {
-            CustomProgressView(tint: LiquidGlassColors.primaryPink)
+            CustomProgressView(
+                tint: LiquidGlassColors.primaryPink,
+                trackerTag: "PaginationLoadingView"
+            )
 
             Text(t("loadMore"))
                 .font(.system(size: 13, weight: .medium))

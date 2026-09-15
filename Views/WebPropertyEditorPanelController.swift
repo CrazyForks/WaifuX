@@ -334,7 +334,9 @@ final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
         }
 
         Task { await loadAndInjectData() }
-        scheduleApply()
+        // 删除覆盖值后，renderer 的局部 setProperties 不会清除旧运行时值；
+        // Scene / SceneConfig 必须重载同一场景，才能回到 scene.json/project.json 默认值。
+        scheduleApply(reloadScene: currentType == .scene || currentType == .sceneConfig)
     }
 
     func handleSelectFile(key: String, isDirectory: Bool) {
@@ -394,7 +396,7 @@ final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
 
     // MARK: - Apply to Renderer
 
-    private func scheduleApply() {
+    private func scheduleApply(reloadScene: Bool = false) {
         applyTask?.cancel()
         applyTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -405,7 +407,10 @@ final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
                 switch currentType {
                 case .scene:
                     let json = SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path)
-                    try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(userProperties: json)
+                    try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(
+                        userProperties: json,
+                        reloadScene: reloadScene
+                    )
 
                 case .web:
                     let doc = try WebWallpaperDesignService.loadDocumentFromDisk(for: path)
@@ -422,7 +427,10 @@ final class WebPropertyEditorPanelController: NSObject, NSPopoverDelegate {
                         userPropertiesJSON: baseJSON,
                         for: path
                     )
-                    try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(userProperties: mergedJSON)
+                    try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(
+                        userProperties: mergedJSON,
+                        reloadScene: reloadScene
+                    )
 
                 case .sceneDesign:
                     // Scene design changes are applied via LiquidGlassClockOverlayManager.rebuildAll()

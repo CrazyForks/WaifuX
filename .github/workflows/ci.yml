@@ -66,6 +66,9 @@ jobs:
                   restore-keys: |
                       ${{ runner.os }}-spm-
 
+            - name: Check Homebrew cask template
+              run: python3 scripts/generate-homebrew-cask.py --check
+
             - name: Read Version
               id: version
               run: |
@@ -611,28 +614,41 @@ jobs:
                   # 等待 Release 资产可下载（刚创建的 Release 偶尔有几秒传播延迟）
                   echo "等待 DMG 可下载: $DMG_URL"
                   for i in {1..6}; do
-                    if curl -sL -o /tmp/WaifuX.dmg "$DMG_URL" && [ -s /tmp/WaifuX.dmg ]; then
+                    if curl --fail --silent --show-error --location --retry 2 \
+                      --output /tmp/WaifuX.dmg "$DMG_URL" && \
+                      [ -s /tmp/WaifuX.dmg ] && \
+                      [ "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576 ]; then
                       echo "✅ DMG 下载成功"
                       break
                     fi
                     echo "attempt $i: 尚未就绪，10s 后重试..."
+                    rm -f /tmp/WaifuX.dmg
                     sleep 10
                   done
-                  if [ ! -s /tmp/WaifuX.dmg ]; then
-                    echo "❌ DMG 下载失败，跳过 tap 更新"
-                    exit 0
+                  if [ ! -s /tmp/WaifuX.dmg ] || [ "$(wc -c < /tmp/WaifuX.dmg)" -le 1048576 ]; then
+                    echo "❌ DMG 下载失败，tap 更新失败"
+                    exit 1
                   fi
 
-                  SHA256=$(shasum -a 256 /tmp/WaifuX.dmg | cut -d' ' -f1)
+                  SHA256=$(python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' /tmp/WaifuX.dmg)
                   echo "版本: $VERSION  SHA256: $SHA256"
 
                   # 克隆 tap 仓库（用 PAT 认证）
                   git clone --depth 1 "https://x-access-token:${TAP_REPO_TOKEN}@github.com/jipika/homebrew-waifux.git" /tmp/tap
                   cd /tmp/tap
 
-                  # 用 base64 模板避免 YAML/Shell 引号转义问题（与 update-homebrew-tap.yml 一致）
-                  echo "Y2FzayAid2FpZnV4IiBkbwogIHZlcnNpb24gIiN7VkVSU0lPTn0iCiAgc2hhMjU2ICIje1NIQTI1Nn0iCgogIHVybCAiaHR0cHM6Ly9naXRodWIuY29tL2ppcGlrYS9XYWlmdVgvcmVsZWFzZXMvZG93bmxvYWQvdiN7VkVSU0lPTn0vV2FpZnVYLmRtZyIKICBuYW1lICJXYWlmdVgiCiAgZGVzYyAiQmVhdXRpZnVsIGFuaW1lIHdhbGxwYXBlciBhbmQgY29udGVudCBicm93c2VyIgogIGhvbWVwYWdlICJodHRwczovL2dpdGh1Yi5jb20vamlwaWthL1dhaWZ1WCIKCiAgbGl2ZWNoZWNrIGRvCiAgICB1cmwgOnVybAogICAgcmVnZXgoL152PyhcZCsoPzpcLlxkKykrKSQvaSkKICBlbmQKCiAgYXV0b191cGRhdGVzIHRydWUKCiAgYXBwICJXYWlmdVguYXBwIgoKICAjIGJyZXcg5pu05paw5piv5YWI5Yig5penIGJ1bmRsZSDlho3mi7fmlrAgYnVuZGxl77yMbWFjT1Mg5Lya6YeN572u5omp5bGV5ZCv55So54q25oCB44CCCiAgIyBsc3JlZ2lzdGVyIC1mIOmHjeaWsOazqOWGjCBBcHAgYnVuZGxl77yI5ZCr5YaF5bWMIC5hcHBleO+8ie+8jAogICMgcGx1Z2lua2l0IC1lIHVzZSDmmL7lvI/lkK/nlKjmianlsZXvvIwKICAjIOacgOWQjumHjeWQryBXYWxscGFwZXJBZ2VudCDkvb/lhbbph43mlrDliqDovb3mianlsZXliJfooajvvIjmuIXpmaTlhoXlrZjnvJPlrZjvvInjgIIKICBwb3N0ZmxpZ2h0X3N0ZXBzIGRvCiAgICBydW4gIi9TeXN0ZW0vTGlicmFyeS9GcmFtZXdvcmtzL0NvcmVTZXJ2aWNlcy5mcmFtZXdvcmsvRnJhbWV3b3Jrcy9MYXVuY2hTZXJ2aWNlcy5mcmFtZXdvcmsvU3VwcG9ydC9sc3JlZ2lzdGVyIiwKICAgICAgYXJnczogWyItZiIsICJ7e3N0YWdlZF9wYXRofX0vV2FpZnVYLmFwcCJdCiAgICBydW4gIi91c3IvYmluL3BsdWdpbmtpdCIsCiAgICAgIGFyZ3M6IFsiLWUiLCAidXNlIiwgIi1pIiwgImNvbS53YWlmdXguYXBwLndhbGxwYXBlcmV4dGVuc2lvbiJdCiAgICBydW4gIi91c3IvYmluL2tpbGxhbGwiLAogICAgICBhcmdzOiBbIldhbGxwYXBlckFnZW50Il0sCiAgICAgIHByaW50X3N0ZGVycjogZmFsc2UKICBlbmQKCiAgemFwIHRyYXNoOiBbCiAgICAifi9MaWJyYXJ5L0FwcGxpY2F0aW9uIFN1cHBvcnQvV2FpZnVYIiwKICAgICJ+L0xpYnJhcnkvQ2FjaGVzL2NvbS53YWlmdXguYXBwIiwKICAgICJ+L0xpYnJhcnkvUHJlZmVyZW5jZXMvY29tLndhaWZ1eC5hcHAucGxpc3QiLAogICAgIn4vTGlicmFyeS9TYXZlZCBBcHBsaWNhdGlvbiBTdGF0ZS9jb20ud2FpZnV4LmFwcC5zYXZlZFN0YXRlIiwKICBdCmVuZAo=" | base64 -d > Casks/waifux.rb
-                  sed -i '' "s/#{VERSION}/$VERSION/g; s/#{SHA256}/$SHA256/" Casks/waifux.rb
+                  # Render the cask from the canonical repository template.
+                  python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
+                    --check
+                  python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
+                    --version "$VERSION" \
+                    --sha256 "$SHA256" \
+                    --output Casks/waifux.rb
+                  python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
+                    --check-file Casks/waifux.rb \
+                    --version "$VERSION" \
+                    --sha256 "$SHA256"
+                  ruby -c Casks/waifux.rb
 
                   git config user.name "github-actions[bot]"
                   git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -641,9 +657,19 @@ jobs:
                     echo "无变更，跳过"
                   else
                     git commit -m "Bump waifux to v${VERSION}"
-                    git push
+                    git push origin HEAD:main
                     echo "✅ homebrew tap 已更新到 v${VERSION}"
                   fi
+
+                  # Validate the exact file present on the remote branch after push.
+                  git fetch origin main --depth=1
+                  git show FETCH_HEAD:Casks/waifux.rb > /tmp/waifux-cask-pushed.rb
+                  cmp -s Casks/waifux.rb /tmp/waifux-cask-pushed.rb
+                  python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
+                    --check-file /tmp/waifux-cask-pushed.rb \
+                    --version "$VERSION" \
+                    --sha256 "$SHA256"
+                  ruby -c /tmp/waifux-cask-pushed.rb
 
             - name: Build (PRs)
               if: github.event_name == 'pull_request'

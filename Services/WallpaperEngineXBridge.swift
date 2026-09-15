@@ -1339,9 +1339,12 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
     }
 
-    /// 刷新当前壁纸的用户属性（通过重启 wallpaper-wgpu 进程）
-    /// - Parameter userProperties: 用户属性覆盖 JSON
-    func refreshWallpaperProperties(userProperties: String?) async throws {
+    /// 刷新当前壁纸的用户属性。
+    /// - Parameters:
+    ///   - userProperties: 用户属性覆盖 JSON
+    ///   - reloadScene: 是否重载当前场景。重置覆盖值时必须重载，
+    ///     因为 wallpaper-control 的 setProperties 是局部更新，缺失键会保留旧运行时值。
+    func refreshWallpaperProperties(userProperties: String?, reloadScene: Bool = false) async throws {
         guard let path = lastWallpaperPath else {
             print("[WallpaperEngineXBridge] ❌ refreshWallpaperProperties: lastWallpaperPath 为空，没有正在运行的壁纸")
             throw WallpaperEngineError.executionFailed("没有正在运行的壁纸")
@@ -1350,14 +1353,28 @@ final class WallpaperEngineXBridge: ObservableObject {
             print("[WallpaperEngineXBridge] ❌ refreshWallpaperProperties: 当前壁纸不是场景类型 (isControllingExternalEngine=\(isControllingExternalEngine), activeRenderKind=\(String(describing: activeRenderKind)))")
             throw WallpaperEngineError.executionFailed("当前壁纸不是场景类型")
         }
-        print("[WallpaperEngineXBridge] refreshWallpaperProperties: 刷新壁纸属性 path=\(path)")
-        // 改为写壁纸控制文件热更新属性，不再重启进程
+        print("[WallpaperEngineXBridge] refreshWallpaperProperties: 刷新壁纸属性 path=\(path) reloadScene=\(reloadScene)")
         let screens = activeTargetScreens().filter { screen in
             let screenID = screen.wallpaperScreenIdentifier
             let fingerprint = screen.wallpaperScreenFingerprint
             let state = screenRenderStates[screenID] ?? screenRenderStates.values.first { $0.screenFingerprint == fingerprint }
             return state?.path == path || screenRenderStates.isEmpty
         }
+
+        // wallpaper-control 的 setProperties 是局部更新：缺失的键会保留
+        // renderer 当前值。因此删除覆盖项（重置默认值）不能只写一个空/部分
+        // properties 字典，必须让 renderer 从 scene.json/project.json 重新构建。
+        // 复用 setWallpaper 的同路径热切换分支，保留多屏、crop 和状态收尾逻辑。
+        if reloadScene {
+            try await setWallpaper(
+                path: path,
+                targetScreens: screens.isEmpty ? nil : screens,
+                userProperties: userProperties
+            )
+            return
+        }
+
+        // 普通单项修改仍走控制文件局部热更新，避免重建场景。
         var anyWritten = false
         for screen in screens {
             let screenID = screen.wallpaperScreenIdentifier

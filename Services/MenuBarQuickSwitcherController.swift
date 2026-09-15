@@ -47,7 +47,9 @@ final class MenuBarQuickSwitcherController: NSObject {
         relativeTo anchorView: NSView,
         targetScreen: NSScreen?,
         currentWallpaperURL: URL?,
+        canDesignCurrentWallpaper: Bool,
         onOpenSettings: @escaping () -> Void,
+        onOpenDesignWallpaper: @escaping () -> Void,
         onOpenDetail: @escaping (MainWallpaperDetailRequest) -> Void
     ) {
         if panel.isVisible {
@@ -60,13 +62,18 @@ final class MenuBarQuickSwitcherController: NSObject {
             self?.dismiss()
             onOpenSettings()
         }
+        viewModel.onOpenDesignWallpaper = { [weak self] in
+            self?.dismiss()
+            onOpenDesignWallpaper()
+        }
         viewModel.onOpenDetail = { [weak self] request in
             self?.dismiss()
             onOpenDetail(request)
         }
         viewModel.prepare(
             targetScreen: targetScreen,
-            currentWallpaperURL: currentWallpaperURL
+            currentWallpaperURL: currentWallpaperURL,
+            canDesignCurrentWallpaper: canDesignCurrentWallpaper
         )
         mountContentIfNeeded()
 
@@ -170,6 +177,33 @@ private final class MenuBarQuickSwitcherPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+private enum MenuBarQuickFolderSelectionStore {
+    private static let defaultsKey = "menu_bar_quick_switcher_folder_selections_v1"
+
+    static func load(scopeID: String) -> (found: Bool, folderIDs: [String]?) {
+        let selections = loadSelections()
+        guard let storedFolderIDs = selections[scopeID] else {
+            return (false, nil)
+        }
+        return (true, storedFolderIDs.isEmpty ? nil : storedFolderIDs)
+    }
+
+    static func save(_ folderIDs: [String]?, scopeID: String) {
+        var selections = loadSelections()
+        selections[scopeID] = folderIDs ?? []
+        guard let data = try? JSONEncoder().encode(selections) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+
+    private static func loadSelections() -> [String: [String]] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let selections = try? JSONDecoder().decode([String: [String]].self, from: data) else {
+            return [:]
+        }
+        return selections
+    }
+}
+
 @MainActor
 final class MenuBarQuickSwitcherViewModel: ObservableObject {
     /// Enough candidates for a real horizontal scroll; ~5 remain visible in the rail.
@@ -180,10 +214,12 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
     @Published private(set) var isApplying = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var previewWarmupToken = UUID()
+    @Published private(set) var canDesignCurrentWallpaper = false
     /// nil = 我的库（全部本地项目）；非空数组 = 选中的下载文件夹。
     @Published private(set) var selectedFolderIDs: [String]?
 
     var onOpenSettings: (() -> Void)?
+    var onOpenDesignWallpaper: (() -> Void)?
     var onApplied: (() -> Void)?
     var onOpenDetail: ((MainWallpaperDetailRequest) -> Void)?
 
@@ -214,17 +250,31 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
         onOpenDetail?(request)
     }
 
-    func prepare(targetScreen: NSScreen?, currentWallpaperURL: URL?) {
+    func openDesignWallpaper() {
+        guard canDesignCurrentWallpaper else { return }
+        onOpenDesignWallpaper?()
+    }
+
+    func prepare(
+        targetScreen: NSScreen?,
+        currentWallpaperURL: URL?,
+        canDesignCurrentWallpaper: Bool
+    ) {
         targetScreenID = targetScreen?.wallpaperScreenIdentifier
         targetScreenFingerprint = targetScreen?.wallpaperScreenFingerprint
+        self.canDesignCurrentWallpaper = canDesignCurrentWallpaper
         errorMessage = nil
 
         let schedulerConfig = activeSchedulerConfig()
-        // 左键面板和自动切换共用同一份文件夹范围。自动切换关闭时也要恢复用户上次
-        // 在菜单栏里选中的文件夹，否则每次重新打开都会错误回退到“我的库”。
-        let defaultFolderIDs = schedulerConfig?.folderIDs
-        let didChangeFolderSelection = selectedFolderIDs != defaultFolderIDs
-        selectedFolderIDs = defaultFolderIDs
+        let storedSelection = MenuBarQuickFolderSelectionStore.load(scopeID: folderSelectionScopeID)
+        let restoredFolderIDs = storedSelection.found
+            ? validatedFolderIDs(storedSelection.folderIDs)
+            : validatedFolderIDs(schedulerConfig?.folderIDs)
+        let didChangeFolderSelection = selectedFolderIDs != restoredFolderIDs
+        selectedFolderIDs = restoredFolderIDs
+        if !storedSelection.found, let restoredFolderIDs {
+            MenuBarQuickFolderSelectionStore.save(restoredFolderIDs, scopeID: folderSelectionScopeID)
+        }
 
         guard !batchItems.isEmpty, !didChangeFolderSelection else {
             replaceBatch(preferredCurrentURL: currentWallpaperURL, avoidPreviousBatch: false)
@@ -330,6 +380,10 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
     }
 
     func selectEntireLibrary() {
+        MenuBarQuickFolderSelectionStore.save(nil, scopeID: folderSelectionScopeID)
+        if selectedFolderIDs == nil, activeSchedulerConfig()?.folderIDs != nil {
+            persistFolderSelectionToScheduler(nil)
+        }
         updateFolderSelection(nil)
     }
 
@@ -371,8 +425,29 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
     private func updateFolderSelection(_ folderIDs: [String]?) {
         guard selectedFolderIDs != folderIDs else { return }
         selectedFolderIDs = folderIDs
+        MenuBarQuickFolderSelectionStore.save(folderIDs, scopeID: folderSelectionScopeID)
         persistFolderSelectionToScheduler(folderIDs)
         replaceBatch(preferredCurrentURL: nil, avoidPreviousBatch: false)
+    }
+
+    private var folderSelectionScopeID: String {
+        if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
+            return "global"
+        }
+        if let fingerprint = targetScreenFingerprint, !fingerprint.isEmpty {
+            return "display:\(fingerprint)"
+        }
+        if let screenID = targetScreenID, !screenID.isEmpty {
+            return "display-id:\(screenID)"
+        }
+        return "display:default"
+    }
+
+    private func validatedFolderIDs(_ folderIDs: [String]?) -> [String]? {
+        guard let folderIDs else { return nil }
+        let visibleFolderIDs = Set(availableFolders.map(\.id))
+        let validated = folderIDs.filter { visibleFolderIDs.contains($0) }
+        return validated.isEmpty ? nil : validated
     }
 
     private func persistFolderSelectionToScheduler(_ folderIDs: [String]?) {

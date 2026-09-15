@@ -281,6 +281,19 @@ private final class TaskQueueRowView: NSView {
 
 @MainActor
 final class StatusBarController: NSObject {
+    private enum WallpaperDesignTarget {
+        case web(String)
+        case scene(String)
+        case sceneDesign(String)
+
+        var wallpaperPath: String {
+            switch self {
+            case .web(let path), .scene(let path), .sceneDesign(let path):
+                return path
+            }
+        }
+    }
+
     // MARK: - 单例
     static let shared = StatusBarController()
 
@@ -433,8 +446,12 @@ final class StatusBarController: NSObject {
                 relativeTo: sender,
                 targetScreen: targetScreen,
                 currentWallpaperURL: targetScreen.flatMap { currentWallpaperURL(for: $0) },
+                canDesignCurrentWallpaper: resolvedWallpaperDesignTarget() != nil,
                 onOpenSettings: { [weak self] in
                     self?.openAppSettingsPanel()
+                },
+                onOpenDesignWallpaper: { [weak self] in
+                    self?.openWebWallpaperDesignPanel()
                 },
                 onOpenDetail: { [weak self] request in
                     MainNavigationRequestStore.requestWallpaperDetail(request)
@@ -675,27 +692,10 @@ final class StatusBarController: NSObject {
         let hasNativeWallpaper = videoWallpaperManager.isVideoWallpaperActive
         let hasExternalWallpaper = weBridge.isControllingExternalEngine
         let hasWallpaper = hasNativeWallpaper || hasExternalWallpaper
-        let shouldShowDesignWallpaperItem: Bool
-        if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
-            shouldShowDesignWallpaperItem = true
-            designWallpaperItem.representedObject = sceneWallpaperPath
-        } else if let wallpaperPath = weBridge.currentWallpaperPathForDesign {
-            if weBridge.isCurrentWallpaperWeb {
-                shouldShowDesignWallpaperItem = WebWallpaperDesignService.shared.hasEditableProperties(for: wallpaperPath)
-                designWallpaperItem.representedObject = wallpaperPath
-            } else if weBridge.isCurrentWallpaperScene {
-                shouldShowDesignWallpaperItem = true
-                designWallpaperItem.representedObject = wallpaperPath
-            } else {
-                shouldShowDesignWallpaperItem = false
-                designWallpaperItem.representedObject = nil
-            }
-        } else {
-            shouldShowDesignWallpaperItem = false
-            designWallpaperItem.representedObject = nil
-        }
-        designWallpaperItem.isHidden = !shouldShowDesignWallpaperItem
-        designWallpaperItem.isEnabled = shouldShowDesignWallpaperItem
+        let designTarget = resolvedWallpaperDesignTarget()
+        designWallpaperItem.representedObject = designTarget?.wallpaperPath
+        designWallpaperItem.isHidden = designTarget == nil
+        designWallpaperItem.isEnabled = designTarget != nil
 
         // 场景高级设置（仅在实时渲染场景壁纸时显示）
         let shouldShowSceneConfig = weBridge.isCurrentWallpaperScene
@@ -1429,37 +1429,43 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func openWebWallpaperDesignPanel() {
-        if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
-            presentEditorPopover { anchorView in
-                WebPropertyEditorPanelController.shared.presentSceneDesign(for: sceneWallpaperPath, from: anchorView)
-            }
-            return
-        }
-
-        guard let wallpaperPath = weBridge.currentWallpaperPathForDesign else {
+        guard let target = resolvedWallpaperDesignTarget() else {
             NSSound.beep()
             return
         }
-        if weBridge.isCurrentWallpaperWeb {
-            presentEditorPopover { anchorView in
+
+        presentEditorPopover { anchorView in
+            switch target {
+            case .web(let wallpaperPath):
                 WebPropertyEditorPanelController.shared.presentWeb(for: wallpaperPath, from: anchorView)
+            case .scene(let wallpaperPath):
+                WebPropertyEditorPanelController.shared.presentScene(for: wallpaperPath, from: anchorView)
+            case .sceneDesign(let wallpaperPath):
+                WebPropertyEditorPanelController.shared.presentSceneDesign(for: wallpaperPath, from: anchorView)
             }
-            return
+        }
+    }
+
+    private func resolvedWallpaperDesignTarget() -> WallpaperDesignTarget? {
+        if let sceneWallpaperPath = currentSceneDesignWallpaperPath() {
+            return .sceneDesign(sceneWallpaperPath)
+        }
+
+        guard let wallpaperPath = weBridge.currentWallpaperPathForDesign else {
+            return nil
+        }
+        if weBridge.isCurrentWallpaperWeb {
+            guard WebWallpaperDesignService.shared.hasEditableProperties(for: wallpaperPath) else {
+                return nil
+            }
+            return .web(wallpaperPath)
         }
         if weBridge.isCurrentWallpaperScene {
-            // 实时渲染模式下，显示属性编辑面板；否则显示文本设计面板
-            if UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled") {
-                presentEditorPopover { anchorView in
-                    WebPropertyEditorPanelController.shared.presentScene(for: wallpaperPath, from: anchorView)
-                }
-            } else {
-                presentEditorPopover { anchorView in
-                    WebPropertyEditorPanelController.shared.presentSceneDesign(for: wallpaperPath, from: anchorView)
-                }
-            }
-            return
+            return UserDefaults.standard.bool(forKey: "scene_realtime_rendering_enabled")
+                ? .scene(wallpaperPath)
+                : .sceneDesign(wallpaperPath)
         }
-        NSSound.beep()
+        return nil
     }
 
     private func presentEditorPopover(_ present: @escaping (NSView) -> Void) {

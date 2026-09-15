@@ -150,25 +150,24 @@ struct MenuBarQuickSwitcherView: View {
                         }
                     }
 
-                Button {
-                    viewModel.openDetail()
-                } label: {
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.system(size: 14, weight: .semibold))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(.white)
-                        .frame(width: 32, height: 32)
-                        .background(.ultraThinMaterial, in: Circle())
-                        .background(Color.black.opacity(0.22), in: Circle())
-                        .overlay {
-                            Circle()
-                                .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.8)
+                HStack(spacing: 8) {
+                    if viewModel.canDesignCurrentWallpaper {
+                        heroActionButton(
+                            systemName: "paintbrush.pointed",
+                            help: t("design.designWallpaper")
+                        ) {
+                            viewModel.openDesignWallpaper()
                         }
+                    }
+
+                    heroActionButton(
+                        systemName: "arrow.up.right.square",
+                        help: t("statusbar.openCurrentWallpaper")
+                    ) {
+                        viewModel.openDetail()
+                    }
                 }
-                .buttonStyle(QuickSwitcherPressButtonStyle())
-                .help(t("statusbar.openCurrentWallpaper"))
                 .padding(10)
-                .disabled(viewModel.isApplying)
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "photo.on.rectangle.angled")
@@ -187,6 +186,30 @@ struct MenuBarQuickSwitcherView: View {
         .animation(crossfadeAnimation, value: viewModel.selectedItem?.id)
         .animation(crossfadeAnimation, value: viewModel.isApplying)
         .animation(crossfadeAnimation, value: viewModel.errorMessage)
+    }
+
+    private func heroActionButton(
+        systemName: String,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 14, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .background(.ultraThinMaterial, in: Circle())
+                .background(Color.black.opacity(0.22), in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.8)
+                }
+        }
+        .buttonStyle(QuickSwitcherPressButtonStyle())
+        .help(help)
+        .accessibilityLabel(Text(help))
+        .disabled(viewModel.isApplying)
     }
 
     private var thumbnailRail: some View {

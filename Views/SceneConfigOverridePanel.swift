@@ -135,7 +135,9 @@ final class SceneConfigOverrideViewModel: ObservableObject {
     func resetAll() {
         SceneConfigOverrideService.resetAllOverrides(for: wallpaperPath)
         load()
-        scheduleApply()
+        // setProperties 是局部更新；删除覆盖后必须重载场景，才能清掉 renderer
+        // 中仍保留的旧运行时值并恢复 scene.json 默认值。
+        scheduleApply(reloadScene: true)
     }
 
     func reset(key: SceneConfigOverrideKey) {
@@ -144,10 +146,12 @@ final class SceneConfigOverrideViewModel: ObservableObject {
             let defaultVal = sceneDefaults[key] ?? defaultCodableValue(for: key)
             rows[index].currentValue = defaultVal
         }
-        scheduleApply()
+        // 单项重置同样会删除一个 override；局部 setProperties 无法清除 renderer
+        // 中对应的旧值，因此与“重置全部”一样需要重载场景。
+        scheduleApply(reloadScene: true)
     }
 
-    private func scheduleApply() {
+    private func scheduleApply(reloadScene: Bool = false) {
         applyTask?.cancel()
         applyTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -157,7 +161,10 @@ final class SceneConfigOverrideViewModel: ObservableObject {
                 for: wallpaperPath
             )
             do {
-                try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(userProperties: mergedJSON)
+                try await WallpaperEngineXBridge.shared.refreshWallpaperProperties(
+                    userProperties: mergedJSON,
+                    reloadScene: reloadScene
+                )
             } catch {
                 print("[SceneConfigOverridePanel] 场景配置更新失败: \(error.localizedDescription)")
             }

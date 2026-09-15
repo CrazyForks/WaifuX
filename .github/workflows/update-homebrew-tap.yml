@@ -26,32 +26,74 @@ jobs:
           token: ${{ secrets.TAP_REPO_TOKEN }}
           path: tap
 
+      - name: Checkout WaifuX source
+        uses: actions/checkout@v4
+        with:
+          repository: jipika/WaifuX
+          ref: main
+          path: source
+          sparse-checkout: |
+            packaging/homebrew/waifux.rb.in
+            scripts/generate-homebrew-cask.py
+          sparse-checkout-cone-mode: false
+
       - name: Extract Version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          elif [ -n "$RELEASE_TAG" ]; then
+            VERSION="${RELEASE_TAG#v}"
           else
-            VERSION=${GITHUB_REF_NAME#v}
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "Invalid release version: $VERSION"
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download DMG and Compute SHA256
+        id: download
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           DMG_URL="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX.dmg"
-          curl -sL -o /tmp/WaifuX.dmg "$DMG_URL"
-          SHA256=$(shasum -a 256 /tmp/WaifuX.dmg | cut -d ' ' -f 1)
-          echo "sha256=$SHA256" >> "$GITHUB_ENV"
+          for i in {1..6}; do
+            if curl --fail --silent --show-error --location --retry 2 \
+              --output /tmp/WaifuX.dmg "$DMG_URL" && \
+              test -s /tmp/WaifuX.dmg && \
+              test "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576; then
+              break
+            fi
+            echo "attempt $i: DMG not ready, retrying in 10s..."
+            rm -f /tmp/WaifuX.dmg
+            sleep 10
+          done
+          test -s /tmp/WaifuX.dmg
+          test "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576
+          SHA256=$(python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' /tmp/WaifuX.dmg)
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Update Cask
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.download.outputs.sha256 }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
-          SHA256=${{ env.sha256 }}
-          # base64 编码避免所有 YAML / Shell 引号转义问题
-          echo "Y2FzayAid2FpZnV4IiBkbwogIHZlcnNpb24gIiN7VkVSU0lPTn0iCiAgc2hhMjU2ICIje1NIQTI1Nn0iCgogIHVybCAiaHR0cHM6Ly9naXRodWIuY29tL2ppcGlrYS9XYWlmdVgvcmVsZWFzZXMvZG93bmxvYWQvdiN7VkVSU0lPTn0vV2FpZnVYLmRtZyIKICBuYW1lICJXYWlmdVgiCiAgZGVzYyAiQmVhdXRpZnVsIGFuaW1lIHdhbGxwYXBlciBhbmQgY29udGVudCBicm93c2VyIgogIGhvbWVwYWdlICJodHRwczovL2dpdGh1Yi5jb20vamlwaWthL1dhaWZ1WCIKCiAgbGl2ZWNoZWNrIGRvCiAgICB1cmwgOnVybAogICAgcmVnZXgoL152PyhcZCsoPzpcLlxkKykrKSQvaSkKICBlbmQKCiAgYXV0b191cGRhdGVzIHRydWUKCiAgYXBwICJXYWlmdVguYXBwIgoKICAjIGJyZXcg5pu05paw5piv5YWI5Yig5penIGJ1bmRsZSDlho3mi7fmlrAgYnVuZGxl77yMbWFjT1Mg5Lya6YeN572u5omp5bGV5ZCv55So54q25oCB44CCCiAgIyBsc3JlZ2lzdGVyIC1mIOmHjeaWsOazqOWGjCBBcHAgYnVuZGxl77yI5ZCr5YaF5bWMIC5hcHBleO+8ieOAggogICMg5rOo5oSP77yaYnJldyA2IOi1tyBwb3N0ZmxpZ2h0X3N0ZXBzIOeahCBydW4g5ZyoIEhvbWVicmV3IOaymeeuseWGheaJp+ihjO+8jAogICMg57O757uf5a6I5oqk6L+b56iL5Lya5ouS57ud5rKZ566x5a6i5oi356uv77yacGtkIOaLkue7nSBwbHVnaW5raXQg55qEIFBLRGlzY292ZXJBbGwg5YWo6YeP5Y+R546w77yMCiAgIyBsc3JlZ2lzdGVyIOeahCBTcG90bGlnaHQg5omr5o+P5Zyo6YOo5YiG5py65Zmo5LiK5Lmf5LyaIC0xMDgyMiDlpLHotKXvvJsKICAjIGtpbGxhbGwg5ZyoIFdhbGxwYXBlckFnZW50IOacqui/kOihjOaXtuWQjOagtyBleGl0IDHjgIIKICAjIOS4ieatpemDveagh+iusCBtdXN0X3N1Y2NlZWQ6IGZhbHNlIOS9nOS4uuWwveWKm+iAjOS4uueahOWFnOW6le+8jOmBv+WFjeivr+S8pOaVtOS4quWuieijhe+8mwogICMg5omp5bGV5rOo5YaML+WQr+eUqOi/mOaciSBBcHAg5ZCv5Yqo5pe2IExhdW5jaFNlcnZpY2VzIOeahOiHquWKqOazqOWGjOWFnOW6leOAggogIHBvc3RmbGlnaHRfc3RlcHMgZG8KICAgIHJ1biAiL1N5c3RlbS9MaWJyYXJ5L0ZyYW1ld29ya3MvQ29yZVNlcnZpY2VzLmZyYW1ld29yay9GcmFtZXdvcmtzL0xhdW5jaFNlcnZpY2VzLmZyYW1ld29yay9TdXBwb3J0L2xzcmVnaXN0ZXIiLAogICAgICBhcmdzOiBbIi1mIiwgInt7c3RhZ2VkX3BhdGh9fS9XYWlmdVguYXBwIl0sCiAgICAgIG11c3Rfc3VjY2VlZDogZmFsc2UsCiAgICAgIHByaW50X3N0ZGVycjogZmFsc2UKICAgIHJ1biAiL3Vzci9iaW4vcGx1Z2lua2l0IiwKICAgICAgYXJnczogWyItZSIsICJ1c2UiLCAiLWkiLCAiY29tLndhaWZ1eC5hcHAud2FsbHBhcGVyZXh0ZW5zaW9uIl0sCiAgICAgIG11c3Rfc3VjY2VlZDogZmFsc2UsCiAgICAgIHByaW50X3N0ZGVycjogZmFsc2UKICAgIHJ1biAiL3Vzci9iaW4va2lsbGFsbCIsCiAgICAgIGFyZ3M6IFsiV2FsbHBhcGVyQWdlbnQiXSwKICAgICAgcHJpbnRfc3RkZXJyOiBmYWxzZSwKICAgICAgbXVzdF9zdWNjZWVkOiBmYWxzZQogIGVuZAoKICB6YXAgdHJhc2g6IFsKICAgICJ+L0xpYnJhcnkvQXBwbGljYXRpb24gU3VwcG9ydC9XYWlmdVgiLAogICAgIn4vTGlicmFyeS9DYWNoZXMvY29tLndhaWZ1eC5hcHAiLAogICAgIn4vTGlicmFyeS9QcmVmZXJlbmNlcy9jb20ud2FpZnV4LmFwcC5wbGlzdCIsCiAgICAifi9MaWJyYXJ5L1NhdmVkIEFwcGxpY2F0aW9uIFN0YXRlL2NvbS53YWlmdXguYXBwLnNhdmVkU3RhdGUiLAogIF0KZW5kCg==" | base64 -d > tap/Casks/waifux.rb
-          # 替换模板变量
-          sed -i "s/#{VERSION}/$VERSION/g; s/#{SHA256}/$SHA256/" tap/Casks/waifux.rb
+          # Render from the canonical WaifuX source template.
+          python3 source/scripts/generate-homebrew-cask.py --check
+          python3 source/scripts/generate-homebrew-cask.py \
+            --version "$VERSION" \
+            --sha256 "$SHA256" \
+            --output tap/Casks/waifux.rb
+          python3 source/scripts/generate-homebrew-cask.py \
+            --check-file tap/Casks/waifux.rb \
+            --version "$VERSION" \
+            --sha256 "$SHA256"
+          ruby -c tap/Casks/waifux.rb
 
       - name: Push to Tap Repo
         working-directory: tap
@@ -61,7 +103,17 @@ jobs:
           git add Casks/waifux.rb
           if git diff --cached --quiet; then
             echo "No changes to commit"
-            exit 0
+          else
+            git commit -m "Bump waifux to v${{ steps.version.outputs.version }}"
+            git push origin HEAD:main
           fi
-          git commit -m "Bump waifux to v${{ steps.version.outputs.version }}"
-          git push
+
+          # Validate the exact file present on the remote branch after push.
+          git fetch origin main --depth=1
+          git show FETCH_HEAD:Casks/waifux.rb > /tmp/waifux-cask-pushed.rb
+          cmp -s Casks/waifux.rb /tmp/waifux-cask-pushed.rb
+          python3 ../source/scripts/generate-homebrew-cask.py \
+            --check-file /tmp/waifux-cask-pushed.rb \
+            --version "${{ steps.version.outputs.version }}" \
+            --sha256 "${{ steps.download.outputs.sha256 }}"
+          ruby -c /tmp/waifux-cask-pushed.rb

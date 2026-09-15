@@ -1,34 +1,128 @@
 import SwiftUI
+import AppKit
+import QuartzCore
 
 // MARK: - 自定义加载指示器（解决 ProgressView 尺寸约束警告）
 struct CustomProgressView: View {
     var tint: Color = .white
     var scale: CGFloat = 1.0
+    private let trackerTag: String
 
-    @State private var isAnimating = false
+    init(
+        tint: Color = .white,
+        scale: CGFloat = 1.0,
+        trackerTag: String = "\(#fileID):\(#line)"
+    ) {
+        self.tint = tint
+        self.scale = scale
+        self.trackerTag = trackerTag
+    }
 
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(tint.opacity(0.3), lineWidth: 2)
-                .frame(width: 20 * scale, height: 20 * scale)
+        CoreAnimationSpinner(tint: tint)
+            .frame(width: 20 * scale, height: 20 * scale)
+            .onAppear {
+                RepeatForeverAnimationTracker.shared.enter(trackerTag)
+            }
+            .onDisappear {
+                RepeatForeverAnimationTracker.shared.exit(trackerTag)
+            }
+    }
+}
 
-            Circle()
-                .trim(from: 0, to: 0.7)
-                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .frame(width: 20 * scale, height: 20 * scale)
-                .rotationEffect(Angle(degrees: isAnimating ? 360 : 0))
+/// 把连续旋转交给 Core Animation，避免 SwiftUI repeatForever 每帧触发 ViewGraph/layout。
+private struct CoreAnimationSpinner: NSViewRepresentable {
+    let tint: Color
+
+    func makeNSView(context: Context) -> CoreAnimationSpinnerView {
+        CoreAnimationSpinnerView(tint: tint)
+    }
+
+    func updateNSView(_ nsView: CoreAnimationSpinnerView, context: Context) {
+        nsView.update(tint: tint)
+    }
+
+    static func dismantleNSView(_ nsView: CoreAnimationSpinnerView, coordinator: ()) {
+        nsView.stopAnimating()
+    }
+}
+
+private final class CoreAnimationSpinnerView: NSView {
+    private let trackLayer = CAShapeLayer()
+    private let arcLayer = CAShapeLayer()
+    private let rotationKey = "waifux.core-animation-spinner.rotation"
+    private let lineWidth: CGFloat = 2
+
+    init(tint: Color) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer = CALayer()
+        layer?.addSublayer(trackLayer)
+        layer?.addSublayer(arcLayer)
+
+        trackLayer.fillColor = NSColor.clear.cgColor
+        trackLayer.strokeColor = NSColor.white.withAlphaComponent(0.3).cgColor
+        trackLayer.lineWidth = lineWidth
+
+        arcLayer.fillColor = NSColor.clear.cgColor
+        arcLayer.lineCap = .round
+        arcLayer.lineWidth = lineWidth
+        arcLayer.strokeStart = 0
+        arcLayer.strokeEnd = 0.7
+        update(tint: tint)
+        startAnimating()
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func layout() {
+        super.layout()
+        let bounds = self.bounds
+        trackLayer.frame = bounds
+        arcLayer.frame = bounds
+
+        let diameter = min(bounds.width, bounds.height) - lineWidth
+        guard diameter > 0 else { return }
+        let pathRect = CGRect(
+            x: bounds.midX - diameter / 2,
+            y: bounds.midY - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+        let path = CGPath(ellipseIn: pathRect, transform: nil)
+        trackLayer.path = path
+        arcLayer.path = path
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopAnimating()
+        } else {
+            startAnimating()
         }
-        // repeatForever 永不自然结束；离开层级时用有限动画回落，终结渲染循环
-        .animation(isAnimating ? .linear(duration: 1).repeatForever(autoreverses: false) : .linear(duration: 0.25), value: isAnimating)
-        .onAppear {
-            RepeatForeverAnimationTracker.shared.enter("CustomProgressView")
-            isAnimating = true
-        }
-        .onDisappear {
-            RepeatForeverAnimationTracker.shared.exit("CustomProgressView")
-            isAnimating = false
-        }
+    }
+
+    func update(tint: Color) {
+        arcLayer.strokeColor = NSColor(tint).cgColor
+        needsLayout = true
+    }
+
+    func startAnimating() {
+        guard arcLayer.animation(forKey: rotationKey) == nil else { return }
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = 0
+        animation.toValue = Double.pi * 2
+        animation.duration = 1
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        arcLayer.add(animation, forKey: rotationKey)
+    }
+
+    func stopAnimating() {
+        arcLayer.removeAnimation(forKey: rotationKey)
     }
 }
 
