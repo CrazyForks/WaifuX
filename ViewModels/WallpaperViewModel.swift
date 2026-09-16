@@ -1832,8 +1832,18 @@ class WallpaperViewModel: ObservableObject {
                     return
                 }
             }
-            // 桌面：不写系统壁纸，用独立 overlay 显示（与系统壁纸同步关闭路径一致）
+            // 桌面：不写系统壁纸。扩展已在该屏渲染（活跃管线）时交给扩展原生显示，
+            // 不再叠加 overlay——macOS 27 上不透明 overlay 会成为菜单栏背板的采样源，
+            // 把采样和系统设置切壁纸一起冻住。仅扩展无活跃管线时用 overlay 兜底。
             for screen in screens {
+                guard let displayID = (screen.deviceDescription[
+                    NSDeviceDescriptionKey("NSScreenNumber")
+                ] as? NSNumber)?.uint32Value else {
+                    continue
+                }
+                if WallpaperExtensionSocketServer.shared.hasActivePipeline(for: displayID) {
+                    continue
+                }
                 let resolvedImageURL = imageURLByScreen[screen.wallpaperScreenIdentifier] ?? imageURL
                 await StaticImageWallpaperOverlayManager.shared.showPrepared(
                     imageURL: resolvedImageURL,

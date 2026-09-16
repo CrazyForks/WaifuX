@@ -802,13 +802,17 @@ final class StatusBarController: NSObject {
             if isGlobalDisplaySyncEnabled {
                 screenHasStaticOverlay = NSScreen.screens.contains {
                     StaticImageWallpaperOverlayManager.shared.imageURL(for: $0) != nil
+                        || LockScreenWallpaperService.shared.staticImageSourceURL(for: $0) != nil
                 }
                 screenHasLiveDynamicWallpaper = NSScreen.screens.contains { screen in
                     videoWallpaperManager.hasActiveWallpaper(on: screen)
                         || weBridge.hasLivePresentation(on: screen)
                 }
             } else {
+                // 扩展本地解码静态图时不建 overlay（交给扩展原生渲染），
+                // 用扩展的静态图源登记补足「该屏有静态壁纸」信号。
                 screenHasStaticOverlay = StaticImageWallpaperOverlayManager.shared.imageURL(for: screen) != nil
+                    || LockScreenWallpaperService.shared.staticImageSourceURL(for: screen) != nil
                 screenHasLiveDynamicWallpaper = videoWallpaperManager.hasActiveWallpaper(on: screen)
                     || weBridge.hasLivePresentation(on: screen)
             }

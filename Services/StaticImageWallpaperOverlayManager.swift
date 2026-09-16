@@ -363,7 +363,10 @@ final class StaticImageWallpaperOverlayManager {
         // 与 VideoWallpaperManager 视频壁纸窗口一致：精确 desktop 级
         window.level = .init(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        window.isOpaque = true
+        // 与 VideoWallpaperManager 视频窗口一致的菜单栏采样契约：按半透明层合成
+        // （alphaValue≈1 视觉无差别），避免 macOS 27 菜单栏背板采样冻结在不透明表面。
+        window.isOpaque = false
+        window.alphaValue = 0.99999
         window.backgroundColor = .black
         window.hasShadow = false
         window.isReleasedWhenClosed = false
