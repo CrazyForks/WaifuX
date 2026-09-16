@@ -6,15 +6,15 @@
     <description>WaifuX Updates</description>
     <language>zh</language>
     <item>
-      <title>Version 38.0.151</title>
-      <sparkle:version>38.0.151</sparkle:version>
-      <sparkle:shortVersionString>38.0.151</sparkle:shortVersionString>
-      <pubDate>Tue, 15 Sep 2026 14:32:09 +0800</pubDate>
+      <title>Version 38.0.152</title>
+      <sparkle:version>38.0.152</sparkle:version>
+      <sparkle:shortVersionString>38.0.152</sparkle:shortVersionString>
+      <pubDate>Wed, 16 Sep 2026 17:13:55 +0800</pubDate>
       <description><![CDATA[
-<h3>WaifuX 38.0.151</h3><ul><li><strong>refactor: 完成多项功能优化与代码重构 (019bbc3)</strong><ul><li>主要变更：</li><li>重写 CustomProgressView，改用 Core Animation 优化动画性能</li><li>为所有进度指示器添加唯一追踪标签，便于调试动画生命周期</li><li>重构场景配置重置逻辑，修复重置后未重载场景的问题</li><li>重构菜单栏快速切换面板，添加壁纸设计按钮与文件夹选择持久化</li><li>新增 Homebrew Cask 生成脚本与自动化校验流程</li><li>修复轮播图当前项判断逻辑，避免多 Hero 动画冲突</li><li>完善状态栏控制器逻辑，统一壁纸设计入口</li><li>添加场景配置重置回归测试用例</li></ul></li></ul>
+<h3>WaifuX 38.0.152</h3><ul><li><strong>🐛 fix(overlay): 扩展原生渲染的屏幕跳过静态壁纸 overlay (f30d2e6)</strong><ul><li>动态锁屏开启且该屏存在活跃扩展管线时，overlay 会盖住扩展帧并冻结 mac27</li><li>菜单栏采样、挡住系统设置切换壁纸。新增 extensionOwnsDesktop 判断，</li><li>在启动恢复与 restorePreviousImageIfAvailable 两条路径上均跳过该屏，</li><li>避免与扩展争抢桌面渲染。</li></ul></li><li><strong>🐛 fix(StaticImageOverlay): 修复静态壁纸 overlay 冻结菜单栏背板采样 (cf71106)</strong><ul><li>macOS 27 上不透明 overlay 会成为菜单栏背板采样源，导致采样与系统切</li><li>壁纸一起冻结。改为按半透明层合成，alphaValue≈1 视觉无差别。</li><li>扩展已有活跃管线时交给扩展原生渲染，不再叠加 overlay；状态栏的</li><li>「该屏有静态壁纸」信号补上扩展静态图源登记。</li></ul></li><li><strong>chore: 移除内置 SteamCMD 相关资源与脚本 (0bafb65)</strong><ul><li>删除所有内置的 steamcmd 二进制、依赖库与 Breakpad 框架</li><li>更新项目配置与 CI 脚本，移除 SteamCMD 签名与切片剥离逻辑</li><li>重构代码与文案，移除所有 SteamCMD 相关引用，替换为原生 Steam 服务</li><li>简化本地化文本，更新下载排队逻辑与设置页UI</li><li>修复 macOS 27+ 壁纸扩展重载假死问题</li></ul></li></ul>
       ]]></description>
       <enclosure
-        url="https://github.com/jipika/WaifuX/releases/download/v38.0.151/WaifuX.dmg"
+        url="https://github.com/jipika/WaifuX/releases/download/v38.0.152/WaifuX.dmg"
         type="application/octet-stream"
         length="0"
       />

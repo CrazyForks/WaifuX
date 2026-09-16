@@ -279,34 +279,34 @@ struct MenuBarQuickSwitcherView: View {
 
             HStack(spacing: 8) {
                 Menu {
-                    Button {
-                        withAnimation(selectionSpring) {
-                            viewModel.selectEntireLibrary()
-                        }
-                    } label: {
-                        HStack {
-                            Text(t("menubar.quick.myLibrary"))
-                            if viewModel.isUsingEntireLibrary {
-                                Image(systemName: "checkmark")
+                    // NSMenu 丢弃 HStack 标签里的 Image，勾选必须用 Toggle 渲染。
+                    Toggle(
+                        t("menubar.quick.myLibrary"),
+                        isOn: Binding(
+                            get: { viewModel.isUsingEntireLibrary },
+                            set: { newValue in
+                                guard newValue else { return }
+                                withAnimation(selectionSpring) {
+                                    viewModel.selectEntireLibrary()
+                                }
                             }
-                        }
-                    }
+                        )
+                    )
 
                     if !viewModel.availableFolders.isEmpty {
                         Divider()
                         ForEach(viewModel.availableFolders) { folder in
-                            Button {
-                                withAnimation(selectionSpring) {
-                                    viewModel.toggleFolderSelection(folder.id)
-                                }
-                            } label: {
-                                HStack {
-                                    Text(viewModel.folderOptionLabel(for: folder))
-                                    if viewModel.isFolderSelected(folder.id) {
-                                        Image(systemName: "checkmark")
+                            Toggle(
+                                viewModel.folderOptionLabel(for: folder),
+                                isOn: Binding(
+                                    get: { viewModel.isFolderSelected(folder.id) },
+                                    set: { _ in
+                                        withAnimation(selectionSpring) {
+                                            viewModel.toggleFolderSelection(folder.id)
+                                        }
                                     }
-                                }
-                            }
+                                )
+                            )
                         }
                     }
                 } label: {
