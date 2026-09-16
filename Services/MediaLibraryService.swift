@@ -951,7 +951,7 @@ final class MediaLibraryService: ObservableObject {
     private func deletePhysicalFile(at path: String) {
         guard !path.isEmpty else { return }
         let fm = FileManager.default
-        // 如果是 SteamCMD Workshop 下载的内容，删除整个 workshop_xxx 文件夹
+        // 如果是 Workshop 下载的内容，删除整个 workshop_xxx 文件夹
         if let workshopRoot = workshopRootDirectory(for: path),
            fm.fileExists(atPath: workshopRoot) {
             do {
@@ -1053,7 +1053,7 @@ final class MediaLibraryService: ObservableObject {
         }
     }
 
-    /// 检测并返回 SteamCMD Workshop 下载的根文件夹路径
+    /// 检测并返回 Workshop 下载的根文件夹路径
     private func workshopRootDirectory(for path: String) -> String? {
         let components = path.components(separatedBy: "/")
         if let steamappsIndex = components.firstIndex(of: "steamapps"),
@@ -1906,7 +1906,7 @@ final class WallpaperLibraryService: ObservableObject {
     private func wallpaperDeletePhysicalFile(at path: String) {
         guard !path.isEmpty else { return }
         let fm = FileManager.default
-        // 如果是 SteamCMD Workshop 下载的内容，删除整个 workshop_xxx 文件夹
+        // 如果是 Workshop 下载的内容，删除整个 workshop_xxx 文件夹
         if let workshopRoot = wallpaperWorkshopRootDirectory(for: path),
            fm.fileExists(atPath: workshopRoot) {
             do {
@@ -1927,7 +1927,7 @@ final class WallpaperLibraryService: ObservableObject {
         }
     }
 
-    /// 检测并返回 SteamCMD Workshop 下载的根文件夹路径
+    /// 检测并返回 Workshop 下载的根文件夹路径
     private func wallpaperWorkshopRootDirectory(for path: String) -> String? {
         let components = path.components(separatedBy: "/")
         if let steamappsIndex = components.firstIndex(of: "steamapps"),

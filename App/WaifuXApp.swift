@@ -666,8 +666,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                             if #available(macOS 26.0, *) {
                                 WallpaperExtensionSocketServer.shared.start()
                                 LockScreenWallpaperService.shared.syncInstanceCatalogToSocketServer()
-                                // 通知旧扩展进程退出，macOS WallpaperAgent 从新 bundle 重新加载
-                                WallpaperExtensionSocketServer.shared.notifyExtensionReload()
+                                // 仅当扩展 bundle 相对上次启动发生变化（App 更新）时才通知旧扩展退出。
+                                // macOS 27 上无条件 reload 会杀掉健康扩展，且 WallpaperAgent
+                                // 不会及时重新拉载（实测 ≥30 分钟），锁屏实例就此假死。
+                                WallpaperExtensionSocketServer.shared.notifyExtensionReloadIfBundleChanged()
                             }
 
                             // 恢复刘海隐藏设置（纯 UI 覆盖层，不依赖壁纸）

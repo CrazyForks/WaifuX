@@ -10,7 +10,7 @@ struct WorkshopWallpaper: Identifiable, Codable {
     let previewURL: URL?        // 预览图 URL
     let author: WorkshopAuthor
     let fileSize: Int64?        // 文件大小（字节）
-    let fileURL: URL?           // 下载链接（需要 SteamCMD 获取）
+    let fileURL: URL?           // 下载链接（需要 Steam 账号获取）
     
     // Steam 相关数据
     let steamAppID: String      // 通常是 431960 (Wallpaper Engine)

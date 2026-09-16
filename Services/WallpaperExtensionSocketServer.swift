@@ -222,6 +222,7 @@ final class WallpaperExtensionSocketServer: @unchecked Sendable {
     }
 
     /// 通知扩展重载：App 更新后启动时调用，旧扩展进程退出后 macOS WallpaperAgent 从新 bundle 重新加载。
+    /// App 正常退出不触发此通知，扩展继续运行以保持锁屏壁纸不中断。
     func notifyExtensionReload() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(
@@ -232,6 +233,50 @@ final class WallpaperExtensionSocketServer: @unchecked Sendable {
             true
         )
         os_log(.info, log: appLog, "已广播扩展重载通知")
+    }
+
+    private static let extensionReloadFingerprintDefaultsKey =
+        "wallpaper_extension_bundle_fingerprint_at_reload"
+
+    /// 当前 App 内嵌扩展 bundle 的指纹（版本 + 构建 + 可执行文件大小/mtime）。
+    /// App 更新（包括 Sparkle 原地替换和开发构建）都会改变该值。
+    /// 必须在主线程调用：macOS 26+ 后台线程访问 Bundle 有崩溃风险。
+    static func embeddedExtensionBundleFingerprint() -> String? {
+        let extensionURL = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/PlugIns/WaifuXWallpaperExtension.appex", isDirectory: true)
+        guard let extBundle = Bundle(url: extensionURL) else { return nil }
+        let info = extBundle.infoDictionary
+        let version = (info?["CFBundleShortVersionString"] as? String) ?? "0"
+        let build = (info?["CFBundleVersion"] as? String) ?? "0"
+        var execPart = "noexec"
+        if let execURL = extBundle.executableURL,
+           let values = try? execURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) {
+            let mtime = Int64((values.contentModificationDate ?? .distantPast).timeIntervalSince1970)
+            execPart = "\(values.fileSize ?? 0)-\(mtime)"
+        }
+        return "v\(version)-b\(build)-\(execPart)"
+    }
+
+    /// 仅当扩展 bundle 相对上次记录发生变化（App 更新/重编）时才广播 reload。
+    ///
+    /// 背景：无条件 reload 会杀掉健康的扩展进程，而 macOS 27 的 WallpaperAgent
+    /// 在扩展自杀后不会及时重新拉载（实测 ≥30 分钟，极端情况整夜假死），
+    /// 表现为锁屏实例死掉、后续设置壁纸无法同步过去。扩展侧有对应的
+    /// bundle 指纹自检（bundle 未变则忽略 reload），这里是第一道闸。
+    func notifyExtensionReloadIfBundleChanged() {
+        let fingerprint = Self.embeddedExtensionBundleFingerprint()
+        let stored = UserDefaults.standard.string(forKey: Self.extensionReloadFingerprintDefaultsKey)
+        guard let fingerprint else {
+            os_log(.error, log: appLog, "无法读取内嵌扩展 bundle 指纹，跳过 reload（避免误杀存活扩展）")
+            return
+        }
+        guard fingerprint != stored else {
+            os_log(.info, log: appLog, "扩展 bundle 未变化 (fingerprint=%{public}@)，跳过 reload", fingerprint)
+            return
+        }
+        os_log(.info, log: appLog, "扩展 bundle 变化 (%{public}@ → %{public}@)，广播 reload", stored ?? "nil", fingerprint)
+        UserDefaults.standard.set(fingerprint, forKey: Self.extensionReloadFingerprintDefaultsKey)
+        notifyExtensionReload()
     }
 
     /// 检查扩展是否已有活跃的渲染管线（任何显示器）。

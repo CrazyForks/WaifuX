@@ -3844,7 +3844,7 @@ struct MyLibraryContentView: View {
 
         let mediaItems = mediaViewModel.workshopService.convertToMediaItems(items)
 
-        // 并发提交所有下载任务，SteamCMD 下载限制器会自动控制并发（最多 2 个同时下载）
+        // 并发提交所有下载任务，Workshop 下载限制器会自动控制并发（最多 3 个同时下载）
         let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
             for item in mediaItems {
                 group.addTask {

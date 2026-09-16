@@ -411,7 +411,7 @@ private func extractPKG(at url: URL) -> URL? {
     return nil
 }
 
-/// SteamCMD 解压目录常见为 `.../431960/<id>/`，真实 `project.json` 可能在唯一子目录内；与 App 内 `WorkshopService.resolveWallpaperEngineProjectRoot` 行为对齐。
+/// Workshop 解压目录常见为 `.../431960/<id>/`，真实 `project.json` 可能在唯一子目录内；与 App 内 `WorkshopService.resolveWallpaperEngineProjectRoot` 行为对齐。
 private func resolveSteamWorkshopDirectoryIfNeeded(_ path: String) -> String {
     let url = URL(fileURLWithPath: path)
     var isDir: ObjCBool = false
@@ -468,7 +468,7 @@ private func steamWorkshopContentInstallRootIfApplicable(forProjectDir projectDi
     return url
 }
 
-/// Web 本地文件可读范围：`SteamCMD` 解压的 workshop 根，否则退化为工程目录（本地 .pkg 解压或扁平导入）。
+/// Web 本地文件可读范围：Workshop 解压根目录，否则退化为工程目录（本地 .pkg 解压或扁平导入）。
 private func webWallpaperFileReadAccessURL(projectContentDir: URL, cliWallpaperPath: String) -> URL {
     if cliWallpaperPath.contains("/steamapps/workshop/content/"),
        let root = steamWorkshopContentInstallRootIfApplicable(forProjectDir: projectContentDir) {

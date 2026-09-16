@@ -603,8 +603,8 @@ final class StatusBarController: NSObject {
             section.isEnabled = false
             taskQueueMenu.addItem(section)
             for entry in entries where entry.category == category {
-                // 仅下载类任务可取消（普通 URL 下载与 SteamCMD Workshop 下载同走
-                // DownloadTaskService.cancelTask，SteamCMD 队列会终止子进程）
+                // 仅下载类任务可取消（普通 URL 下载与 Workshop 下载同走
+                // DownloadTaskService.cancelTask，由下载队列终止任务）
                 let isDownload = entry.category == .download
                 let row = TaskQueueRowView(
                     title: entry.title,
@@ -627,7 +627,7 @@ final class StatusBarController: NSObject {
     }
 
     /// 取消一条下载任务。排队中 / 下载中 / 等待 Steam 登录的任务均可取消；
-    /// SteamCMD 下载会经 PersistentDownloadQueueService 终止 steamcmd 子进程。
+    /// Workshop 下载会经 PersistentDownloadQueueService 取消内嵌 Steam 服务的下载。
     private func cancelDownloadQueueTask(id: String) {
         DownloadTaskService.shared.cancelTask(id: id)
     }

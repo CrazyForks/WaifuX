@@ -1845,7 +1845,7 @@ private struct WorkshopSettingsTab: View {
 
                 steamServiceStatusSection
 
-                steamCMDLoginSection
+                steamLoginSection
 
                 // 场景壁纸实时渲染模式
                 MacSettingsSection {
@@ -2015,13 +2015,13 @@ private struct WorkshopSettingsTab: View {
         }
     }
 
-    private var steamCMDLoginSection: some View {
+    private var steamLoginSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Image(systemName: "person.badge.key.fill")
                     .font(.system(size: 14))
                     .foregroundStyle(.cyan)
-                Text(t("steamCMDAccount"))
+                Text(t("steamServiceAccount"))
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 if case .available = sourceManager.steamCredentialState {
@@ -2172,8 +2172,6 @@ private struct WorkshopSettingsTab: View {
                                             steamLoginStatusText = "账号、密码或验证码不正确，请检查后重试。"
                                         case .steamLoginFailed(let msg):
                                             steamLoginStatusText = msg
-                                        case .steamcmdNotFound:
-                                            steamLoginStatusText = "Steam 服务组件不可用，请重新构建或安装应用。"
                                         case .downloadFailed(let msg):
                                             steamLoginStatusText = msg
                                         case .executionFailed(let msg):
@@ -2219,7 +2217,7 @@ private struct WorkshopSettingsTab: View {
                 Image(systemName: "network")
                     .font(.system(size: 14))
                     .foregroundStyle(.cyan)
-                Text(t("steamCMDStatus"))
+                Text(t("steamServiceStatus"))
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button("刷新") {
@@ -2355,14 +2353,14 @@ private struct WorkshopSettingsTab: View {
                 : "Steam 服务已就绪，登录后会自动恢复会话。"
         }
         if case .failed(let message) = steamService.loginState {
-            return String(format: t("steamCMDError"), message)
+            return String(format: t("steamServiceError"), message)
         }
         return "正在启动 Steam 服务…"
     }
 
     private var steamServiceStatusLabel: String {
         if steamService.isAvailable {
-            return steamService.isLoggedIn ? "已登录" : t("steamCMDReady")
+            return steamService.isLoggedIn ? "已登录" : t("steamServiceReady")
         }
         if case .failed = steamService.loginState {
             return "不可用"

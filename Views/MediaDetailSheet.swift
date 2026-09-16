@@ -3169,12 +3169,11 @@ struct MediaDetailSheet: View {
         (NSApp.delegate as? AppDelegate)?.showSettingsWindow(nil)
     }
 
-    /// 根据 SteamCMD/业务错误文本生成用户可读提示，避免一律套“检查 VPN”的无效话术。
+    /// 根据业务错误文本生成用户可读提示，避免一律套“检查 VPN”的无效话术。
     private static func workshopDownloadUserFacingMessage(_ message: String) -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         // WorkshopService 已给出结构化诊断时，直接展示，不再叠加泛化提示
-        if trimmed.contains("SteamCMD 原始信息")
-            || trimmed.contains("建议按顺序排查")
+        if trimmed.contains("建议按顺序排查")
             || trimmed.contains("可依次排查") {
             return trimmed
         }

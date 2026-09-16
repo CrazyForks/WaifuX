@@ -135,7 +135,7 @@ class WorkshopSourceManager: ObservableObject {
         }
     }
 
-    // MARK: - SteamCMD 账号标识
+    // MARK: - Steam 账号标识
 
     struct SteamIdentity: Codable, Equatable {
         let username: String
@@ -159,15 +159,10 @@ class WorkshopSourceManager: ObservableObject {
 
     @Published private(set) var steamIdentity: SteamIdentity?
     @Published private(set) var steamCredentialState: SteamCredentialState = .unknown
-    @Published private(set) var steamCMDLastSetupError: String?
 
-    /// 仅检查本地是否保存过账号名，不代表 SteamCMD 会话仍然有效。
+    /// 仅检查本地是否保存过账号名，不代表 Steam 会话仍然有效。
     var hasStoredSteamIdentity: Bool {
         steamIdentity != nil
-    }
-
-    var storedSteamUsername: String? {
-        steamIdentity?.username
     }
 
     func setSteamIdentity(username: String) {
@@ -211,149 +206,16 @@ class WorkshopSourceManager: ObservableObject {
 
     private let profileIDKey = "workshop_steam_profile_id"
 
-    /// 加载已保存的 Steam Profile ID，若没有则尝试从 SteamCMD loginusers.vdf 自动提取
+    /// 加载已保存的 Steam Profile ID
     func loadSteamProfileID() {
-        // 优先使用已保存的
         if let saved = UserDefaults.standard.string(forKey: profileIDKey), !saved.isEmpty {
             steamProfileID = saved
-            return
-        }
-        // 尝试从 SteamCMD config 自动提取
-        if let extracted = extractSteamID64FromSteamCMD() {
-            AppLogger.info(.media, "从 SteamCMD loginusers.vdf 自动提取 SteamID64: \(extracted)")
-            steamProfileID = extracted
         }
     }
 
     /// 是否有有效的 Steam Profile ID
     var hasSteamProfileID: Bool {
         !steamProfileID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// 从 SteamCMD loginusers.vdf 提取最近登录用户的 SteamID64
-    func extractSteamID64FromSteamCMD() -> String? {
-        guard let steamcmdDir = steamCMDWorkingDirectory() else {
-            AppLogger.info(.media, "extractSteamID64FromSteamCMD: steamcmd 工作目录不可用")
-            return nil
-        }
-
-        let vdfPath = steamcmdDir.appendingPathComponent("config/loginusers.vdf")
-        guard FileManager.default.fileExists(atPath: vdfPath.path) else {
-            AppLogger.info(.media, "extractSteamID64FromSteamCMD: loginusers.vdf 不存在")
-            return nil
-        }
-
-        do {
-            let content = try String(contentsOf: vdfPath, encoding: .utf8)
-            return parseLoginUsersVDF(content)
-        } catch {
-            AppLogger.error(.media, "extractSteamID64FromSteamCMD: 读取 VDF 失败", metadata: ["error": "\(error)"])
-            return nil
-        }
-    }
-
-    /// 简单的 loginusers.vdf 解析器，提取最近登录用户的 SteamID64
-    /// VDF 格式示例：
-    /// "users"
-    /// {
-    ///     "76561198113134000"
-    ///     {
-    ///         "AccountName"  "username"
-    ///         "MostRecent"   "1"
-    ///     }
-    /// }
-    private func parseLoginUsersVDF(_ content: String) -> String? {
-        // 先找到 "users" 块
-        guard let usersRange = content.range(of: "\"users\"") else { return nil }
-        let searchStart = usersRange.upperBound
-
-        // 找到第一个 {
-        guard let openBrace = content[searchStart...].range(of: "{") else { return nil }
-        let afterBrace = openBrace.upperBound
-
-        var currentSteamID: String?
-        var mostRecentSteamID: String?
-        var lastSteamID: String?
-        var depth = 1
-        let lines = content[afterBrace...].split(separator: "\n", omittingEmptySubsequences: false)
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-
-            if trimmed.hasPrefix("{") {
-                depth += 1
-                continue
-            }
-            if trimmed.hasPrefix("}") {
-                depth -= 1
-                if depth == 0 { break } // users 块结束
-                if depth == 1 {
-                    // 回到 users 顶层，结束当前账号块
-                    currentSteamID = nil
-                }
-                continue
-            }
-
-            // users 顶层下的 key 通常是 SteamID64
-            if depth == 1, let key = extractVDFKey(trimmed), isSteamID64(key) {
-                currentSteamID = key
-                lastSteamID = key
-                continue
-            }
-
-            // 账号块内：优先取 MostRecent = 1 的 SteamID64
-            if depth >= 2,
-               let key = extractVDFKey(trimmed),
-               key.caseInsensitiveCompare("MostRecent") == .orderedSame,
-               let value = extractVDFValue(trimmed),
-               value == "1",
-               let currentSteamID {
-                mostRecentSteamID = currentSteamID
-            }
-        }
-
-        return mostRecentSteamID ?? lastSteamID
-    }
-
-    private func isSteamID64(_ value: String) -> Bool {
-        value.count >= 15 && value.count <= 20 && value.allSatisfy(\.isNumber)
-    }
-
-    /// 提取 VDF 行中的 key（第一个引号内容）
-    private func extractVDFKey(_ line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("\"") else { return nil }
-        let afterFirst = trimmed.dropFirst()
-        guard let endQuote = afterFirst.firstIndex(of: "\"") else { return nil }
-        return String(afterFirst[..<endQuote])
-    }
-
-    /// 提取 VDF 行中的 value（第二个引号内容）
-    private func extractVDFValue(_ line: String) -> String? {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("\"") else { return nil }
-        let afterFirst = trimmed.dropFirst()
-        guard let firstEnd = afterFirst.firstIndex(of: "\"") else { return nil }
-        let afterFirstValue = afterFirst[afterFirst.index(after: firstEnd)...]
-        // 跳过空白
-        let afterSpace = afterFirstValue.trimmingCharacters(in: .whitespaces)
-        guard afterSpace.hasPrefix("\"") else { return nil }
-        let afterSecondStart = afterSpace.dropFirst()
-        guard let secondEnd = afterSecondStart.firstIndex(of: "\"") else { return nil }
-        return String(afterSecondStart[..<secondEnd])
-    }
-
-    /// 获取 SteamCMD 工作目录
-    func steamCMDWorkingDirectory() -> URL? {
-        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            let destDir = appSupport.appendingPathComponent("com.waifux.app/steamcmd", isDirectory: true)
-            if FileManager.default.fileExists(atPath: destDir.path) {
-                return destDir
-            }
-        }
-        // 兜底：检查 Bundle 内
-        return Self.bundledSteamCMDDirectoryURL()
     }
 
     // MARK: - 本地存储操作
@@ -384,7 +246,7 @@ class WorkshopSourceManager: ObservableObject {
         let identity = SteamIdentity(username: legacy.username)
         persistIdentityLocally(identity)
         defaults.removeObject(forKey: legacyCredentialsKey)
-        AppLogger.info(.media, "已迁移 SteamCMD 账号并删除旧版明文密码")
+        AppLogger.info(.media, "已迁移旧版 Steam 账号并删除明文密码")
         return .success(identity)
     }
 
@@ -396,181 +258,6 @@ class WorkshopSourceManager: ObservableObject {
         UserDefaults.standard.set(data, forKey: localIdentityKey)
         steamIdentity = identity
         steamCredentialState = .available(username: identity.username)
-    }
-
-    // MARK: - SteamCMD 路径管理
-    //
-    // 用户侧：安装/打开 App 即可，无需自己找路径。首次使用 Workshop 下载时，若尚未准备可写副本，
-    // 会自动把 **App 内已打包的** `Contents/Resources/steamcmd/` 复制到 Application Support（见 `steamCMDExecutableURL()`）。
-    // 原因：Valve 的 `steamcmd.sh` 会在运行目录写入更新与 `config/` 登录缓存，`.app` 内 Resources 在正式安装环境下通常不可写，
-    // 因此工作副本固定在 `~/Library/Application Support/com.waifux.app/steamcmd/`，避免自更新/登录失败。
-    //
-    // 开发侧：`Resources/steamcmd/` 已随仓库提交即可直接构建；更新二进制时运行 `scripts/sync-steamcmd-into-resources.sh`（默认拉官方包）。
-
-    /// 应用包内 `steamcmd/`（与 Valve 官方 macOS 解压目录一致，目录内须有 `steamcmd.sh`）。
-    ///
-    /// 注意：若 Xcode 将仓库根目录的 **`Resources` 文件夹整体**作为 folder reference 打进包内，
-    /// 实际路径为 `App.app/Contents/Resources/Resources/steamcmd/`，而不是 `.../Resources/steamcmd/`。
-    /// 这里同时兼容「扁平」与「多套一层 Resources」两种布局，避免误判为「内置组件缺失」。
-    private static func bundledSteamCMDDirectoryURL() -> URL? {
-        let fm = FileManager.default
-        if let sh = Bundle.main.url(forResource: "steamcmd", withExtension: "sh", subdirectory: "steamcmd"),
-           fm.fileExists(atPath: sh.path) {
-            return sh.deletingLastPathComponent()
-        }
-        if let bin = Bundle.main.url(forResource: "steamcmd", withExtension: nil, subdirectory: "steamcmd"),
-           fm.fileExists(atPath: bin.path) {
-            return bin.deletingLastPathComponent()
-        }
-        guard let bundleResources = Bundle.main.resourceURL else { return nil }
-        let nestedBases = [
-            bundleResources,
-            bundleResources.appendingPathComponent("Resources", isDirectory: true)
-        ]
-        for base in nestedBases {
-            let dir = base.appendingPathComponent("steamcmd", isDirectory: true)
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue,
-               fm.fileExists(atPath: dir.appendingPathComponent("steamcmd.sh").path) {
-                return dir
-            }
-        }
-        return nil
-    }
-
-    /// 返回 SteamCMD 可执行文件路径
-    /// 首次调用时会将 Bundle 中的 steamcmd 复制到 Application Support，
-    /// 避免重新编译 App 时覆盖掉 steamcmd 的自更新文件和登录缓存。
-    /// 若已存在副本但缺少 Bundle 中新增的文件（版本更新），增量补充缺失文件，保留 config/ 登录缓存。
-    func steamCMDExecutableURL() -> URL? {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            steamCMDLastSetupError = "无法定位用户 Application Support 目录"
-            return nil
-        }
-        let destDir = appSupport.appendingPathComponent("com.waifux.app/steamcmd", isDirectory: true)
-        let script = destDir.appendingPathComponent("steamcmd.sh")
-
-        // 如果 Application Support 中已有可工作的副本，直接返回
-        Self.repairSteamCMDExecutablePermissions(at: destDir)
-        if Self.isValidSteamCMDInstallation(at: destDir) {
-            steamCMDLastSetupError = nil
-            return script
-        }
-
-        // 从 Bundle 复制原始 steamcmd 目录
-        guard let bundleSteamcmdDir = Self.bundledSteamCMDDirectoryURL() else {
-            steamCMDLastSetupError = "App 包内缺少 Resources/steamcmd/steamcmd.sh"
-            return nil
-        }
-
-        do {
-            try FileManager.default.createDirectory(at: destDir.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-            if FileManager.default.fileExists(atPath: destDir.path) {
-                // 目录已存在但缺少关键文件（版本更新），增量补充缺失文件，保留 config/ 登录缓存
-                let bundleContents = try FileManager.default.contentsOfDirectory(at: bundleSteamcmdDir, includingPropertiesForKeys: nil)
-                for item in bundleContents {
-                    let destItem = destDir.appendingPathComponent(item.lastPathComponent)
-                    if !FileManager.default.fileExists(atPath: destItem.path) {
-                        try FileManager.default.copyItem(at: item, to: destItem)
-                    }
-                }
-                print("[WorkshopSourceManager] 已增量补充 steamcmd 到 \(destDir.path)（保留现有登录缓存）")
-            } else {
-                // 首次安装，完整复制
-                try FileManager.default.copyItem(at: bundleSteamcmdDir, to: destDir)
-                print("[WorkshopSourceManager] 已将 steamcmd 复制到 \(destDir.path)")
-            }
-            Self.repairSteamCMDExecutablePermissions(at: destDir)
-        } catch {
-            steamCMDLastSetupError = "复制 SteamCMD 到 \(destDir.path) 失败：\(error.localizedDescription)"
-            print("[WorkshopSourceManager] 复制 steamcmd 失败: \(error)")
-            return nil
-        }
-
-        guard Self.isValidSteamCMDInstallation(at: destDir) else {
-            steamCMDLastSetupError = Self.steamCMDInstallationProblem(at: destDir)
-            print("[WorkshopSourceManager] steamcmd 校验失败: \(steamCMDLastSetupError ?? "unknown")")
-            return nil
-        }
-
-        steamCMDLastSetupError = nil
-        return script
-    }
-
-    private static func repairSteamCMDExecutablePermissions(at dir: URL) {
-        let executableNames = [
-            "steamcmd.sh",
-            "steamcmd",
-            "steamconsole.dylib",
-            "steamclient.dylib",
-            "libtier0_s.dylib",
-            "libvstdlib_s.dylib",
-            "crashhandler.dylib",
-            "libaudio.dylib",
-            "libsteaminput.dylib"
-        ]
-        for name in executableNames {
-            let path = dir.appendingPathComponent(name).path
-            guard FileManager.default.fileExists(atPath: path) else { continue }
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-        }
-    }
-
-    private static func steamCMDInstallationProblem(at dir: URL) -> String {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
-            return "SteamCMD 工作目录不存在：\(dir.path)"
-        }
-
-        let requiredExecutableFiles = ["steamcmd.sh", "steamcmd"]
-        for name in requiredExecutableFiles {
-            let path = dir.appendingPathComponent(name).path
-            if !fm.fileExists(atPath: path) {
-                return "缺少 \(name)：\(path)"
-            }
-            if !fm.isExecutableFile(atPath: path) {
-                return "\(name) 不可执行：\(path)"
-            }
-        }
-
-        let requiredDylibs = ["steamclient.dylib", "libtier0_s.dylib", "libvstdlib_s.dylib"]
-        for name in requiredDylibs {
-            let path = dir.appendingPathComponent(name).path
-            if !fm.fileExists(atPath: path) {
-                return "缺少 \(name)：\(path)"
-            }
-        }
-
-        return "SteamCMD 文件存在但校验未通过：\(dir.path)"
-    }
-
-    /// 验证 Application Support 中的 steamcmd 是否是可工作的安装
-    /// 新版 SteamCMD 不再生成 steamcmd-pty，因此只检查核心必需文件的可执行性
-    static func isValidSteamCMDInstallation(at dir: URL) -> Bool {
-        let fm = FileManager.default
-        let script = dir.appendingPathComponent("steamcmd.sh")
-        let steamBin = dir.appendingPathComponent("steamcmd")
-
-        // 核心文件必须存在且可执行
-        guard fm.fileExists(atPath: script.path),
-              fm.isExecutableFile(atPath: script.path),
-              fm.fileExists(atPath: steamBin.path),
-              fm.isExecutableFile(atPath: steamBin.path) else {
-            return false
-        }
-
-        // 关键 dylib 必须存在
-        let requiredDylibs = ["steamclient.dylib", "libtier0_s.dylib", "libvstdlib_s.dylib"]
-        for name in requiredDylibs {
-            let dylibPath = dir.appendingPathComponent(name)
-            if !fm.fileExists(atPath: dylibPath.path) {
-                return false
-            }
-        }
-
-        return true
     }
 
     // MARK: - Workshop 内容级别（与壁纸列表 Purity 对齐）
@@ -760,12 +447,6 @@ class WorkshopSourceManager: ObservableObject {
         guard let currentIndex = allSources.firstIndex(of: activeSource) else { return }
         let nextIndex = (currentIndex + 1) % allSources.count
         switchTo(allSources[nextIndex])
-    }
-
-    /// SteamCMD 是否已配置/安装
-    var isSteamCMDConfigured: Bool {
-        guard let dir = Self.bundledSteamCMDDirectoryURL() else { return false }
-        return FileManager.default.fileExists(atPath: dir.appendingPathComponent("steamcmd.sh").path)
     }
 
     /// 已恢复的 SteamKit2 会话优先；在启动恢复完成前保留本地账号标识，

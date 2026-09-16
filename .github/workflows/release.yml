@@ -247,22 +247,8 @@ jobs:
             done
           }
 
-          should_skip_embedded_code() {
-            local f="$1"
-            case "$f" in
-              */Contents/Resources/Resources/steamcmd/steamclient.dylib|*/Contents/Resources/steamcmd/steamclient.dylib)
-                echo "  Skipping Valve-signed steamclient.dylib: ${f#build/WaifuX.app/Contents/Resources/}"
-                return 0
-                ;;
-            esac
-            return 1
-          }
-
           sign_embedded_code() {
             local f="$1"
-            if should_skip_embedded_code "$f"; then
-              return 0
-            fi
             # macOS 26: codesign --entitlements 对 .appex 不再生效。
             # 优先使用仓库中预签名的 .appex（本地 xcodebuild 签名后提交）。
             if [[ "$f" == *.appex ]]; then
@@ -362,9 +348,6 @@ jobs:
             fi
             codesign "${SIGN_ARGS[@]}" "$f"
           }
-
-          strip_unsupported_slices build/WaifuX.app/Contents/Resources/Resources/steamcmd
-          strip_unsupported_slices build/WaifuX.app/Contents/Resources/steamcmd
 
           find build/WaifuX.app/Contents/Resources -type f | while read -r f; do
             if file "$f" | grep -qE "Mach-O|ELF"; then

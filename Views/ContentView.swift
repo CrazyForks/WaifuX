@@ -990,7 +990,7 @@ private struct DownloadProgressToastHost: View {
                 DownloadProgressToast(
                     snapshot: snapshot,
                     activeTaskCount: viewModel.activeTaskCount,
-                    steamCMDQueuedCount: viewModel.steamCMDQueuedCount,
+                    workshopQueuedCount: viewModel.workshopQueuedCount,
                     suppressProgressAnimation: scrollTracker.isScrolling,
                     onDismiss: {
                         dismiss(snapshot)
@@ -1308,7 +1308,7 @@ private struct BackgroundTaskProgressToast: View {
 private struct DownloadProgressToast: View {
     let snapshot: DownloadToastSnapshot
     let activeTaskCount: Int
-    let steamCMDQueuedCount: Int
+    let workshopQueuedCount: Int
     /// 列表滚动期间为 true：进度直接跳变，不启动新动画（避免与滚动渲染抢主线程）
     var suppressProgressAnimation: Bool = false
     let onDismiss: () -> Void
@@ -1368,9 +1368,9 @@ private struct DownloadProgressToast: View {
             if !snapshot.subtitle.isEmpty { parts.append(snapshot.subtitle) }
             if !snapshot.badgeText.isEmpty { parts.append(snapshot.badgeText) }
         }
-        // SteamCMD 排队提示
-        if steamCMDQueuedCount > 0 {
-            parts.append(String(format: t("status.queued"), steamCMDQueuedCount))
+        // Workshop 下载排队提示
+        if workshopQueuedCount > 0 {
+            parts.append(String(format: t("status.queued"), workshopQueuedCount))
         }
         return parts.isEmpty ? "" : parts.joined(separator: " · ")
     }

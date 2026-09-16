@@ -744,7 +744,7 @@ enum SceneOfflineBakeService {
             return exact
         }
         return MediaLibraryService.shared.downloadedItems.first { record in
-            // SteamCMD stores a Workshop download at its outer `workshop_<id>` directory,
+            // A Workshop download lives at its outer `workshop_<id>` directory,
             // whose sibling content/downloads/temp folders prevent a generic root walk from
             // reaching the actual project. Use the record's canonical path comparison first.
             record.hasSameLocalContent(as: resolvedContentRoot)

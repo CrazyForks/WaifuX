@@ -271,12 +271,6 @@ sign_exported_app() {
   sign_nested_code() {
     local code_path="$1"
     local extension_entitlements="$PROJECT_DIR/WaifuXWallpaperExtension/WaifuXWallpaperExtension.entitlements"
-    case "$code_path" in
-      "$app_path"/Contents/Resources/Resources/steamcmd/steamclient.dylib|"$app_path"/Contents/Resources/steamcmd/steamclient.dylib)
-        echo "  跳过 Valve 签名 steamclient.dylib: ${code_path#"$app_path/Contents/Resources/"}"
-        return 0
-        ;;
-    esac
     if [[ "$(basename "$code_path")" == "wallpaper-wgpu" && -f "$renderer_entitlements" ]]; then
       codesign --force --timestamp=none --options runtime --entitlements "$renderer_entitlements" -s "$identity" "$code_path" 2>/dev/null || \
         codesign --force --options runtime --entitlements "$renderer_entitlements" -s "$identity" "$code_path" 2>/dev/null || \
@@ -397,9 +391,6 @@ sign_exported_app() {
         codesign --force -s "$identity" "$code_path" 2>/dev/null || true
     fi
   }
-
-  strip_unsupported_slices "$app_path/Contents/Resources/Resources/steamcmd"
-  strip_unsupported_slices "$app_path/Contents/Resources/steamcmd"
 
   while IFS= read -r code_path; do
     sign_nested_code "$code_path"

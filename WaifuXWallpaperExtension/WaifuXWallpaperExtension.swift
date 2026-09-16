@@ -174,6 +174,7 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
             _ = handle
             extLog("INIT (PID: \(ProcessInfo.processInfo.processIdentifier)) — WallpaperExtensionKit loaded")
             swizzleSnapshotEncodeIfNeeded()
+            Self.recordLaunchBundleFingerprint()
             VideoLibrary.shared.scan()
             WallpaperPrefs.shared.observeChanges()
             observeLibraryChanges()
@@ -245,8 +246,12 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
     }
 
     /// 监听 App 重启时的扩展重载通知。
-    /// App 更新后启动时发送此通知，旧扩展进程退出，macOS WallpaperAgent 从新 bundle 重新加载。
-    /// App 正常退出不触发此通知，扩展继续运行以保持锁屏壁纸不中断。
+    /// App 更新（bundle 变化）后旧扩展进程退出，macOS WallpaperAgent 从新 bundle 重新加载。
+    ///
+    /// ⚠️ macOS 27 陷阱：扩展 exit 后 WallpaperAgent 可能长时间不重新拉载（实测 ≥30 分钟），
+    /// 期间锁屏实例假死。而 Host 曾在每次启动时无条件广播本通知（现已在 Host 侧改为
+    /// 仅 bundle 变化时发送），因此这里再做一道自检：磁盘 bundle 与本进程启动时一致
+    /// 说明没有新二进制要换，直接忽略通知，绝不自杀。
     private func observeExtensionReload() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let observer = Unmanaged.passUnretained(self).toOpaque()
@@ -254,6 +259,10 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
             center,
             observer,
             { _, _, _, _, _ in
+                guard WaifuXWallpaperExtension.shouldExitForBundleSwap() else {
+                    extLog("[Extension] Reload ignored — bundle unchanged since launch (no new binary to swap)")
+                    return
+                }
                 extLog("[Extension] Reload requested by app — exiting to allow new version to load")
                 FrameChannel.shared.stop()
                 let removed = WallpaperState.shared.removeAllContexts()
@@ -266,6 +275,45 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
             .deliverImmediately
         )
         extLog("[Extension] Reload notification observer registered")
+    }
+
+    // MARK: - Bundle Fingerprint（reload 自检）
+
+    private static let launchBundleFingerprint = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    /// 计算扩展自身 bundle 的指纹（版本 + 构建 + 可执行文件大小/mtime）。
+    /// 与 Host 侧 WallpaperExtensionSocketServer.embeddedExtensionBundleFingerprint() 同构。
+    private static func currentBundleFingerprint() -> String {
+        let info = Bundle.main.infoDictionary
+        let version = (info?["CFBundleShortVersionString"] as? String) ?? "0"
+        let build = (info?["CFBundleVersion"] as? String) ?? "0"
+        var execPart = "noexec"
+        if let execURL = Bundle.main.executableURL,
+           let values = try? execURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]) {
+            let mtime = Int64((values.contentModificationDate ?? .distantPast).timeIntervalSince1970)
+            execPart = "\(values.fileSize ?? 0)-\(mtime)"
+        }
+        return "v\(version)-b\(build)-\(execPart)"
+    }
+
+    private static func recordLaunchBundleFingerprint() {
+        let fingerprint = currentBundleFingerprint()
+        launchBundleFingerprint.withLock { $0 = fingerprint }
+        extLog("[Extension] Bundle fingerprint at launch: \(fingerprint)")
+    }
+
+    /// 收到 reload 通知时判断是否真的有新二进制要换：
+    /// 磁盘 bundle 与本进程启动时一致 → 无需换（忽略通知，保持存活）。
+    /// 指纹未记录（异常路径）→ 保持旧行为（退出），宁可多杀不可不换。
+    private static func shouldExitForBundleSwap() -> Bool {
+        let atLaunch = launchBundleFingerprint.withLock { $0 }
+        guard let atLaunch else { return true }
+        let onDisk = currentBundleFingerprint()
+        if atLaunch != onDisk {
+            extLog("[Extension] Bundle changed since launch: \(atLaunch) → \(onDisk); honoring reload")
+            return true
+        }
+        return false
     }
 
     // MARK: - SnapshotXPC Swizzle

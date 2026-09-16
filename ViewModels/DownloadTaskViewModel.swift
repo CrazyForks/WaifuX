@@ -122,7 +122,7 @@ class DownloadTaskViewModel: ObservableObject {
 final class DownloadToastViewModel: ObservableObject {
     @Published private(set) var snapshot: DownloadToastSnapshot?
     @Published private(set) var activeTaskCount: Int = 0
-    @Published private(set) var steamCMDQueuedCount: Int = 0
+    @Published private(set) var workshopQueuedCount: Int = 0
 
     private let downloadService: DownloadTaskService
     private let workshopService: WorkshopService
@@ -155,10 +155,10 @@ final class DownloadToastViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        workshopService.$steamCMDQueuedCount
+        workshopService.$workshopQueuedCount
             .receive(on: DispatchQueue.main)
             .removeDuplicates()
-            .assign(to: &$steamCMDQueuedCount)
+            .assign(to: &$workshopQueuedCount)
     }
 
     func isSuppressed(taskID: String) -> Bool {

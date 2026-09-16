@@ -444,7 +444,7 @@ struct MediaDownloadRecord: Identifiable, Codable, Hashable {
         URL(fileURLWithPath: localFilePath)
     }
 
-    /// A Workshop download may be registered at either its SteamCMD root or its nested content root.
+    /// A Workshop download may be registered at either its outer download root or its nested content root.
     /// Treat those representations as the same source so applying it does not re-register the download.
     func hasSameLocalContent(as candidateURL: URL) -> Bool {
         // 字符串标准化一次即可；避免两次 standardizedFileURL.path 的 Foundation 重解析

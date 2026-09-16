@@ -1183,7 +1183,7 @@ final class MediaExploreViewModel: ObservableObject {
         )
     }
 
-    /// 只执行 Workshop 下载；SteamCMD 复用本地缓存会话，不接收密码或 Guard 码。
+    /// 只执行 Workshop 下载；复用本地保存的 Steam 会话，不接收密码或 Guard 码。
     func executeQueuedWorkshopDownload(
         _ item: MediaItem,
         folderID: String?,
@@ -2745,7 +2745,7 @@ final class MediaExploreViewModel: ObservableObject {
 
     // MARK: - Workshop 下载
 
-    /// 下载 Workshop 壁纸（通过 SteamCMD）
+    /// 下载 Workshop 壁纸（通过内置 Steam 服务）
     /// - Parameter folderID: 下载入库时一并写入的库文件夹归属（作者批量下载用）。
     func downloadWorkshopWallpaper(_ item: MediaItem, folderID: String? = nil) async throws {
         guard item.id.hasPrefix("workshop_") else {
@@ -3055,7 +3055,7 @@ final class MediaExploreViewModel: ObservableObject {
     /// 下载指定的 Workshop 物品列表
     /// - Parameter mediaItems: 要下载的媒体项
     func downloadWorkshopItems(_ mediaItems: [MediaItem]) async throws -> Int {
-        // 并发提交所有下载任务，SteamCMD 下载限制器会自动控制并发（最多 2 个同时下载）
+        // 并发提交所有下载任务，Workshop 下载限制器会自动控制并发（最多 3 个同时下载）
         return await withTaskGroup(of: Bool.self, returning: Int.self) { group in
             for item in mediaItems {
                 group.addTask { [weak self] in
@@ -3113,7 +3113,7 @@ final class MediaExploreViewModel: ObservableObject {
         AppLogger.info(.media, "syncSubscribedWorkshopItems: \(toDownload.count) new, \(alreadyDownloaded.count) already downloaded")
 
         // 3. 转换为 MediaItem 并并发提交到下载队列
-        // SteamCMD 下载限制器会自动控制并发（最多 2 个同时下载），超出的会排队等待
+        // Workshop 下载限制器会自动控制并发（最多 3 个同时下载），超出的会排队等待
         let mediaItems = workshopService.convertToMediaItems(toDownload)
         
         return await withTaskGroup(of: Bool.self, returning: (Int, Int).self) { group in
