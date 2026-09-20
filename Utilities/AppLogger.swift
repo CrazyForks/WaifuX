@@ -287,13 +287,16 @@ final class AppLogger: @unchecked Sendable {
 
 // MARK: - repeatForever 动画存活追踪器（诊断后台 CPU 空转）
 /// 可常驻的动画组件在 onAppear/onDisappear 进出注册表；
-/// 心跳每 20s 打印仍存活的动画清单，用于对照 sample 定位常驻空转来源。
+/// 心跳每 20s 检查一次，存活清单有变化才立即打点，无变化每 15 分钟提醒一次，
+/// 用于对照 sample 定位常驻空转来源（避免心跳刷屏淹没真实错误）。
 final class RepeatForeverAnimationTracker: @unchecked Sendable {
     static let shared = RepeatForeverAnimationTracker()
 
     private let lock = NSLock()
     private var alive: [String: Int] = [:]
     private var heartbeatTimer: Timer?
+    private var lastHeartbeatSignature: String?
+    private var lastHeartbeatReminderAt = Date()
 
     func enter(_ tag: String) {
         lock.lock()
@@ -319,7 +322,17 @@ final class RepeatForeverAnimationTracker: @unchecked Sendable {
             let snapshot = self.alive
             self.lock.unlock()
             let names = snapshot.map { "\($0.key)x\($0.value)" }.sorted().joined(separator: ",")
-            AppLogger.error(.general, "[AnimTracker] heartbeat alive=\(snapshot.isEmpty ? "none" : names)")
+            let signature = snapshot.isEmpty ? "none" : names
+            let now = Date()
+            if signature != self.lastHeartbeatSignature {
+                AppLogger.error(.general, "[AnimTracker] heartbeat alive=\(signature)")
+                self.lastHeartbeatSignature = signature
+                self.lastHeartbeatReminderAt = now
+            } else if !snapshot.isEmpty,
+                      now.timeIntervalSince(self.lastHeartbeatReminderAt) >= 900 {
+                AppLogger.error(.general, "[AnimTracker] heartbeat unchanged ≥15m alive=\(signature)")
+                self.lastHeartbeatReminderAt = now
+            }
         }
     }
 }

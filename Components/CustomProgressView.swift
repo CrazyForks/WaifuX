@@ -7,6 +7,8 @@ struct CustomProgressView: View {
     var tint: Color = .white
     var scale: CGFloat = 1.0
     private let trackerTag: String
+    // App 全部窗口被遮挡时暂停旋转，避免后台持续驱动渲染（与 Shimmer 同一门）。
+    @ObservedObject private var visibility = MainWindowVisibility.shared
 
     init(
         tint: Color = .white,
@@ -19,7 +21,7 @@ struct CustomProgressView: View {
     }
 
     var body: some View {
-        CoreAnimationSpinner(tint: tint)
+        CoreAnimationSpinner(tint: tint, animating: visibility.allowContinuousAnimation)
             .frame(width: 20 * scale, height: 20 * scale)
             .onAppear {
                 RepeatForeverAnimationTracker.shared.enter(trackerTag)
@@ -33,6 +35,7 @@ struct CustomProgressView: View {
 /// 把连续旋转交给 Core Animation，避免 SwiftUI repeatForever 每帧触发 ViewGraph/layout。
 private struct CoreAnimationSpinner: NSViewRepresentable {
     let tint: Color
+    var animating: Bool
 
     func makeNSView(context: Context) -> CoreAnimationSpinnerView {
         CoreAnimationSpinnerView(tint: tint)
@@ -40,6 +43,7 @@ private struct CoreAnimationSpinner: NSViewRepresentable {
 
     func updateNSView(_ nsView: CoreAnimationSpinnerView, context: Context) {
         nsView.update(tint: tint)
+        nsView.setAnimating(animating)
     }
 
     static func dismantleNSView(_ nsView: CoreAnimationSpinnerView, coordinator: ()) {
@@ -108,6 +112,15 @@ private final class CoreAnimationSpinnerView: NSView {
     func update(tint: Color) {
         arcLayer.strokeColor = NSColor(tint).cgColor
         needsLayout = true
+    }
+
+    /// App 无可见窗口时暂停 CABasicAnimation（遮挡门），恢复可见时续播。
+    func setAnimating(_ allowed: Bool) {
+        if allowed {
+            startAnimating()
+        } else {
+            stopAnimating()
+        }
     }
 
     func startAnimating() {
