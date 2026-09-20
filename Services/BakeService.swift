@@ -183,7 +183,9 @@ final class BakeService: ObservableObject {
         } catch {
             print("[BakeService] ❌ 启动 wallpaper-wgpu 失败: \(error.localizedDescription)")
             isBaking = false
-            throw BakeError.executionFailed("启动 wallpaper-wgpu 失败: \(error.localizedDescription)")
+            throw BakeError.executionFailed(
+                "启动 wallpaper-wgpu 失败: \(WallpaperEngineError.userFacingLaunchFailure(error))"
+            )
         }
 
         // 4. 等待桌面层窗口出现（--wallpaper 已铺满显示器，无需移动/缩放）

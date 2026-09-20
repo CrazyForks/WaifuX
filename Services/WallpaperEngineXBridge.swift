@@ -1168,19 +1168,24 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
         }
 
+        // 失败文案统一走一次翻译：Intel Mac 上跑 arm64 渲染器时系统只回
+        // 「可执行文件中CPU类型不正确」，用户看不懂，客服每次都要解释一遍。
+        let launchFailureText = lastLaunchError.map { WallpaperEngineError.userFacingLaunchFailure($0) }
+        let launchFailedByCPUType = lastLaunchError.map { WallpaperEngineError.isCPUTypeMismatch($0) } ?? false
+
         if anyLaunchFailed && !preservedRenderers.isEmpty {
             await discardPreparedRenderersPreservingOld(preservedRenderers)
             releaseSettingFlag()
-            throw lastLaunchError
-                ?? WallpaperEngineError.executionFailed("唤醒后 renderer 启动失败")
+            throw WallpaperEngineError.executionFailed(launchFailureText ?? "唤醒后 renderer 启动失败")
         }
         // 全局同步不能把“一块屏成功”当成成功：必须让全局协调器回滚到上一张，
         // 否则会留下部分屏新 Scene、部分屏旧 Scene 的分裂状态。
         if anyLaunchFailed && requireAllTargetScreens {
             updateControlStateFromScreenStates()
             persistState()
+            let cpuHint = launchFailedByCPUType ? "（\(WallpaperEngineError.unsupportedIntelCPUDescription)）" : ""
             throw WallpaperEngineError.executionFailed(
-                "Scene 壁纸未能同步到所有显示器: \(failedScreenIDs.sorted().joined(separator: ","))"
+                "Scene 壁纸未能同步到所有显示器: \(failedScreenIDs.sorted().joined(separator: ","))\(cpuHint)"
             )
         }
 
@@ -1188,7 +1193,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         if anyLaunchFailed && screenProcesses.isEmpty {
             updateControlStateFromScreenStates()
             persistState()
-            throw WallpaperEngineError.executionFailed("所有屏幕 wallpaper-wgpu 启动均失败: \(lastLaunchError!.localizedDescription)")
+            throw WallpaperEngineError.executionFailed("所有屏幕 wallpaper-wgpu 启动均失败: \(launchFailureText ?? "未知错误")")
         } else if anyLaunchFailed {
             print("[WallpaperEngineXBridge] ⚠️ 部分屏幕启动失败，但至少有一个屏幕成功")
         }
@@ -5270,6 +5275,27 @@ enum WallpaperEngineError: LocalizedError {
     case legacyCliNotFound
     case screenCaptureDenied
     case executionFailed(String)
+
+    /// CPU 架构不匹配时的用户可见文案。wallpaper-wgpu 只发布 arm64 版本，Intel
+    /// Mac 上必然启动失败，而系统原文案是「未能完成该操作。可执行文件中CPU类型不正确」，
+    /// 用户看到后只能来问「CPU类型不正确是什么意思」，所以换成能自解释的说法。
+    static let unsupportedIntelCPUDescription = "不支持英特尔处理器：Scene 渲染器 wallpaper-wgpu 只提供 Apple 芯片（arm64）版本"
+
+    /// `posix_spawn` 在 CPU 架构不匹配时返回 EBADARCH；LaunchServices 路径则给出
+    /// 本地化文案，所以 errno 与文案双保险。
+    static func isCPUTypeMismatch(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(EBADARCH) { return true }
+        let text = nsError.localizedDescription
+        return text.contains("Bad CPU type")
+            || text.contains("CPU类型")
+            || text.contains("not supported on this type of Mac")
+    }
+
+    /// 渲染器启动失败给用户看的说明：架构不匹配换成可读文案，其它错误保持系统原文。
+    static func userFacingLaunchFailure(_ error: Error) -> String {
+        isCPUTypeMismatch(error) ? unsupportedIntelCPUDescription : (error as NSError).localizedDescription
+    }
 
     var errorDescription: String? {
         switch self {
