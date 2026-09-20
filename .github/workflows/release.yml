@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
 
     steps:
       - name: Checkout
@@ -19,12 +19,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select Xcode 26.6
+      - name: Select Xcode 27
         run: |
-          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          sudo xcode-select -s /Applications/Xcode_27.0.0.app/Contents/Developer
           echo "Xcode Path: $(xcode-select -p)"
           xcodebuild -version
           swift --version
+
+      # xcode-27 是预览镜像，可能不自带 Metal 工具链
+      # （actions/runner-images#14548 仍 open）。本项目要编译
+      # Metal/LiquidGlassClockShaders.metal，缺了会直接构建失败；已装则秒回。
+      - name: Ensure Metal Toolchain
+        run: sudo xcodebuild -downloadComponent MetalToolchain
 
       - name: Check XcodeGen
         run: which xcodegen || brew install xcodegen
