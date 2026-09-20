@@ -57,6 +57,20 @@ class SettingsViewModel: ObservableObject {
     @Published var pauseInactiveDisplays = false { didSet { UserDefaults.standard.set(pauseInactiveDisplays, forKey: "pause_inactive_displays") } }
     @Published var pauseWhenFullscreenCovers = false { didSet { UserDefaults.standard.set(pauseWhenFullscreenCovers, forKey: "pause_when_fullscreen_covers") } }
     @Published var pauseOnBatteryPower = false { didSet { UserDefaults.standard.set(pauseOnBatteryPower, forKey: "pause_on_battery_power") } }
+    /// 电池供电时播放策略（继续播放 / 暂停），落到 DynamicWallpaperAutoPauseManager 持久化
+    @Published var batteryPlaybackPolicy: WallpaperPlaybackTriggerPolicy = .keepRunning {
+        didSet {
+            guard !isBatchUpdating, batteryPlaybackPolicy != oldValue else { return }
+            DynamicWallpaperAutoPauseManager.shared.batteryPolicy = batteryPlaybackPolicy
+        }
+    }
+    /// 显示器休眠时播放策略（继续播放 / 暂停）
+    @Published var displaySleepPlaybackPolicy: WallpaperPlaybackTriggerPolicy = .pause {
+        didSet {
+            guard !isBatchUpdating, displaySleepPlaybackPolicy != oldValue else { return }
+            DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy = displaySleepPlaybackPolicy
+        }
+    }
     @Published var pauseWhenWindowCoverage = false { didSet { UserDefaults.standard.set(pauseWhenWindowCoverage, forKey: "pause_when_window_coverage") } }
     @Published var windowCoveragePauseThreshold: Double = 50 { didSet { UserDefaults.standard.set(windowCoveragePauseThreshold, forKey: "window_coverage_pause_threshold") } }
     /// 默认关闭：桌面 AVPlayerLayer 开启逐帧 HDR 元数据时，在部分 15.x + XDR 上会偶发整层 tone-map 闪暗。
@@ -210,6 +224,19 @@ class SettingsViewModel: ObservableObject {
                 LockScreenWallpaperService.shared.syncDisplayInstancesToSocketServer()
             }
         }
+    }
+
+    /// 用户是否在系统设置（壁纸 > 锁屏）中选择了 WaifuX 实例。
+    /// 权威来源是系统壁纸 store 的 Index.plist（只读探测），而非扩展 state 行为推断。
+    @Published var lockScreenSelectionStatus: WallpaperStoreSelectionProbe.Selection = .unknown
+
+    /// 设置页出现/刷新时重探系统壁纸 store（探测内部按文件 mtime 缓存，代价低）
+    func refreshLockScreenSelectionStatus() {
+        guard #available(macOS 26.0, *) else {
+            lockScreenSelectionStatus = .unknown
+            return
+        }
+        lockScreenSelectionStatus = WallpaperStoreSelectionProbe.currentSelection()
     }
 
     /// 系统壁纸同步开关（默认开启）。
@@ -525,6 +552,9 @@ class SettingsViewModel: ObservableObject {
             pauseInactiveDisplays = defaults.bool(forKey: "pause_inactive_displays")
             pauseWhenFullscreenCovers = defaults.bool(forKey: "pause_when_fullscreen_covers")
             pauseOnBatteryPower = defaults.bool(forKey: "pause_on_battery_power")
+            // 策略值从 AutoPauseManager 读取（内含旧布尔开关的一次性迁移）
+            batteryPlaybackPolicy = DynamicWallpaperAutoPauseManager.shared.batteryPolicy
+            displaySleepPlaybackPolicy = DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy
             pauseWhenWindowCoverage = defaults.bool(forKey: "pause_when_window_coverage")
             let savedThreshold = defaults.double(forKey: "window_coverage_pause_threshold")
             windowCoveragePauseThreshold = savedThreshold > 0 ? savedThreshold : 50

@@ -38,6 +38,58 @@ enum WallpaperScreenIdentity {
         return String(fingerprint[..<range.lowerBound])
     }
 
+    /// 解析指纹中的 `:position:XxY` 后缀（无序列号显示器的桌面排列位置）。
+    /// 有序列号指纹与旧版短指纹没有 position 后缀，返回 nil。
+    static func position(fromFingerprint fingerprint: String) -> CGPoint? {
+        guard let range = fingerprint.range(of: ":position:") else {
+            return nil
+        }
+        let parts = fingerprint[range.upperBound...]
+            .split(separator: "x", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let x = Double(parts[0]),
+              let y = Double(parts[1]) else {
+            return nil
+        }
+        return CGPoint(x: x, y: y)
+    }
+
+    /// 同硬件分组内的 1:1 配对：按「x 升序 → y 降序」的组内相对次序配对，而不是绝对坐标。
+    ///
+    /// AppKit 的屏幕原点是相对当前主屏的坐标。唤醒/重启后主屏锚点可能变化，
+    /// 所有屏幕的绝对原点整体平移——组内相对次序不变，而「绝对坐标相等」
+    /// 会把 A 屏的旧指纹精确命中到平移后的另一块同型号屏上（配置互换的根源）。
+    /// 无坐标的 orphan（旧版短指纹）排在有坐标的之后，按 id 序兜底。
+    static func pairByRelativeRank(
+        orphans: [(id: String, position: CGPoint?)],
+        screens: [(id: String, position: CGPoint)]
+    ) -> [String: String] {
+        let rankedOrphans = orphans.sorted { lhs, rhs in
+            switch (lhs.position, rhs.position) {
+            case let (l?, r?):
+                if abs(l.x - r.x) > 0.5 { return l.x < r.x }
+                if abs(l.y - r.y) > 0.5 { return l.y > r.y }
+                return lhs.id < rhs.id
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                return lhs.id < rhs.id
+            }
+        }
+        let rankedScreens = screens.sorted { lhs, rhs in
+            if abs(lhs.position.x - rhs.position.x) > 0.5 { return lhs.position.x < rhs.position.x }
+            if abs(lhs.position.y - rhs.position.y) > 0.5 { return lhs.position.y > rhs.position.y }
+            return lhs.id < rhs.id
+        }
+        var pairs: [String: String] = [:]
+        for index in 0..<min(rankedOrphans.count, rankedScreens.count) {
+            pairs[rankedOrphans[index].id] = rankedScreens[index].id
+        }
+        return pairs
+    }
+
     /// Matches a physical display fingerprint while tolerating a changed
     /// desktop position. Callers that have multiple identical no-serial
     /// displays must still require a unique candidate before using this match.

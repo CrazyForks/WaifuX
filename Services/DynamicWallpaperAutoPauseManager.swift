@@ -3,6 +3,14 @@ import AppKit
 import CoreGraphics
 import Combine
 
+/// 「屏幕休眠时 / 电池供电时」等触发型场景的播放策略（二档，参考 MirageWallpaper）。
+/// - `keepRunning`：触发期间不主动干预播放器（继续播放）
+/// - `pause`：触发期间暂停，条件解除后自动恢复
+enum WallpaperPlaybackTriggerPolicy: String {
+    case keepRunning
+    case pause
+}
+
 /// 动态壁纸自动暂停管理器
 /// 根据用户设置，在以下场景自动暂停/恢复动态壁纸：
 /// 1. 前台存在其他应用时（排除 Finder，按屏幕独立判定）
@@ -27,6 +35,12 @@ final class DynamicWallpaperAutoPauseManager {
     private var activeDisplayEventMonitors: [Any] = []
     /// 当前是否存在"电池供电"这一自动暂停原因。
     private var batteryPauseRequested = false
+    /// 电池全局暂停期间被推迟的按屏恢复集合。
+    /// 电池插入时若某屏已被其他自动原因暂停（不在全局快照里），电池期间该原因
+    /// 解除时差量恢复会被 `hasActiveGlobalPauseReason` 挡住；若此时把差量记账
+    /// 消费掉，插电后就再也没有恢复路径，壁纸会永久暂停。这里把"原因已解除"
+    /// 的屏记下来，插电时统一恢复。
+    private var deferredResumeScreenIDsAfterBattery: Set<String> = []
     /// 全局自动暂停（电池）前，原生视频壁纸里真实处于播放中的屏幕。
     private var globalAutoPausedNativePlayingScreenIDs: Set<String> = []
     /// 触发全局自动暂停（电池）前，原生视频里已经处于手动暂停状态的屏幕。
@@ -94,6 +108,8 @@ final class DynamicWallpaperAutoPauseManager {
     private let pauseInactiveDisplaysKey = "pause_inactive_displays"
     private let pauseWhenFullscreenKey = "pause_when_fullscreen_covers"
     private let pauseOnBatteryKey = "pause_on_battery_power"
+    private let batteryPolicyKey = "playback_policy_on_battery"
+    private let displaySleepPolicyKey = "playback_policy_display_sleep"
     private let pauseWhenWindowCoverageKey = "pause_when_window_coverage"
     private let windowCoverageThresholdKey = "window_coverage_pause_threshold"
 
@@ -124,12 +140,45 @@ final class DynamicWallpaperAutoPauseManager {
         }
     }
 
-    /// 切换到电池供电时自动暂停动态壁纸
-    var pauseOnBatteryPower: Bool {
-        get { UserDefaults.standard.bool(forKey: pauseOnBatteryKey) }
+    /// 切换到电池供电时的播放策略（继续播放 / 暂停）。
+    /// 首次读取时从旧布尔开关 `pause_on_battery_power` 迁移。
+    var batteryPolicy: WallpaperPlaybackTriggerPolicy {
+        get {
+            if let raw = UserDefaults.standard.string(forKey: batteryPolicyKey),
+               let policy = WallpaperPlaybackTriggerPolicy(rawValue: raw) {
+                return policy
+            }
+            let legacy = UserDefaults.standard.object(forKey: pauseOnBatteryKey) as? Bool
+            let policy: WallpaperPlaybackTriggerPolicy = (legacy == true) ? .pause : .keepRunning
+            UserDefaults.standard.set(policy.rawValue, forKey: batteryPolicyKey)
+            return policy
+        }
         set {
-            UserDefaults.standard.set(newValue, forKey: pauseOnBatteryKey)
+            UserDefaults.standard.set(newValue.rawValue, forKey: batteryPolicyKey)
+            // 同步旧布尔 key，保持其他读取方兼容
+            UserDefaults.standard.set(newValue == .pause, forKey: pauseOnBatteryKey)
             handleBatterySettingChange()
+        }
+    }
+
+    /// 旧布尔开关兼容口：true 等价于 `batteryPolicy == .pause`。
+    var pauseOnBatteryPower: Bool {
+        get { batteryPolicy == .pause }
+        set { batteryPolicy = newValue ? .pause : .keepRunning }
+    }
+
+    /// 显示器休眠时的播放策略（继续播放 / 暂停）。
+    /// 默认 `.pause` 与历史行为一致：休眠期间暂停播放器省电，唤醒后自动恢复。
+    var displaySleepPolicy: WallpaperPlaybackTriggerPolicy {
+        get {
+            if let raw = UserDefaults.standard.string(forKey: displaySleepPolicyKey),
+               let policy = WallpaperPlaybackTriggerPolicy(rawValue: raw) {
+                return policy
+            }
+            return .pause
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: displaySleepPolicyKey)
         }
     }
 
@@ -474,6 +523,12 @@ final class DynamicWallpaperAutoPauseManager {
                 }
             }
         }
+
+        // 电池全局暂停期间换片：上面清掉了旧快照，必须立即重新快照并把新播放器
+        // 压回暂停，否则新壁纸会在电池供电下直接播放，直到下一次电源切换。
+        if hasActiveGlobalPauseReason {
+            applyGlobalPauseIfNeeded()
+        }
     }
 
     private func updateTimer() {
@@ -510,15 +565,10 @@ final class DynamicWallpaperAutoPauseManager {
             if !fullscreenAutoPausedScreenIDs.isEmpty {
                 let screenIDs = fullscreenAutoPausedScreenIDs
                 fullscreenAutoPausedScreenIDs.removeAll()
-                if !hasActiveGlobalPauseReason {
-                    let stillPausedByOther = foregroundPausedScreenIDs
-                        .union(inactiveDisplayPausedScreenIDs)
-                        .union(windowCoveragePausedScreenIDs)
-                    let canResume = screenIDs.subtracting(stillPausedByOther)
-                    if !canResume.isEmpty {
-                        resumeScreens(byIDs: canResume)
-                    }
-                }
+                let stillPausedByOther = foregroundPausedScreenIDs
+                    .union(inactiveDisplayPausedScreenIDs)
+                    .union(windowCoveragePausedScreenIDs)
+                deferOrResumeScreens(screenIDs, blockedByOtherReasons: stillPausedByOther)
             }
 
             // 旧版全局 WE 全屏暂停标志：关闭开关时兜底恢复
@@ -538,19 +588,15 @@ final class DynamicWallpaperAutoPauseManager {
             if !windowCoveragePausedScreenIDs.isEmpty {
                 let screenIDs = windowCoveragePausedScreenIDs
                 windowCoveragePausedScreenIDs.removeAll()
-                if !hasActiveGlobalPauseReason {
-                    let stillPausedByOther = foregroundPausedScreenIDs
-                        .union(inactiveDisplayPausedScreenIDs)
-                        .union(fullscreenAutoPausedScreenIDs)
-                    let canResume = screenIDs.subtracting(stillPausedByOther)
-                    if !canResume.isEmpty {
-                        resumeScreens(byIDs: canResume)
-                        let weBridge = WallpaperEngineXBridge.shared
-                        if weBridge.isControllingExternalEngine {
-                            for sid in canResume where weBridge.isManaging(screenID: sid) {
-                                weBridge.resumeWallpaper(for: sid)
-                            }
-                        }
+                let stillPausedByOther = foregroundPausedScreenIDs
+                    .union(inactiveDisplayPausedScreenIDs)
+                    .union(fullscreenAutoPausedScreenIDs)
+                deferOrResumeScreens(screenIDs, blockedByOtherReasons: stillPausedByOther)
+                let weBridge = WallpaperEngineXBridge.shared
+                if !hasActiveGlobalPauseReason, weBridge.isControllingExternalEngine {
+                    for sid in screenIDs.subtracting(stillPausedByOther)
+                        where weBridge.isManaging(screenID: sid) {
+                        weBridge.resumeWallpaper(for: sid)
                     }
                 }
             }
@@ -599,6 +645,7 @@ final class DynamicWallpaperAutoPauseManager {
             inactiveDisplayManuallyPausedScreenIDs.removeAll()
             activeDisplayScreenID = nil
             batteryPauseRequested = false
+            deferredResumeScreenIDsAfterBattery.removeAll()
             globalAutoPausedNativePlayingScreenIDs.removeAll()
             globalAutoPausedNativeManuallyPausedScreenIDs.removeAll()
             globalAutoPausedExternalEngine = false
@@ -682,8 +729,8 @@ final class DynamicWallpaperAutoPauseManager {
                 .subtracting(foregroundPausedScreenIDs)
                 .subtracting(inactiveDisplayPausedScreenIDs)
                 .subtracting(windowCoveragePausedScreenIDs)
-            if !filteredResumeIDs.isEmpty, !hasActiveGlobalPauseReason, !isInDisplayTransitionGrace {
-                resumeScreens(byIDs: filteredResumeIDs)
+            if !filteredResumeIDs.isEmpty, !isInDisplayTransitionGrace {
+                deferOrResumeScreens(filteredResumeIDs)
             }
         }
 
@@ -894,14 +941,24 @@ final class DynamicWallpaperAutoPauseManager {
         }
         foregroundPausedScreenIDs = newForegroundPausedIDs
 
+        // 仍被独立机制（全屏/非活动屏/窗口覆盖）压住的屏不能被前台恢复 override
+        let stillBlocked = fullscreenAutoPausedScreenIDs
+            .union(inactiveDisplayPausedScreenIDs)
+            .union(windowCoveragePausedScreenIDs)
+
         // 电池暂停期间：只记录前台状态变化，不实际暂停/恢复壁纸
         // 壁纸已由电池全局暂停，恢复时会根据当前 foregroundPausedScreenIDs 重新施加前台暂停
-        guard !batteryPauseRequested else { return }
+        guard !batteryPauseRequested else {
+            // 前台原因解除的屏：记账已更新，实际恢复推迟到插电时执行
+            let releasedIDs = previouslyPausedIDs.subtracting(newForegroundPausedIDs)
+            deferOrResumeScreens(releasedIDs, blockedByOtherReasons: stillBlocked)
+            return
+        }
 
         // 恢复不再被前台应用覆盖的屏幕
         let screenIDsToResume = previouslyPausedIDs.subtracting(newForegroundPausedIDs)
         if !screenIDsToResume.isEmpty, !isInDisplayTransitionGrace {
-            applyPerScreenForegroundResume(screenIDs: screenIDsToResume)
+            deferOrResumeScreens(screenIDsToResume, blockedByOtherReasons: stillBlocked)
         }
 
         // 暂停新被前台应用覆盖的屏幕
@@ -1415,16 +1472,33 @@ final class DynamicWallpaperAutoPauseManager {
         }
     }
 
+    /// 按屏恢复的统一入口：电池全局暂停期间把实际恢复推迟到插电时执行。
+    /// 电池期间各差量检测的「原因解除」事件照常维护记账集合，但播放器仍被
+    /// 全局暂停压住；若此时直接消费差量记账，插电后这些屏将没有恢复路径。
+    private func deferOrResumeScreens(
+        _ screenIDs: Set<String>,
+        blockedByOtherReasons: Set<String> = []
+    ) {
+        let resumable = screenIDs.subtracting(blockedByOtherReasons)
+        guard !resumable.isEmpty else { return }
+        if hasActiveGlobalPauseReason {
+            deferredResumeScreenIDsAfterBattery.formUnion(resumable)
+        } else {
+            resumeScreens(byIDs: resumable)
+        }
+    }
+
     private func syncForegroundPauseRequest() {
         guard pauseWhenOtherAppForeground else {
             // 关闭前台暂停时：恢复所有被前台暂停的屏幕
             if !foregroundPausedScreenIDs.isEmpty {
                 let pausedIDs = foregroundPausedScreenIDs
                 foregroundPausedScreenIDs.removeAll()
-                // 电池暂停期间不实际恢复（电池恢复时会处理）
-                if !batteryPauseRequested {
-                    applyPerScreenForegroundResume(screenIDs: pausedIDs)
-                }
+                // 电池暂停期间不实际恢复（推迟到插电时执行）
+                let stillBlocked = fullscreenAutoPausedScreenIDs
+                    .union(inactiveDisplayPausedScreenIDs)
+                    .union(windowCoveragePausedScreenIDs)
+                deferOrResumeScreens(pausedIDs, blockedByOtherReasons: stillBlocked)
             }
             return
         }
@@ -1489,15 +1563,15 @@ final class DynamicWallpaperAutoPauseManager {
         let manuallyPausedScreenIDs = inactiveDisplayManuallyPausedScreenIDs
         inactiveDisplayPausedScreenIDs.removeAll()
         inactiveDisplayManuallyPausedScreenIDs.removeAll()
-        guard !hasActiveGlobalPauseReason else { return }
 
         let blockedByOtherReasons = foregroundPausedScreenIDs
             .union(fullscreenAutoPausedScreenIDs)
             .union(windowCoveragePausedScreenIDs)
-        let screenIDsToResume = screenIDs
+        let candidates = screenIDs
             .subtracting(manuallyPausedScreenIDs)
             .subtracting(blockedByOtherReasons)
-        resumeScreens(byIDs: screenIDsToResume)
+        // 电池暂停期间播放器被全局暂停压住，恢复推迟到插电时执行
+        deferOrResumeScreens(candidates)
     }
 
     private func reevaluateInactiveDisplayPause() {
@@ -1532,8 +1606,19 @@ final class DynamicWallpaperAutoPauseManager {
             let blockedByOtherReasons = foregroundPausedScreenIDs
                 .union(fullscreenAutoPausedScreenIDs)
                 .union(windowCoveragePausedScreenIDs)
-            resumeScreens(
-                byIDs: screenIDsToResume
+            deferOrResumeScreens(
+                screenIDsToResume
+                    .subtracting(manuallyPausedScreenIDs)
+                    .subtracting(blockedByOtherReasons)
+            )
+        } else {
+            // 电池期间非活动屏原因解除：记账已更新为当前状态，
+            // 实际恢复推迟到插电时执行，否则插电后无恢复路径。
+            let blockedByOtherReasons = foregroundPausedScreenIDs
+                .union(fullscreenAutoPausedScreenIDs)
+                .union(windowCoveragePausedScreenIDs)
+            deferOrResumeScreens(
+                screenIDsToResume
                     .subtracting(manuallyPausedScreenIDs)
                     .subtracting(blockedByOtherReasons)
             )
@@ -1606,9 +1691,15 @@ final class DynamicWallpaperAutoPauseManager {
 
         // ---- 外部引擎 ----
         if weBridge.isControllingExternalEngine {
-            guard !weBridge.isExternalPaused else { return }
-            globalAutoPausedExternalEngine = true
-            weBridge.pauseWallpaper()
+            if weBridge.isExternalPaused {
+                // WE 已被其他原因（手动/全屏/覆盖）暂停：不能记成电池暂停，
+                // 否则插电恢复会误唤醒它；但绝不能在这里提前 return——
+                // 此前会把后面原生视频的全局暂停一并跳过（混合壁纸场景漏暂停）。
+                globalAutoPausedExternalEngine = false
+            } else {
+                globalAutoPausedExternalEngine = true
+                weBridge.pauseWallpaper()
+            }
         } else {
             globalAutoPausedExternalEngine = false
         }
@@ -1706,6 +1797,14 @@ final class DynamicWallpaperAutoPauseManager {
             .subtracting(globalAutoPausedNativeManuallyPausedScreenIDs)
         globalAutoPausedNativePlayingScreenIDs.removeAll()
         globalAutoPausedNativeManuallyPausedScreenIDs.removeAll()
+
+        // 电池期间被推迟的按屏恢复（插入电池时已不在播、后来暂停原因又解除的屏）。
+        // 这些屏不在全局快照里，若不在这里补恢复，插电后会永久停在暂停状态。
+        let deferredScreenIDs = deferredResumeScreenIDsAfterBattery
+        deferredResumeScreenIDsAfterBattery.removeAll()
+        if !deferredScreenIDs.isEmpty {
+            resumeScreens(byIDs: deferredScreenIDs)
+        }
     }
 
     /// 是否存在全局暂停原因（电池供电）
@@ -1895,7 +1994,14 @@ final class DynamicWallpaperAutoPauseManager {
     private func applyWindowCoverageResume(screenIDs: Set<String>) {
         guard !screenIDs.isEmpty else { return }
         windowCoveragePausedScreenIDs.subtract(screenIDs)
-        guard !hasActiveGlobalPauseReason else { return }
+        guard !hasActiveGlobalPauseReason else {
+            // 电池全局暂停期间：记账照常维护，实际恢复推迟到插电时统一执行。
+            let stillPausedByOther = foregroundPausedScreenIDs
+                .union(inactiveDisplayPausedScreenIDs)
+                .union(fullscreenAutoPausedScreenIDs)
+            deferOrResumeScreens(screenIDs.subtracting(stillPausedByOther))
+            return
+        }
 
         let stillPausedByOther = foregroundPausedScreenIDs
             .union(inactiveDisplayPausedScreenIDs)
@@ -1958,16 +2064,15 @@ final class DynamicWallpaperAutoPauseManager {
         let toResume = windowCoveragePausedScreenIDs
         windowCoveragePausedScreenIDs.removeAll()
         windowCoverageCoveredScreenIDs.removeAll()
-        guard !hasActiveGlobalPauseReason else { return }
         let stillPaused = foregroundPausedScreenIDs
             .union(inactiveDisplayPausedScreenIDs)
             .union(fullscreenAutoPausedScreenIDs)
-        let canResume = toResume.subtracting(stillPaused)
-        if !canResume.isEmpty {
-            resumeScreens(byIDs: canResume)
+        deferOrResumeScreens(toResume, blockedByOtherReasons: stillPaused)
+        if !hasActiveGlobalPauseReason {
             let weBridge = WallpaperEngineXBridge.shared
             if weBridge.isControllingExternalEngine {
-                for sid in canResume where weBridge.isManaging(screenID: sid) {
+                for sid in toResume.subtracting(stillPaused)
+                    where weBridge.isManaging(screenID: sid) {
                     weBridge.resumeWallpaper(for: sid)
                 }
             }
