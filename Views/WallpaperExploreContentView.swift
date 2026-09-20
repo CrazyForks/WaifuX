@@ -352,6 +352,47 @@ struct WallpaperExploreContentView: View {
 
     @ViewBuilder
     private var mainContent: some View {
+        contentWithFilterObservers
+        .overlay(alertOverlay)
+        .overlay(alignment: .center) { wallpaperURLOverlay }
+        .animation(.easeInOut(duration: 0.18), value: showWallpaperURLSheet)
+    }
+
+    /// 后半段观察者：数据源 / 分类 / 排序变更。
+    ///
+    /// ⚠️ 不要把它并回 `contentBase`。原先这些观察者与视觉主体同属 `mainContent`
+    /// 一条 140+ 行的修饰符链，Xcode 26.6（CI 用的版本）在 Release 下会报
+    /// `WallpaperExploreContentView.swift:488: the compiler is unable to type-check
+    /// this expression in reasonable time`；本地 Xcode 27 的预算更大、不复现。
+    /// 因此按「拆短每个 `some View` 属性的表达式」处理，合并回去会重新触发超时。
+    @ViewBuilder
+    private var contentWithFilterObservers: some View {
+        contentBase
+        .onReceive(NotificationCenter.default.publisher(for: .wallpaperDataSourceChanged)) { _ in
+            handleDataSourceChange()
+        }
+        .onChange(of: category) { _, _ in
+            handleCategoryChange()
+            syncAtmosphereIfNeeded()
+            // 分类切换同步执行重算（无需防抖，用户主动操作频率低）
+            recomputeTask?.cancel()
+            recomputeTask = Task { @MainActor in
+                recomputeVisibleWallpapers()
+            }
+        }
+        .onChange(of: fourKCategory) { _, _ in handle4KCategoryChange() }
+        .onChange(of: hotTag) { _, _ in handleHotTagChange() }
+        .onChange(of: viewModel.sortingOption) { _, _ in handleSortingChange() }
+        .onChange(of: fourKSorting) { _, _ in handle4KSortingChange() }
+        .onChange(of: konachanSorting) { _, _ in handleKonachanSortingChange() }
+        .onChange(of: viewModel.wallpapers) { _, _ in
+            handleWallpapersChanged()
+        }
+    }
+
+    /// 视觉主体：几何读取 + 背景 + 滚动网格。
+    @ViewBuilder
+    private var visualCore: some View {
         GeometryReader { geometry in
             let contentWidth = calculateContentWidth(geometry: geometry)
             let gridConfig = WallpaperGridConfig(contentWidth: contentWidth)
@@ -381,6 +422,13 @@ struct WallpaperExploreContentView: View {
                 )
             }
         }
+    }
+
+    /// 前半段观察者：生命周期 + 选择/可见状态。
+    /// 与 `contentWithFilterObservers` 分开的理由同上（控制单个表达式的类型检查规模）。
+    @ViewBuilder
+    private var contentBase: some View {
+        visualCore
         .onAppear {
             syncExploreSortStateFromViewModel()
             if isFirstAppearance {
@@ -436,63 +484,52 @@ struct WallpaperExploreContentView: View {
             viewModel.searchQuery = query
             reloadData()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .wallpaperDataSourceChanged)) { _ in
-            handleDataSourceChange()
-        }
-        .onChange(of: category) { _, _ in
-            handleCategoryChange()
-            syncAtmosphereIfNeeded()
-            // 分类切换同步执行重算（无需防抖，用户主动操作频率低）
-            recomputeTask?.cancel()
-            recomputeTask = Task { @MainActor in
-                recomputeVisibleWallpapers()
-            }
-        }
-        .onChange(of: fourKCategory) { _, _ in handle4KCategoryChange() }
-        .onChange(of: hotTag) { _, _ in handleHotTagChange() }
-        .onChange(of: viewModel.sortingOption) { _, _ in handleSortingChange() }
-        .onChange(of: fourKSorting) { _, _ in handle4KSortingChange() }
-        .onChange(of: konachanSorting) { _, _ in handleKonachanSortingChange() }
-        .onChange(of: viewModel.wallpapers) { _, _ in
-            let count = viewModel.wallpapers.count
-            WallpaperExploreDiagnostics.markWallpapersChanged(
-                totalCount: count,
-                isLoading: viewModel.isLoading
-            )
-            AppLogger.debug(.wallpaper, "[诊断] wallpapers 变化", metadata: [
-                "count": "\(count)",
-                "isLoading": "\(viewModel.isLoading)"
-            ])
-            // ⚡ 3s 节流：loadMore 时 wallpapers 高频追加，syncAtmosphereIfNeeded 会下载缩略图
-            // + CoreImage 颜色分析，不加节流会导致 CPU 持续满载。
-            let now = Date()
-            if now.timeIntervalSince(lastAtmosphereSyncTime) >= 3.0 {
-                lastAtmosphereSyncTime = now
-                syncAtmosphereIfNeeded()
-            }
+    }
 
-            // ✅ 异步防抖：取消上一次尚未执行的重算，开启新任务并等待 400ms 缓冲。
-            // wallpapers 变更通知 + upsert 的 @Published 通知可能重叠，400ms 给 SwiftUI 足够时间
-            // 完成观察系统处理，避免与滚动期间的 view 更新竞态导致主线程死锁。
-            // ⚠️ 之前是 200ms，但偶发场景下仍能击破竞态保护——加大到 400ms 几乎能压住所有
-            // 边界情况，代价仅是 loadMore 后新数据呈现稍晚 200ms（用户几乎感知不到）。
-            recomputeTask?.cancel()
-            recomputeTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 400_000_000) // 400ms 缓冲，避免与 SwiftUI 观察系统竞态
-                guard !Task.isCancelled else { return }
-                recomputeVisibleWallpapers()
+    /// 链接弹窗走应用内玻璃 overlay（同 DisplaySelector），原生 glassEffect 可采样页面内容。
+    /// 独立成属性：`GlassOverlayCardShell` 的泛型推断叠加 `wallpaperURLSheet` 的大初始化器
+    /// 挂在主链尾端，是 Xcode 26.6 类型检查超时的直接触发点。
+    @ViewBuilder
+    private var wallpaperURLOverlay: some View {
+        if showWallpaperURLSheet {
+            GlassOverlayCardShell(backdropTapToDismiss: { showWallpaperURLSheet = false }) {
+                wallpaperURLSheet
             }
         }
-        .overlay(alertOverlay)
-        // 链接弹窗走应用内玻璃 overlay（同 DisplaySelector），原生 glassEffect 可采样页面内容
-        .overlay {
-            if showWallpaperURLSheet {
-                GlassOverlayCardShell(backdropTapToDismiss: { showWallpaperURLSheet = false }) {
-                    wallpaperURLSheet
-                }
-            }
+    }
+
+    /// wallpapers 变更后的氛围同步节流 + 400ms 防抖重算。
+    /// 从修饰符链里移出来（逻辑与原先的内联闭包逐行一致）：30 行的内联闭包
+    /// 会显著抬高所在表达式的类型检查开销，是同一个超时根因。
+    private func handleWallpapersChanged() {
+        let count = viewModel.wallpapers.count
+        WallpaperExploreDiagnostics.markWallpapersChanged(
+            totalCount: count,
+            isLoading: viewModel.isLoading
+        )
+        AppLogger.debug(.wallpaper, "[诊断] wallpapers 变化", metadata: [
+            "count": "\(count)",
+            "isLoading": "\(viewModel.isLoading)"
+        ])
+        // ⚡ 3s 节流：loadMore 时 wallpapers 高频追加，syncAtmosphereIfNeeded 会下载缩略图
+        // + CoreImage 颜色分析，不加节流会导致 CPU 持续满载。
+        let now = Date()
+        if now.timeIntervalSince(lastAtmosphereSyncTime) >= 3.0 {
+            lastAtmosphereSyncTime = now
+            syncAtmosphereIfNeeded()
         }
-        .animation(.easeInOut(duration: 0.18), value: showWallpaperURLSheet)
+
+        // ✅ 异步防抖：取消上一次尚未执行的重算，开启新任务并等待 400ms 缓冲。
+        // wallpapers 变更通知 + upsert 的 @Published 通知可能重叠，400ms 给 SwiftUI 足够时间
+        // 完成观察系统处理，避免与滚动期间的 view 更新竞态导致主线程死锁。
+        // ⚠️ 之前是 200ms，但偶发场景下仍能击破竞态保护——加大到 400ms 几乎能压住所有
+        // 边界情况，代价仅是 loadMore 后新数据呈现稍晚 200ms（用户几乎感知不到）。
+        recomputeTask?.cancel()
+        recomputeTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000) // 400ms 缓冲，避免与 SwiftUI 观察系统竞态
+            guard !Task.isCancelled else { return }
+            recomputeVisibleWallpapers()
+        }
     }
 
     private var wallpaperURLSheet: some View {
