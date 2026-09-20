@@ -547,6 +547,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // 启动后错峰检查一次系统壁纸缓存水位（>2GB 时 LRU 清到 100MB，见 WallpaperSystemCacheJanitor）
         WallpaperSystemCacheJanitor.shared.noteAppLaunch()
 
+        // .saver 是从 App 包里拷到 ~/Library/Screen Savers 的，App 升级后要同步那份副本
+        ScreenSaverService.shared.refreshInstalledVersionIfNeeded()
+        // 屏保跟随桌面壁纸：启动时对齐一次（壁纸状态恢复后观察者还会再同步）
+        ScreenSaverService.shared.syncFromDesktop(reason: "launch")
+
         // Sparkle 自动按 SUScheduledCheckInterval (24h) 检查更新，无需手动触发
     }
 
@@ -1119,11 +1124,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
         let currentAppURL = appURL.standardizedFileURL
 
+        // 第 1.5 步：健康闸门（指纹在主线程读取，elected 检查在后台做）。
+        // lsregister / pluginkit -a 会更新 LaunchServices 与 pkd 登记，pkd 的标准响应是
+        // 终止该扩展的所有运行实例（launchd: "remove all extension instances: caller = pkd"，
+        // 2026-09-20 SIGTERM 实锤）。宿主每次启动都无条件修复 = 扩展必死一次，
+        // Xcode 反复 Run / 二次启动 / Sparkle 更新重启时表现为扩展被连续杀、锁屏实例假死。
+        // 仅当 bundle 指纹变化或登记失去 elected 时才执行修复。指纹 key 与
+        // SocketServer 的 extensionReloadFingerprintDefaultsKey 分开，避免写序耦合。
+        let fingerprint = WallpaperExtensionSocketServer.embeddedExtensionBundleFingerprint()
+        let registrationFingerprintKey = "wallpaper_extension_registration_fingerprint"
+        let lastRegisteredFingerprint = UserDefaults.standard.string(forKey: registrationFingerprintKey)
+
         // 第 2 步：Process 系统调用派发到后台，不阻塞主线程。
         // 先注册当前正在运行的 App/appex，再清理旧注册。
         // 这样即使旧路径文件已不存在（如 brew 更新后移到废纸篓）导致清理失败，
         // 系统也已持有新路径的有效注册，WallpaperAgent 能正常发现扩展。
-        DispatchQueue.global(qos: .utility).async { [appURL, extensionURL, currentAppURL] in
+        DispatchQueue.global(qos: .utility).async { [appURL, extensionURL, currentAppURL, fingerprint, lastRegisteredFingerprint] in
+            // —— 健康闸门：bundle 未变且当前副本已被系统选中 → 整体跳过修复 ——
+            // （读不到指纹视为异常，走修复路径，宁修勿漏）
+            if let fingerprint, fingerprint == lastRegisteredFingerprint,
+               self.isExtensionElected(extensionURL: extensionURL) {
+                print("[WaifuXApp] Wallpaper extension registration healthy (fingerprint unchanged, elected) — skip repair")
+                return
+            }
+
             // —— 优先注册当前 bundle ——
             self.registerBundleWithLaunchServices(appURL)
             self.registerBundleWithPlugInKit(extensionURL)
@@ -1144,8 +1168,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 print("[WaifuXApp] Removed stale wallpaper extension registration: \(candidate.path)")
             }
 
+            // —— 选举验证：清理后当前 bundle 的 appex 必须是系统选中（elected）副本 ——
+            // 参考 Mirage：pluginkit 可能在数据库里保留指向旧路径的登记或选中其他副本，
+            // 导致 WallpaperAgent 加载到错误版本。未当选时重跑一次注册并复查。
+            // 不删除其他合法路径的登记（误伤用户另装副本），stale 判定仍由上方逻辑负责。
+            self.verifyElectedWallpaperExtensionRegistration(extensionURL: extensionURL)
+
             // 重启 WallpaperAgent，强制其从更新后的 PlugInKit 数据库重新加载扩展列表。
             // 解决 brew 更新后 WallpaperAgent 内存缓存仍指向旧扩展的问题。
+            // （仅修复路径会走到这里；健康启动不再杀 agent/扩展）
             self.runRegistrationTool("/usr/bin/killall", arguments: ["WallpaperAgent"], label: "killall WallpaperAgent")
 
             self.terminateStaleWallpaperExtensionProcessesByPID(currentAppURL: currentAppURL)
@@ -1154,7 +1185,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             DispatchQueue.main.async {
                 self.terminateStaleWallpaperExtensionProcesses(currentAppURL: currentAppURL)
             }
+
+            if let fingerprint {
+                UserDefaults.standard.set(fingerprint, forKey: registrationFingerprintKey)
+            }
         }
+    }
+
+    /// 检查当前 bundle 的扩展是否为 PlugInKit 数据库中选中的（elected）副本。
+    /// 只读查询，不触发登记变更；在后台线程调用。
+    nonisolated private func isExtensionElected(extensionURL: URL) -> Bool {
+        let output = processOutput(
+            launchPath: "/usr/bin/pluginkit",
+            arguments: ["-m", "-v", "-i", "com.waifux.app.wallpaperextension"]
+        )
+        return WallpaperExtensionElection.isElected(
+            output: output,
+            targetPath: extensionURL.standardizedFileURL.path
+        )
     }
 
     /// 计算需要清理的过期扩展列表。
@@ -1187,6 +1235,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
             arguments: ["-e", "use", "-i", "com.waifux.app.wallpaperextension"],
             label: "pluginkit enable"
         )
+    }
+
+    /// 验证当前 bundle 的扩展在 PlugInKit 数据库中被选中（elected）。
+    /// 未当选时重跑一次注册后复查，最多重试一次；在后台线程调用。
+    nonisolated private func verifyElectedWallpaperExtensionRegistration(extensionURL: URL, attempt: Int = 0) {
+        let targetPath = extensionURL.standardizedFileURL.path
+        let output = processOutput(
+            launchPath: "/usr/bin/pluginkit",
+            arguments: ["-m", "-v", "-i", "com.waifux.app.wallpaperextension"]
+        )
+        guard WallpaperExtensionElection.isElected(output: output, targetPath: targetPath) else {
+            if attempt < 1 {
+                print("[WaifuXApp] Extension not elected — re-registering: \(targetPath)")
+                registerBundleWithPlugInKit(extensionURL)
+                Thread.sleep(forTimeInterval: 0.3)
+                verifyElectedWallpaperExtensionRegistration(extensionURL: extensionURL, attempt: attempt + 1)
+            } else {
+                print("[WaifuXApp] ⚠️ Extension still not elected after re-registration. pluginkit output:\n\(output)")
+            }
+            return
+        }
+        print("[WaifuXApp] Extension registration verified (elected): \(targetPath)")
     }
 
     nonisolated private func wallpaperExtensionRegistrationCandidates(currentAppURL: URL) -> [URL] {
@@ -1579,6 +1649,9 @@ extension AppDelegate {
             settingsWindowController = nil
             return true
         }
+        // 保留系统 NSAlert：此 delegate 必须同步返回是否允许关闭，且关闭设置窗后
+        // 主窗口可能已隐藏（托盘模式），应用内玻璃 alert 没有宿主窗口。
+        // 玻璃化前置条件：GlassAlertCenter 增加独立悬浮窗宿主后再迁移。
         let alert = NSAlert()
         alert.messageText = t("settings.modules.closePending.title")
         alert.informativeText = t("settings.modules.closePending.message")

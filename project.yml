@@ -12,6 +12,7 @@ schemes:
       targets:
         WaifuX: all
         WaifuXWallpaperExtension: all
+        WaifuXScreenSaver: all
     run:
       config: Debug
     archive:
@@ -97,6 +98,15 @@ targets:
       - package: Sparkle
       - target: WaifuXWallpaperExtension
         embed: true
+      # 屏保组件：拷进 App 资源目录下的固定位置，用户点「安装」时再复制到 ~/Library/Screen Savers。
+      # 用 Copy Files 阶段而不是 Run Script：脚本沙箱 deny 了构建产物目录，
+      # 脚本里对 .app 内的 rm/mv 会被拒（Operation not permitted）。
+      - target: WaifuXScreenSaver
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Resources/Screen Savers
     postBuildScripts:
       - basedOnDependencyAnalysis: false
         script: |
@@ -300,3 +310,31 @@ targets:
         LD_RUNPATH_SEARCH_PATHS: $(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks
     entitlements:
       path: WaifuXWallpaperExtension/WaifuXWallpaperExtension.entitlements
+
+  # 屏保组件：独立 .saver 包，由系统 legacyScreenSaver 进程加载。
+  # 只读 App 写好的 ~/Library/Application Support/WaifuX/screensaver.json，
+  # 不依赖主程序运行（结构参考 MirageWallpaper 的 MirageScreenSaver）。
+  WaifuXScreenSaver:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: WaifuXScreenSaver
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_NAME: WaifuXScreenSaver
+        PRODUCT_BUNDLE_IDENTIFIER: com.waifux.app.screensaver
+        MARKETING_VERSION: 38.0.152
+        CURRENT_PROJECT_VERSION: 38.0.152
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.4"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: H6W325NJX2
+        INFOPLIST_FILE: WaifuXScreenSaver/Info.plist
+        WRAPPER_EXTENSION: saver
+        SKIP_INSTALL: YES
+        # 屏保是插件包：宿主是系统的 legacyScreenSaver，开 Hardened Runtime 只会
+        # 让库校验/沙盒行为不可控，这里显式关掉（与 Mirage 的屏保目标一致）。
+        ENABLE_HARDENED_RUNTIME: NO
+        LD_RUNPATH_SEARCH_PATHS: $(inherited) @loader_path/../Frameworks

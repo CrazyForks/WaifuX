@@ -352,6 +352,18 @@ sign_exported_app() {
         echo "$ent_check" | head -20 >&2
         return 1
       fi
+    elif [[ "$code_path" == *.saver ]]; then
+      # 屏保是插件包，宿主是系统的 legacyScreenSaver：不带 entitlements，
+      # 也不加 --options runtime，避免插件在系统宿主里被库校验/沙盒策略拦住。
+      # 顺序固定为先可执行文件、后整包，否则封条会被后续单独的签名动作打坏。
+      local saver_exe="$code_path/Contents/MacOS/$(basename "$code_path" .saver)"
+      if [[ -f "$saver_exe" ]]; then
+        codesign --force --timestamp=none -s "$identity" "$saver_exe" 2>/dev/null || \
+          codesign --force -s "$identity" "$saver_exe" 2>/dev/null || true
+      fi
+      codesign --force --timestamp=none -s "$identity" "$code_path" 2>/dev/null || \
+        codesign --force -s "$identity" "$code_path" 2>/dev/null || true
+      echo "  ✅ 屏保组件已签名: $(basename "$code_path")"
     else
 	      # 对 framework：清除旧封印后用 --deep 递归签名
 	      if [[ "$code_path" == *.framework ]]; then
@@ -397,6 +409,11 @@ sign_exported_app() {
   done < <(
     find "$app_path/Contents/Resources" -type f \( -perm -111 -o -name "*.dylib" \) -print 2>/dev/null \
       | while IFS= read -r candidate; do
+          # .saver 内部的可执行文件由 sign_nested_code 的屏保分支按插件包顺序签，
+          # 这里跳过，避免"先签可执行文件再签整包"之外的第三种顺序。
+          if [[ "$candidate" == *.saver/* ]]; then
+            continue
+          fi
           if file "$candidate" | grep -q "Mach-O"; then
             echo "$candidate"
           fi
@@ -406,7 +423,7 @@ sign_exported_app() {
   while IFS= read -r bundle_path; do
     sign_nested_code "$bundle_path"
   done < <(
-    find "$app_path/Contents/Resources" -type d \( -name "*.app" -o -name "*.framework" \) -print 2>/dev/null \
+    find "$app_path/Contents/Resources" -type d \( -name "*.app" -o -name "*.framework" -o -name "*.saver" \) -print 2>/dev/null \
       | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2-
   )
 

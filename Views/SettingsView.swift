@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
 import ApplicationServices
+import CoreImage
+import CoreImage.CIFilterBuiltins
 
 private let settingsSliderTint = Color(hex: "30D158")
 
@@ -250,6 +252,7 @@ struct SettingsView: View {
 // MARK: - 功能模块设置标签
 private struct ModulesSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
+    @State private var showRestartConfirm = false
 
     var body: some View {
         MacSettingsForm {
@@ -297,19 +300,19 @@ private struct ModulesSettingsTab: View {
                 }
             }
         }
+        .glassAlert(t("settings.modules.restartConfirm.title"), isPresented: $showRestartConfirm,
+                    message: t("settings.modules.restartConfirm.message"),
+                    actions: [
+                        GlassAlertAction(t("settings.modules.restartNow")) {
+                            AppRelauncher.relaunch()
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel)
+                    ])
     }
 
     /// 重启确认弹窗
     private func confirmRestart() {
-        let alert = NSAlert()
-        alert.messageText = t("settings.modules.restartConfirm.title")
-        alert.informativeText = t("settings.modules.restartConfirm.message")
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: t("settings.modules.restartNow"))
-        alert.addButton(withTitle: t("cancel"))
-        if alert.runModal() == .alertFirstButtonReturn {
-            AppRelauncher.relaunch()
-        }
+        showRestartConfirm = true
     }
 }
 
@@ -319,6 +322,23 @@ private struct GeneralSettingsTab: View {
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
     @State private var showClearLockScreenAlert = false
     @State private var importProfileURL = ""
+
+    /// 系统壁纸 store 的选择状态说明（设置页动态锁屏区展示）
+    private var lockScreenSelectionDescription: String {
+        switch viewModel.lockScreenSelectionStatus {
+        case .selected: return t("lockScreenSelectionSelected")
+        case .notSelected: return t("lockScreenSelectionNotSelected")
+        case .unknown: return t("lockScreenSelectionUnknown")
+        }
+    }
+
+    private var lockScreenSelectionColor: Color {
+        switch viewModel.lockScreenSelectionStatus {
+        case .selected: return Color(hex: "30D158")
+        case .notSelected: return Color(hex: "FF9F0A")
+        case .unknown: return Color.white.opacity(0.35)
+        }
+    }
 
     private var languageBinding: Binding<LocalizationService.Language> {
         Binding(
@@ -598,6 +618,17 @@ private struct GeneralSettingsTab: View {
                     }
 
                     MacSettingsRow(
+                        title: t("lockScreenSelectionStatus"),
+                        subtitle: lockScreenSelectionDescription,
+                        showDivider: true
+                    ) {
+                        Circle()
+                            .fill(lockScreenSelectionColor)
+                            .frame(width: 8, height: 8)
+                    }
+                    .onAppear { viewModel.refreshLockScreenSelectionStatus() }
+
+                    MacSettingsRow(
                         title: t("clearLockScreenInstances"),
                         subtitle: t("clearLockScreenInstancesDesc"),
                         showDivider: false
@@ -610,6 +641,9 @@ private struct GeneralSettingsTab: View {
                     }
                 }
             }
+
+            // 屏保组（安装/跟随状态，跟随桌面壁纸，与动态锁屏同语义）
+            ScreenSaverSettingsTab()
 
             // 代理设置组
             MacSettingsSection(header: t("proxySettings")) {
@@ -712,14 +746,14 @@ private struct GeneralSettingsTab: View {
                 }
             }
         }
-        .alert(t("clearLockScreenInstances"), isPresented: $showClearLockScreenAlert) {
-            Button(t("cancel"), role: .cancel) {}
-            Button(t("clear"), role: .destructive) {
-                viewModel.clearLockScreenInstances()
-            }
-        } message: {
-            Text(t("clearLockScreenInstancesConfirm"))
-        }
+        .glassAlert(t("clearLockScreenInstances"), isPresented: $showClearLockScreenAlert,
+                    message: t("clearLockScreenInstancesConfirm"),
+                    actions: [
+                        GlassAlertAction(t("cancel"), role: .cancel),
+                        GlassAlertAction(t("clear"), role: .destructive) {
+                            viewModel.clearLockScreenInstances()
+                        }
+                    ])
     }
 
 }
@@ -862,28 +896,28 @@ private struct DownloadSettingsTab: View {
         .sheet(isPresented: $showMigrationSheet) {
             DirectoryMigrationSheet(isPresented: $showMigrationSheet)
         }
-        .alert(t("repairData"), isPresented: $showRepairAlert) {
-            Button(t("cancel"), role: .cancel) {}
-            Button(t("repair"), role: .destructive) {
-                startRepair()
-            }
-        } message: {
-            Text(t("repairDataConfirm"))
-        }
-        .alert(t("clearCache"), isPresented: $showClearCacheAlert) {
-            Button(t("cancel"), role: .cancel) {}
-            Button(t("clear"), role: .destructive) {
-                Task { await viewModel.clearCache() }
-            }
-        } message: {
-            Text(t("clearCacheConfirm"))
-        }
-        .alert(repairResultMessage, isPresented: Binding(
+        .glassAlert(t("repairData"), isPresented: $showRepairAlert,
+                    message: t("repairDataConfirm"),
+                    actions: [
+                        GlassAlertAction(t("cancel"), role: .cancel),
+                        GlassAlertAction(t("repair"), role: .destructive) {
+                            startRepair()
+                        }
+                    ])
+        .glassAlert(t("clearCache"), isPresented: $showClearCacheAlert,
+                    message: t("clearCacheConfirm"),
+                    actions: [
+                        GlassAlertAction(t("cancel"), role: .cancel),
+                        GlassAlertAction(t("clear"), role: .destructive) {
+                            Task { await viewModel.clearCache() }
+                        }
+                    ])
+        .glassAlert(repairResultMessage, isPresented: Binding(
             get: { !repairResultMessage.isEmpty && !isRepairing },
             set: { if !$0 { repairResultMessage = "" } }
-        )) {
-            Button("OK") { repairResultMessage = "" }
-        }
+        ), actions: [
+            GlassAlertAction("OK", role: .cancel) { repairResultMessage = "" }
+        ])
         .onReceive(NotificationCenter.default.publisher(for: .downloadPathChanged)) { _ in
             pathRefreshID = UUID()
         }
@@ -1700,33 +1734,38 @@ private struct AboutSettingsTab: View {
                     .padding(.vertical, 12)
                 }
             }
-            .alert(t("resetAllData"), isPresented: $showResetAlert) {
-                Button(t("cancel"), role: .cancel) {}
-                Button(t("reset"), role: .destructive) {
-                    Task { await viewModel.resetAllData() }
-                }
-            } message: {
-                Text(t("resetAllDataConfirm"))
-            }
-            .alert(t("settings.exportLog"), isPresented: $showExportLogConfirm) {
-                Button(t("cancel"), role: .cancel) {}
-                Button(t("confirm")) {
-                    exportLog()
-                }
-            } message: {
-                Text(t("settings.exportLog.confirm"))
-            }
-            .alert(exportResultTitle, isPresented: $showExportResultAlert) {
-                if let url = exportedLogURL {
-                    Button(t("settings.exportLog.reveal")) {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
-                    }
-                }
-                Button(t("ok"), role: .cancel) {}
-            } message: {
-                Text(exportResultMessage)
-            }
+            .glassAlert(t("resetAllData"), isPresented: $showResetAlert,
+                        message: t("resetAllDataConfirm"),
+                        actions: [
+                            GlassAlertAction(t("cancel"), role: .cancel),
+                            GlassAlertAction(t("reset"), role: .destructive) {
+                                Task { await viewModel.resetAllData() }
+                            }
+                        ])
+            .glassAlert(t("settings.exportLog"), isPresented: $showExportLogConfirm,
+                        message: t("settings.exportLog.confirm"),
+                        actions: [
+                            GlassAlertAction(t("cancel"), role: .cancel),
+                            GlassAlertAction(t("confirm")) {
+                                exportLog()
+                            }
+                        ])
+            .glassAlert(exportResultTitle, isPresented: $showExportResultAlert,
+                        message: exportResultMessage,
+                        actions: exportResultActions)
         }
+    }
+
+    /// 导出结果弹窗按钮：成功时附加「在 Finder 中显示」
+    private var exportResultActions: [GlassAlertAction] {
+        var actions: [GlassAlertAction] = []
+        if let url = exportedLogURL {
+            actions.append(GlassAlertAction(t("settings.exportLog.reveal")) {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            })
+        }
+        actions.append(GlassAlertAction(t("ok"), role: .cancel))
+        return actions
     }
 
     /// 确认导出后执行：复制运行日志到桌面，成功/失败都弹结果框。
@@ -1808,6 +1847,11 @@ private struct AboutSettingsTab: View {
 
 
 // MARK: - Workshop 设置标签
+private enum SteamLoginMethod {
+    case qr
+    case password
+}
+
 private struct WorkshopSettingsTab: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject private var sourceManager = WorkshopSourceManager.shared
@@ -1819,6 +1863,7 @@ private struct WorkshopSettingsTab: View {
     @State private var steamGuardCode = ""
     @State private var isSteamPasswordVisible = false
     @State private var showLoginForm = false
+    @State private var steamLoginMethod: SteamLoginMethod = .qr
     @State private var isVerifyingSteamLogin = false
     @State private var steamLoginStatusText: String?
     @State private var cleanupResult: (count: Int, bytesFreed: Int64)?
@@ -2013,6 +2058,9 @@ private struct WorkshopSettingsTab: View {
         .onChange(of: sourceManager.steamCredentialState) { _, _ in
             syncCredentialPresentation()
         }
+        .onChange(of: steamService.loginState) { _, newState in
+            handleSteamLoginStateChange(newState)
+        }
     }
 
     private var steamLoginSection: some View {
@@ -2031,7 +2079,7 @@ private struct WorkshopSettingsTab: View {
                 }
             }
 
-            if case .available(let username) = sourceManager.steamCredentialState, !showLoginForm {
+            if case .available(let username) = sourceManager.steamCredentialState, !showLoginForm, !isSteamQRFlowActive {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(String(format: t("accountSaved"), username))
@@ -2040,6 +2088,11 @@ private struct WorkshopSettingsTab: View {
                         Text("下载会复用 WaifuX 的 Steam 会话。密码和 Guard 验证码不会保存。")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary.opacity(0.85))
+                        if let steamLoginStatusText {
+                            Text(steamLoginStatusText)
+                                .font(.system(size: 10))
+                                .foregroundStyle(loginStatusColor)
+                        }
                     }
                     Spacer()
                     Button(t("relogin")) {
@@ -2047,6 +2100,7 @@ private struct WorkshopSettingsTab: View {
                         steamPassword = ""
                         steamGuardCode = ""
                         steamLoginStatusText = nil
+                        steamLoginMethod = .password
                         showLoginForm = true
                     }
                     .controlSize(.small)
@@ -2064,6 +2118,8 @@ private struct WorkshopSettingsTab: View {
                 .padding(12)
                 .background(Color.white.opacity(0.03))
                 .cornerRadius(8)
+            } else if steamLoginMethod == .qr, !isVerifyingSteamLogin {
+                steamQRLoginView
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 10) {
@@ -2196,13 +2252,28 @@ private struct WorkshopSettingsTab: View {
                             : steamUsername.isEmpty || steamPassword.isEmpty || isVerifyingSteamLogin
                         )
                     }
+
+                    if !isVerifyingSteamLogin {
+                        HStack {
+                            Spacer()
+                            Button("改用二维码扫码登录") {
+                                showLoginForm = false
+                                steamLoginMethod = .qr
+                                steamLoginStatusText = nil
+                                SteamServiceManager.shared.cancelLogin()
+                                SteamServiceManager.shared.loginWithQR()
+                            }
+                            .controlSize(.small)
+                            .buttonStyle(.link)
+                        }
+                    }
                 }
                 .padding(12)
                 .background(Color.white.opacity(0.03))
                 .cornerRadius(8)
             }
 
-            Text("Steam 下载只保存会话令牌到 macOS 钥匙串。密码与 Guard 验证码仅用于当前登录，不会写入本地。")
+            Text("扫码登录的二维码在本机生成，凭据不经过第三方。Steam 下载只保存会话令牌到 macOS 钥匙串，密码与 Guard 验证码仅用于当前登录，不会写入本地。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
@@ -2245,6 +2316,207 @@ private struct WorkshopSettingsTab: View {
             .padding(12)
             .background(Color.white.opacity(0.03))
             .cornerRadius(8)
+        }
+    }
+
+    // MARK: - Steam 二维码扫码登录（对齐 MirageWallpaper 的登录流程）
+
+    /// 二维码登录流程进行中（连接/等待扫码/等待确认）时，登录卡片需让位给二维码视图。
+    private var isSteamQRFlowActive: Bool {
+        guard steamLoginMethod == .qr else { return false }
+        switch steamService.loginState {
+        case .loggingIn, .waitingForQR, .waitingForMobileConfirmation, .waitingForCode:
+            return true
+        case .idle, .success, .failed:
+            return false
+        }
+    }
+
+    private var steamQRLoginView: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Label(credentialStateTitle, systemImage: credentialStateIcon)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(credentialStateColor)
+                Spacer()
+            }
+
+            Text(credentialStateDescription)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            steamQRStateView
+
+            if let steamLoginStatusText {
+                Text(steamLoginStatusText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(loginStatusColor)
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private var steamQRStateView: some View {
+        switch steamService.loginState {
+        case .waitingForQR(let challenge):
+            steamQRCodeView(challenge)
+        case .loggingIn:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.8)
+                Text("正在连接 Steam，请稍候…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("取消登录") {
+                    SteamServiceManager.shared.cancelLogin()
+                }
+                .controlSize(.small)
+            }
+        case .waitingForMobileConfirmation:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.8)
+                Text("已扫码，请在 Steam 手机 App 上确认登录…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("取消登录") {
+                    SteamServiceManager.shared.cancelLogin()
+                }
+                .controlSize(.small)
+            }
+        case .waitingForCode:
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Steam 要求补充验证码，请改用账号密码登录后提交。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Button("改用账户密码登录") {
+                    SteamServiceManager.shared.cancelLogin()
+                    steamLoginMethod = .password
+                    showLoginForm = true
+                }
+                .controlSize(.small)
+            }
+        case .success:
+            Label("登录成功。", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(.green)
+        case .idle, .failed:
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    SteamServiceManager.shared.loginWithQR()
+                } label: {
+                    Label("使用 Steam 手机 App 扫码登录", systemImage: "qrcode")
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.small)
+
+                Button("改用账户密码登录") {
+                    steamLoginMethod = .password
+                    showLoginForm = true
+                    steamLoginStatusText = nil
+                }
+                .controlSize(.small)
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    private func steamQRCodeView(_ challenge: String) -> some View {
+        VStack(spacing: 10) {
+            Group {
+                if let image = Self.steamQRCodeImage(for: challenge) {
+                    Image(nsImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 168, height: 168)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .id(challenge)
+                } else {
+                    Text("二维码生成失败，请点击下方刷新。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 168, height: 168)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            Text("使用 Steam 手机 App 扫描二维码")
+                .font(.system(size: 12, weight: .medium))
+            Text("打开 Steam 手机 App 的扫码功能，扫描后按提示确认登录；二维码会自动更新。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 10) {
+                Button {
+                    SteamServiceManager.shared.loginWithQR()
+                } label: {
+                    Label("刷新二维码", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
+
+                Button("取消登录") {
+                    SteamServiceManager.shared.cancelLogin()
+                }
+                .controlSize(.small)
+
+                Spacer()
+
+                Button("改用账户密码登录") {
+                    SteamServiceManager.shared.cancelLogin()
+                    steamLoginMethod = .password
+                    showLoginForm = true
+                    steamLoginStatusText = nil
+                }
+                .controlSize(.small)
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    private static func steamQRCodeImage(for value: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(value.utf8)
+        filter.correctionLevel = "M"
+        guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 10, y: 10)) else {
+            return nil
+        }
+        let representation = NSCIImageRep(ciImage: output)
+        let image = NSImage(size: representation.size)
+        image.addRepresentation(representation)
+        return image
+    }
+
+    private func handleSteamLoginStateChange(_ state: SteamServiceLoginState) {
+        switch state {
+        case .success:
+            let username = steamService.accountName
+            guard !username.isEmpty else { return }
+            sourceManager.setSteamIdentity(username: username)
+            if !steamService.steamID.isEmpty {
+                sourceManager.steamProfileID = steamService.steamID
+            }
+            PersistentDownloadQueueService.shared.resumeWaitingForSteamLogin()
+            isVerifyingSteamLogin = false
+            steamPassword = ""
+            steamGuardCode = ""
+            steamLoginStatusText = "登录成功。会话令牌已保存到 macOS 钥匙串，密码和验证码未保存。"
+            showLoginForm = false
+        case .failed(let message):
+            // 密码登录路径的失败信息由 verifySteamLogin 的 catch 分支负责展示。
+            guard !isVerifyingSteamLogin else { return }
+            steamLoginStatusText = message
+        default:
+            break
         }
     }
 
@@ -2442,7 +2714,9 @@ private struct WorkshopSettingsTab: View {
                 showLoginForm = false
             }
         } else if !isVerifyingSteamLogin {
-            showLoginForm = true
+            // 与 Mirage 一致：未登录时默认展示二维码扫码入口。
+            showLoginForm = false
+            steamLoginMethod = .qr
         }
     }
 }
@@ -2490,7 +2764,7 @@ private struct DirectoryMigrationSheet: View {
             Spacer()
         }
         .frame(width: 480, height: 320)
-        .background(Color(hex: "0F1115"))
+        .background(DarkLiquidGlassBackground(cornerRadius: 16, isHovered: false))
     }
 
     private var directorySelectionView: some View {

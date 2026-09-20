@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Scheme
-   LastUpgradeVersion = "2700"
+   LastUpgradeVersion = "2640"
    version = "1.3">
    <BuildAction
       parallelizeBuildables = "YES"
@@ -17,6 +17,20 @@
                BlueprintIdentifier = "43FF1F1B38F8BD5B8FFDBE0F"
                BuildableName = "WaifuX.app"
                BlueprintName = "WaifuX"
+               ReferencedContainer = "container:WaifuX.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "4CB9C43382030B8AE13C405D"
+               BuildableName = "WaifuXScreenSaver.saver"
+               BlueprintName = "WaifuXScreenSaver"
                ReferencedContainer = "container:WaifuX.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
