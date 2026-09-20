@@ -138,6 +138,10 @@ struct DisplaySelectorSheet: View {
                 }
             }
         }
+        // Esc 关闭兜底：从库/状态栏触发时没有详情页键盘监听接住 Esc，由卡片自己关闭
+        .onExitCommand {
+            dismiss()
+        }
     }
 
     private func dismiss() {

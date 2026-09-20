@@ -484,9 +484,15 @@ struct WallpaperExploreContentView: View {
             }
         }
         .overlay(alertOverlay)
-        .sheet(isPresented: $showWallpaperURLSheet) {
-            wallpaperURLSheet
+        // 链接弹窗走应用内玻璃 overlay（同 DisplaySelector），原生 glassEffect 可采样页面内容
+        .overlay {
+            if showWallpaperURLSheet {
+                GlassOverlayCardShell(backdropTapToDismiss: { showWallpaperURLSheet = false }) {
+                    wallpaperURLSheet
+                }
+            }
         }
+        .animation(.easeInOut(duration: 0.18), value: showWallpaperURLSheet)
     }
 
     private var wallpaperURLSheet: some View {
@@ -679,12 +685,13 @@ struct WallpaperExploreContentView: View {
     }
 
     private var alertOverlay: some View {
-        EmptyView()
-            .alert(t("apiKeyRequired"), isPresented: $showAPIKeyAlert) {
-                Button(t("ok"), role: .cancel) {}
-            } message: {
-                Text(t("apiKeyNeeded"))
-            }
+        // glassAlert 的 overlay 需要真实边界铺满压暗背景，EmptyView 零尺寸弹不出来
+        Color.clear
+            .glassAlert(t("apiKeyRequired"), isPresented: $showAPIKeyAlert,
+                        message: t("apiKeyNeeded"),
+                        actions: [
+                            GlassAlertAction(t("ok"), role: .cancel)
+                        ])
     }
 
     // MARK: - Sections

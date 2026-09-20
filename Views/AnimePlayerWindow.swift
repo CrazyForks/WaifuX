@@ -2244,8 +2244,8 @@ private struct LiquidGlassCaptchaSheet: View {
     var body: some View {
         GeometryReader { geometry in
             ZStack {
-                // 深色背景
-                Color(hex: "0D0D10")
+                // 深色液态玻璃背景
+                DarkLiquidGlassBackground(cornerRadius: 16, isHovered: false)
                     .ignoresSafeArea()
 
                 // 主内容区

@@ -383,49 +383,49 @@ struct MediaDetailSheet: View {
             }
         }
         .ignoresSafeArea()
-        .alert(t("mediaError"), isPresented: $showError) {
-            Button(t("ok"), role: .cancel) {}
-        } message: {
-            Text(errorMessage)
-        }
-        .alert(t("delete"), isPresented: $showDeleteConfirm) {
-            Button(t("delete"), role: .destructive) {
-                viewModel.removeDownloads(withIDs: [resolvedItem.id])
-                onClose()
-            }
-            Button(t("cancel"), role: .cancel) {}
-        } message: {
-            Text(t("deleteConfirmMessage"))
-        }
-        .alert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadConfirm) {
-            Button(t("library.redownload.item"), role: .destructive) {
-                redownloadCurrentItem()
-            }
-            Button(t("cancel"), role: .cancel) {}
-        } message: {
-            Text(t("library.redownload.item.confirm.message"))
-        }
-        .alert("删除烘焙产物?", isPresented: $showDeleteBakeConfirm) {
-            Button("删除", role: .destructive) {
-                Task { await performDeleteSceneBakeKeepingPoster() }
-            }
-            Button(t("cancel"), role: .cancel) {}
-        } message: {
-            Text("将删除该壁纸的离线烘焙视频，静态预览图保留。删除后会立即用静态图替换正在显示的锁屏/桌面壁纸。")
-        }
-        .alert(t("frameInterpolationBlacklistRemoveConfirmTitle"), isPresented: $showRemoveFrameInterpolationBlacklistConfirm) {
-            Button(t("frameInterpolationBlacklistRemoveButton"), role: .destructive) {
-                if let url = pendingRemoveFrameInterpolationBlacklistURL {
-                    frameInterpolationQueue.removeBlacklisted(videoURL: url)
-                }
-                pendingRemoveFrameInterpolationBlacklistURL = nil
-            }
-            Button(t("cancel"), role: .cancel) {
-                pendingRemoveFrameInterpolationBlacklistURL = nil
-            }
-        } message: {
-            Text(t("frameInterpolationBlacklistRemoveConfirmMessage"))
-        }
+        .glassAlert(t("mediaError"), isPresented: $showError,
+                    message: errorMessage,
+                    actions: [
+                        GlassAlertAction(t("ok"), role: .cancel)
+                    ])
+        .glassAlert(t("delete"), isPresented: $showDeleteConfirm,
+                    message: t("deleteConfirmMessage"),
+                    actions: [
+                        GlassAlertAction(t("delete"), role: .destructive) {
+                            viewModel.removeDownloads(withIDs: [resolvedItem.id])
+                            onClose()
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel)
+                    ])
+        .glassAlert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadConfirm,
+                    message: t("library.redownload.item.confirm.message"),
+                    actions: [
+                        GlassAlertAction(t("library.redownload.item"), role: .destructive) {
+                            redownloadCurrentItem()
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel)
+                    ])
+        .glassAlert("删除烘焙产物?", isPresented: $showDeleteBakeConfirm,
+                    message: "将删除该壁纸的离线烘焙视频，静态预览图保留。删除后会立即用静态图替换正在显示的锁屏/桌面壁纸。",
+                    actions: [
+                        GlassAlertAction("删除", role: .destructive) {
+                            Task { await performDeleteSceneBakeKeepingPoster() }
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel)
+                    ])
+        .glassAlert(t("frameInterpolationBlacklistRemoveConfirmTitle"), isPresented: $showRemoveFrameInterpolationBlacklistConfirm,
+                    message: t("frameInterpolationBlacklistRemoveConfirmMessage"),
+                    actions: [
+                        GlassAlertAction(t("frameInterpolationBlacklistRemoveButton"), role: .destructive) {
+                            if let url = pendingRemoveFrameInterpolationBlacklistURL {
+                                frameInterpolationQueue.removeBlacklisted(videoURL: url)
+                            }
+                            pendingRemoveFrameInterpolationBlacklistURL = nil
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel) {
+                            pendingRemoveFrameInterpolationBlacklistURL = nil
+                        }
+                    ])
         .overlay {
             authorSheetOverlay
         }
@@ -433,18 +433,20 @@ struct MediaDetailSheet: View {
             sceneBakeRendererOverlay
         }
         .onExitCommand {
-            if showSceneBakeRendererDialog {
+            if DisplaySelectorManager.shared.isShowingSelector {
+                DisplaySelectorManager.shared.handleCancel()
+            } else if showSceneBakeRendererDialog {
                 dismissSceneBakeRendererDialog()
             }
         }
-        .alert("需要重新登录 Steam", isPresented: $showSteamLoginRequiredAlert) {
-            Button("稍后", role: .cancel) {}
-            Button("打开设置") {
-                openSteamLoginSettings()
-            }
-        } message: {
-            Text(steamLoginRequiredMessage)
-        }
+        .glassAlert("需要重新登录 Steam", isPresented: $showSteamLoginRequiredAlert,
+                    message: steamLoginRequiredMessage,
+                    actions: [
+                        GlassAlertAction("稍后", role: .cancel),
+                        GlassAlertAction("打开设置") {
+                            openSteamLoginSettings()
+                        }
+                    ])
         .navigationBarBackButtonHidden(true)
         .task {
             AppLogger.info(.media, "媒体详情页 onAppear",
@@ -2947,7 +2949,10 @@ struct MediaDetailSheet: View {
                 return nil
             case 53: // ESC：优先关闭当前弹窗，再关闭预览，最后返回详情栈
                 if CropAdjustOverlayController.shared.isAdjusting { return event }
-                if self.showSceneBakeRendererDialog {
+                if DisplaySelectorManager.shared.isShowingSelector {
+                    // 显示器选择弹窗盖在详情页上，Esc 先关它，不能直接退出详情页
+                    DisplaySelectorManager.shared.handleCancel()
+                } else if self.showSceneBakeRendererDialog {
                     self.dismissSceneBakeRendererDialog()
                 } else if self.showAuthorSheet {
                     self.dismissAuthorSheet()

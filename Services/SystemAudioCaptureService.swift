@@ -294,6 +294,8 @@ public final class SystemAudioCaptureService: NSObject, ObservableObject {
         guard !systemAudioPermissionAlertShown else { return }
         systemAudioPermissionAlertShown = true
 
+        // 保留系统 NSAlert：音频权限引导可能在托盘/后台模式触发（主窗口不可见），
+        // 应用内玻璃 alert 没有宿主窗口。玻璃化前置条件：GlassAlertCenter 独立悬浮窗宿主。
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = t("audio.permission.title")

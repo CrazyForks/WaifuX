@@ -35,10 +35,6 @@ struct WallpaperDetailSheet: View {
         heroForeground.opacity(usesDarkHeroForeground ? 0.62 : 0.60)
     }
 
-    private var heroGlassTint: Color? {
-        usesDarkHeroForeground ? Color.white.opacity(0.34) : nil
-    }
-
     @State private var scrollOffset: CGFloat = 0
     @State private var showInfoBubble = false
     @State private var isHeroContentHidden = false
@@ -289,22 +285,22 @@ struct WallpaperDetailSheet: View {
             }
         }
         .ignoresSafeArea()
-        .alert(t("error"), isPresented: $showError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(errorMessage)
-        }
-        .alert(t("delete"), isPresented: $showDeleteConfirm) {
-            Button(t("delete"), role: .destructive) {
-                // 纯 local_* 扫描项没有下载记录，必须走本地删除；
-                // 导入的 local_import_* 也一并按路径兜底清理，避免删不掉 preview 残留。
-                _ = viewModel.deleteLocalWallpaper(wallpaper)
-                onClose()
-            }
-            Button(t("cancel"), role: .cancel) {}
-        } message: {
-            Text(t("deleteConfirmMessage"))
-        }
+        .glassAlert(t("error"), isPresented: $showError,
+                    message: errorMessage,
+                    actions: [
+                        GlassAlertAction("OK", role: .cancel)
+                    ])
+        .glassAlert(t("delete"), isPresented: $showDeleteConfirm,
+                    message: t("deleteConfirmMessage"),
+                    actions: [
+                        GlassAlertAction(t("delete"), role: .destructive) {
+                            // 纯 local_* 扫描项没有下载记录，必须走本地删除；
+                            // 导入的 local_import_* 也一并按路径兜底清理，避免删不掉 preview 残留。
+                            _ = viewModel.deleteLocalWallpaper(wallpaper)
+                            onClose()
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel)
+                    ])
         .overlay {
             authorSheetOverlay
         }
@@ -680,12 +676,12 @@ struct WallpaperDetailSheet: View {
         .frame(maxWidth: 920)
         .frame(maxWidth: .infinity)
         .background {
-            // Keep the wallpaper visible while giving glass controls a stable
-            // contrast field when the artwork is bright in the center.
+            // 恒定的对比底：壁纸照常可见，玻璃控件始终有稳定的衬底。
+            // 这里不随壁纸明暗变化，页面唯一随内容变化的是文字颜色。
             RadialGradient(
                 colors: [
-                    Color.black.opacity(usesDarkHeroForeground ? 0.10 : 0.06),
-                    Color.black.opacity(usesDarkHeroForeground ? 0.03 : 0.01),
+                    Color.black.opacity(0.08),
+                    Color.black.opacity(0.02),
                     .clear
                 ],
                 center: .center,
@@ -713,7 +709,7 @@ struct WallpaperDetailSheet: View {
                         systemName: viewModel.isFavorite(wallpaper) ? "heart.fill" : "heart",
                         foreground: viewModel.isFavorite(wallpaper) ? Color(hex: "FF5A7D") : heroForeground
                     )
-                    .detailGlassCircleChrome(tint: heroGlassTint)
+                    .detailGlassCircleChrome()
                 }
                 .buttonStyle(.plain)
 
@@ -725,7 +721,7 @@ struct WallpaperDetailSheet: View {
                             systemName: "arrow.up.backward.and.arrow.down.forward",
                             foreground: heroForeground
                         )
-                            .detailGlassCircleChrome(tint: heroGlassTint)
+                            .detailGlassCircleChrome()
                     }
                     .buttonStyle(.plain)
                     .help(t("preview"))
@@ -753,7 +749,7 @@ struct WallpaperDetailSheet: View {
                 .padding(.horizontal, 28)
                 .frame(height: 46)
                 .contentShape(Capsule())
-                .detailPrimaryGlassButtonChrome(tint: heroGlassTint)
+                .detailPrimaryGlassButtonChrome()
             }
             .buttonStyle(.plain)
             .disabled(isSettingWallpaper)
@@ -769,7 +765,7 @@ struct WallpaperDetailSheet: View {
                         systemName: isAlreadyDownloaded ? "checkmark" : "arrow.down",
                         foreground: heroForeground
                     )
-                        .detailGlassCircleChrome(tint: heroGlassTint)
+                        .detailGlassCircleChrome()
                 }
                 .buttonStyle(.plain)
                 .disabled(isDownloading || isAlreadyDownloaded)
@@ -778,7 +774,7 @@ struct WallpaperDetailSheet: View {
                     showMoreOptionsPopover = true
                 } label: {
                     DetailSheetCircleIconLabel(systemName: "ellipsis", foreground: heroForeground)
-                        .detailGlassCircleChrome(tint: heroGlassTint)
+                        .detailGlassCircleChrome()
                 }
                 .buttonStyle(.plain)
                 .help(t("wallpaperDetail.moreOptions"))
@@ -1240,7 +1236,7 @@ struct WallpaperDetailSheet: View {
             .tracking(2)
             .padding(.horizontal, 16)
             .frame(height: 34)
-            .detailGlassCapsuleChrome(tint: heroGlassTint, level: .prominent)
+            .detailGlassCapsuleChrome(level: .prominent)
     }
 
     // MARK: - 元数据胶囊（参考图风格：细长边框）
@@ -1258,7 +1254,7 @@ struct WallpaperDetailSheet: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 32)
-        .detailGlassCapsuleChrome(tint: heroGlassTint, level: .prominent)
+        .detailGlassCapsuleChrome(level: .prominent)
         .padding(.trailing, isLast ? 0 : 8)
     }
 
@@ -1667,7 +1663,10 @@ struct WallpaperDetailSheet: View {
                 return nil
             case 53: // ESC：优先关闭当前弹窗，再关闭预览，最后返回详情栈
                 if CropAdjustOverlayController.shared.isAdjusting { return event }
-                if self.showAuthorSheet {
+                if DisplaySelectorManager.shared.isShowingSelector {
+                    // 显示器选择弹窗盖在详情页上，Esc 先关它，不能直接退出详情页
+                    DisplaySelectorManager.shared.handleCancel()
+                } else if self.showAuthorSheet {
                     self.dismissAuthorSheet()
                 } else if PreviewWindowManager.shared.isPresented {
                     PreviewWindowManager.shared.closePreview()

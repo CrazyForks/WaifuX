@@ -30,11 +30,11 @@ struct AnimeRulesMarketView: View {
         .task {
             await loadData()
         }
-        .alert(t("animeRules.error"), isPresented: $showingError) {
-            Button(t("animeRules.ok")) {}
-        } message: {
-            Text(errorMessage ?? t("unknown"))
-        }
+        .glassAlert(t("animeRules.error"), isPresented: $showingError,
+                    message: errorMessage ?? t("unknown"),
+                    actions: [
+                        GlassAlertAction(t("animeRules.ok"), role: .cancel)
+                    ])
     }
 
     // MARK: - 工具栏

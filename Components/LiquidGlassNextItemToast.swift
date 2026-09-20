@@ -228,11 +228,24 @@ public struct LiquidGlassNextItemToast: View {
                 .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
             }
             .buttonStyle(ToastPressableStyle(isPressed: $isPressed))
-            .background(
-                DarkLiquidGlassBackground(
-                    cornerRadius: 20,
-                    isHovered: isHovered
-                )
+            // 统一液态玻璃基座：macOS 26 原生 glassEffect（interactive 响应按压，真实采样背后内容），旧系统 fallback 材质
+            .liquidGlassEffect(
+                .interactive,
+                in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+            )
+            .overlay {
+                // 悬停高光描边（原生 glassEffect 无内置边框，保留悬停反馈）
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(
+                        Color.white.opacity(isHovered ? 0.22 : 0.0),
+                        lineWidth: 1
+                    )
+            }
+            .shadow(
+                color: Color.black.opacity(isHovered ? 0.35 : 0.25),
+                radius: isHovered ? 20 : 14,
+                x: 0,
+                y: isHovered ? 10 : 6
             )
             // iOS 风格按压反馈：轻微缩放 + 暗色叠加
             .scaleEffect(isPressed ? 0.96 : 1.0)

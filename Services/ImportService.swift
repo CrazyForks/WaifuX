@@ -549,6 +549,8 @@ final class ImportService: ObservableObject {
         existingName: String,
         remainingCount: Int
     ) -> (action: ImportConflictAction, applyToAll: Bool) {
+        // 保留系统 NSAlert：导入管线要求同步拿到冲突决定（runModal 阻塞循环推进），
+        // 玻璃化需先把冲突处理改为异步管道，再走 GlassAlertCenter。
         let alert = NSAlert()
         alert.messageText = t("import.conflict.title")
         alert.informativeText = String(

@@ -137,6 +137,8 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         isPresentingPrompt = true
         let display = pendingDisplays.removeFirst()
 
+        // 保留系统 NSAlert：显示器热插拔可能在托盘/后台模式触发，主窗口不可见时
+        // 应用内玻璃 alert 没有宿主窗口。玻璃化前置条件：GlassAlertCenter 独立悬浮窗宿主。
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = t("externalDisplay.connected.title")
@@ -227,7 +229,9 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     }
 
     private static func currentExternalDisplaySnapshots() -> [String: ExternalDisplaySnapshot] {
-        Dictionary(uniqueKeysWithValues: currentExternalScreensByFingerprint().map { fingerprint, screen in
+        // 同型号且无硬件序列号（或序列号相同）的两块外接屏会产出相同指纹，
+        // Dictionary(uniqueKeysWithValues:) 会直接 trap；这里保底去重防崩溃。
+        Dictionary(currentExternalScreensByFingerprint().map { fingerprint, screen in
             (
                 fingerprint,
                 ExternalDisplaySnapshot(
@@ -235,7 +239,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
                     fingerprint: fingerprint
                 )
             )
-        })
+        }, uniquingKeysWith: { existing, _ in existing })
     }
 }
 

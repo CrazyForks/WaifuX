@@ -228,18 +228,24 @@ struct MediaExploreContentView: View {
                 }
             }
         }
-        .sheet(isPresented: $showWorkshopURLSheet) {
-            WorkshopURLInputSheet(
-                urlInput: $workshopURLInput,
-                errorMessage: workshopURLError,
-                isLoading: isResolvingWorkshopURL,
-                onSubmit: { handleWorkshopURLSubmit() },
-                onDismiss: { showWorkshopURLSheet = false },
-                title: "通过链接打开壁纸",
-                placeholder: "粘贴壁纸链接...",
-                supportedFormatsHint: "支持格式：steamcommunity.com/sharedfiles/filedetails/?id=1234567890、motionbgs.com/xxx、wallsflow.com/…/数字-slug.html，或动态桌面 OSS 视频直链"
-            )
+        // 链接弹窗走应用内玻璃 overlay（同 DisplaySelector），原生 glassEffect 可采样页面内容
+        .overlay {
+            if showWorkshopURLSheet {
+                GlassOverlayCardShell(backdropTapToDismiss: { showWorkshopURLSheet = false }) {
+                    WorkshopURLInputSheet(
+                        urlInput: $workshopURLInput,
+                        errorMessage: workshopURLError,
+                        isLoading: isResolvingWorkshopURL,
+                        onSubmit: { handleWorkshopURLSubmit() },
+                        onDismiss: { showWorkshopURLSheet = false },
+                        title: "通过链接打开壁纸",
+                        placeholder: "粘贴壁纸链接...",
+                        supportedFormatsHint: "支持格式：steamcommunity.com/sharedfiles/filedetails/?id=1234567890、motionbgs.com/xxx、wallsflow.com/…/数字-slug.html，或动态桌面 OSS 视频直链"
+                    )
+                }
+            }
         }
+        .animation(.easeInOut(duration: 0.18), value: showWorkshopURLSheet)
         .onAppear {
             if isFirstAppearance {
                 Task { await performFirstAppearanceLoad() }
@@ -2300,54 +2306,52 @@ struct WorkshopURLInputSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // Buttons
-            HStack(spacing: 12) {
-                Button(action: onDismiss) {
-                    Text("取消")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.6))
+                // Buttons
+                HStack(spacing: 12) {
+                    Button(action: onDismiss) {
+                        Text("取消")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .liquidGlassSurface(.regular, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: onSubmit) {
+                        HStack(spacing: 6) {
+                            if isLoading {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .scaleEffect(0.8)
+                            }
+                            Text("确认")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
                         .frame(height: 36)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(.white.opacity(0.06))
+                        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        // 主色调加重到 0.45：原生玻璃上 0.3 染色太淡，接近纯玻璃
+                        .liquidGlassSurface(
+                            .max,
+                            tint: Color.accentColor.opacity(0.45),
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                         )
-                }
-                .buttonStyle(.plain)
-
-                Button(action: onSubmit) {
-                    HStack(spacing: 6) {
-                        if isLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                                .scaleEffect(0.8)
-                        }
-                        Text("确认")
-                            .font(.system(size: 13, weight: .semibold))
                     }
-                    .foregroundStyle(.white.opacity(0.95))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 36)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.accentColor.opacity(0.35))
-                    )
+                    .buttonStyle(.plain)
+                    .disabled(isLoading || urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.plain)
-                .disabled(isLoading || urlInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-        }
-        .padding(24)
-        .frame(width: 420)
-        .background(
-            DarkLiquidGlassBackground(cornerRadius: 16, isHovered: false)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isInputFocused = true
+            .padding(24)
+            .frame(width: 420)
+            .liquidGlassSurface(.prominent, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .onAppear {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    isInputFocused = true
+                }
             }
-        }
     }
 }
 

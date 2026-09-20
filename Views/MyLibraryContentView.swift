@@ -590,65 +590,99 @@ struct MyLibraryContentView: View {
         .sheet(isPresented: $showAddToFolderSheet) {
             addToFolderSheetContent
         }
-        .alert(t("folder.redownload.all.media.confirm.title"), isPresented: $showRedownloadMediaFolderConfirm) {
-            Button(t("folder.redownload.all.media"), role: .destructive) {
-                guard let folder = pendingRedownloadMediaFolder else { return }
-                redownloadAllMedia(in: folder)
-                pendingRedownloadMediaFolder = nil
-            }
-            Button(t("cancel"), role: .cancel) {
-                pendingRedownloadMediaFolder = nil
-            }
-        } message: {
-            let count = pendingRedownloadMediaFolder.map {
-                MediaLibraryService.shared.downloadedItems(inFolder: $0.id).count
-            } ?? 0
-            Text(String(format: t("folder.redownload.all.media.confirm.message"), count))
-        }
-        .alert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadMediaItemConfirm) {
-            Button(t("library.redownload.item"), role: .destructive) {
-                guard let item = pendingRedownloadMediaItem else { return }
-                redownloadMediaItem(item)
-                pendingRedownloadMediaItem = nil
-            }
-            Button(t("cancel"), role: .cancel) {
-                pendingRedownloadMediaItem = nil
-            }
-        } message: {
-            Text(t("library.redownload.item.confirm.message"))
-        }
-        .alert(t("delete"), isPresented: wallpaperDeletionAlertPresented) {
-            Button(t("delete"), role: .destructive) {
-                if let item = pendingWallpaperDeletion {
-                    deleteWallpaperItem(item)
+        .glassAlert(t("folder.redownload.all.media.confirm.title"), isPresented: $showRedownloadMediaFolderConfirm,
+                    message: {
+                        let count = pendingRedownloadMediaFolder.map {
+                            MediaLibraryService.shared.downloadedItems(inFolder: $0.id).count
+                        } ?? 0
+                        return String(format: t("folder.redownload.all.media.confirm.message"), count)
+                    }(),
+                    actions: [
+                        GlassAlertAction(t("folder.redownload.all.media"), role: .destructive) {
+                            guard let folder = pendingRedownloadMediaFolder else { return }
+                            redownloadAllMedia(in: folder)
+                            pendingRedownloadMediaFolder = nil
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel) {
+                            pendingRedownloadMediaFolder = nil
+                        }
+                    ])
+        .glassAlert(t("library.redownload.item.confirm.title"), isPresented: $showRedownloadMediaItemConfirm,
+                    message: t("library.redownload.item.confirm.message"),
+                    actions: [
+                        GlassAlertAction(t("library.redownload.item"), role: .destructive) {
+                            guard let item = pendingRedownloadMediaItem else { return }
+                            redownloadMediaItem(item)
+                            pendingRedownloadMediaItem = nil
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel) {
+                            pendingRedownloadMediaItem = nil
+                        }
+                    ])
+        .glassAlert(t("delete"), isPresented: wallpaperDeletionAlertPresented,
+                    message: t("deleteConfirmMessage"),
+                    actions: [
+                        GlassAlertAction(t("delete"), role: .destructive) {
+                            if let item = pendingWallpaperDeletion {
+                                deleteWallpaperItem(item)
+                            }
+                            pendingWallpaperDeletion = nil
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel) {
+                            pendingWallpaperDeletion = nil
+                        }
+                    ])
+        .glassAlert(t("delete"), isPresented: mediaDeletionAlertPresented,
+                    message: t("deleteConfirmMessage"),
+                    actions: [
+                        GlassAlertAction(t("delete"), role: .destructive) {
+                            if let item = pendingMediaDeletion {
+                                deleteMediaItem(item)
+                            }
+                            pendingMediaDeletion = nil
+                        },
+                        GlassAlertAction(t("cancel"), role: .cancel) {
+                            pendingMediaDeletion = nil
+                        }
+                    ])
+        .glassAlert(t("import.completed"), isPresented: $showImportResultAlert,
+                    message: importResultMessage,
+                    icon: importResultIsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
+                    iconTint: importResultIsWarning ? LiquidGlassColors.warningOrange : LiquidGlassColors.onlineGreen,
+                    actions: [
+                        GlassAlertAction("OK", role: .cancel)
+                    ])
+        .glassAlert("获取订阅列表失败", isPresented: $showSyncFetchErrorAlert,
+                    message: syncErrorMessage,
+                    icon: "exclamationmark.triangle.fill",
+                    iconTint: LiquidGlassColors.warningOrange,
+                    actions: [
+                        GlassAlertAction("OK", role: .cancel)
+                    ])
+        .glassAlert("同步订阅", isPresented: $showSyncResultAlert,
+                    message: syncResultMessage,
+                    icon: syncResultIsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
+                    iconTint: syncResultIsWarning ? LiquidGlassColors.warningOrange : LiquidGlassColors.onlineGreen,
+                    actions: [
+                        GlassAlertAction("OK", role: .cancel)
+                    ])
+        // 同步订阅弹窗走应用内玻璃 overlay（同 DisplaySelector），原生 glassEffect 可采样页面内容
+        .overlay {
+            if showSyncProfileSheet {
+                GlassOverlayCardShell(backdropTapToDismiss: { showSyncProfileSheet = false }) {
+                    syncProfileSheet
                 }
-                pendingWallpaperDeletion = nil
             }
-            Button(t("cancel"), role: .cancel) {
-                pendingWallpaperDeletion = nil
-            }
-        } message: {
-            Text(t("deleteConfirmMessage"))
         }
-        .alert(t("delete"), isPresented: mediaDeletionAlertPresented) {
-            Button(t("delete"), role: .destructive) {
-                if let item = pendingMediaDeletion {
-                    deleteMediaItem(item)
+        .overlay {
+            if showSyncSelectionSheet {
+                // 多选进行中不允许误点背景丢弃选择，仅按钮关闭
+                GlassOverlayCardShell {
+                    syncSelectionSheet
                 }
-                pendingMediaDeletion = nil
             }
-            Button(t("cancel"), role: .cancel) {
-                pendingMediaDeletion = nil
-            }
-        } message: {
-            Text(t("deleteConfirmMessage"))
         }
-        .sheet(isPresented: $showSyncProfileSheet) {
-            syncProfileSheet
-        }
-        .sheet(isPresented: $showSyncSelectionSheet) {
-            syncSelectionSheet
-        }
+        .animation(.easeInOut(duration: 0.18), value: showSyncProfileSheet || showSyncSelectionSheet)
         .sheet(isPresented: $showSteamLoginSheet) {
             SteamLoginSheet(isPresented: $showSteamLoginSheet)
                 .environmentObject(workshopSourceManager)
@@ -2603,14 +2637,7 @@ struct MyLibraryContentView: View {
         }
         .padding(30)
         .frame(width: 400)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(hex: "1C1C1E"))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                )
-        )
+        .liquidGlassSurface(.prominent, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     // MARK: - 同步订阅 - 选择列表 Sheet
@@ -2753,14 +2780,8 @@ struct MyLibraryContentView: View {
             .padding(.vertical, 16)
         }
         .frame(width: 520, height: 480)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(hex: "1C1C1E"))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                )
-        )
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .liquidGlassSurface(.prominent, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
     }
 
     private func syncSelectionRow(item: WorkshopWallpaper) -> some View {
@@ -3792,13 +3813,10 @@ struct MyLibraryContentView: View {
                 message = t("import.result.none")
             }
 
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.messageText = t("import.completed")
-                alert.informativeText = message
-                alert.alertStyle = (progress.failedImports > 0 || progress.skippedImports > 0) ? .warning : .informational
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+            await MainActor.run {
+                importResultMessage = message
+                importResultIsWarning = progress.failedImports > 0 || progress.skippedImports > 0
+                showImportResultAlert = true
             }
         }
     }
@@ -3810,7 +3828,8 @@ struct MyLibraryContentView: View {
         defer { syncIsLoadingList = false }
 
         let steamID = workshopSourceManager.steamProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !steamID.isEmpty else {
+        // Steam 服务已登录时协议层同步不依赖 steamProfileID（服务端用会话自身的 SteamId）
+        guard !steamID.isEmpty || SteamServiceManager.shared.isLoggedIn else {
             showSyncSelectionSheet = false
             showSyncProfileSheet = true
             return
@@ -3826,14 +3845,7 @@ struct MyLibraryContentView: View {
             syncErrorMessage = error.localizedDescription
             // 关闭加载中的选择 Sheet，然后显示错误弹窗
             showSyncSelectionSheet = false
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.messageText = "获取订阅列表失败"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-            }
+            showSyncFetchErrorAlert = true
         }
     }
 
@@ -3872,26 +3884,33 @@ struct MyLibraryContentView: View {
         isSyncingSubscriptions = false
         mediaViewModel.objectWillChange.send()
 
-        DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "同步订阅"
-            if failCount > 0 {
-                alert.informativeText = "下载完成！\n成功：\(successCount) 个\n失败：\(failCount) 个"
-                alert.alertStyle = .warning
-            } else {
-                alert.informativeText = "所有勾选的订阅已开始下载！\n共 \(successCount) 个"
-                alert.alertStyle = .informational
-            }
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
+        syncResultMessage = failCount > 0
+            ? "下载完成！\n成功：\(successCount) 个\n失败：\(failCount) 个"
+            : "所有勾选的订阅已开始下载！\n共 \(successCount) 个"
+        syncResultIsWarning = failCount > 0
+        showSyncResultAlert = true
     }
 
-    /// 同步按钮入口：始终弹出 Steam Web 登录页面以建立有效会话
+    /// 同步按钮入口：Steam 服务已登录时直接走协议层同步（免 WebView）；
+    /// 未登录时弹出 Steam Web 登录页面建立会话。
     /// 登录成功后自动关闭 Web 页面 → onDisappear 触发 fetchSubscriptionList() → 弹出选择弹窗
     @State private var showSteamLoginSheet = false
+    @State private var showImportResultAlert = false
+    @State private var importResultMessage = ""
+    @State private var importResultIsWarning = false
+    @State private var showSyncFetchErrorAlert = false
+    @State private var showSyncResultAlert = false
+    @State private var syncResultMessage = ""
+    @State private var syncResultIsWarning = false
 
     private func syncSubscriptions() {
+        if SteamServiceManager.shared.isLoggedIn {
+            syncIsLoadingList = true
+            syncSelectedIDs = []
+            showSyncSelectionSheet = true
+            Task { await fetchSubscriptionList() }
+            return
+        }
         showSteamLoginSheet = true
     }
 

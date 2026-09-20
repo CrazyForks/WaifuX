@@ -190,14 +190,7 @@ struct AddToFolderSheetView: View {
             .padding(.vertical, 16)
         }
         .frame(width: 600, height: 520)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(hex: "1C1C1E"))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                )
-        )
+        .background(DarkLiquidGlassBackground(cornerRadius: 16, isHovered: false))
     }
 
     // MARK: - Picker Cards
