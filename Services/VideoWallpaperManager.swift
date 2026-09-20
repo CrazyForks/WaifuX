@@ -1544,8 +1544,31 @@ final class VideoWallpaperManager: ObservableObject {
             return
         }
 
+        // 心跳验活（Mirage 健康报告语义）：isActive=true 但写状态的扩展进程已死
+        // → 立即清理残留，不等 20s 复核。旧版扩展的 state 没有 pid，跳过验活走原逻辑。
+        let heartbeat = ProcessLiveness.heartbeat(fromJSON: json)
+        if isActive, let pid = heartbeat.pid, !ProcessLiveness.isAlive(pid) {
+            print("[VideoWallpaperManager] Lock screen extension state stale (pid \(pid) dead) → inactive")
+            writeExtensionStateInactive(reason: "pid 失活")
+            return
+        }
+
+        // 扩展上报的渲染/切换错误落日志（按错误内容去重，避免同一错误刷屏）
+        if isActive, let lastError = heartbeat.lastError, !lastError.isEmpty,
+           Self.lastLoggedExtensionStateError != lastError {
+            Self.lastLoggedExtensionStateError = lastError
+            AppLogger.error(.wallpaper, "扩展上报错误", metadata: ["error": lastError])
+        }
+
         let wasActive = isLockScreenExtensionActive
         isLockScreenExtensionActive = isActive
+
+        // 扩展只在锁屏期间渲染；解锁态读到 active 一律是残留（扩展被 WallpaperAgent
+        // 回收前重写 state / 解锁通知丢失）。调度延迟复核自愈，否则残留标志会让
+        // 镜像相关路径长期空转。
+        if isActive, !isScreenLocked {
+            scheduleStaleExtensionStateCleanup()
+        }
 
         if isActive && !wasActive {
             print("[VideoWallpaperManager] Lock screen extension became active")
@@ -1575,6 +1598,60 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// 上次检查到的扩展 videoID，用于检测视频切换
     private static var lastCheckedExtensionVideoID: String?
+
+    /// 上次落日志的扩展上报错误（按内容去重）
+    private static var lastLoggedExtensionStateError: String?
+
+    private var staleExtensionCleanupPending = false
+    private var lastStaleExtensionCleanupAt: Date?
+
+    /// 解锁态下对扩展 state 残留的自愈：20 秒后复核（避开「刚锁屏但 isScreenLocked
+    /// 尚未置位」的窗口期），文件仍为 active 才补写；5 分钟内不重复补写，
+    /// 避免与仍存活的扩展互相覆写。兜住 reconcileExtensionStateAfterUnlock
+    /// 依赖的解锁通知丢失 / 扩展回收前重写的场景。
+    private func scheduleStaleExtensionStateCleanup() {
+        guard !staleExtensionCleanupPending else { return }
+        staleExtensionCleanupPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) { [weak self] in
+            guard let self else { return }
+            self.staleExtensionCleanupPending = false
+            guard !self.isScreenLocked else { return }
+            if let last = self.lastStaleExtensionCleanupAt,
+               Date().timeIntervalSince(last) < 300 { return }
+            guard let container = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: "group.com.waifux.app"
+            ) else { return }
+            let stateURL = container.appendingPathComponent("waifux-wallpaper-state.json")
+            guard let data = try? Data(contentsOf: stateURL),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (json["isActive"] as? Bool) == true else { return }
+            self.lastStaleExtensionCleanupAt = Date()
+            self.writeExtensionStateInactive(reason: "解锁态复核")
+        }
+    }
+
+    /// 把扩展 state 文件补写为 inactive，并清掉内存活跃标志。
+    private func writeExtensionStateInactive(reason: String) {
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.com.waifux.app"
+        ) else { return }
+        let stateURL = container.appendingPathComponent("waifux-wallpaper-state.json")
+        let json: [String: Any] = [
+            "isActive": false,
+            "currentVideoID": NSNull(),
+            "currentVideoName": NSNull(),
+            "contexts": NSNull()
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: json) {
+            try? data.write(to: stateURL, options: .atomic)
+        }
+        if isLockScreenExtensionActive {
+            isLockScreenExtensionActive = false
+            AppLogger.error(.wallpaper, "扩展 state 残留 active 已清理", metadata: [
+                "reason": reason
+            ])
+        }
+    }
 
     /// 将所有显示器的当前视频源同步到锁屏扩展。
     /// 用户在系统设置中手动为每个显示器选择一次 WaifuX 实例后，
@@ -5043,12 +5120,15 @@ final class VideoWallpaperManager: ObservableObject {
 
     /// 仅拆掉本机 AVPlayer 视频壁纸，**不**调用 `WallpaperEngineXBridge.stopWallpaper()`。
     /// 在即将通过 CLI 设置 scene / web 等 WE 壁纸前调用，否则会误停 CLI 且把 `isControllingExternalEngine` 清掉，菜单栏暂停恢复会走错视频分支。
-    func stopNativeVideoWallpaperOnly(for targetScreen: NSScreen? = nil) {
+    /// - Parameter caller: 调用方函数名（默认参数在调用点取值），用于在日志中
+    ///   定位反复空转重试的实际来源。
+    func stopNativeVideoWallpaperOnly(for targetScreen: NSScreen? = nil, caller: String = #function) {
         AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly", metadata: [
             "targetScreen": targetScreen?.localizedName ?? "nil(全部)",
             "windows": windows.count,
             "players": players.count,
-            "isLockScreenExtensionActive": isLockScreenExtensionActive
+            "isLockScreenExtensionActive": isLockScreenExtensionActive,
+            "caller": caller
         ])
         // 子进程渲染路径：只停止子进程，不触发 WallpaperEngineXBridge 链式停止
         if externalRenderingActive {
@@ -5231,6 +5311,16 @@ final class VideoWallpaperManager: ObservableObject {
             teardownWindow(for: teardownKey)
         } else if windows[screenID] != nil || players[screenID] != nil {
             teardownWindow(for: screenID)
+        } else if videoTargetScreenIDs.contains(screenID)
+                    || videoTargetScreenFingerprints.contains(screenFingerprint) {
+            // 状态认为该屏仍有视频，但窗口/播放器键已不可达——不暴露就永远拆不掉，
+            // 上层重试会无限空转。打点留存活键，供日志定位。
+            AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 空转：状态认为该屏有视频但窗口键不可达", metadata: [
+                "screenID": screenID,
+                "fingerprint": screenFingerprint,
+                "survivingWindowKeys": windows.keys.sorted().joined(separator: ","),
+                "survivingPlayerKeys": players.keys.sorted().joined(separator: ",")
+            ])
         }
 
         videoTargetScreenIDs.remove(screenID)
@@ -6402,6 +6492,8 @@ final class VideoWallpaperManager: ObservableObject {
     /// fingerprint 兜底要求旧键仍能解析到当前屏）。若 frame 又因分辨率/排列
     /// 变化对不上，existingVideoWindowEntry 兜底 miss 后 createWindow 会在
     /// 同一块屏上再建一层 → 用户看到两个动态壁纸叠加。
+    /// 匹配兜底顺序：fingerprint → frame 近似相等 → window.screen 实际贴附屏
+    /// （2026-09-19 用户日志实证：唤醒重编号后前两条同时失效，窗口永远拆不掉）。
     ///
     /// 在 apply/stop 入口幂等调用：贴在目标屏上的异键窗口，单窗 rekey 到当前键
     /// （保住"旧层保留到新层首帧就绪"的复用路径），已叠成多层的其余直接拆毁。
@@ -6419,7 +6511,18 @@ final class VideoWallpaperManager: ObservableObject {
             for (key, window) in windows {
                 guard key != screenID, !currentScreenIDs.contains(key) else { continue }
                 let fingerprintMatches = windowFingerprintByScreenID[key] == screenFingerprint
-                if fingerprintMatches || framesApproximatelyEqual(window.frame, screen.frame) {
+                let framesMatch = framesApproximatelyEqual(window.frame, screen.frame)
+                // 睡眠唤醒/重插后 CGDirectDisplayID 重编号会同时改写 fingerprint 与
+                // frame；最后按窗口实际贴附的物理屏兜底（window.screen 由 WindowServer
+                // 实时给出），否则旧键窗口对所有拆窗/复用路径永久不可达。
+                let windowOnTargetScreen: Bool
+                if let hostScreen = window.screen {
+                    windowOnTargetScreen = hostScreen === screen
+                        || hostScreen.wallpaperScreenIdentifier == screenID
+                } else {
+                    windowOnTargetScreen = false
+                }
+                if fingerprintMatches || framesMatch || windowOnTargetScreen {
                     misKeyedEntries.append((key, window))
                 }
             }
@@ -6458,6 +6561,9 @@ final class VideoWallpaperManager: ObservableObject {
                 self.markExternalRendererSuspended()
                 return
             }
+            // 「屏幕休眠时：继续播放」策略下不主动暂停播放器：
+            // 屏幕熄灭期间本就没有可见输出，唤醒后按休眠前状态继续。
+            guard DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy == .pause else { return }
             for player in self.players.values {
                 player.pause()
                 player.rate = 0
@@ -6558,6 +6664,8 @@ final class VideoWallpaperManager: ObservableObject {
                 self.markExternalRendererSuspended()
                 return
             }
+            // 与 screensDidSleep 一致：「屏幕休眠时：继续播放」策略下不主动暂停。
+            guard DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy == .pause else { return }
             for player in self.players.values {
                 player.pause()
                 player.rate = 0

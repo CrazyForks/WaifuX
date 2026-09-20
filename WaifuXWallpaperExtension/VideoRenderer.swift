@@ -139,6 +139,13 @@ final class VideoRenderer: @unchecked Sendable {
                 extLog("  [Renderer] 同步首帧底图已设置: \(asset.url.lastPathComponent)")
             }
         }
+        // 第三级兜底：BMP 缓存与首帧提取都失败（解码器异常/文件损坏）时挂系统桌面图，
+        // 保证 acquire 后永不纯黑。动态首帧就绪后 displayLayer 会盖在上面。
+        if backgroundFrameLayer.contents == nil, let systemImage = SystemFallbackImage.image() {
+            backgroundFrameLayer.contents = systemImage
+            backgroundFrameLayer.opacity = 1
+            extLog("  [Renderer] ⚠️ BMP 缓存与首帧均不可用，已挂系统桌面图兜底: \(asset.url.lastPathComponent)")
+        }
         generateBackgroundFrame(for: asset)
     }
 

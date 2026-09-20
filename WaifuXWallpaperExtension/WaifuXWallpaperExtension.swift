@@ -409,8 +409,31 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
         guard isCurrentWakeRecoveryGeneration(generation) else { return }
         PowerMonitor.shared.refreshNow()
         WallpaperState.shared.forEachRenderer { $0.recoverFromDisplayWake() }
+        remountRemoteLayersAfterWake(source: source)
+        WallpaperXPCHandler.invalidateSnapshotsAfterWake()
         Self.recomputeAndApplyPolicy()
         extLog("[Extension] Display wake (\(source)) — refreshed power state and recovered renderers")
+    }
+
+    /// 唤醒后远端 CAContext 的 layer 挂载可能被 WindowServer 回收（解码管线正常但画面黑屏）。
+    /// 参考 Mirage：把 rootLayer 重新赋给 caContext.layer 并 flush，让远程合成树重新指向本进程图层。
+    /// 必须在主线程调用（NSWorkspace 通知队列即为 .main，补做路径也经 main.asyncAfter）。
+    private static func remountRemoteLayersAfterWake(source: String) {
+        let contexts = WallpaperState.shared.activeContextsSnapshot()
+        guard !contexts.isEmpty else { return }
+        var remounted = 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for context in contexts {
+            guard let caContext = context.caContext as? CAContext else { continue }
+            caContext.layer = context.rootLayer
+            remounted += 1
+        }
+        CATransaction.commit()
+        CATransaction.flush()
+        if remounted > 0 {
+            extLog("[Extension] Wake (\(source)) — remounted \(remounted) remote CAContext layer(s)")
+        }
     }
 
     // MARK: - Screen Lock
@@ -630,6 +653,7 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
                                 extLog("[Commands] ✅ 已从静态图切回视频: display=\(displayID) video=\(videoID)")
                             } catch {
                                 extLog("[Commands] ❌ 从静态图切回视频失败: \(error.localizedDescription)")
+                                WallpaperPrefs.shared.reportError("switch_video 失败: \(error.localizedDescription)")
                                 // 恢复：尝试加载缓存快照作为兜底内容，避免永久黑屏
                                 if rootLayer.sublayers?.isEmpty ?? true {
                                     if let cachedImage = loadCachedSnapshotImage() {
@@ -639,6 +663,13 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
                                         rootLayer.contentsGravity = .resizeAspectFill
                                         CATransaction.commit()
                                         extLog("[Commands] ✅ 已恢复缓存快照作为 fallback display=\(displayID)")
+                                    } else if let systemImage = SystemFallbackImage.image() {
+                                        CATransaction.begin()
+                                        CATransaction.setDisableActions(true)
+                                        rootLayer.contents = systemImage
+                                        rootLayer.contentsGravity = .resizeAspectFill
+                                        CATransaction.commit()
+                                        extLog("[Commands] ✅ 无缓存快照，已挂系统桌面图兜底 display=\(displayID)")
                                     } else {
                                         extLog("[Commands] ⚠️ 无缓存快照可用，rootLayer 将保持空载 display=\(displayID)")
                                     }

@@ -11,7 +11,7 @@ import os
 final class WallpaperPrefs: @unchecked Sendable {
     static let shared = WallpaperPrefs()
 
-    private struct PrefsFile: Codable {
+    private struct PrefsFile: Codable, Equatable {
         var userPaused: Bool = false
         var alwaysPauseDesktop: Bool = true
         var pauseWhenOccluded: Bool = false
@@ -26,11 +26,17 @@ final class WallpaperPrefs: @unchecked Sendable {
         var videoName: String?
     }
 
+    /// 扩展 → 宿主的状态文件。pid/updatedAt/lastError 是心跳字段：
+    /// 宿主读到 isActive=true 但 pid 已死时可立即清理残留，不必等 20s 复核。
+    /// 新字段全部 optional，旧宿主/旧扩展双向兼容。
     private struct StateFile: Codable {
         var isActive: Bool
         var currentVideoID: String?
         var currentVideoName: String?
         var contexts: [ContextState]?
+        var pid: Int32? = nil
+        var updatedAt: TimeInterval? = nil
+        var lastError: String? = nil
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: PrefsFile())
@@ -86,11 +92,7 @@ final class WallpaperPrefs: @unchecked Sendable {
     func setActive(_ active: Bool) {
         let videoID = active ? WallpaperState.shared.currentVideoID : nil
         let contexts = active ? buildContextStates() : nil
-        let state = StateFile(isActive: active, currentVideoID: videoID, currentVideoName: nil, contexts: contexts)
-        guard let data = try? JSONEncoder().encode(state),
-              let url = Self.stateURL else { return }
-        try? data.write(to: url, options: .atomic)
-        postStateNotification()
+        writeState(StateFile(isActive: active, currentVideoID: videoID, currentVideoName: nil, contexts: contexts))
         extLog("[WallpaperPrefs] setActive(\(active), video: \(videoID ?? "nil"))")
     }
 
@@ -98,12 +100,29 @@ final class WallpaperPrefs: @unchecked Sendable {
     func updateCurrentVideo() {
         let videoID = WallpaperState.shared.currentVideoID
         let contexts = buildContextStates()
-        let state = StateFile(isActive: true, currentVideoID: videoID, currentVideoName: nil, contexts: contexts)
-        guard let data = try? JSONEncoder().encode(state),
+        writeState(StateFile(isActive: true, currentVideoID: videoID, currentVideoName: nil, contexts: contexts))
+        extLog("[WallpaperPrefs] updateCurrentVideo(\(videoID ?? "nil"))")
+    }
+
+    /// 渲染/切换失败时附加 lastError 写入 state；宿主读到后落日志。
+    /// 正常路径的 setActive/updateCurrentVideo 会覆盖清空旧错误。
+    func reportError(_ message: String) {
+        let active = WallpaperState.shared.activeContextCount > 0
+        let videoID = active ? WallpaperState.shared.currentVideoID : nil
+        let contexts = active ? buildContextStates() : nil
+        writeState(StateFile(isActive: active, currentVideoID: videoID, currentVideoName: nil, contexts: contexts,
+                             lastError: message))
+        extLog("[WallpaperPrefs] reportError(\(message))")
+    }
+
+    private func writeState(_ state: StateFile) {
+        var stamped = state
+        stamped.pid = ProcessInfo.processInfo.processIdentifier
+        stamped.updatedAt = Date().timeIntervalSince1970
+        guard let data = try? JSONEncoder().encode(stamped),
               let url = Self.stateURL else { return }
         try? data.write(to: url, options: .atomic)
         postStateNotification()
-        extLog("[WallpaperPrefs] updateCurrentVideo(\(videoID ?? "nil"))")
     }
 
     private func buildContextStates() -> [ContextState] {
@@ -118,7 +137,14 @@ final class WallpaperPrefs: @unchecked Sendable {
         guard let url = Self.prefsURL,
               let data = try? Data(contentsOf: url),
               let decoded = try? JSONDecoder().decode(PrefsFile.self, from: data) else { return }
-        lock.withLock { $0 = decoded }
+        // 内容未变时跳过 applyPauseState：宿主侧库变化与 prefs 变化共用同一个
+        // Darwin 通知，无差别重算会给所有渲染器来一次策略抖动（可能触发速率 ramp）。
+        let changed = lock.withLock { state -> Bool in
+            guard state != decoded else { return false }
+            state = decoded
+            return true
+        }
+        guard changed else { return }
         applyPauseState()
     }
 

@@ -64,6 +64,15 @@ private final class WallpaperPrefsChangeObserver: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 对当前存活的 handler 执行闭包（XPC 连接失效后 weak 引用自然消失）。
+    /// 供唤醒恢复等进程级事件触达所有活跃连接的 agentProxy。
+    func withLiveHandlers(_ body: (WallpaperXPCHandler) -> Void) {
+        lock.lock()
+        let activeHandlers = handlers.values.compactMap(\.value)
+        lock.unlock()
+        activeHandlers.forEach(body)
+    }
+
     private func dispatchPrefsChanged() {
         lock.lock()
         let activeHandlers = handlers.values.compactMap(\.value)
@@ -511,6 +520,10 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         if let cachedImage = loadCachedSnapshotImage() {
             rootLayer.contents = cachedImage
             extLog("  Set cached snapshot as initial layer content")
+        } else if let systemImage = SystemFallbackImage.image() {
+            // acquire 即时底图第二级：无缓存快照时先挂系统桌面图，renderer 创建后即被覆盖
+            rootLayer.contents = systemImage
+            extLog("  Set system desktop picture as initial layer content (no cached snapshot)")
         }
 
         if let did = displayID {
@@ -1066,6 +1079,20 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     }
 
     // MARK: - Prefs Change Monitoring
+
+    /// 唤醒/恢复后让 WallpaperAgent 丢弃缓存的壁纸快照，促使其重新拉取。
+    /// 参考 Mirage：唤醒后系统侧快照缓存会滞留旧帧，主动失效可避免
+    /// 系统设置页/调度预览停留在唤醒前内容。
+    static func invalidateSnapshotsAfterWake() {
+        WallpaperPrefsChangeObserver.shared.withLiveHandlers { handler in
+            guard let proxy = handler.agentProxy else { return }
+            proxy.invalidateSnapshots { error in
+                if let error {
+                    extLog("[XPCHandler] 唤醒后 invalidateSnapshots 失败: \(error)")
+                }
+            }
+        }
+    }
 
     /// 开始监听 App 部署新视频的 Darwin 通知，并通知系统刷新壁纸设置。
     /// 在 agentProxy 设置后调用。
