@@ -1,13 +1,31 @@
 import Foundation
 import Security
+import CFNetwork
 
 enum SteamServiceLoginState: Equatable {
     case idle
     case loggingIn
+    case waitingForQR(challengeURL: String)
     case waitingForMobileConfirmation
     case waitingForCode
     case success
     case failed(String)
+}
+
+/// 一条订阅记录（来自 SteamKit2 CPublishedFile_GetUserFiles，type=mysubscriptions）。
+struct SteamSubscriptionItem {
+    let workshopID: String
+    let subscribedAt: Date
+    let updatedAt: Date
+    let contentHash: String
+    let fileSize: Int64
+}
+
+/// listSubscriptions 的一页结果；`total` 是服务端总数，精确翻页用。
+struct SteamSubscriptionPage {
+    let total: Int
+    let startIndex: Int
+    let items: [SteamSubscriptionItem]
 }
 
 enum SteamServiceError: LocalizedError {
@@ -69,6 +87,13 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
     private var restartCount = 0
     private var loginID: UInt32
     private var sessionIsLoggedIn = false
+    private var launchedProxySignature = ""
+    private var restartingForProxyChange = false
+    private var qrLoginActive = false
+    private var qrChallenge = ""
+    private var qrChallengeUpdatedAt: Date?
+    private var qrWatchdogWorkItem: DispatchWorkItem?
+    private static let qrChallengeStaleInterval: TimeInterval = 30
 
     private override init() {
         loginID = Self.loadLoginID(forKey: loginIDKey)
@@ -89,6 +114,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             restartWorkItem?.cancel()
             restartWorkItem = nil
             sendCommandOnQueue("shutdown")
+            stopQRLoginOnQueue()
             try? input?.close()
             let deadline = Date().addingTimeInterval(1.5)
             while process?.isRunning == true && Date() < deadline {
@@ -171,6 +197,71 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         }
     }
 
+    /// QR-code login: asks the helper for a Steam challenge URL, renders it as
+    /// a QR code for the Steam mobile app, and stores the resulting refresh
+    /// token through the shared `loggedIn` event.
+    func loginWithQR() {
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            guard loginContinuation == nil else { return }
+            guard ensureStartedOnQueue() else {
+                updateOnMain {
+                    self.loginState = .failed("WaifuX Steam 服务不可用，请重新构建应用。")
+                }
+                return
+            }
+            startQRLoginOnQueue()
+        }
+    }
+
+    private func startQRLoginOnQueue() {
+        stopQRWatchdogOnQueue()
+        qrLoginActive = true
+        qrChallenge = ""
+        qrChallengeUpdatedAt = nil
+        restoringSession = false
+        updateOnMain {
+            self.loginState = .loggingIn
+        }
+        sendCommandOnQueue("loginQr", fields: ["loginId": loginID]) { [weak self] success, message, errorCode, _ in
+            guard let self, !success else { return }
+            self.qrLoginActive = false
+            self.updateOnMain {
+                self.loginState = .failed(message ?? "Steam 二维码登录失败。")
+            }
+        }
+    }
+
+    /// Steam rotates the QR challenge URL periodically; if no fresh URL
+    /// arrives within the stale interval, rebuild the QR session so the
+    /// on-screen code never outlives its validity window.
+    private func scheduleQRWatchdogOnQueue() {
+        qrWatchdogWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.qrLoginActive else { return }
+            let staleSince = self.qrChallengeUpdatedAt ?? .distantPast
+            guard Date().timeIntervalSince(staleSince) >= Self.qrChallengeStaleInterval else {
+                self.scheduleQRWatchdogOnQueue()
+                return
+            }
+            self.startQRLoginOnQueue()
+        }
+        qrWatchdogWorkItem = work
+        ioQueue.asyncAfter(deadline: .now() + Self.qrChallengeStaleInterval, execute: work)
+    }
+
+    private func stopQRWatchdogOnQueue() {
+        qrWatchdogWorkItem?.cancel()
+        qrWatchdogWorkItem = nil
+    }
+
+    private func stopQRLoginOnQueue() {
+        qrLoginActive = false
+        stopQRWatchdogOnQueue()
+        qrChallenge = ""
+        qrChallengeUpdatedAt = nil
+    }
+
     func submitGuardCode(_ code: String) {
         ioQueue.async { [weak self] in
             guard let self, !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -182,6 +273,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         ioQueue.async { [weak self] in
             guard let self else { return }
             sendCommandOnQueue("cancelLogin")
+            stopQRLoginOnQueue()
             finishLoginOnQueue(.failure(SteamServiceError.cancelled))
         }
     }
@@ -191,6 +283,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             guard let self else { return }
             let username = UserDefaults.standard.string(forKey: usernameKey) ?? accountName
             sendCommandOnQueue("logout")
+            stopQRLoginOnQueue()
             if !username.isEmpty {
                 _ = deleteKeychainValue(account: refreshTokenAccount(username))
                 _ = deleteKeychainValue(account: guardDataAccount(username))
@@ -292,8 +385,103 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         }
     }
 
+    /// 从 Steam 服务（SteamKit2 协议层）分页拉取已订阅的创意工坊物品，
+    /// 不依赖 WebView cookie，也不解析 steamcommunity HTML。
+    /// 服务端每页固定 50 条，调用方按 `startIndex + items.count < total` 翻页。
+    ///
+    /// 与 `downloadItem` 相同：先等会话恢复完成再发命令。helper 重启/换代理
+    /// 的窗口期里主线程的 `isLoggedIn` 是旧值 true，而 ioQueue 上的
+    /// `sessionIsLoggedIn` 已被终止处理清掉——不等待就会误报"需要重新登录"。
+    func fetchSubscriptions(startIndex: Int) async throws -> SteamSubscriptionPage {
+        let ready: Bool = await withCheckedContinuation { continuation in
+            ioQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                guard self.ensureStartedOnQueue() else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                if self.sessionIsLoggedIn {
+                    continuation.resume(returning: true)
+                    return
+                }
+                if !self.restoringSession {
+                    self.restoreSessionOnQueue()
+                }
+                if self.restoringSession {
+                    self.restoreWaiters.append(continuation)
+                } else {
+                    // 无已保存会话可恢复（未登录或令牌失效）。
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+        guard ready else {
+            throw SteamServiceError.notAuthenticated
+        }
+
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SteamSubscriptionPage, Error>) in
+            ioQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(throwing: SteamServiceError.unavailable("Steam 服务已释放。"))
+                    return
+                }
+                guard self.sessionIsLoggedIn else {
+                    continuation.resume(throwing: SteamServiceError.notAuthenticated)
+                    return
+                }
+                self.sendCommandOnQueue("listSubscriptions", fields: ["startIndex": max(0, startIndex)]) { _, message, errorCode, data in
+                    guard let data else {
+                        continuation.resume(throwing: SteamServiceError.downloadFailed(
+                            message ?? "获取订阅列表失败。",
+                            errorCode
+                        ))
+                        return
+                    }
+                    guard let total = data["total"] as? Int,
+                          let returnedStart = data["startIndex"] as? Int,
+                          let rawItems = data["items"] as? [[String: Any]] else {
+                        continuation.resume(throwing: SteamServiceError.downloadFailed(
+                            "Steam 服务返回的订阅数据格式异常。",
+                            "MALFORMED_SUBSCRIPTIONS"
+                        ))
+                        return
+                    }
+                    let items = rawItems.compactMap { payload -> SteamSubscriptionItem? in
+                        guard let workshopID = payload["workshopId"] as? String,
+                              !workshopID.isEmpty else { return nil }
+                        let subscribedAt = (payload["subscribedAt"] as? NSNumber)?.doubleValue ?? 0
+                        let updatedAt = (payload["updatedAt"] as? NSNumber)?.doubleValue ?? 0
+                        return SteamSubscriptionItem(
+                            workshopID: workshopID,
+                            subscribedAt: Date(timeIntervalSince1970: subscribedAt),
+                            updatedAt: Date(timeIntervalSince1970: updatedAt),
+                            contentHash: (payload["contentHash"] as? String) ?? "",
+                            fileSize: (payload["fileSize"] as? NSNumber)?.int64Value ?? 0
+                        )
+                    }
+                    continuation.resume(returning: SteamSubscriptionPage(
+                        total: total,
+                        startIndex: returnedStart,
+                        items: items
+                    ))
+                }
+            }
+        }
+    }
+
     private func startOnQueue() {
-        guard process?.isRunning != true else {
+        if process?.isRunning == true {
+            // 子进程的环境变量在启动时固定；系统代理开关/换端口后重启服务，
+            // 让新代理以环境变量形式注入（终止处理链会自动拉起新进程）。
+            if Self.readSystemProxySettings().signature != launchedProxySignature {
+                NSLog("[SteamService] 检测到系统代理变化，重启 Steam 服务使新代理生效。")
+                restartingForProxyChange = true
+                process?.terminate()
+                return
+            }
             restoreSessionOnQueue()
             return
         }
@@ -340,6 +528,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             self.process = process
             input = stdinPipe.fileHandleForWriting
             restartCount = 0
+            launchedProxySignature = Self.readSystemProxySettings().signature
             updateOnMain {
                 self.isAvailable = true
             }
@@ -473,7 +662,19 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             updateOnMain {
                 self.loginState = .waitingForCode
             }
+        case "qr":
+            if let challenge = event["challengeUrl"] as? String, !challenge.isEmpty {
+                if challenge != qrChallenge {
+                    qrChallenge = challenge
+                    qrChallengeUpdatedAt = Date()
+                }
+                scheduleQRWatchdogOnQueue()
+                updateOnMain {
+                    self.loginState = .waitingForQR(challengeURL: challenge)
+                }
+            }
         case "loggedIn":
+            stopQRLoginOnQueue()
             let resolvedSteamID = event["steamId"] as? String ?? steamID
             if let token = event["refreshToken"] as? String, !token.isEmpty {
                 _ = setKeychainValue(token, account: refreshTokenAccount(resolvedUsername))
@@ -497,6 +698,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             }
         case "loggedOut":
             let wasRestoring = restoringSession
+            stopQRLoginOnQueue()
             restoringSession = false
             sessionIsLoggedIn = false
             resolveRestoreWaitersOnQueue(isLoggedIn: false)
@@ -513,6 +715,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             let message = event["message"] as? String ?? "Steam 登录失败。"
             let errorCode = event["errorCode"] as? String
             let wasRestoring = restoringSession
+            stopQRLoginOnQueue()
             restoringSession = false
             sessionIsLoggedIn = false
             resolveRestoreWaitersOnQueue(isLoggedIn: false)
@@ -581,6 +784,10 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         process = nil
         input = nil
         sessionIsLoggedIn = false
+        stopQRLoginOnQueue()
+        // 恢复流程随进程一起死了：复位标志，否则重启后的 restoreSessionOnQueue
+        // 会被这个残留 guard 挡住，restoreWaiters 里的等待者永远无人唤醒。
+        restoringSession = false
         resolveRestoreWaitersOnQueue(isLoggedIn: false)
         updateOnMain {
             self.isAvailable = false
@@ -593,6 +800,11 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         let pendingDownloads = downloadHandlers
         downloadHandlers.removeAll()
         pendingDownloads.values.forEach { $0("failed", "Steam 服务已退出。", "SERVICE_TERMINATED", nil) }
+        if restartingForProxyChange {
+            // 代理变化触发的计划内重启不消耗崩溃重试预算。
+            restartingForProxyChange = false
+            restartCount = 0
+        }
         guard !explicitShutdown, restartCount < 5 else { return }
         let delay = min(30.0, pow(2.0, Double(restartCount)))
         restartCount += 1
@@ -618,12 +830,95 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
         let environment: [String: String]
     }
 
+    // MARK: - 系统代理桥接
+
+    /// macOS 系统代理设置（ClashX/Surge/小火箭类工具写入 System Configuration 的那份）。
+    /// .NET 在 macOS 上只认 http_proxy/https_proxy/all_proxy 环境变量，不读系统代理，
+    /// 而 GUI 启动的子进程又拿不到终端里的环境变量；这里负责把系统代理翻译成
+    /// 标准环境变量注入 Steam 服务子进程，否则用户的 VPN 代理不到 Steam 流量。
+    private struct SystemProxySettings {
+        var httpProxy: URL?
+        var httpsProxy: URL?
+        var socksProxy: URL?
+        var exceptions: [String]
+        var signature: String
+    }
+
+    private static func readSystemProxySettings() -> SystemProxySettings {
+        var settings = SystemProxySettings(httpProxy: nil, httpsProxy: nil, socksProxy: nil,
+                                           exceptions: [], signature: "none")
+        guard let raw = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return settings
+        }
+        func string(_ key: String) -> String? {
+            (raw[key] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
+        func number(_ key: String) -> Int? {
+            (raw[key] as? NSNumber)?.intValue
+        }
+        func proxyURL(scheme: String, hostKey: String, portKey: String, enabledKey: String) -> URL? {
+            guard number(enabledKey) == 1,
+                  let host = string(hostKey),
+                  let port = number(portKey), port > 0 else { return nil }
+            return URL(string: "\(scheme)://\(host):\(port)")
+        }
+        settings.httpProxy = proxyURL(scheme: "http", hostKey: "HTTPProxy", portKey: "HTTPPort", enabledKey: "HTTPEnable")
+        settings.httpsProxy = proxyURL(scheme: "http", hostKey: "HTTPSProxy", portKey: "HTTPSPort", enabledKey: "HTTPSEnable")
+        settings.socksProxy = proxyURL(scheme: "socks5", hostKey: "SOCKSProxy", portKey: "SOCKSPort", enabledKey: "SOCKSEnable")
+        settings.exceptions = (raw["ExceptionsList"] as? [String]) ?? []
+        settings.signature = [
+            settings.httpProxy?.absoluteString ?? "-",
+            settings.httpsProxy?.absoluteString ?? "-",
+            settings.socksProxy?.absoluteString ?? "-",
+            settings.exceptions.sorted().joined(separator: ",")
+        ].joined(separator: "|")
+        return settings
+    }
+
+    /// 系统代理未启用时返回 nil：保留进程现有环境变量，不覆盖手动设置。
+    private static func proxyEnvironmentOverrides() -> [String: String]? {
+        let proxy = readSystemProxySettings()
+        guard proxy.httpProxy != nil || proxy.httpsProxy != nil || proxy.socksProxy != nil else { return nil }
+        var overrides: [String: String] = [:]
+        if let url = proxy.httpProxy {
+            overrides["http_proxy"] = url.absoluteString
+            overrides["HTTP_PROXY"] = url.absoluteString
+        }
+        if let url = proxy.httpsProxy {
+            overrides["https_proxy"] = url.absoluteString
+            overrides["HTTPS_PROXY"] = url.absoluteString
+        }
+        if let url = proxy.socksProxy {
+            overrides["all_proxy"] = url.absoluteString
+            overrides["ALL_PROXY"] = url.absoluteString
+        }
+        let noProxy = (["localhost", "127.0.0.1", "::1"] + proxy.exceptions).joined(separator: ",")
+        overrides["no_proxy"] = noProxy
+        overrides["NO_PROXY"] = noProxy
+        return overrides
+    }
+
+    private static func proxyEnvironment(_ base: [String: String]) -> [String: String] {
+        var environment = base
+        if let overrides = proxyEnvironmentOverrides() {
+            if let proxy = overrides["https_proxy"] ?? overrides["http_proxy"] ?? overrides["all_proxy"] {
+                NSLog("[SteamService] 系统代理已启用，注入 Steam 服务环境变量：%@", proxy)
+            }
+            overrides.forEach { environment[$0.key] = $0.value }
+        }
+        return environment
+    }
+
     private func serviceLaunchConfiguration() -> LaunchConfiguration? {
         if let configured = ProcessInfo.processInfo.environment["WAIFUX_STEAM_SERVICE_PATH"],
            !configured.isEmpty {
             let url = URL(fileURLWithPath: configured)
             if FileManager.default.isExecutableFile(atPath: url.path) {
-                return LaunchConfiguration(executableURL: url, arguments: [], environment: ProcessInfo.processInfo.environment)
+                return LaunchConfiguration(
+                    executableURL: url,
+                    arguments: [],
+                    environment: Self.proxyEnvironment(ProcessInfo.processInfo.environment)
+                )
             }
         }
 
@@ -653,7 +948,7 @@ final class SteamServiceManager: NSObject, ObservableObject, @unchecked Sendable
             return LaunchConfiguration(
                 executableURL: executable,
                 arguments: [assembly.path],
-                environment: environment
+                environment: Self.proxyEnvironment(environment)
             )
         }
         return nil

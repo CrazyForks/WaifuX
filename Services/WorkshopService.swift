@@ -424,10 +424,77 @@ class WorkshopService: ObservableObject {
         }
     }
 
+    /// Mirage 式订阅同步：走 WaifuX Steam 服务（SteamKit2 协议层）精确分页拉订阅，
+    /// 再用公开 Web API 富化详情。不需要 WebView cookie，也不受 steamcommunity
+    /// 页面改版影响。仅在 Steam 服务已登录时可用。
+    private func fetchAllSubscriptionsViaSteamService() async throws -> [WorkshopWallpaper] {
+        let manager = SteamServiceManager.shared
+        guard manager.isLoggedIn else {
+            throw SteamServiceError.notAuthenticated
+        }
+
+        var allItems: [WorkshopWallpaper] = []
+        var seenIDs = Set<String>()
+        var startIndex = 0
+
+        // 防御性上限：订阅数远超此值只可能是服务端返回异常，避免死循环。
+        while startIndex < 20_000 {
+            let page = try await manager.fetchSubscriptions(startIndex: startIndex)
+            let ids = page.items.map(\.workshopID).filter { seenIDs.insert($0).inserted }
+            if !ids.isEmpty {
+                let details = try await fetchPublishedFileDetails(ids: ids)
+                let detailMap = Dictionary(details.map { ($0.publishedfileid, $0) },
+                                           uniquingKeysWith: { first, _ in first })
+                for id in ids {
+                    guard let detail = detailMap[id] else { continue }
+                    let placeholder = WorkshopWallpaper(
+                        id: id,
+                        title: "",
+                        description: nil,
+                        previewURL: nil,
+                        author: WorkshopAuthor(steamID: detail.creator, name: "Unknown", avatarURL: nil),
+                        fileSize: nil,
+                        fileURL: nil,
+                        steamAppID: String(detail.consumer_app_id ?? 431960),
+                        subscriptions: nil,
+                        favorites: nil,
+                        views: nil,
+                        rating: nil,
+                        type: .unknown,
+                        tags: [],
+                        isAnimatedImage: nil,
+                        createdAt: nil,
+                        updatedAt: nil
+                    )
+                    allItems.append(WorkshopWallpaper(base: placeholder, detail: detail))
+                }
+            }
+            if page.items.isEmpty { break }
+            startIndex = page.startIndex + page.items.count
+            if startIndex >= page.total { break }
+        }
+
+        AppLogger.info(.media, "fetchAllSubscriptionsViaSteamService total: \(allItems.count) items")
+        return allItems
+    }
+
     /// 获取用户所有已订阅的壁纸（自动翻页）
     /// - Parameter steamID: Steam 64位数字 ID
     /// - Returns: 所有已订阅壁纸
     func fetchAllSubscriptions(steamID: String) async throws -> [WorkshopWallpaper] {
+        // 优先走 Steam 服务协议层同步（免 cookie、免爬页面、精确分页）；
+        // 服务未登录或失败时回退到原有的 steamcommunity 网页爬取路径。
+        if SteamServiceManager.shared.isLoggedIn {
+            do {
+                return try await fetchAllSubscriptionsViaSteamService()
+            } catch {
+                AppLogger.error(.media, "Steam 服务订阅同步失败，回退网页爬取", metadata: [
+                    "steamID": steamID,
+                    "error": "\(error)"
+                ])
+            }
+        }
+
         var allItems: [WorkshopWallpaper] = []
         var seenIDs = Set<String>()
         var page = 1
