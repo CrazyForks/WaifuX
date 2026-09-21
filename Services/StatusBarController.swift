@@ -456,6 +456,11 @@ final class StatusBarController: NSObject {
                 onOpenDetail: { [weak self] request in
                     MainNavigationRequestStore.requestWallpaperDetail(request)
                     self?.showWindowHandler?()
+                },
+                onQuit: { [weak self] in
+                    // 与右键菜单退出同链路：quitHandler → WaifuXApp.quitApplication()
+                    // （applicationWillTerminate 清理 + 退出诊断都依赖这条路径）。
+                    self?.quitApplication()
                 }
             )
         } else if event.type == .leftMouseUp || event.type == .rightMouseUp {

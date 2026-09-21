@@ -47,6 +47,8 @@ final class WaifuXScreenSaverView: ScreenSaverView {
     private var readyObservation: NSKeyValueObservation?
     private var statusObservation: NSKeyValueObservation?
     private var messageLabel: NSTextField?
+    /// 下一次多屏相位核对的时间戳（挂钟秒）。
+    private var nextPhaseCheckAt: TimeInterval = 0
 
     /// 媒体原始像素尺寸；未知时退化为"铺满屏幕"。
     private var mediaSize: CGSize = .zero
@@ -142,6 +144,7 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         if cropRefreshTick % fps == 0 {
             refreshCropIfNeeded()
         }
+        syncPlaybackPhaseIfNeeded()
     }
 
     // MARK: - 加载
@@ -255,7 +258,7 @@ final class WaifuXScreenSaverView: ScreenSaverView {
                 self.updateMediaSize()
                 self.hideMessage()
                 if self.isAnimatingWallpaper {
-                    self.player?.playImmediately(atRate: configuration.playbackRate)
+                    self.playInSync(rate: configuration.playbackRate)
                 }
             }
         }
@@ -281,7 +284,61 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         }
 
         if isAnimatingWallpaper {
-            player.playImmediately(atRate: configuration.playbackRate)
+            playInSync(rate: configuration.playbackRate)
+        }
+    }
+
+    // MARK: - 多屏相位同步
+
+    /// 多块屏的 legacyScreenSaver 是互相独立的进程，启动时刻各不相同，各自从 0
+    /// 起播会永久错位。所有屏读同一份配置、共用同一台机器的时钟，所以把播放
+    /// 位置锁成挂钟的确定函数（position = 挂钟 × 倍率 mod 时长）：任意时刻
+    /// 各屏天然处于同一相位，起播先后只影响第一帧的落点，不影响对齐。
+    private func synchronizedPhase(forDuration duration: Double) -> Double {
+        let rate = Double(max(configuration?.playbackRate ?? 1, 0.01))
+        var phase = (Date().timeIntervalSinceReferenceDate * rate)
+            .truncatingRemainder(dividingBy: duration)
+        if phase < 0 { phase += duration }
+        return phase
+    }
+
+    /// 起播前先 seek 到当前共享相位，抹掉各屏引擎启动时刻差。
+    private func playInSync(rate: Float) {
+        guard let player else { return }
+        let duration = player.currentItem?.duration.seconds ?? 0
+        guard duration.isFinite, duration > 0 else {
+            // 时长未知（流式/探测失败）时无从锁相，退回直接起播。
+            player.playImmediately(atRate: rate)
+            return
+        }
+        let target = CMTime(seconds: synchronizedPhase(forDuration: duration), preferredTimescale: 600)
+        player.seek(
+            to: target,
+            toleranceBefore: CMTime(seconds: 0.1, preferredTimescale: 600),
+            toleranceAfter: CMTime(seconds: 0.1, preferredTimescale: 600)
+        ) { [weak player] _ in
+            player?.playImmediately(atRate: rate)
+        }
+    }
+
+    /// 起播后按 2s 周期核对相位，偏差超过 0.35s 就轻推回共享相位，
+    /// 吸收各屏循环缝隙、解码停顿造成的慢漂移；阈值以下不动，避免可见跳动。
+    private func syncPlaybackPhaseIfNeeded() {
+        guard isAnimatingWallpaper, let player, player.rate > 0 else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        guard now >= nextPhaseCheckAt else { return }
+        nextPhaseCheckAt = now + 2
+        let duration = player.currentItem?.duration.seconds ?? 0
+        guard duration.isFinite, duration > 0 else { return }
+        let expected = synchronizedPhase(forDuration: duration)
+        var delta = player.currentTime().seconds - expected
+        delta -= duration * (delta / duration).rounded()
+        if abs(delta) > 0.35 {
+            player.seek(
+                to: CMTime(seconds: expected, preferredTimescale: 600),
+                toleranceBefore: CMTime(seconds: 0.08, preferredTimescale: 600),
+                toleranceAfter: CMTime(seconds: 0.08, preferredTimescale: 600)
+            )
         }
     }
 

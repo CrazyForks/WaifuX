@@ -135,6 +135,7 @@ final class ExploreGridCoordinator: NSObject {
     private var pendingVisibilityRefreshWorkItems: [DispatchWorkItem] = []
     private var pendingRestoreScrollOffset: CGFloat?
     private var registeredCellClassIdentifiers: Set<NSUserInterfaceItemIdentifier> = []
+    private var isRegisteredForReorderDrops = false
     private var isHoverInteractionEnabled = true
     /// 仅当可见 item 索引范围变化时再回调，减轻 SwiftUI 侧与预取链路的无效触发
     private var lastReportedVisibleItemRange: (min: Int, max: Int)?
@@ -543,6 +544,19 @@ final class ExploreGridCoordinator: NSObject {
         layout.rowSpacing = resolved
         layout.invalidateLayout()
         scheduleViewUpdateLayout()
+    }
+
+    /// SwiftUI update 时同步「拖放排序」的落点注册。
+    ///
+    /// NSCollectionView 必须先 `registerForDraggedTypes:` 才会把 drop 消息派给 delegate：
+    /// 不注册时 `validateDrop` / `acceptDrop` 永远不会被调用 —— 拖拽能拖起来，松手毫无反应。
+    /// 只对提供排序落点回调的页面（我的库网格）注册，探索页等只读网格保持不注册。
+    func syncReorderDropRegistrationIfNeeded() {
+        guard !isRegisteredForReorderDrops,
+              parent.onValidateReorderDrop != nil,
+              parent.onPerformReorderDrop != nil else { return }
+        collectionView.registerForDraggedTypes([.string])
+        isRegisteredForReorderDrops = true
     }
 
     func performBatchUpdates(insertedCount: Int, oldCount: Int) {
@@ -1117,7 +1131,28 @@ extension ExploreGridCoordinator: NSCollectionViewDelegate {
             targetIndex = min(max(0, indexPath.item), itemCount)
         }
         let payloads = Self.dropPayloadStrings(from: draggingInfo.draggingPasteboard)
-        return onPerform(payloads, targetIndex)
+        let consumed = onPerform(payloads, targetIndex)
+        AppLogger.debug(.grid, "[DragDiag] 排序落点落地", metadata: [
+            "targetIndex": targetIndex,
+            "itemCount": itemCount,
+            "payloadStrings": payloads.count,
+            "consumed": consumed
+        ])
+        return consumed
+    }
+
+    // MARK: 拖拽诊断（每次拖拽一条，便于从 waifux.log 复盘「拖了但没落地」）
+
+    func collectionView(
+        _ collectionView: NSCollectionView,
+        draggingSession session: NSDraggingSession,
+        willBeginAt screenPoint: NSPoint,
+        forItemsAt indexPaths: Set<IndexPath>
+    ) {
+        AppLogger.debug(.grid, "[DragDiag] 拖拽开始", metadata: [
+            "draggedItems": indexPaths.count,
+            "payloadStrings": Self.dropPayloadStrings(from: session.draggingPasteboard).count
+        ])
     }
 }
 

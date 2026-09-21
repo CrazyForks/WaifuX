@@ -100,6 +100,7 @@ struct ExploreGridContainer: NSViewRepresentable {
         coordinator.parent = self
         coordinator.syncHeaderCollapseStateFromParent()
         coordinator.syncGridSpacingIfNeeded(gridSpacing)
+        coordinator.syncReorderDropRegistrationIfNeeded()
         let layoutRefreshChanged = layoutRefreshToken != coordinator.lastLayoutRefreshToken
         let visibilityRefreshChanged = visibilityRefreshToken != coordinator.lastVisibilityRefreshToken
 

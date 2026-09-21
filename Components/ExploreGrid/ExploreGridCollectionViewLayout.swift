@@ -421,4 +421,90 @@ final class ExploreGridCollectionViewLayout: NSCollectionViewLayout {
         return newBounds.width != collectionView.bounds.width
     }
 
+    // MARK: - 拖拽落点（我的库「编辑态拖拽排序」依赖）
+
+    /// 把 hover 点换算成「插入到第 index 张之前」的 inter-item gap 落点。
+    /// NSCollectionView 只有在布局给出落点属性后才会向 delegate 提出 drop 提案
+    /// （`validateDrop`）；自定义布局不实现本方法时恒为 nil，collection view 推断不出落点，
+    /// drop 永远不会发生 —— 表现为卡片能拖起来、松手毫无反应。
+    override func layoutAttributesForDropTarget(at pointInCollectionView: NSPoint) -> NSCollectionViewLayoutAttributes? {
+        rebuildCacheIfNeeded()
+        guard !cache.isEmpty else { return nil }
+        let item = insertionIndex(for: pointInCollectionView)
+        let attributes = NSCollectionViewLayoutAttributes(
+            forInterItemGapBefore: IndexPath(item: item, section: 0)
+        )
+        // 指示器直接按这里返回的 frame 绘制，必须一并带上（默认是 .zero，会看不见）。
+        attributes.frame = insertionIndicatorFrame(before: item)
+        return attributes
+    }
+
+    /// 插入指示条位置：贴在目标卡片左缘的一道竖条；追加到末尾时贴最后一张卡片右缘。
+    /// collection view 用这个 frame 绘制内置的 inter-item gap 指示器。
+    override func layoutAttributesForInterItemGap(before indexPath: IndexPath) -> NSCollectionViewLayoutAttributes? {
+        rebuildCacheIfNeeded()
+        guard !cache.isEmpty else { return nil }
+        let attributes = NSCollectionViewLayoutAttributes(forInterItemGapBefore: indexPath)
+        attributes.frame = insertionIndicatorFrame(before: indexPath.item)
+        return attributes
+    }
+
+    /// 卡片左半 → 插到它前面；右半 → 插到它后面（等价于下一张之前）。
+    /// 点落在所有卡片下方（网格空白/底部留白）→ 追加到末尾；
+    /// 其余情况取视口内最近的一张做左右半判定。
+    private func insertionIndex(for point: NSPoint) -> Int {
+        let itemCount = cache.count
+        guard let collectionView else { return itemCount }
+        let probeRect = collectionView.bounds.insetBy(dx: -columnSpacing, dy: -rowSpacing)
+        var nearest: NSCollectionViewLayoutAttributes?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        var lowestMaxY = -CGFloat.greatestFiniteMagnitude
+
+        for attributes in layoutAttributesForElements(in: probeRect) {
+            let frame = attributes.frame
+            lowestMaxY = max(lowestMaxY, frame.maxY)
+            if frame.contains(point) {
+                let item = attributes.indexPath?.item ?? 0
+                return point.x > frame.midX ? item + 1 : item
+            }
+            let dx = max(max(frame.minX - point.x, point.x - frame.maxX), 0)
+            let dy = max(max(frame.minY - point.y, point.y - frame.maxY), 0)
+            let distance = dx * dx + dy * dy
+            if distance < nearestDistance {
+                nearestDistance = distance
+                nearest = attributes
+            }
+        }
+
+        // 拖到所有卡片下方 = 排到最后
+        if point.y > lowestMaxY { return itemCount }
+        guard let nearest, let item = nearest.indexPath?.item else { return itemCount }
+        return point.x > nearest.frame.midX ? item + 1 : item
+    }
+
+    private func insertionIndicatorFrame(before item: Int) -> NSRect {
+        let thickness: CGFloat = 3
+        let verticalInset: CGFloat = 6
+
+        let cardFrame: NSRect
+        if item < cache.count {
+            cardFrame = cache[item].frame
+            return NSRect(
+                x: cardFrame.minX - thickness - 2,
+                y: cardFrame.minY + verticalInset,
+                width: thickness,
+                height: max(1, cardFrame.height - verticalInset * 2)
+            )
+        }
+
+        // 追加到末尾：贴最后一张卡片右缘（瀑布流里最后一张所在列就是新卡片会落下的列）
+        guard let last = cache.last else { return .zero }
+        return NSRect(
+            x: last.frame.maxX + 2,
+            y: last.frame.minY + verticalInset,
+            width: thickness,
+            height: max(1, last.frame.height - verticalInset * 2)
+        )
+    }
+
 }

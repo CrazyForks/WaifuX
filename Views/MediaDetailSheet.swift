@@ -5111,9 +5111,25 @@ struct WallpaperPreviewSheet: View {
                 WebWallpaperPreviewView(url: url, onLoaded: { isWebLoaded = true })
                     .ignoresSafeArea()
             } else if isVideo {
-                // 原生播放器悬浮控件（播放/暂停、进度条、音量、全屏）
-                AVPlayerViewRepresentable(player: previewPlayer.player, controlsStyle: .floating)
+                // AVPlayerLayer + 自绘控制条。不走 AVPlayerView(.floating)：其浮动控件
+                // 在 macOS 27 上存在 KVO↔布局重入递归（AVFloatingPlaybackControlsViewController
+                // 增删辅助按钮 → intrinsicContentSize 变更 → layoutSubtreeIfNeeded →
+                // frame KVO → _updateControlsState），会把 8MB 主线程栈打爆（SIGSEGV）。
+                PreviewVideoLayerView(player: previewPlayer.player)
                     .ignoresSafeArea()
+                    .overlay(alignment: .bottom) {
+                        PreviewPlayerControls(player: previewPlayer, isMuted: $isPreviewMuted)
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, 16)
+                    }
+                    .overlay {
+                        // 替代 AVPlayerView 原生缓冲指示器
+                        if previewPlayer.isBuffering {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                .scaleEffect(1.3)
+                        }
+                    }
                     .onAppear {
                         previewPlayer.load(url: url, isMuted: isPreviewMuted)
                     }
@@ -5181,6 +5197,7 @@ final class PreviewPlayer: ObservableObject, @unchecked Sendable {
     @Published var currentTime: TimeInterval = 0
     @Published var totalDuration: TimeInterval = 0
     @Published var isPlaying: Bool = true
+    @Published var isBuffering: Bool = false
     nonisolated(unsafe) private var timeObserver: Any?
 
     func load(url: URL, isMuted: Bool) {
@@ -5195,14 +5212,19 @@ final class PreviewPlayer: ObservableObject, @unchecked Sendable {
         player.replaceCurrentItem(with: item)
         player.play()
         isPlaying = true
+        isBuffering = true
 
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.isBuffering = self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 let duration = self.player.currentItem?.duration.seconds ?? 0
                 guard duration.isFinite, duration > 0 else { return }
                 self.currentTime = time.seconds
                 self.totalDuration = duration
+                if time.seconds >= duration - 0.05, self.isPlaying {
+                    self.isPlaying = false
+                }
             }
         }
     }
@@ -5216,6 +5238,11 @@ final class PreviewPlayer: ObservableObject, @unchecked Sendable {
         if isPlaying {
             player.pause()
         } else {
+            // 播完后再按播放：从头重播
+            if totalDuration > 0, currentTime >= totalDuration - 0.1 {
+                currentTime = 0
+                player.seek(to: .zero)
+            }
             player.play()
         }
         isPlaying.toggle()
@@ -5225,6 +5252,7 @@ final class PreviewPlayer: ObservableObject, @unchecked Sendable {
         removeTimeObserver()
         player.pause()
         player.replaceCurrentItem(with: nil)
+        isBuffering = false
     }
 
     private func removeTimeObserver() {
@@ -5241,21 +5269,6 @@ final class PreviewPlayer: ObservableObject, @unchecked Sendable {
             }
         }
     }
-}
-
-struct AVPlayerViewRepresentable: NSViewRepresentable {
-    let player: AVPlayer
-    var controlsStyle: AVPlayerViewControlsStyle = .none
-
-    func makeNSView(context: Context) -> AVPlayerView {
-        let view = AVPlayerView()
-        view.player = player
-        view.controlsStyle = controlsStyle
-        view.videoGravity = .resizeAspect
-        return view
-    }
-
-    func updateNSView(_ nsView: AVPlayerView, context: Context) {}
 }
 
 // MARK: - 预览视频渲染层（AVPlayerLayer，避免 AVPlayerView 内部精确 seek）
@@ -5292,6 +5305,7 @@ struct PreviewVideoLayerView: NSViewRepresentable {
 
 struct PreviewPlayerControls: View {
     @ObservedObject var player: PreviewPlayer
+    @Binding var isMuted: Bool
     @State private var isDragging = false
     @State private var dragValue: TimeInterval = 0
 
@@ -5333,6 +5347,18 @@ struct PreviewPlayerControls: View {
             Text(formatTime(player.totalDuration))
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .foregroundStyle(.white.opacity(0.85))
+
+            // 静音切换
+            Button {
+                isMuted.toggle()
+                player.player.isMuted = isMuted
+            } label: {
+                Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+            .help(isMuted ? "取消静音" : "静音")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

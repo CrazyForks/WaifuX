@@ -273,6 +273,9 @@ struct MenuBarQuickSwitcherView: View {
                         viewModel.refreshBatch()
                     }
                 }
+                iconButton(systemName: "power", help: t("statusbar.quit")) {
+                    viewModel.quitApplication()
+                }
             }
 
             Spacer(minLength: 8)
@@ -321,7 +324,7 @@ struct MenuBarQuickSwitcherView: View {
                     }
                         .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(Color.black.opacity(0.86))
-                        .frame(width: 152, height: footerButtonHeight)
+                        .frame(width: 150, height: footerButtonHeight)
                         .background(Color.white, in: Capsule())
                         .shadow(color: .black.opacity(0.05), radius: 1.5, y: 1)
                 }
@@ -333,10 +336,12 @@ struct MenuBarQuickSwitcherView: View {
                     viewModel.applySelectedItem()
                 } label: {
                     Text(t("setWallpaper"))
-                        .font(.system(size: 13.5, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white)
-                        .frame(minWidth: 88, minHeight: footerButtonHeight)
-                        .padding(.horizontal, 14)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(minWidth: 68, minHeight: footerButtonHeight)
+                        .padding(.horizontal, 10)
                         .background(Color.black.opacity(0.92), in: Capsule())
                 }
                 .buttonStyle(QuickSwitcherPressButtonStyle())

@@ -50,7 +50,8 @@ final class MenuBarQuickSwitcherController: NSObject {
         canDesignCurrentWallpaper: Bool,
         onOpenSettings: @escaping () -> Void,
         onOpenDesignWallpaper: @escaping () -> Void,
-        onOpenDetail: @escaping (MainWallpaperDetailRequest) -> Void
+        onOpenDetail: @escaping (MainWallpaperDetailRequest) -> Void,
+        onQuit: @escaping () -> Void
     ) {
         if panel.isVisible {
             dismiss()
@@ -70,6 +71,7 @@ final class MenuBarQuickSwitcherController: NSObject {
             self?.dismiss()
             onOpenDetail(request)
         }
+        viewModel.onQuitApplication = onQuit
         viewModel.prepare(
             targetScreen: targetScreen,
             currentWallpaperURL: currentWallpaperURL,
@@ -222,6 +224,7 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
     var onOpenDesignWallpaper: (() -> Void)?
     var onApplied: (() -> Void)?
     var onOpenDetail: ((MainWallpaperDetailRequest) -> Void)?
+    var onQuitApplication: (() -> Void)?
 
     private var targetScreenID: String?
     private var targetScreenFingerprint: String?
@@ -420,6 +423,10 @@ final class MenuBarQuickSwitcherViewModel: ObservableObject {
 
     func openSettings() {
         onOpenSettings?()
+    }
+
+    func quitApplication() {
+        onQuitApplication?()
     }
 
     private func updateFolderSelection(_ folderIDs: [String]?) {

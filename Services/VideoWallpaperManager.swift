@@ -5311,16 +5311,45 @@ final class VideoWallpaperManager: ObservableObject {
             teardownWindow(for: teardownKey)
         } else if windows[screenID] != nil || players[screenID] != nil {
             teardownWindow(for: screenID)
-        } else if videoTargetScreenIDs.contains(screenID)
-                    || videoTargetScreenFingerprints.contains(screenFingerprint) {
-            // 状态认为该屏仍有视频，但窗口/播放器键已不可达——不暴露就永远拆不掉，
-            // 上层重试会无限空转。打点留存活键，供日志定位。
-            AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 空转：状态认为该屏有视频但窗口键不可达", metadata: [
-                "screenID": screenID,
-                "fingerprint": screenFingerprint,
-                "survivingWindowKeys": windows.keys.sorted().joined(separator: ","),
-                "survivingPlayerKeys": players.keys.sorted().joined(separator: ",")
-            ])
+        } else {
+            // 终极兜底：键与 fingerprint 双双失配（睡眠唤醒互换编号、无序列号同型号
+            // 双屏位置指纹漂移）时，按 WindowServer 实时宿主屏认领窗口——物理贴在
+            // 目标屏上的视频层就是该屏的壁纸层，键写的是谁不再重要。旧键若恰好落在
+            // 另一块仍存活的屏 ID 上，reconcile 会按「宁丢不换」跳过，只有 stopNative
+            // 自带明确的「拆掉该屏视频」意图，可以安全越过该守卫。
+            let hostMatchedKeys = windows.compactMap { (key, window) -> String? in
+                guard let hostScreen = window.screen,
+                      hostScreen === targetScreen || hostScreen.wallpaperScreenIdentifier == screenID
+                else { return nil }
+                return key
+            }
+            if !hostMatchedKeys.isEmpty {
+                AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 按实时宿主屏认领失配视频窗口", metadata: [
+                    "screenID": screenID,
+                    "fingerprint": screenFingerprint,
+                    "hostMatchedKeys": hostMatchedKeys.joined(separator: ","),
+                    "survivingWindowKeys": windows.keys.sorted().joined(separator: ",")
+                ])
+                for key in hostMatchedKeys {
+                    teardownWindow(for: key)
+                    videoURLByScreen.removeValue(forKey: key)
+                    posterURLByScreen.removeValue(forKey: key)
+                    volumeByScreen.removeValue(forKey: key)
+                    nativePausedScreenIDs.remove(key)
+                    videoTargetScreenIDs.remove(key)
+                    onEndModeScreens.remove(key)
+                }
+            } else if videoTargetScreenIDs.contains(screenID)
+                        || videoTargetScreenFingerprints.contains(screenFingerprint) {
+                // 状态认为该屏仍有视频，但窗口/播放器键已不可达——不暴露就永远拆不掉，
+                // 上层重试会无限空转。打点留存活键，供日志定位。
+                AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 空转：状态认为该屏有视频但窗口键不可达", metadata: [
+                    "screenID": screenID,
+                    "fingerprint": screenFingerprint,
+                    "survivingWindowKeys": windows.keys.sorted().joined(separator: ","),
+                    "survivingPlayerKeys": players.keys.sorted().joined(separator: ",")
+                ])
+            }
         }
 
         videoTargetScreenIDs.remove(screenID)

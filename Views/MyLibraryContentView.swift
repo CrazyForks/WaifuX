@@ -1041,9 +1041,10 @@ struct MyLibraryContentView: View {
             },
             onValidateReorderDrop: { payloads, _ in
                 guard isEditing else { return false }
-                let movingIDs = LibraryDragPayload.ids(from: payloads)
-                    .filter { currentItemIDs.contains($0) }
-                return !movingIDs.isEmpty
+                // 拖拽 hover 期间每次鼠标移动都会走这里：availableIDs 必须只求值一次，
+                // 不能写进 filter 闭包内（那样每个负载 ID 都会重算一遍 currentItemIDs 的排序结果）。
+                let availableIDs = Set(currentItemIDs)
+                return LibraryDragPayload.ids(from: payloads).contains { availableIDs.contains($0) }
             },
             onPerformReorderDrop: { payloads, targetIndex in
                 let targetID: String? = targetIndex < entries.count ? entries[targetIndex].id : nil
@@ -1342,12 +1343,20 @@ struct MyLibraryContentView: View {
     private func moveWallpapersToFolder(ids: [String], folderID: String) {
         // 空字符串不是合法文件夹 ID，统一视为根目录 nil，避免写入 "" 后变成“幽灵归属”
         let normalizedFolderID = WallpaperLibraryService.normalizedFolderID(folderID)
-        gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        // 「全选」会连文件夹卡一起选中，但文件夹不能被收纳进文件夹（本 App 不做嵌套）：
+        // 过滤掉，顺带避免 gridOrderStore 连带清掉文件夹自己的排序记录。
+        let itemIDs = ids.filter { !$0.hasPrefix("folder_") }
+        AppLogger.debug(.grid, "[DragDiag] 壁纸拖入文件夹", metadata: [
+            "folderID": normalizedFolderID ?? "<根目录>",
+            "movedItems": itemIDs.count,
+            "skippedFolders": ids.count - itemIDs.count
+        ])
+        gridOrderStore.removeIDs(Set(itemIDs), from: currentGridOrderScope)
         let scope = currentWallpaperFolderScope
         let unifiedByID: [String: UnifiedLocalWallpaper] = Dictionary(
             uniqueKeysWithValues: viewModel.allLocalWallpapers.map { ($0.id, $0) }
         )
-        for id in ids {
+        for id in itemIDs {
             // 对「扫描进来但还没有 DownloadRecord」的项传 fallback，
             // 让 Service 层自动补登记，确保 folderID 写得进去。
             let fallback: (wallpaper: Wallpaper, fileURL: URL)?
@@ -1726,9 +1735,10 @@ struct MyLibraryContentView: View {
             },
             onValidateReorderDrop: { payloads, _ in
                 guard isEditing else { return false }
-                let movingIDs = LibraryDragPayload.ids(from: payloads)
-                    .filter { currentItemIDs.contains($0) }
-                return !movingIDs.isEmpty
+                // 拖拽 hover 期间每次鼠标移动都会走这里：availableIDs 必须只求值一次，
+                // 不能写进 filter 闭包内（那样每个负载 ID 都会重算一遍 currentItemIDs 的排序结果）。
+                let availableIDs = Set(currentItemIDs)
+                return LibraryDragPayload.ids(from: payloads).contains { availableIDs.contains($0) }
             },
             onPerformReorderDrop: { payloads, targetIndex in
                 let targetID: String? = targetIndex < entries.count ? entries[targetIndex].id : nil
@@ -1934,12 +1944,19 @@ struct MyLibraryContentView: View {
 
     private func moveMediasToFolder(ids: [String], folderID: String) {
         let normalizedFolderID = MediaLibraryService.normalizedFolderID(folderID)
-        gridOrderStore.removeIDs(Set(ids), from: currentGridOrderScope)
+        // 同 moveWallpapersToFolder：文件夹卡不参与「收纳进文件夹」。
+        let itemIDs = ids.filter { !$0.hasPrefix("folder_") }
+        AppLogger.debug(.grid, "[DragDiag] 媒体拖入文件夹", metadata: [
+            "folderID": normalizedFolderID ?? "<根目录>",
+            "movedItems": itemIDs.count,
+            "skippedFolders": ids.count - itemIDs.count
+        ])
+        gridOrderStore.removeIDs(Set(itemIDs), from: currentGridOrderScope)
         let scope = currentMediaFolderScope
         let unifiedByID: [String: UnifiedLocalMedia] = Dictionary(
             uniqueKeysWithValues: mediaViewModel.allLocalMedia.map { ($0.id, $0) }
         )
-        for id in ids {
+        for id in itemIDs {
             let fallback: (item: MediaItem, fileURL: URL)?
             if scope == .downloads, let unified = unifiedByID[id], unified.downloadRecord == nil {
                 fallback = (unified.mediaItem, unified.fileURL)
@@ -1964,15 +1981,19 @@ struct MyLibraryContentView: View {
         selectedContentType == .wallpaper ? wallpaperRatioFilter : mediaRatioFilter
     }
 
+    /// 拖拽负载：选中项 + 被拖动的这一张。
+    ///
+    /// NSCollectionView 的鼠标按下本身就是一次选中操作（点击切换选中全靠它），
+    /// 所以按下「已选中」的卡片时它会先被反选、从 `selectedItems` 掉出去；
+    /// 负载若只认 `selectedItems`，「编辑 → 全选 → 拖拽」就退化成只拖一张。
     private func dragPayload(for itemID: String) -> String {
-        let selectedMovableIDs = selectedItems
-            .filter { currentItemIDs.contains($0) }
-
-        guard selectedItems.contains(itemID), !selectedMovableIDs.isEmpty else {
-            return "waifux:item:\(itemID)"
+        let availableIDs = Set(currentItemIDs)
+        var movingIDs = Array(selectedItems.lazy.filter { availableIDs.contains($0) })
+        if availableIDs.contains(itemID), !movingIDs.contains(itemID) {
+            movingIDs.append(itemID)
         }
-
-        return "waifux:items:\(selectedMovableIDs.sorted().joined(separator: "\n"))"
+        guard movingIDs.count > 1 else { return "waifux:item:\(itemID)" }
+        return "waifux:items:\(movingIDs.sorted().joined(separator: "\n"))"
     }
 
     // MARK: - 拖拽反馈辅助
@@ -2012,15 +2033,23 @@ struct MyLibraryContentView: View {
     /// - Parameter targetID: 插入到该 entry 之前；传 nil 表示插入到末尾。
     @discardableResult
     private func handleGridReorderDrop(_ payloads: [String], before targetID: String?) -> Bool {
+        let orderedItemIDs = currentItemIDs
+        let availableIDs = Set(orderedItemIDs)
         let movingIDs = uniqueIDs(payloads.flatMap(parseDropPayload))
-            .filter { currentItemIDs.contains($0) }
+            .filter { availableIDs.contains($0) }
+        AppLogger.debug(.grid, "[DragDiag] 排序落点", metadata: [
+            "payloadStrings": payloads.count,
+            "movingItems": movingIDs.count,
+            "target": targetID ?? "<末尾>",
+            "isEditing": isEditing
+        ])
         guard !movingIDs.isEmpty else { return false }
 
         withAnimation(.spring(response: 0.36, dampingFraction: 0.85)) {
             gridOrderStore.reorder(
                 moving: movingIDs,
                 before: targetID,
-                availableIDs: currentItemIDs,
+                availableIDs: orderedItemIDs,
                 scope: currentGridOrderScope
             )
             updateWallpaperItems()
@@ -2547,9 +2576,10 @@ struct MyLibraryContentView: View {
             },
             onValidateReorderDrop: { payloads, _ in
                 guard isEditing else { return false }
-                let movingIDs = LibraryDragPayload.ids(from: payloads)
-                    .filter { currentItemIDs.contains($0) }
-                return !movingIDs.isEmpty
+                // 拖拽 hover 期间每次鼠标移动都会走这里：availableIDs 必须只求值一次，
+                // 不能写进 filter 闭包内（那样每个负载 ID 都会重算一遍 currentItemIDs 的排序结果）。
+                let availableIDs = Set(currentItemIDs)
+                return LibraryDragPayload.ids(from: payloads).contains { availableIDs.contains($0) }
             },
             onPerformReorderDrop: { payloads, targetIndex in
                 let targetID: String? = targetIndex < items.count ? items[targetIndex].id : nil
