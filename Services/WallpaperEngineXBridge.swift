@@ -695,11 +695,12 @@ final class WallpaperEngineXBridge: ObservableObject {
                 kill(info.pid, SIGCONT)
             }
         }
-        perScreenPausedScreenIDs.subtract(effectiveScreenIDs)
-        // FIX: 壁纸切换时强制恢复全局暂停状态。如果 isExternalPaused 仍为 true，
-        // 新启动的 wallpaper-wgpu 进程会收到 --paused 参数，导致启动即暂停。
-        isExternalPaused = false
-        updateRendererAudioControls(paused: false)
+        if !preserveAutoPauseState {
+            perScreenPausedScreenIDs.subtract(effectiveScreenIDs)
+            // 普通切换清除旧的自动暂停；唤醒恢复必须保留电池/按屏暂停。
+            isExternalPaused = false
+            updateRendererAudioControls(paused: false)
+        }
 
         let targetWebStates = screenRenderStates.values.filter { state in
             state.renderKind == .web && effectiveScreenIDs.contains(state.screenID)
@@ -4928,8 +4929,10 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         let targets = activeTargetScreens().compactMap { screen -> (NSScreen, ScreenRenderState)? in
             let screenID = screen.wallpaperScreenIdentifier
-            guard !isPaused(screenID: screenID),
-                  let state = renderState(for: screen),
+            // A paused screen still owns a renderer whose Metal surface may
+            // have died during sleep. Rebuild it as well; AutoPauseManager
+            // reapplies the original pause reason after the replacement starts.
+            guard let state = renderState(for: screen),
                   FileManager.default.fileExists(atPath: state.path) else {
                 return nil
             }

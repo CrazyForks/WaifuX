@@ -289,6 +289,19 @@ final class DynamicWallpaperAutoPauseManager {
     /// 当动态壁纸刚被重新应用或被用户手动恢复时，立刻重新计算自动暂停状态。
     func reevaluateCurrentState() {
         updateTimer()
+        // Sleep can span the power-source notification and wake can arrive
+        // before IOKit has published the new state. Re-read it here and
+        // reapply a battery pause to any renderer just rebuilt after wake.
+        if pauseOnBatteryPower {
+            PowerSourceMonitor.shared.refreshState()
+            if PowerSourceMonitor.shared.isOnBatteryPower {
+                batteryPauseRequested = true
+                applyGlobalPauseIfNeeded()
+            } else if batteryPauseRequested {
+                batteryPauseRequested = false
+                resumeFromGlobalPauseIfPossible()
+            }
+        }
         // 唤醒/解锁路径常会先把播放器全部 play，再调 reevaluate。
         // 先按已追踪的暂停原因重新施加，避免空窗口快照把覆盖暂停清掉后壁纸继续播。
         reassertTrackedPauses()
@@ -644,7 +657,10 @@ final class DynamicWallpaperAutoPauseManager {
             inactiveDisplayPausedScreenIDs.removeAll()
             inactiveDisplayManuallyPausedScreenIDs.removeAll()
             activeDisplayScreenID = nil
-            batteryPauseRequested = false
+            // A renderer can be absent briefly while wake recovery replaces it.
+            // Keep the current battery fact so the replacement is paused too.
+            batteryPauseRequested = pauseOnBatteryPower
+                && PowerSourceMonitor.shared.isOnBatteryPower
             deferredResumeScreenIDsAfterBattery.removeAll()
             globalAutoPausedNativePlayingScreenIDs.removeAll()
             globalAutoPausedNativeManuallyPausedScreenIDs.removeAll()
