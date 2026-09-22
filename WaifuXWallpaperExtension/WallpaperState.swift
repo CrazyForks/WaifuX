@@ -122,6 +122,29 @@ final class WallpaperState: Sendable {
         }
     }
 
+    /// 只移除某一条 XPC 连接创建的 context。
+    ///
+    /// WallpaperExtensionKit 可能为桌面、锁屏或不同显示器建立多条连接；
+    /// 其中一条连接失效并不代表其它连接的 CAContext 也失效。失效回调必须
+    /// 按连接归属清理，不能直接调用 removeAllContexts() 把其它屏幕一起带走。
+    func removeContexts(ids: Set<UInt32>) -> [ActiveWallpaper] {
+        guard !ids.isEmpty else { return [] }
+        let removed = lock.withLock { state -> [ActiveWallpaper] in
+            var result: [ActiveWallpaper] = []
+            result.reserveCapacity(ids.count)
+            for id in ids {
+                if let context = state.activeContexts.removeValue(forKey: id) {
+                    result.append(context)
+                }
+            }
+            return result
+        }
+        for context in removed {
+            context.renderer?.stop()
+        }
+        return removed
+    }
+
     func removeAllContexts() -> [ActiveWallpaper] {
         let removed = lock.withLock { state -> ([ActiveWallpaper], [IOSurfaceFrameRenderer]) in
             let all = Array(state.activeContexts.values)

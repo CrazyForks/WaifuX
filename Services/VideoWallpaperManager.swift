@@ -5292,19 +5292,45 @@ final class VideoWallpaperManager: ObservableObject {
         // 仍能解析到当前屏），视频层会残留在当前壁纸之上。
         reconcileMisKeyedVideoWindows(for: [targetScreen])
 
-        // 兼容 screenID 变化：按 fingerprint 找回旧 key 上的窗口/播放器。
-        let windowKey = windows[screenID] != nil
-            ? screenID
-            : windows.keys.first(where: { key in
-                NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == key })?
-                    .wallpaperScreenFingerprint == screenFingerprint
-            })
-        let playerKey = players[screenID] != nil
-            ? screenID
-            : players.keys.first(where: { key in
-                NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == key })?
-                    .wallpaperScreenFingerprint == screenFingerprint
-            })
+        // Position-tolerant fingerprints are safe only when the current
+        // topology has one candidate. Two identical no-serial displays share
+        // the same stable fingerprint, so never let that fallback cross-wire
+        // their windows.
+        let storedFingerprintMatchesTarget: (String) -> Bool = { storedFingerprint in
+            guard WallpaperScreenIdentity.fingerprintsMatch(storedFingerprint, screenFingerprint) else {
+                return false
+            }
+            if storedFingerprint == screenFingerprint { return true }
+            let candidates = NSScreen.screens.filter {
+                WallpaperScreenIdentity.fingerprintsMatch(
+                    $0.wallpaperScreenFingerprint,
+                    screenFingerprint
+                )
+            }
+            return candidates.count == 1
+        }
+
+        // 兼容 screenID 变化：按创建时的物理 fingerprint 找回旧 key 上的
+        // 窗口/播放器。WindowServer 可能把旧 ID 重新分给另一块屏，因此不能
+        // 先信任 windows[screenID]；只有没有任何物理匹配时才使用当前 ID 兜底。
+        let windowKey = windows.keys.first(where: { key in
+            guard let storedFingerprint = windowFingerprintByScreenID[key] else { return false }
+            return storedFingerprintMatchesTarget(storedFingerprint)
+        }) ?? windows.keys.first(where: { key in
+            guard let currentScreenFingerprint = NSScreen.screens.first(where: {
+                $0.wallpaperScreenIdentifier == key
+            })?.wallpaperScreenFingerprint else { return false }
+            return WallpaperScreenIdentity.fingerprintsMatch(currentScreenFingerprint, screenFingerprint)
+        }) ?? (windows[screenID] != nil ? screenID : nil)
+        let playerKey = players.keys.first(where: { key in
+            guard let storedFingerprint = windowFingerprintByScreenID[key] else { return false }
+            return storedFingerprintMatchesTarget(storedFingerprint)
+        }) ?? players.keys.first(where: { key in
+            guard let currentScreenFingerprint = NSScreen.screens.first(where: {
+                $0.wallpaperScreenIdentifier == key
+            })?.wallpaperScreenFingerprint else { return false }
+            return WallpaperScreenIdentity.fingerprintsMatch(currentScreenFingerprint, screenFingerprint)
+        }) ?? (players[screenID] != nil ? screenID : nil)
         let teardownKey = windowKey ?? playerKey
 
         if let teardownKey {
@@ -6538,8 +6564,16 @@ final class VideoWallpaperManager: ObservableObject {
 
             var misKeyedEntries: [(key: String, window: NSWindow)] = []
             for (key, window) in windows {
-                guard key != screenID, !currentScreenIDs.contains(key) else { continue }
-                let fingerprintMatches = windowFingerprintByScreenID[key] == screenFingerprint
+                guard key != screenID else { continue }
+                let fingerprintMatches = windowFingerprintByScreenID[key].map {
+                    WallpaperScreenIdentity.fingerprintsMatch($0, screenFingerprint)
+                        && ($0 == screenFingerprint || NSScreen.screens.filter {
+                            WallpaperScreenIdentity.fingerprintsMatch(
+                                $0.wallpaperScreenFingerprint,
+                                screenFingerprint
+                            )
+                        }.count == 1)
+                } ?? false
                 let framesMatch = framesApproximatelyEqual(window.frame, screen.frame)
                 // 睡眠唤醒/重插后 CGDirectDisplayID 重编号会同时改写 fingerprint 与
                 // frame；最后按窗口实际贴附的物理屏兜底（window.screen 由 WindowServer
@@ -6548,8 +6582,18 @@ final class VideoWallpaperManager: ObservableObject {
                 if let hostScreen = window.screen {
                     windowOnTargetScreen = hostScreen === screen
                         || hostScreen.wallpaperScreenIdentifier == screenID
+                        || hostScreen.wallpaperScreenFingerprint == screenFingerprint
                 } else {
                     windowOnTargetScreen = false
+                }
+                // A stale window may still have a key that WindowServer has
+                // reused for another display. Keep the safety rule for a live
+                // window belonging to a different physical screen, but allow a
+                // creation-time fingerprint match to cross that reused key.
+                if currentScreenIDs.contains(key),
+                   !fingerprintMatches,
+                   !windowOnTargetScreen {
+                    continue
                 }
                 if fingerprintMatches || framesMatch || windowOnTargetScreen {
                     misKeyedEntries.append((key, window))

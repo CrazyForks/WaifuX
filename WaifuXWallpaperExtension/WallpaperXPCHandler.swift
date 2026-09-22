@@ -85,10 +85,36 @@ private final class WallpaperPrefsChangeObserver: @unchecked Sendable {
 
 final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     var agentProxy: (any WallpaperExtensionProxyXPCProtocol)?
+    /// Contexts acquired through this XPC connection. WallpaperAgent can keep
+    /// separate connections for desktop/lock-screen instances and displays, so
+    /// an invalidated connection must not tear down contexts owned by others.
+    private let ownedContextLock = NSLock()
+    private var ownedContextIDs: Set<UInt32> = []
     private var previousPresentationMode = "default"
     /// 上次收到 presentationMode == "locked" 的时间。用于防止 screenIsUnlocked
     /// DistributedNotification 偶发丢失导致 isScreenLocked 永久卡死。
     private var lastLockedUpdate: Date = .distantPast
+
+    func registerOwnedContext(_ contextID: UInt32) {
+        ownedContextLock.lock()
+        ownedContextIDs.insert(contextID)
+        ownedContextLock.unlock()
+    }
+
+    func forgetOwnedContexts(_ contextIDs: Set<UInt32>) {
+        guard !contextIDs.isEmpty else { return }
+        ownedContextLock.lock()
+        ownedContextIDs.subtract(contextIDs)
+        ownedContextLock.unlock()
+    }
+
+    func takeOwnedContextIDs() -> Set<UInt32> {
+        ownedContextLock.lock()
+        defer { ownedContextLock.unlock() }
+        let ids = ownedContextIDs
+        ownedContextIDs.removeAll()
+        return ids
+    }
 
     private static func extractWallpaperContextIdentifier(from object: Any?) -> String? {
         guard let object else { return nil }
@@ -490,8 +516,13 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
 
         let contextId = caContext.contextId
+        // Register before starting asynchronous renderer setup. If the XPC
+        // connection dies during setup, its partially-created context still
+        // belongs to this handler and can be reclaimed safely.
+        registerOwnedContext(contextId)
 
         guard let replyObj = createRemoteContextXPC(contextId: contextId) else {
+            forgetOwnedContexts([contextId])
             reply(nil, NSError(domain: "WaifuXExtension", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to create WallpaperRemoteContextXPC"]))
             return
         }
@@ -1041,6 +1072,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             for ctx in removed {
                 ctx.renderer?.stop()
             }
+            forgetOwnedContexts(Set(removed.map(\.contextId)))
             cleanedCount = removed.count
         }
         let remaining = WallpaperState.shared.activeContextCount

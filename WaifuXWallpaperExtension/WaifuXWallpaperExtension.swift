@@ -98,34 +98,41 @@ struct WallpaperExtensionConfiguration: AppExtensionConfiguration {
         let handler = WallpaperXPCHandler()
         connection.exportedObject = handler
 
-        connection.interruptionHandler = { extLog("XPC interrupted") }
+        connection.interruptionHandler = {
+            extLog("XPC interrupted from PID=\(connection.processIdentifier)")
+        }
         connection.invalidationHandler = { [weak handler] in
             handler?.stopObservingPrefs()
             handler?.agentProxy = nil
-            let removed = WallpaperState.shared.removeAllContexts()
+            let ownedContextIDs = handler?.takeOwnedContextIDs() ?? []
+            let removed = WallpaperState.shared.removeContexts(ids: ownedContextIDs)
+            let remaining = WallpaperState.shared.activeContextCount
             guard !removed.isEmpty else {
                 // Benign teardown: no live contexts (settings-only connection, or
                 // we were already inactive). Nothing rendering, nothing to recover.
-                extLog("XPC invalidated")
+                extLog("XPC invalidated from PID=\(connection.processIdentifier) ownedContexts=\(ownedContextIDs.count) remaining=\(remaining)")
                 return
             }
             // Abnormal path: the host connection died while we still held live
             // rendering contexts. Deep standby/hibernation tears the XPC connection
             // down after hours asleep (it can also drop spontaneously during normal
-            // use). removeAllContexts() has freed the now-dead CAContexts, but the
+            // use). removeContexts(ids:) has freed the now-dead CAContexts, but the
             // wallpaper is still the user's selection and WindowServer does NOT
             // re-acquire on its own — it keeps compositing the dead surface, leaving
             // the desktop grey/black until the wallpaper is reselected.
             //
             // Normal teardown (switching wallpaper, a display being removed) arrives
-            // as invalidate(withId:), which clears each context first — so `removed`
-            // is empty there and we never reach this branch. Exiting only on a
-            // mid-render disconnect lets the framework relaunch the extension fresh;
-            // the agent then re-acquires every display. This is the recovery path
-            // verified empirically by killing the extension out from under a live
-            // WallpaperAgent (it relaunched and re-acquired immediately).
-            WallpaperPrefs.shared.setActive(false)
-            extLog("XPC invalidated mid-render — freed \(removed.count) context(s); exiting to force re-acquire")
+            // as invalidate(withId:), which clears each context first. If this was
+            // only one of several live connections, keep the process alive: the
+            // remaining connections still own valid CAContexts and exiting here
+            // would blank unrelated displays. Exit only after the last live context
+            // has been reclaimed so WallpaperAgent can re-acquire the whole set.
+            WallpaperPrefs.shared.setActive(remaining > 0)
+            if remaining > 0 {
+                extLog("XPC invalidated for one connection — freed \(removed.count) owned context(s), kept \(remaining) other context(s)")
+                return
+            }
+            extLog("XPC invalidated mid-render — freed \(removed.count) owned context(s); exiting to force re-acquire")
             exit(0)
         }
 

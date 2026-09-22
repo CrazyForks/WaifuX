@@ -36,7 +36,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         isStarted = true
         migrateLegacyRetainedDisplayFingerprintsIfNeeded()
         previousExternalDisplays = Self.currentExternalDisplaySnapshots()
-        markDisplaysAsKnown(previousExternalDisplays.keys)
+        markDisplaysAsKnown(previousExternalDisplays.values.map(\.fingerprint))
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleScreenParametersChanged),
@@ -64,22 +64,28 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         let scheduler = WallpaperSchedulerService.shared
         scheduler.relinkDisplayConfigsForCurrentScreens()
 
-        let current = Self.currentExternalScreensByFingerprint()
-        let currentFingerprints = Set(current.keys)
-        let previousFingerprints = Set(previousExternalDisplays.keys)
-        let connectedFingerprints = currentFingerprints.subtracting(previousFingerprints)
+        // Identical no-serial monitors can share one connection fingerprint.
+        // Compare occurrence tokens so a second identical display is not silently
+        // collapsed into the first dictionary entry.
+        let current = Self.currentExternalScreensByToken()
+        let currentFingerprints = Set(current.values.map(\.externalConnectionFingerprint))
+        let previousFingerprints = Set(previousExternalDisplays.values.map(\.fingerprint))
+        let newlyVisibleTokens = current.keys.filter { previousExternalDisplays[$0] == nil }
+        let connectedFingerprints = Set(newlyVisibleTokens.compactMap { current[$0]?.externalConnectionFingerprint })
 
         AppLogger.error(.wallpaper, "ExternalDisplay processed display change", metadata: [
-            "currentExternal": currentFingerprints.count,
-            "connected": connectedFingerprints.count,
+            "currentExternal": current.count,
+            "currentFingerprints": currentFingerprints.count,
+            "connected": newlyVisibleTokens.count,
             "known": knownDisplayFingerprints.count,
-            "connectedFingerprints": connectedFingerprints.joined(separator: ",")
+            "connectedFingerprints": connectedFingerprints.joined(separator: ","),
+            "previousFingerprints": previousFingerprints.joined(separator: ",")
         ])
 
         previousExternalDisplays = Self.currentExternalDisplaySnapshots()
 
-        for fingerprint in connectedFingerprints {
-            guard let screen = current[fingerprint] else { continue }
+        for token in newlyVisibleTokens {
+            guard let screen = current[token] else { continue }
             handleConnectedExternalDisplay(screen)
         }
     }
@@ -184,7 +190,7 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         UserDefaults.standard.set(fingerprints.sorted(), forKey: knownDisplayFingerprintsKey)
     }
 
-    private func markDisplaysAsKnown(_ fingerprints: Dictionary<String, ExternalDisplaySnapshot>.Keys) {
+    private func markDisplaysAsKnown<S: Sequence>(_ fingerprints: S) where S.Element == String {
         var known = knownDisplayFingerprints
         let originalCount = known.count
         known.formUnion(fingerprints)
@@ -220,23 +226,56 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         }
     }
 
-    private static func currentExternalScreensByFingerprint() -> [String: NSScreen] {
-        var result: [String: NSScreen] = [:]
-        for screen in NSScreen.screens where !screen.isBuiltInDisplay {
-            result[screen.externalConnectionFingerprint] = screen
+    private static func currentExternalScreens() -> [NSScreen] {
+        NSScreen.screens
+            .filter { !$0.isBuiltInDisplay }
+            .sorted { lhs, rhs in
+                let lFingerprint = lhs.externalConnectionFingerprint
+                let rFingerprint = rhs.externalConnectionFingerprint
+                if lFingerprint != rFingerprint { return lFingerprint < rFingerprint }
+                // Relative position is only an ordering tie-breaker. It is not
+                // persisted as identity, so a main-screen origin shift does not
+                // make an existing monitor look newly connected.
+                if lhs.frame.origin.y != rhs.frame.origin.y {
+                    return lhs.frame.origin.y > rhs.frame.origin.y
+                }
+                if lhs.frame.origin.x != rhs.frame.origin.x {
+                    return lhs.frame.origin.x < rhs.frame.origin.x
+                }
+                return lhs.localizedName < rhs.localizedName
+            }
+    }
+
+    /// One token per physical screen, including duplicate connection
+    /// fingerprints. The rank is local to two adjacent screen-parameter
+    /// samples and is only used to detect count changes.
+    private static func currentExternalScreensByToken() -> [String: NSScreen] {
+        var occurrenceByFingerprint: [String: Int] = [:]
+        let entries = currentExternalScreens().map { screen -> (String, NSScreen) in
+            let fingerprint = screen.externalConnectionFingerprint
+            let rank = occurrenceByFingerprint[fingerprint, default: 0]
+            occurrenceByFingerprint[fingerprint] = rank + 1
+            return ("\(fingerprint)#\(rank)", screen)
         }
-        return result
+        // Keep a uniquing closure as a defensive guard for malformed snapshots
+        // and regression coverage of duplicate-fingerprint handling.
+        return Dictionary(entries, uniquingKeysWith: { existing, _ in existing })
+    }
+
+    /// Compatibility helper for code/tests that need a lossy one-screen-per-
+    /// fingerprint view. Change detection must use currentExternalScreensByToken().
+    private static func currentExternalScreensByFingerprint() -> [String: NSScreen] {
+        Dictionary(currentExternalScreens().map { ($0.externalConnectionFingerprint, $0) },
+                   uniquingKeysWith: { existing, _ in existing })
     }
 
     private static func currentExternalDisplaySnapshots() -> [String: ExternalDisplaySnapshot] {
-        // 同型号且无硬件序列号（或序列号相同）的两块外接屏会产出相同指纹，
-        // Dictionary(uniqueKeysWithValues:) 会直接 trap；这里保底去重防崩溃。
-        Dictionary(currentExternalScreensByFingerprint().map { fingerprint, screen in
+        Dictionary(currentExternalScreensByToken().map { token, screen in
             (
-                fingerprint,
+                token,
                 ExternalDisplaySnapshot(
                     screenID: screen.wallpaperScreenIdentifier,
-                    fingerprint: fingerprint
+                    fingerprint: screen.externalConnectionFingerprint
                 )
             )
         }, uniquingKeysWith: { existing, _ in existing })

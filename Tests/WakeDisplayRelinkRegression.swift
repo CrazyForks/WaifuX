@@ -58,6 +58,17 @@ struct WakeDisplayRelinkRegression {
             "external display snapshots must not trap on duplicate fingerprints"
         )
 
+        let videoManager = try source("Services/VideoWallpaperManager.swift", from: sourceRoot)
+        precondition(
+            videoManager.contains("storedFingerprint = windowFingerprintByScreenID[key]")
+                && videoManager.contains("fingerprintsMatch(storedFingerprint, screenFingerprint)"),
+            "stop/reconcile must use the window creation fingerprint after display-ID reuse"
+        )
+        precondition(
+            videoManager.contains("WallpaperScreenIdentity.fingerprintsMatch"),
+            "window matching must tolerate position changes without trusting a reused display ID"
+        )
+
         print("Wake display relink regression passed: rank pairing + settle gate + safe snapshots")
     }
 
