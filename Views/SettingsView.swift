@@ -535,6 +535,15 @@ private struct GeneralSettingsTab: View {
                     ))
                 }
 
+                // 壁纸扩展守护：App 退出后 pkd 清杀扩展时自动重新拉载
+                MacSettingsRow(
+                    title: t("wallpaperExtensionKeeper"),
+                    subtitle: t("wallpaperExtensionKeeperDesc"),
+                    showDivider: true
+                ) {
+                    MacToggle(isOn: $viewModel.wallpaperExtensionKeeperEnabled)
+                }
+
                 MacSettingsRow(
                     title: t("pauseWhenWindowCoverage"),
                     subtitle: t("pauseWhenWindowCoverageDesc"),

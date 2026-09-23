@@ -204,8 +204,10 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 每个屏幕的 wallpaper-wgpu 进程信息（key = screenID）
     private var screenProcesses: [String: ScreenProcessInfo] = [:]
-    /// setWallpaper 完成后的渲染器窗口 alpha 兜底校验任务（key = screenID）。
-    private var rendererAlphaWatchdogs: [String: Task<Void, Never>] = [:]
+    /// 渲染器运行期健康巡检循环（alpha 卡死 / 外部 SIGSTOP / 残留 overlay 遮挡）。
+    private var rendererHealthLoop: Task<Void, Never>?
+    /// 巡检日志节流（key = 事件:screenID，60s 内同类只记一次）。
+    private var rendererHealthLogAt: [String: Date] = [:]
     /// 从系统进程表发现的桌面 Scene renderer。它们可能来自上一次崩溃的
     /// WaifuX，已经不在 `screenProcesses` 中，但窗口仍能重新抢占桌面层。
     private struct DiscoveredDesktopRenderer {
@@ -1302,7 +1304,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             "screenProcesses": screenProcesses.count,
             "screenRenderStates": screenRenderStates.keys.sorted().joined(separator: ",")
         ])
-        scheduleRendererAlphaWatchdog(generation: switchGeneration)
+        ensureRendererHealthLoop()
         for screen in effectiveScreens {
             applyPersistedCrop(for: screen)
         }
@@ -1440,30 +1442,74 @@ final class WallpaperEngineXBridge: ObservableObject {
         ])
     }
 
-    /// setWallpaper 完成后的渲染器窗口 alpha 兜底校验。macOS 27.2 出现过
-    /// --startup-fade 渲染器停在初始 alpha≈0.001：场景满帧率渲染但整窗不可见，
-    /// 桌面表现为静态壁纸。渲染器内有自愈看门狗；这里延迟校验窗口 alpha，
-    /// 仍低于阈值时向 wallpaper-control 注入 presentationAlpha=1 并留痕。
-    private func scheduleRendererAlphaWatchdog(generation: UInt64) {
-        for (screenID, info) in screenProcesses {
-            guard let controlURL = info.wallpaperControlURL else { continue }
-            rendererAlphaWatchdogs[screenID]?.cancel()
-            rendererAlphaWatchdogs[screenID] = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+    /// 渲染器运行期健康巡检：每 10s 对每个活跃 scene 渲染器做三项检查——
+    /// ① 进程被外部 SIGSTOP（我方未暂停）→ SIGCONT 恢复并留痕；
+    /// ② 窗口 alpha 卡在低值（启动淡入或运行期 WindowServer 异常）→ 注入 presentationAlpha=1；
+    /// ③ 残留静态 overlay 窗口盖在活跃渲染器上 → 收掉并留痕。
+    /// 之前 +3s 一次性校验只覆盖启动瞬间，运行期发生的冻结完全无感知。
+    private func ensureRendererHealthLoop() {
+        guard rendererHealthLoop == nil else { return }
+        rendererHealthLoop = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard let self, !Task.isCancelled else { return }
-                guard self.wallpaperSwitchGeneration == generation,
-                      let current = self.screenProcesses[screenID],
-                      current.pid == info.pid else { return }
-                guard let alpha = Self.desktopWindowAlpha(pid: info.pid) else { return }
-                guard alpha < 0.5 else { return }
+                self.auditRendererHealth()
+            }
+        }
+    }
+
+    private func auditRendererHealth() {
+        let screenLocked = VideoWallpaperManager.shared.isScreenLocked
+        for (screenID, info) in screenProcesses {
+            guard screenRenderStates[screenID]?.renderKind == .scene else { continue }
+            guard kill(info.pid, 0) == 0 else { continue }
+            let pausedByUs = isExternalPaused || perScreenPausedScreenIDs.contains(screenID)
+
+            if !pausedByUs, Self.isProcessStopped(pid: info.pid) {
+                let result = kill(info.pid, SIGCONT)
+                logRendererHealth("sigcont", screenID: screenID, message: "Renderer externally stopped; SIGCONT sent", metadata: [
+                    "pid": info.pid,
+                    "result": result
+                ])
+                continue
+            }
+            guard !pausedByUs else { continue }
+
+            if let alpha = Self.desktopWindowAlpha(pid: info.pid), alpha < 0.5,
+               let controlURL = info.wallpaperControlURL {
                 Self.injectPresentationAlpha(controlURL)
-                AppLogger.error(.wallpaper, "Renderer window stuck at startup alpha; injected presentationAlpha", metadata: [
-                    "screenID": screenID,
+                logRendererHealth("alpha", screenID: screenID, message: "Renderer window stuck at low alpha; injected presentationAlpha", metadata: [
                     "pid": info.pid,
                     "alpha": String(format: "%.4f", alpha)
                 ])
             }
+
+            if !screenLocked,
+               let screen = NSScreen.screens.first(where: { $0.wallpaperScreenIdentifier == screenID }),
+               hasLivePresentation(on: screen),
+               StaticImageWallpaperOverlayManager.shared.hasOverlayWindow(for: screen) {
+                StaticImageWallpaperOverlayManager.shared.hide(for: screen)
+                logRendererHealth("overlay", screenID: screenID, message: "Static overlay above live renderer hidden", metadata: [
+                    "pid": info.pid
+                ])
+            }
         }
+    }
+
+    private func logRendererHealth(_ kind: String, screenID: String, message: String, metadata: [String: Any]) {
+        let key = "\(kind):\(screenID)"
+        if let last = rendererHealthLogAt[key], Date().timeIntervalSince(last) < 60 { return }
+        rendererHealthLogAt[key] = Date()
+        AppLogger.error(.wallpaper, message, metadata: metadata)
+    }
+
+    /// 进程是否处于 SIGSTOP（T）状态。p_stat: SSTOP = 4。
+    private static func isProcessStopped(pid: pid_t) -> Bool {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return false }
+        return info.kp_proc.p_stat == 4
     }
 
     /// 读取指定进程在桌面层级窗口的 kCGWindowAlpha；找不到窗口返回 nil。

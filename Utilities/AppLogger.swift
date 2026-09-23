@@ -280,6 +280,22 @@ final class AppLogger: @unchecked Sendable {
             sequence += 1
         }
         try FileManager.default.copyItem(at: sourceURL, to: destination)
+        // wgpu 渲染器自身的 stdout/stderr 落在 Caches/com.waifux.wallpaperengine/renderer-logs
+        // （每屏一个文件，GPU init 失败/panic/事件循环异常只在这里）。一并 zip 到桌面，
+        // wgpu 内部问题才能随「导出日志」送达，否则排查渲染器只能看到宿主侧观测。
+        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let rendererLogs = caches.appendingPathComponent(
+                "com.waifux.wallpaperengine/renderer-logs", isDirectory: true)
+            if FileManager.default.fileExists(atPath: rendererLogs.path) {
+                let zipDestination = desktop.appendingPathComponent("WaifuX-RendererLogs-\(stamp).zip")
+                try? FileManager.default.removeItem(at: zipDestination)
+                let zipTask = Process()
+                zipTask.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                zipTask.arguments = ["-c", "-k", "--keepParent", rendererLogs.path, zipDestination.path]
+                try? zipTask.run()
+                zipTask.waitUntilExit()
+            }
+        }
         AppLogger.info(.general, "日志已导出到桌面", metadata: ["path": destination.path])
         return destination
     }

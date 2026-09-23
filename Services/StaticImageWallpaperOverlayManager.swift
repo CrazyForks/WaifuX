@@ -238,6 +238,11 @@ final class StaticImageWallpaperOverlayManager {
         }
     }
 
+    /// 该屏当前是否存在 overlay 窗口（渲染器健康巡检判断残留遮挡用）。
+    func hasOverlayWindow(for screen: NSScreen) -> Bool {
+        imageWindows[screen.wallpaperScreenIdentifier] != nil
+    }
+
     /// 动态目标在后方加载时保持旧静态图可见，避免新 renderer 的未稳定首帧抢到前方。
     func keepPresentationFront(on screens: [NSScreen]) {
         for screen in screens {

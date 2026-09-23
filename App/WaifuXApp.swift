@@ -209,6 +209,14 @@ struct WaifuXApp {
     #endif
 
     static func main() {
+        // keeper CLI 模式：由 LaunchAgent 以 --wallpaper-keeper 常驻运行，
+        // 守护壁纸扩展被 pkd 清杀后自动重新拉载（见 WallpaperExtensionKeeper）。
+        // 必须在一切 GUI/诊断初始化之前分流，keeper 不进入 App 生命周期。
+        if CommandLine.arguments.contains(WallpaperExtensionKeeper.keeperModeArgument) {
+            WallpaperExtensionKeeper.run()
+            return
+        }
+
         AppExitDiagnostics.install()
         // 全局忽略 SIGPIPE：AVFoundation 内部管道在快速切换视频壁纸时可能写入已关闭的 pipe，
         // 若不加此保护会导致信号 13 (SIGPIPE) 传递到 NSEventThread 崩溃。
@@ -461,6 +469,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // 依赖 ModuleAvailability.shared 决定 addPage 哪些 tab。必须在此之前同步读 UserDefaults。
         // 直接读 UserDefaults 是安全的（非 @AppStorage、非 init 读取，与已存在的 line 316/399 一致）。
         ModuleAvailability.shared.refreshFromUserDefaults()
+
+        // 壁纸扩展守护：按持久化开关对齐 LaunchAgent 状态（默认开启）。
+        // 文件被清理工具移除时补装、用户关闭时移除；放后台避免 launchctl 阻塞启动。
+        Task.detached(priority: .utility) {
+            let enabled = UserDefaults.standard.object(
+                forKey: WallpaperExtensionKeeper.launchAgentDefaultsKey
+            ) as? Bool ?? true
+            WallpaperExtensionKeeper.syncLaunchAgentWithEnabledFlag(enabled)
+        }
 
         // 2. 立即创建窗口（使用 defer: false 立即渲染，不等待）
         let contentView = ContentView(

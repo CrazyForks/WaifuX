@@ -239,6 +239,23 @@ class SettingsViewModel: ObservableObject {
         lockScreenSelectionStatus = WallpaperStoreSelectionProbe.currentSelection()
     }
 
+    /// 壁纸扩展守护（keeper）开关。默认开启：App 退出后由 LaunchAgent 常驻守卫，
+    /// 扩展被 pkd 清杀时自动重新注册拉载（详见 WallpaperExtensionKeeper 顶部注释）。
+    @Published var wallpaperExtensionKeeperEnabled = true {
+        didSet {
+            // 批量恢复期间抑制副作用，避免启动时无谓折腾 launchctl
+            guard !isBatchUpdating else { return }
+            UserDefaults.standard.set(
+                wallpaperExtensionKeeperEnabled,
+                forKey: WallpaperExtensionKeeper.launchAgentDefaultsKey
+            )
+            let enabled = wallpaperExtensionKeeperEnabled
+            Task.detached(priority: .utility) {
+                WallpaperExtensionKeeper.syncLaunchAgentWithEnabledFlag(enabled)
+            }
+        }
+    }
+
     /// 系统壁纸同步开关（默认开启）。
     /// 关闭后冻结「系统壁纸」链路：App 不再调用 setDesktopImageURL 写入桌面/锁屏静态壁纸，
     /// 但 mp4/场景渲染器/web 壁纸等动态壁纸引擎不受影响（它们通过 overlay 窗口或 CLI 进程覆盖桌面）。
@@ -595,6 +612,8 @@ class SettingsViewModel: ObservableObject {
             }
             // 系统壁纸同步默认开启（未设值时 true）
             systemWallpaperSyncEnabled = defaults.object(forKey: "system_wallpaper_sync_enabled") as? Bool ?? true
+            // 壁纸扩展守护默认开启（未设值时 true）
+            wallpaperExtensionKeeperEnabled = defaults.object(forKey: WallpaperExtensionKeeper.launchAgentDefaultsKey) as? Bool ?? true
 
             // 功能模块开关恢复（默认 true）
             wallpaperModuleEnabled = defaults.object(forKey: "module_wallpaper_enabled") as? Bool ?? true

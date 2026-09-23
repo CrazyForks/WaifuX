@@ -110,6 +110,7 @@
 		53B268F5E869D296961254E0 /* ExploreGridContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46516D807852C39C100910A6 /* ExploreGridContainer.swift */; };
 		556A1F6298A5E946375C8AB2 /* CaptchaVerificationWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 509F88E110E5EC7E70CE7841 /* CaptchaVerificationWebView.swift */; };
 		567CAB920D17CCAA38CAC210 /* FourKWallpapersParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E5EA68B40F08C0C4032C1D /* FourKWallpapersParser.swift */; };
+		568D464DFF87D084B1A04C41 /* WallpaperExtensionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15CCEA84D7F64CF643F5E971 /* WallpaperExtensionKeeper.swift */; };
 		585AF892B06B0210C2067B6D /* AuthorWallpaperSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43FB96E1C34C1865A12D061B /* AuthorWallpaperSheet.swift */; };
 		58882A37EB534A3F54004334 /* MangaDetailSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 022419AE7625C356EBA50082 /* MangaDetailSheet.swift */; };
 		58CA95EC1C0187AD55AE998C /* WallpaperSystemCacheJanitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42CC0836985545A23D7AFE9A /* WallpaperSystemCacheJanitor.swift */; };
@@ -377,6 +378,7 @@
 		14DDF91A608069837E8FF492 /* AnimePortraitCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimePortraitCard.swift; sourceTree = "<group>"; };
 		14E3DF54D73DDABA010A0185 /* DownloadPathManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadPathManager.swift; sourceTree = "<group>"; };
 		14FCC7E2B2D2C043F74B4102 /* HomeContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeContentView.swift; sourceTree = "<group>"; };
+		15CCEA84D7F64CF643F5E971 /* WallpaperExtensionKeeper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperExtensionKeeper.swift; sourceTree = "<group>"; };
 		1823EAC90BA4264646D4E1D3 /* KonachanService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KonachanService.swift; sourceTree = "<group>"; };
 		185404293E2AF79AC924BE40 /* WallpaperExtensionElection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperExtensionElection.swift; sourceTree = "<group>"; };
 		18D6AC9201B325C7879D3E50 /* LockScreenWallpaperService.swift.bak */ = {isa = PBXFileReference; lastKnownFileType = text; path = LockScreenWallpaperService.swift.bak; sourceTree = "<group>"; };
@@ -713,6 +715,7 @@
 				62D57CBF90122DC1D11BC1FE /* SmoothAnimations.swift */,
 				346599B5EA4571FB1FEAA1F3 /* VideoPreloader.swift */,
 				185404293E2AF79AC924BE40 /* WallpaperExtensionElection.swift */,
+				15CCEA84D7F64CF643F5E971 /* WallpaperExtensionKeeper.swift */,
 				C82778D3A307A22A7032D5B6 /* WebViewCookieSync.swift */,
 			);
 			path = Utilities;
@@ -1581,6 +1584,7 @@
 				D8248F4D14AE1D42EB68B81E /* WallpaperEngineXBridge.swift in Sources */,
 				45533A338ED3A58847FBAAC1 /* WallpaperExploreContentView.swift in Sources */,
 				4279489A68B5C4B61E89ECCF /* WallpaperExtensionElection.swift in Sources */,
+				568D464DFF87D084B1A04C41 /* WallpaperExtensionKeeper.swift in Sources */,
 				A5CAB6CBF6A8E7236F70F688 /* WallpaperExtensionSocketServer.swift in Sources */,
 				3C3D1D709E6DD0518BC81253 /* WallpaperGridCell.swift in Sources */,
 				5D0D335F2BC35E05A2FE7C1F /* WallpaperOption.swift in Sources */,
