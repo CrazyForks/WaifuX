@@ -89,6 +89,8 @@ class WallpaperSchedulerService: ObservableObject {
     /// each actual switch forces one root-level check before applying.
     private var managedLibraryRootAvailability: (path: String, isAvailable: Bool)?
     private var unavailableLibraryRetryUntil: Date?
+    /// 后台 stat 节流时间戳（防止休眠卷被高频轮询反复唤醒）。
+    private var lastRootAvailabilityRefreshAt: Date?
     /// Missing files are removed from this process's candidate pool after the
     /// real apply path detects them, rather than being stat'ed every rotation.
     private var unavailableSchedulableItemIDs = Set<String>()
@@ -1960,27 +1962,65 @@ class WallpaperSchedulerService: ObservableObject {
     /// The scheduler's source of truth is the managed download library. Checking
     /// its root once per actual switch is much cheaper than stat'ing every item
     /// on a removable volume.
+    ///
+    /// stat 可能在休眠的外置卷上阻塞数秒（用户库常在 /Volumes/* 外置盒），
+    /// 必须留在主线程外：forceRefresh 只表示「希望新鲜值」，改为返回缓存值并
+    /// 派后台刷新供下一轮定时器使用。仅首次无缓存时同步查一次（启动期卷通常
+    /// 刚被访问过）。修复前每轮定时器在主线程裸 stat，卷休眠时表现为恒定 ~3s
+    /// 的主线程卡顿，且以 5s/15s 重试间隔反复出现。
     private func isManagedLibraryAvailable(forceRefresh: Bool = false) -> Bool {
         let rootURL = DownloadPathManager.shared.rootFolderURL.standardizedFileURL
         let rootPath = rootURL.path
         let now = Date()
 
-        if !forceRefresh,
-           let cached = managedLibraryRootAvailability,
-           cached.path == rootPath,
-           (cached.isAvailable || (unavailableLibraryRetryUntil ?? .distantPast) > now) {
+        let cacheUsable: Bool
+        if let cached = managedLibraryRootAvailability, cached.path == rootPath {
+            cacheUsable = cached.isAvailable || (unavailableLibraryRetryUntil ?? .distantPast) > now
+        } else {
+            cacheUsable = false
+        }
+
+        if let cached = managedLibraryRootAvailability, cached.path == rootPath, cacheUsable || !forceRefresh {
+            if forceRefresh {
+                refreshManagedLibraryAvailabilityInBackground(rootPath: rootPath)
+            }
             return cached.isAvailable
         }
 
-        let isAvailable = FileManager.default.fileExists(atPath: rootPath)
-        managedLibraryRootAvailability = (path: rootPath, isAvailable: isAvailable)
-        if isAvailable {
-            unavailableLibraryRetryUntil = nil
-        } else {
-            unavailableLibraryRetryUntil = Date().addingTimeInterval(unavailableLibraryRetryDelay)
-            print("\(logTag) Managed library root unavailable: \(rootPath); retry in \(Int(unavailableLibraryRetryDelay))s")
+        if managedLibraryRootAvailability == nil {
+            // 首查：无缓存可用，同步建立基线。
+            let isAvailable = FileManager.default.fileExists(atPath: rootPath)
+            managedLibraryRootAvailability = (path: rootPath, isAvailable: isAvailable)
+            unavailableLibraryRetryUntil = isAvailable
+                ? nil
+                : Date().addingTimeInterval(unavailableLibraryRetryDelay)
+            return isAvailable
         }
-        return isAvailable
+
+        // 有缓存但已过期/被标记不可用：派后台刷新，本轮以缓存值作答。
+        refreshManagedLibraryAvailabilityInBackground(rootPath: rootPath)
+        return managedLibraryRootAvailability?.isAvailable ?? false
+    }
+
+    /// 后台刷新库根目录可用性缓存（2s 节流，防止 5s 轮询期间重复 stat 休眠卷）。
+    private func refreshManagedLibraryAvailabilityInBackground(rootPath: String) {
+        let now = Date()
+        if let last = lastRootAvailabilityRefreshAt,
+           now.timeIntervalSince(last) < 2 {
+            return
+        }
+        lastRootAvailabilityRefreshAt = now
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let isAvailable = FileManager.default.fileExists(atPath: rootPath)
+            DispatchQueue.main.async {
+                guard let self,
+                      self.managedLibraryRootAvailability?.path == rootPath else { return }
+                self.managedLibraryRootAvailability = (path: rootPath, isAvailable: isAvailable)
+                self.unavailableLibraryRetryUntil = isAvailable
+                    ? nil
+                    : Date().addingTimeInterval(self.unavailableLibraryRetryDelay)
+            }
+        }
     }
 
     /// Next one-shot fire: earliest due time among timed displays, or a short

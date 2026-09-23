@@ -1093,9 +1093,6 @@ final class WallpaperEngineXBridge: ObservableObject {
 
             // ⭐ 壁纸控制文件（热切换入口，必传）
             perScreenArgs += ["--wallpaper-control", wallpaperControlURL.path]
-            if preservedRenderers[screenID] != nil {
-                perScreenArgs += ["--startup-fade"]
-            }
 
             if let effectiveUserProperties, !effectiveUserProperties.isEmpty {
                 perScreenArgs += ["--user-properties", effectiveUserProperties]

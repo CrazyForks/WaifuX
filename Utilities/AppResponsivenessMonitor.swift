@@ -162,6 +162,45 @@ enum AppResponsivenessMonitor {
             "appActive": snapshot.appActive,
             "scenePhase": snapshot.scenePhase
         ])
+        captureMainThreadSample(stallMS: elapsed * 1000)
+    }
+
+    /// stall 时用系统 sample 对自己抓 1 秒采样，把主线程调用栈顶帧写进日志。
+    /// 没有这一步，「卡在哪」只能靠猜（stat 外置卷 / 同步写壁纸 / body 重算
+    /// 的日志特征完全相同）；有了栈帧，一次导出即可定案根因。
+    /// 采样期间主线程若已恢复，栈顶会显示 idle 等待——同样是有价值的证据。
+    private static func captureMainThreadSample(stallMS: Double) {
+        let samplePath = "/tmp/waifux-stall-sample-\(Int(Date().timeIntervalSince1970)).txt"
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+        task.arguments = [
+            String(ProcessInfo.processInfo.processIdentifier),
+            "1", "-mayDie", "-file", samplePath
+        ]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        try? task.run()
+        DispatchQueue.global(qos: .utility).async {
+            task.waitUntilExit()
+            guard let text = try? String(contentsOfFile: samplePath, encoding: .utf8) else {
+                AppLogger.error(.ui, "Main thread stall sample unavailable", metadata: [
+                    "stallMS": String(format: "%.0f", stallMS),
+                    "sampleExit": Int(task.terminationStatus)
+                ])
+                return
+            }
+            // 报告头部的 Call graph 段即主线程（Thread_0）调用栈，截取足够定位的头部。
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            let callGraphStart = lines.firstIndex { $0.contains("Call graph") } ?? 0
+            let stackLines = lines.dropFirst(callGraphStart)
+                .prefix(60)
+                .joined(separator: "\n")
+            try? FileManager.default.removeItem(atPath: samplePath)
+            AppLogger.error(.ui, "Main thread stall sample", metadata: [
+                "stallMS": String(format: "%.0f", stallMS),
+                "stack": String(stackLines.prefix(3000))
+            ])
+        }
     }
 
     private static func flushSnapshotIfNeeded(trigger: String, force: Bool = false) {
