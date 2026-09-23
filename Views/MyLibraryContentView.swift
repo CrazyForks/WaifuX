@@ -154,6 +154,10 @@ struct MyLibraryContentView: View {
     @State private var librarySearchQuery = ""
     @State private var isLibrarySearchExpanded = false
     @FocusState private var isLibrarySearchFocused: Bool
+    /// 搜索输入期间不要每个字符都同步重配 NSCollectionView。
+    @State private var librarySearchDebounce: DispatchWorkItem?
+    @State private var librarySearchTask: Task<Void, Never>?
+    @State private var librarySearchGeneration: UInt64 = 0
 
     // 编辑状态
     @State private var isEditing = false
@@ -195,6 +199,12 @@ struct MyLibraryContentView: View {
     // 缓存壁纸和媒体列表，避免 computed property 在 body 重绘时反复 map/filter
     @State private var wallpaperItems: [AnyWallpaperItem] = []
     @State private var mediaItems: [AnyMediaItem] = []
+    /// 未应用文字搜索的当前目录快照；搜索只在此快照上做后台筛选，
+    /// 避免连续输入时反复从服务层重建整个列表。
+    @State private var wallpaperSearchBaseItems: [AnyWallpaperItem] = []
+    @State private var mediaSearchBaseItems: [AnyMediaItem] = []
+    @State private var wallpaperSearchEntries: [LibrarySearchEntry] = []
+    @State private var mediaSearchEntries: [LibrarySearchEntry] = []
     @State private var wallpaperFolderDisplay: [String: FolderDisplayInfo] = [:]
     @State private var mediaFolderDisplay: [String: FolderDisplayInfo] = [:]
     // ⚡ 滚动 prefetch 用的 ID→Index 字典缓存（O(1) 查找替代 firstIndex(where:) O(N)）。
@@ -277,6 +287,11 @@ struct MyLibraryContentView: View {
     private struct FolderDisplayInfo: Equatable {
         let previewURLs: [URL]
         let itemCount: Int
+    }
+
+    private struct LibrarySearchEntry: Sendable {
+        let id: String
+        let searchableText: String
     }
 
     /// 文件夹叠图后台预热任务（按 content+subTab 合并，避免快速切换时堆积）
@@ -430,6 +445,8 @@ struct MyLibraryContentView: View {
         .onDisappear {
             unregisterFolderBackSwipeHandler()
             unregisterFolderBackKeyboardHandler()
+            librarySearchDebounce?.cancel()
+            librarySearchTask?.cancel()
         }
         .onReceive(animeFavoriteStore.$favorites) { _ in
             Task {
@@ -441,9 +458,7 @@ struct MyLibraryContentView: View {
             resumeLibraryPrefetchAfterScroll()
         }
         .onChange(of: librarySearchQuery) { _, _ in
-            updateWallpaperItems()
-            updateMediaItems()
-            syncSelectionWithVisibleItems()
+            scheduleLibrarySearchUpdate()
         }
         .onChange(of: isVisible) { _, visible in
             if !visible {
@@ -807,8 +822,15 @@ struct MyLibraryContentView: View {
         wallpaperContext.removeAll()
         mediaContext.removeAll()
         animeFavorites.removeAll()
+        librarySearchTask?.cancel()
+        librarySearchDebounce?.cancel()
+        librarySearchGeneration &+= 1
         wallpaperItems.removeAll()
         mediaItems.removeAll()
+        wallpaperSearchBaseItems.removeAll()
+        mediaSearchBaseItems.removeAll()
+        wallpaperSearchEntries.removeAll()
+        mediaSearchEntries.removeAll()
         wallpaperFolderDisplay.removeAll()
         mediaFolderDisplay.removeAll()
         wallpaperIDIndexCache.removeAll()
@@ -1393,6 +1415,102 @@ struct MyLibraryContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
     }
 
+    /// 搜索只影响当前打开的内容类型；输入过程中合并更新，避免每个字符都
+    /// 在主线程重建两个列表并触发网格重配。文字匹配在后台索引上进行，
+    /// 主线程只接收最终的匹配位置并重配一次当前网格。
+    private func scheduleLibrarySearchUpdate() {
+        librarySearchDebounce?.cancel()
+        librarySearchTask?.cancel()
+        librarySearchGeneration &+= 1
+
+        let generation = librarySearchGeneration
+        let contentType = selectedContentType
+        let query = trimmedLibrarySearchQuery
+        let normalizedQuery = query.localizedLowercase
+
+        // 清空搜索时直接恢复当前目录快照，不经过后台任务。
+        guard !query.isEmpty else {
+            switch contentType {
+            case .wallpaper:
+                updateWallpaperItems()
+            case .video:
+                updateMediaItems()
+            case .anime:
+                gridReloadToken &+= 1
+            }
+            syncSelectionWithVisibleItems()
+            return
+        }
+
+        // 动漫收藏量通常很小，而且 currentAnimeItems 是派生数组；保持轻量路径。
+        guard contentType != .anime else {
+            librarySearchDebounce = DispatchWorkItem { [self] in
+                guard generation == librarySearchGeneration else { return }
+                gridReloadToken &+= 1
+                syncSelectionWithVisibleItems()
+            }
+            if let work = librarySearchDebounce {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: work)
+            }
+            return
+        }
+
+        let entries = contentType == .wallpaper ? wallpaperSearchEntries : mediaSearchEntries
+        let work = DispatchWorkItem { [self] in
+            guard generation == librarySearchGeneration else { return }
+            librarySearchTask = Task { @MainActor [self] in
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard !Task.isCancelled, generation == librarySearchGeneration else { return }
+
+                let matchingTask = Task.detached(priority: .userInitiated) {
+                    var result: [Int] = []
+                    result.reserveCapacity(entries.count / 4)
+                    for (index, entry) in entries.enumerated() {
+                        guard !Task.isCancelled else { return [Int]() }
+                        if entry.searchableText.contains(normalizedQuery) {
+                            result.append(index)
+                        }
+                    }
+                    return result
+                }
+                let matchingIndices = await withTaskCancellationHandler(operation: {
+                    await matchingTask.value
+                }, onCancel: {
+                    matchingTask.cancel()
+                })
+
+                guard !Task.isCancelled, generation == librarySearchGeneration else { return }
+                switch contentType {
+                case .wallpaper:
+                    wallpaperItems = matchingIndices.map { wallpaperSearchBaseItems[$0] }
+                    var idMap: [String: Int] = [:]
+                    idMap.reserveCapacity(wallpaperItems.count)
+                    for (index, item) in wallpaperItems.enumerated() {
+                        idMap[item.id] = index
+                    }
+                    wallpaperIDIndexCache = idMap
+                    gridReloadToken &+= 1
+                    refreshWallpaperFolderDisplay()
+                case .video:
+                    mediaItems = matchingIndices.map { mediaSearchBaseItems[$0] }
+                    var idMap: [String: Int] = [:]
+                    idMap.reserveCapacity(mediaItems.count)
+                    for (index, item) in mediaItems.enumerated() {
+                        idMap[item.id] = index
+                    }
+                    mediaIDIndexCache = idMap
+                    gridReloadToken &+= 1
+                    refreshMediaFolderDisplay()
+                case .anime:
+                    break
+                }
+                syncSelectionWithVisibleItems()
+            }
+        }
+        librarySearchDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: work)
+    }
+
     // MARK: - 当前壁纸快照（不订阅 CurrentWallpaperService 全对象）
 
     private func syncActiveWallpaperSnapshot() {
@@ -1431,6 +1549,8 @@ struct MyLibraryContentView: View {
     }
 
     private func updateWallpaperItems() {
+        librarySearchTask?.cancel()
+        librarySearchGeneration &+= 1
         lastWallpaperPrefetchBucket = nil
         let baseItems: [AnyWallpaperItem]
         switch selectedSubTab {
@@ -1459,14 +1579,18 @@ struct MyLibraryContentView: View {
             }
             baseItems = filtered.map { AnyWallpaperItem(unified: $0) }
         }
+        let filteredBaseItems: [AnyWallpaperItem]
         switch wallpaperRatioFilter {
         case .all:
-            wallpaperItems = baseItems
+            filteredBaseItems = baseItems
         case .landscape:
-            wallpaperItems = baseItems.filter { $0.wallpaper.dimensionX >= $0.wallpaper.dimensionY }
+            filteredBaseItems = baseItems.filter { $0.wallpaper.dimensionX >= $0.wallpaper.dimensionY }
         case .portrait:
-            wallpaperItems = baseItems.filter { $0.wallpaper.dimensionX < $0.wallpaper.dimensionY }
+            filteredBaseItems = baseItems.filter { $0.wallpaper.dimensionX < $0.wallpaper.dimensionY }
         }
+        wallpaperSearchBaseItems = filteredBaseItems
+        wallpaperSearchEntries = filteredBaseItems.map(Self.makeWallpaperSearchEntry)
+        wallpaperItems = filteredBaseItems
         if hasActiveLibrarySearch {
             let query = trimmedLibrarySearchQuery
             wallpaperItems = wallpaperItems.filter { matchesLibrarySearch(for: $0, query: query) }
@@ -1558,6 +1682,8 @@ struct MyLibraryContentView: View {
     }
 
     private func updateMediaItems() {
+        librarySearchTask?.cancel()
+        librarySearchGeneration &+= 1
         lastMediaPrefetchBucket = nil
         let baseItems: [AnyMediaItem]
         switch selectedSubTab {
@@ -1587,6 +1713,8 @@ struct MyLibraryContentView: View {
             baseItems = filtered.map { AnyMediaItem(unified: $0) }
         }
         // 媒体库不再做横屏/竖屏筛选
+        mediaSearchBaseItems = baseItems
+        mediaSearchEntries = baseItems.map(Self.makeMediaSearchEntry)
         mediaItems = baseItems
         if hasActiveLibrarySearch {
             let query = trimmedLibrarySearchQuery
@@ -3427,6 +3555,7 @@ struct MyLibraryContentView: View {
     }
 
     private func syncSelectionWithVisibleItems() {
+        guard isEditing else { return }
         selectedItems = selectedItems.intersection(Set(currentItemIDs))
     }
 
@@ -3638,11 +3767,55 @@ struct MyLibraryContentView: View {
         folder.name.localizedCaseInsensitiveContains(query)
     }
 
+    private static func makeWallpaperSearchEntry(_ item: AnyWallpaperItem) -> LibrarySearchEntry {
+        let wallpaper = item.wallpaper
+        let directMatches = [
+            item.localFileURL?.deletingPathExtension().lastPathComponent,
+            wallpaper.id,
+            wallpaper.title,
+            wallpaper.category,
+            wallpaper.categoryDisplayName,
+            wallpaper.purity,
+            wallpaper.purityDisplayName,
+            wallpaper.effectiveResolutionLabel,
+            wallpaper.ratio,
+            wallpaper.source,
+            wallpaper.uploader?.username,
+            wallpaper.primaryTagName
+        ]
+        let tags = wallpaper.tags?.flatMap { [$0.name, $0.alias] } ?? []
+        return LibrarySearchEntry(
+            id: item.id,
+            searchableText: (directMatches + tags).compactMap { $0 }.joined(separator: "\u{1F}").localizedLowercase
+        )
+    }
+
+    private static func makeMediaSearchEntry(_ item: AnyMediaItem) -> LibrarySearchEntry {
+        let media = item.mediaItem
+        let directMatches = [
+            item.localFileURL?.deletingPathExtension().lastPathComponent,
+            media.id,
+            media.title,
+            media.collectionTitle,
+            media.summary,
+            media.sourceName,
+            media.authorName,
+            media.resolutionLabel,
+            media.exactResolution,
+            media.primaryTagText
+        ]
+        return LibrarySearchEntry(
+            id: item.id,
+            searchableText: (directMatches.compactMap { $0 } + media.tags).joined(separator: "\u{1F}").localizedLowercase
+        )
+    }
+
     private func matchesLibrarySearch(for item: AnyWallpaperItem, query: String) -> Bool {
         let wallpaper = item.wallpaper
         let directMatches = [
             item.localFileURL?.deletingPathExtension().lastPathComponent,
             wallpaper.id,
+            wallpaper.title,
             wallpaper.category,
             wallpaper.categoryDisplayName,
             wallpaper.purity,

@@ -204,6 +204,8 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     /// 每个屏幕的 wallpaper-wgpu 进程信息（key = screenID）
     private var screenProcesses: [String: ScreenProcessInfo] = [:]
+    /// setWallpaper 完成后的渲染器窗口 alpha 兜底校验任务（key = screenID）。
+    private var rendererAlphaWatchdogs: [String: Task<Void, Never>] = [:]
     /// 从系统进程表发现的桌面 Scene renderer。它们可能来自上一次崩溃的
     /// WaifuX，已经不在 `screenProcesses` 中，但窗口仍能重新抢占桌面层。
     private struct DiscoveredDesktopRenderer {
@@ -1300,6 +1302,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             "screenProcesses": screenProcesses.count,
             "screenRenderStates": screenRenderStates.keys.sorted().joined(separator: ",")
         ])
+        scheduleRendererAlphaWatchdog(generation: switchGeneration)
         for screen in effectiveScreens {
             applyPersistedCrop(for: screen)
         }
@@ -1435,6 +1438,60 @@ final class WallpaperEngineXBridge: ObservableObject {
             "pidAlive": kill(pid, 0) == 0,
             "perScreenPaused": perScreenPausedScreenIDs.sorted().joined(separator: ",")
         ])
+    }
+
+    /// setWallpaper 完成后的渲染器窗口 alpha 兜底校验。macOS 27.2 出现过
+    /// --startup-fade 渲染器停在初始 alpha≈0.001：场景满帧率渲染但整窗不可见，
+    /// 桌面表现为静态壁纸。渲染器内有自愈看门狗；这里延迟校验窗口 alpha，
+    /// 仍低于阈值时向 wallpaper-control 注入 presentationAlpha=1 并留痕。
+    private func scheduleRendererAlphaWatchdog(generation: UInt64) {
+        for (screenID, info) in screenProcesses {
+            guard let controlURL = info.wallpaperControlURL else { continue }
+            rendererAlphaWatchdogs[screenID]?.cancel()
+            rendererAlphaWatchdogs[screenID] = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                guard self.wallpaperSwitchGeneration == generation,
+                      let current = self.screenProcesses[screenID],
+                      current.pid == info.pid else { return }
+                guard let alpha = Self.desktopWindowAlpha(pid: info.pid) else { return }
+                guard alpha < 0.5 else { return }
+                Self.injectPresentationAlpha(controlURL)
+                AppLogger.error(.wallpaper, "Renderer window stuck at startup alpha; injected presentationAlpha", metadata: [
+                    "screenID": screenID,
+                    "pid": info.pid,
+                    "alpha": String(format: "%.4f", alpha)
+                ])
+            }
+        }
+    }
+
+    /// 读取指定进程在桌面层级窗口的 kCGWindowAlpha；找不到窗口返回 nil。
+    private static func desktopWindowAlpha(pid: pid_t) -> Double? {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+        for window in list {
+            guard let ownerPID = window["kCGWindowOwnerPID"] as? Int,
+                  ownerPID == Int(pid),
+                  let layer = window["kCGWindowLayer"] as? Int,
+                  layer < 0 else { continue }
+            return window["kCGWindowAlpha"] as? Double
+        }
+        return nil
+    }
+
+    /// 向 wallpaper-control JSON 合入 presentationAlpha=1（保留其余字段）。
+    private static func injectPresentationAlpha(_ url: URL) {
+        var state: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            state = object
+        }
+        state["presentationAlpha"] = 1
+        if let data = try? JSONSerialization.data(withJSONObject: state) {
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     /// 暂停渲染（发送 SIGSTOP）
