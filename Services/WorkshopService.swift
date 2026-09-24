@@ -1181,7 +1181,7 @@ class WorkshopService: ObservableObject {
            var response = root["response"] as? [String: Any],
            let details = response["publishedfiledetails"] as? [[String: Any]] {
             let unavailableIDs = details
-                .filter { ($0["result"] as? Int ?? 0) != 1 || $0["title"] == nil }
+                .filter { ($0["result"] as? Int ?? 0) != 1 || $0["title"] == nil || $0["creator"] == nil }
                 .compactMap { $0["publishedfileid"] as? String }
             if !unavailableIDs.isEmpty {
                 AppLogger.info(.media, "Skipped unavailable Workshop entries in API details", metadata: [
@@ -1189,7 +1189,7 @@ class WorkshopService: ObservableObject {
                     "ids": unavailableIDs.joined(separator: ",")
                 ])
                 response["publishedfiledetails"] = details.filter {
-                    ($0["result"] as? Int ?? 0) == 1 && $0["title"] != nil
+                    ($0["result"] as? Int ?? 0) == 1 && $0["title"] != nil && $0["creator"] != nil
                 }
                 var root = root
                 root["response"] = response

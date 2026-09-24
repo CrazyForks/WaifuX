@@ -1444,6 +1444,12 @@ final class WallpaperEngineXBridge: ObservableObject {
             print("[WallpaperEngineXBridge] ✅ 屏幕 \(screenID) 属性已通过控制文件热更新")
             anyWritten = true
         }
+        if anyWritten {
+            // 热更新不经过 setWallpaper/recordRenderState，必须手动同步快照，
+            // 否则唤醒/重插/屏变化恢复会用改属性之前的旧 userProperties 重启进程，
+            // 高级设置(__-prefixed)覆盖全靠 setWallpaper 内部 merge 事后补救。
+            updateUserPropertiesInStates(path: path, userProperties: userProperties)
+        }
         if !anyWritten {
             print("[WallpaperEngineXBridge] ⚠️ refreshWallpaperProperties: 无活跃进程可更新，回退到重启方式")
             try await setWallpaper(
@@ -3695,7 +3701,11 @@ final class WallpaperEngineXBridge: ObservableObject {
                     print("[WallpaperEngineXBridge] 未找到持久化目标显示器，跳过恢复: \(state.screenID)")
                     continue
                 }
-                let userProps = state.userProperties ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path)
+                let userProps = Self.mergeSceneConfigOverrides(
+                    state.userProperties
+                        ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path),
+                    wallpaperPath: state.path
+                )
                 try? await setWallpaper(path: state.path, targetScreens: [screen], userProperties: userProps)
             }
             if screenRenderStates.isEmpty {
@@ -3725,8 +3735,11 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         let hasPersistedTargets = !targetScreenIDs.isEmpty || !targetScreenFingerprints.isEmpty
         let screens = hasPersistedTargets ? activeTargetScreens() : []
-        // 恢复用户属性覆盖
-        let userProps = SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path)
+        // 恢复用户属性覆盖（含场景高级设置 __-prefixed 覆盖）
+        let userProps = Self.mergeSceneConfigOverrides(
+            SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path),
+            wallpaperPath: path
+        )
         try? await setWallpaper(path: path, targetScreens: hasPersistedTargets && !screens.isEmpty ? screens : nil, userProperties: userProps)
     }
 
@@ -3746,6 +3759,30 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         updateControlStateFromScreenStates(preferredPath: path, preferredKind: renderKind)
         persistState()
+    }
+
+    /// 热更新属性后同步刷新内存与持久化的渲染状态快照（只替换 path 匹配的屏）。
+    /// 热更新不经过 setWallpaper/recordRenderState，若不同步快照，唤醒/重插/屏变化
+    /// 恢复会用改属性之前的旧 userProperties 重启进程，高级设置(__-prefixed)覆盖
+    /// 只能靠 setWallpaper 内部 merge 事后补救。
+    private func updateUserPropertiesInStates(path: String, userProperties: String?) {
+        var changed = false
+        for (screenID, state) in screenRenderStates where state.path == path {
+            guard state.userProperties != userProperties else { continue }
+            screenRenderStates[screenID] = ScreenRenderState(
+                screenID: state.screenID,
+                screenFingerprint: state.screenFingerprint,
+                path: state.path,
+                renderKind: state.renderKind,
+                userProperties: userProperties,
+                cliScreenIndex: state.cliScreenIndex
+            )
+            changed = true
+        }
+        if changed {
+            updateControlStateFromScreenStates(preferredPath: path)
+            persistState()
+        }
     }
 
     private func renderState(for screen: NSScreen) -> ScreenRenderState? {
@@ -4409,8 +4446,11 @@ final class WallpaperEngineXBridge: ObservableObject {
             }()
 
             if !hasLiveRuntime {
-                let userProps = state.userProperties
-                    ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path)
+                let userProps = Self.mergeSceneConfigOverrides(
+                    state.userProperties
+                        ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path),
+                    wallpaperPath: state.path
+                )
                 do {
                     try await setWallpaper(
                         path: state.path,
@@ -4538,6 +4578,12 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         guard !orphanStates.isEmpty || !orphanProcessIDs.isEmpty else { return false }
 
+        // 返回值语义 = 「本次真的回收了运行时」。合盖/显示器切换后，内建屏的
+        // 离线 state 会留在字典里（供重插恢复），每次屏幕参数通知都会被重新判成
+        // 孤儿；这种幂等空清理若也返回 true，调用方会驱动在线屏 renderer 每
+        // 18~30s 无谓重启一轮（09-24 用户机日志实锤 pid 7520→7537→7548→7581）。
+        var didStopRuntime = false
+
         AppLogger.error(.wallpaper, "WallpaperEngineX cleaning orphaned screen runtimes", metadata: [
             "orphanStates": orphanStates.map { "\($0.screenID):\($0.renderKind.rawValue)" }.joined(separator: ","),
             "orphanProcesses": orphanProcessIDs.sorted().joined(separator: ","),
@@ -4545,6 +4591,14 @@ final class WallpaperEngineXBridge: ObservableObject {
         ])
 
         for state in orphanStates {
+            if state.renderKind == .scene {
+                let hadLiveProcess = screenProcesses[state.screenID] != nil
+                    || screenProcesses.values.contains { $0.screenID == state.screenID }
+                if hadLiveProcess { didStopRuntime = true }
+            } else {
+                // web 走 daemon IPC 停止，无进程字典可查，交给底层幂等
+                didStopRuntime = true
+            }
             await stopRuntimeForDisconnectedScreen(
                 screenID: state.screenID,
                 fingerprint: state.screenFingerprint,
@@ -4554,6 +4608,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         for screenID in orphanProcessIDs where screenProcesses[screenID] != nil {
+            didStopRuntime = true
             await stopScreenProcessKeepingRestoreState(screenID)
             perScreenPausedScreenIDs.remove(screenID)
         }
@@ -4565,7 +4620,13 @@ final class WallpaperEngineXBridge: ObservableObject {
         ensureAudioRelayMatchesActiveWallpaper()
         // 注意：不 persist 删除 orphan state；persist 只同步当前控制标志与仍在线映射
         persistStateKeepingDisconnectedRestoreStates()
-        return true
+        if !didStopRuntime {
+            AppLogger.debug(.wallpaper, "WallpaperEngineX 重复孤儿清理已合并(无运行时可回收,不触发在线屏重启)", metadata: [
+                "orphanStates": orphanStates.map { "\($0.screenID):\($0.renderKind.rawValue)" }.joined(separator: ","),
+                "currentScreens": currentScreenIDs.sorted().joined(separator: ",")
+            ])
+        }
+        return didStopRuntime
     }
 
     /// 停掉已断开屏的 scene 进程或 web 渲染，保留 `screenRenderStates` 供恢复。
@@ -5209,7 +5270,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         guard wakeRecoveryGeneration == generation, !isSettingWallpaper else { return }
         processPendingTermination()
 
-        let targets = activeTargetScreens().compactMap { screen -> (NSScreen, ScreenRenderState)? in
+        var targets = activeTargetScreens().compactMap { screen -> (NSScreen, ScreenRenderState)? in
             let screenID = screen.wallpaperScreenIdentifier
             // A paused screen still owns a renderer whose Metal surface may
             // have died during sleep. Rebuild it as well; AutoPauseManager
@@ -5220,6 +5281,39 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
             return (screen, state)
         }
+
+        // 外置卷的挂载可能晚于本恢复逻辑（开盖唤醒 + 壁纸库在外置盘是常见组合）。
+        // 原实现路径不存在就静默跳过且再无补拉，桌面直接回落静态层/烘焙产物。
+        // 改为：先恢复已就绪屏，缺失路径做 3 轮 × 2s 的等待重试，仍缺失才放弃。
+        var pendingPathScreens = activeTargetScreens().compactMap { screen -> (NSScreen, ScreenRenderState)? in
+            guard let state = renderState(for: screen),
+                  !FileManager.default.fileExists(atPath: state.path) else {
+                return nil
+            }
+            return (screen, state)
+        }
+        if !pendingPathScreens.isEmpty {
+            AppLogger.error(.wallpaper, "WallpaperEngineX wake recovery waiting for wallpaper volumes", metadata: [
+                "paths": pendingPathScreens.map(\.1.path).joined(separator: ",")
+            ])
+        }
+        var retryRound = 0
+        while !pendingPathScreens.isEmpty, retryRound < 3 {
+            try? await Task.sleep(for: .seconds(2))
+            guard wakeRecoveryGeneration == generation, !Task.isCancelled else { return }
+            retryRound += 1
+            pendingPathScreens = pendingPathScreens.filter { screen, state in
+                guard FileManager.default.fileExists(atPath: state.path) else { return true }
+                targets.append((screen, state))
+                return false
+            }
+        }
+        if !pendingPathScreens.isEmpty {
+            AppLogger.error(.wallpaper, "WallpaperEngineX wake recovery gave up on missing wallpaper paths", metadata: [
+                "paths": pendingPathScreens.map(\.1.path).joined(separator: ",")
+            ])
+        }
+
         guard !targets.isEmpty else {
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             return
@@ -5233,8 +5327,11 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         for (screen, state) in targets {
             guard wakeRecoveryGeneration == generation, !isSettingWallpaper else { return }
-            let userProperties = state.userProperties
-                ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path)
+            let userProperties = Self.mergeSceneConfigOverrides(
+                state.userProperties
+                    ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path),
+                wallpaperPath: state.path
+            )
             do {
                 // forceRestart 会重建 scene 的 Metal 进程；web 路径会重新 set 到
                 // daemon，从而创建新的 WKWebView。保留 AutoPause 记账，避免醒来
@@ -5548,8 +5645,11 @@ final class WallpaperEngineXBridge: ObservableObject {
                         else {
                             continue
                         }
-                        let userProps = state.userProperties
-                            ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path)
+                        let userProps = Self.mergeSceneConfigOverrides(
+                            state.userProperties
+                                ?? SceneWallpaperPropertiesService.propertiesOverrideJSON(for: state.path),
+                            wallpaperPath: state.path
+                        )
                         try? await self.setWallpaper(
                             path: state.path,
                             targetScreens: [screen],
@@ -5558,7 +5658,10 @@ final class WallpaperEngineXBridge: ObservableObject {
                         )
                     }
                 } else if let path = self.lastWallpaperPath {
-                    let userProps = SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path)
+                    let userProps = Self.mergeSceneConfigOverrides(
+                        SceneWallpaperPropertiesService.propertiesOverrideJSON(for: path),
+                        wallpaperPath: path
+                    )
                     try? await self.setWallpaper(
                         path: path,
                         targetScreens: screensNeedingRestart,
