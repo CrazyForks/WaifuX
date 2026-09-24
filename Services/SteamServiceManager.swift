@@ -40,7 +40,7 @@ enum SteamServiceError: LocalizedError {
         switch self {
         case .unavailable(let message): return message
         case .busy: return "Steam 登录正在进行中。"
-        case .notAuthenticated: return "Steam 会话尚未登录。"
+        case .notAuthenticated: return "Steam 服务尚未登录，请到「设置 → Steam 服务」中登录。"
         case .authenticationFailed(let message, _): return message
         case .downloadFailed(let message, _): return message
         case .cancelled: return "Steam 下载已取消。"

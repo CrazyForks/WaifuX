@@ -5365,16 +5365,49 @@ final class VideoWallpaperManager: ObservableObject {
                     videoTargetScreenIDs.remove(key)
                     onEndModeScreens.remove(key)
                 }
-            } else if videoTargetScreenIDs.contains(screenID)
-                        || videoTargetScreenFingerprints.contains(screenFingerprint) {
-                // 状态认为该屏仍有视频，但窗口/播放器键已不可达——不暴露就永远拆不掉，
-                // 上层重试会无限空转。打点留存活键，供日志定位。
-                AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 空转：状态认为该屏有视频但窗口键不可达", metadata: [
-                    "screenID": screenID,
-                    "fingerprint": screenFingerprint,
-                    "survivingWindowKeys": windows.keys.sorted().joined(separator: ","),
-                    "survivingPlayerKeys": players.keys.sorted().joined(separator: ",")
-                ])
+            } else {
+                // 孤儿视频窗认领：键与 fingerprint 双失配、窗口也未贴在任何当前
+                // 在线屏上（宿主屏已消失/重编号，window.screen 为 nil 或 CGDisplay
+                // 已不在 NSScreen.screens）。这类窗口永远不可见却会让
+                // remainingWindows>1 残留盖屏，必须直接拆除，避免无限空转。
+                let onlineDisplayIDs = Set(
+                    NSScreen.screens.compactMap {
+                        $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+                    }.map(\.uint32Value)
+                )
+                let orphanWindowKeys = windows.compactMap { (key, window) -> String? in
+                    guard let hostScreen = window.screen else { return key }
+                    guard let displayNumber = hostScreen
+                        .deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                          !onlineDisplayIDs.contains(displayNumber.uint32Value) else { return nil }
+                    return key
+                }
+                if !orphanWindowKeys.isEmpty {
+                    AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 拆除宿主屏已消失的孤儿视频窗口", metadata: [
+                        "screenID": screenID,
+                        "fingerprint": screenFingerprint,
+                        "orphanKeys": orphanWindowKeys.sorted().joined(separator: ",")
+                    ])
+                    for key in orphanWindowKeys {
+                        teardownWindow(for: key)
+                        videoURLByScreen.removeValue(forKey: key)
+                        posterURLByScreen.removeValue(forKey: key)
+                        volumeByScreen.removeValue(forKey: key)
+                        nativePausedScreenIDs.remove(key)
+                        videoTargetScreenIDs.remove(key)
+                        onEndModeScreens.remove(key)
+                    }
+                } else if videoTargetScreenIDs.contains(screenID)
+                            || videoTargetScreenFingerprints.contains(screenFingerprint) {
+                    // 状态认为该屏仍有视频，但窗口/播放器键已不可达——不暴露就永远拆不掉，
+                    // 上层重试会无限空转。打点留存活键，供日志定位。
+                    AppLogger.error(.wallpaper, "stopNativeVideoWallpaperOnly 空转：状态认为该屏有视频但窗口键不可达", metadata: [
+                        "screenID": screenID,
+                        "fingerprint": screenFingerprint,
+                        "survivingWindowKeys": windows.keys.sorted().joined(separator: ","),
+                        "survivingPlayerKeys": players.keys.sorted().joined(separator: ",")
+                    ])
+                }
             }
         }
 

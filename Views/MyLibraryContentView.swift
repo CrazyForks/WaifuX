@@ -674,6 +674,13 @@ struct MyLibraryContentView: View {
                     actions: [
                         GlassAlertAction("OK", role: .cancel)
                     ])
+        .glassAlert("Steam 服务未登录", isPresented: $showSyncServiceLoginHint,
+                    message: "订阅同步与下载都通过 Steam 服务进行。请到「设置 → Steam 服务」登录后重试。",
+                    icon: "exclamationmark.triangle.fill",
+                    iconTint: LiquidGlassColors.warningOrange,
+                    actions: [
+                        GlassAlertAction("OK", role: .cancel)
+                    ])
         .glassAlert("同步订阅", isPresented: $showSyncResultAlert,
                     message: syncResultMessage,
                     icon: syncResultIsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
@@ -698,19 +705,6 @@ struct MyLibraryContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.18), value: showSyncProfileSheet || showSyncSelectionSheet)
-        .sheet(isPresented: $showSteamLoginSheet) {
-            SteamLoginSheet(isPresented: $showSteamLoginSheet)
-                .environmentObject(workshopSourceManager)
-                .onDisappear {
-                    // 登录成功后立即弹出选择 Sheet（显示加载中），再开始获取数据
-                    if workshopSourceManager.hasSteamProfileID {
-                        syncIsLoadingList = true
-                        syncSelectedIDs = []
-                        showSyncSelectionSheet = true
-                        Task { await fetchSubscriptionList() }
-                    }
-                }
-        }
     }
 
     private var wallpaperDeletionAlertPresented: Binding<Bool> {
@@ -1273,7 +1267,6 @@ struct MyLibraryContentView: View {
         pendingMediaDeletion != nil ||
         showSyncProfileSheet ||
         showSyncSelectionSheet ||
-        showSteamLoginSheet ||
         NSApp.modalWindow != nil
     }
 
@@ -4094,10 +4087,10 @@ struct MyLibraryContentView: View {
         showSyncResultAlert = true
     }
 
-    /// 同步按钮入口：Steam 服务已登录时直接走协议层同步（免 WebView）；
-    /// 未登录时弹出 Steam Web 登录页面建立会话。
-    /// 登录成功后自动关闭 Web 页面 → onDisappear 触发 fetchSubscriptionList() → 弹出选择弹窗
-    @State private var showSteamLoginSheet = false
+    /// 同步按钮入口：只走 Steam 服务协议层同步（下载同样依赖服务会话，
+    /// 网页爬取/网页登录对同步与下载都无效，已移除回退）。
+    /// 未登录时引导到「设置 → Steam 服务」登录。
+    @State private var showSyncServiceLoginHint = false
     @State private var showImportResultAlert = false
     @State private var importResultMessage = ""
     @State private var importResultIsWarning = false
@@ -4107,14 +4100,14 @@ struct MyLibraryContentView: View {
     @State private var syncResultIsWarning = false
 
     private func syncSubscriptions() {
-        if SteamServiceManager.shared.isLoggedIn {
-            syncIsLoadingList = true
-            syncSelectedIDs = []
-            showSyncSelectionSheet = true
-            Task { await fetchSubscriptionList() }
+        guard SteamServiceManager.shared.isLoggedIn else {
+            showSyncServiceLoginHint = true
             return
         }
-        showSteamLoginSheet = true
+        syncIsLoadingList = true
+        syncSelectedIDs = []
+        showSyncSelectionSheet = true
+        Task { await fetchSubscriptionList() }
     }
 
 }

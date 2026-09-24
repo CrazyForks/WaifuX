@@ -351,6 +351,9 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 屏幕参数变化（分辨率、显示器热插拔等）时重启渲染进程
     private var screenChangeRestartWorkItem: DispatchWorkItem?
     private var lastAppliedScreenConfigurations: [ScreenConfigurationSignature] = []
+    /// 通知风暴去抖：同签名 15s 内只打一次 ERROR 日志。
+    private var lastScreenChangeLogSignature: String?
+    private var lastScreenChangeLogSignatureAt = Date.distantPast
     /// 合盖唤醒后的 renderer 重建任务。scene 的 Metal surface 与 Web 的 WKWebView
     /// 都可能在深度睡眠后保持进程存活却不再出帧，不能只依赖 AutoPause 的 resume。
     private var wakeRecoveryTask: Task<Void, Never>?
@@ -551,10 +554,25 @@ final class WallpaperEngineXBridge: ObservableObject {
         // 处理之前堆积的进程终止事件
         processPendingTermination()
 
-        // 防重复启动：恢复桌面时可能多次触发，串行化处理
-        guard !isSettingWallpaper else {
-            AppLogger.error(.wallpaper, "setWallpaper 被防重入拦截: 已有壁纸设置任务进行中", metadata: ["path": path])
-            throw WallpaperEngineError.executionFailed("已有壁纸设置任务进行中，请稍后重试")
+        // 不设拒绝型防重入阀门：已有设置任务在跑时，新请求先递增 generation 把
+        // 旧任务作废（它会在下一个 generation 检查点 / 80ms 首帧轮询处自动退出并
+        // 释放标志），随后仅短暂让位等它收尾。用户连续/双屏快速设置时，最新一次
+        // 永远立即生效，绝不因旧任务占用而静默丢弃或报「请稍后重试」。
+        if isSettingWallpaper {
+            wallpaperSwitchGeneration &+= 1
+            AppLogger.error(.wallpaper, "setWallpaper 顶掉进行中的旧设置任务(最新请求胜出)", metadata: [
+                "path": path,
+                "newGeneration": String(wallpaperSwitchGeneration)
+            ])
+            let yieldDeadline = Date().addingTimeInterval(2)
+            while isSettingWallpaper && Date() < yieldDeadline {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            processPendingTermination()
+            guard !isSettingWallpaper else {
+                AppLogger.error(.wallpaper, "setWallpaper 让位超时: 旧任务未在任何检查点退出", metadata: ["path": path])
+                throw WallpaperEngineError.executionFailed("上一项壁纸设置任务尚未结束，请稍后重试")
+            }
         }
         isSettingWallpaper = true
         wallpaperSwitchGeneration &+= 1
@@ -570,14 +588,30 @@ final class WallpaperEngineXBridge: ObservableObject {
             print("[WallpaperEngineXBridge] <<< setWallpaper END")
         }
 
-        let effectiveScreens: [NSScreen]
+        // 无效几何守卫：frame 为 0×0 的屏（虚拟显示器连接过渡态）启动 renderer
+        // 只会得到 0×0 窗口且永不显示，表现为「进程活着但桌面无变化」。
+        let rawEffectiveScreens: [NSScreen]
         if let screens = targetScreens, !screens.isEmpty {
-            effectiveScreens = Self.uniqueLiveScreens(preferred: screens)
+            rawEffectiveScreens = Self.uniqueLiveScreens(preferred: screens)
         } else {
-            effectiveScreens = Self.uniqueLiveScreens(preferred: NSScreen.screens)
+            rawEffectiveScreens = Self.uniqueLiveScreens(preferred: NSScreen.screens)
+        }
+        let effectiveScreens = rawEffectiveScreens.filter {
+            $0.frame.width >= 1 && $0.frame.height >= 1
+        }
+        if effectiveScreens.count != rawEffectiveScreens.count {
+            let rejected = rawEffectiveScreens
+                .filter { $0.frame.width < 1 || $0.frame.height < 1 }
+                .map(\.wallpaperScreenIdentifier)
+            AppLogger.error(.wallpaper, "setWallpaper 跳过无效几何显示器", metadata: [
+                "rejected": rejected.sorted().joined(separator: ","),
+                "frames": rawEffectiveScreens.map { "\($0.wallpaperScreenIdentifier)=\($0.frame.width)x\($0.frame.height)" }
+                    .sorted()
+                    .joined(separator: ",")
+            ])
         }
         guard !effectiveScreens.isEmpty else {
-            throw WallpaperEngineError.executionFailed("没有可用的壁纸目标显示器")
+            throw WallpaperEngineError.executionFailed("没有可用的壁纸目标显示器（全部无效几何）")
         }
         var preservedRenderers: [String: PreservedRenderer] = [:]
         WallpaperCrossTypeTransitionCoordinator.shared.invalidatePendingRequests(
@@ -4320,7 +4354,10 @@ final class WallpaperEngineXBridge: ObservableObject {
     }
 
     func restorePreviousWallpaperIfAvailable(for screen: NSScreen) async -> Bool {
-        guard hasPersistedRestoreState(for: screen) || isManaging(screen: screen) else {
+        // 注意用无参版本做存在性检查：虚拟/无序列号外接屏的连接指纹每次连接都
+        // 可能变化，按屏精确匹配的版本会直接把恢复入口挡死（表现为副屏每次重连
+        // 都被当成「新显示器」弹窗、renderer 永不恢复）。
+        guard hasPersistedRestoreState() || isManaging(screen: screen) else {
             return false
         }
 
@@ -4342,6 +4379,23 @@ final class WallpaperEngineXBridge: ObservableObject {
                         || WallpaperScreenIdentity.fingerprintsMatch($0.screenFingerprint, fingerprint)
                 }
                 return matches.count == 1 ? matches.first : nil
+            }()
+            ?? {
+                // 第四层（虚拟屏宽松认领）：指纹全 miss 时，仅当当前恰好只有一块
+                // 外接屏、且「不属于任何在线屏」的持久化 state 也恰好一个时，才认领。
+                // 多外接屏时宁可放弃恢复也不猜（宁丢不换）。
+                let externalCount = NSScreen.screens.filter { !$0.isBuiltInDisplay }.count
+                guard externalCount == 1 else { return nil }
+                let onlineIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
+                let onlineFingerprints = Set(NSScreen.screens.map(\.wallpaperScreenFingerprint))
+                let candidates = (persistedScreenRenderStates() ?? []).filter { state in
+                    !onlineIDs.contains(state.screenID)
+                        && !onlineFingerprints.contains(state.screenFingerprint)
+                }
+                let uniqueKeys = Set(candidates.map { "\($0.screenID)|\($0.screenFingerprint)" })
+                guard uniqueKeys.count == 1, let state = candidates.first else { return nil }
+                print("[WallpaperEngineXBridge] 虚拟外接屏指纹已变化，按唯一离线 state 宽松恢复: \(state.screenID) → \(screenID)")
+                return state
             }()
 
         if let state = existingState, FileManager.default.fileExists(atPath: state.path) {
@@ -4414,6 +4468,53 @@ final class WallpaperEngineXBridge: ObservableObject {
         let currentScreenIDs = Set(NSScreen.screens.map(\.wallpaperScreenIdentifier))
         let currentFingerprints = Set(NSScreen.screens.map(\.wallpaperScreenFingerprint))
 
+        // 同一物理显示器可能被 WindowServer 重编号（screenID 5→6 漂移，虚拟/
+        // 无序列号外接屏高频出现）。旧 screenID 键上的进程如果其指纹仍在当前
+        // 指纹集合里，说明物理屏还在线——把运行时迁移到新 screenID（rekey），
+        // 绝不能当孤儿杀掉：日志实锤「杀掉→用户重设→又杀」的死循环。
+        var rekeyedScreens: [String] = []
+        for (oldID, var info) in screenProcesses where !currentScreenIDs.contains(oldID) {
+            guard let matchedScreen = NSScreen.screens.first(where: { screen in
+                guard let state = screenRenderStates[oldID] else { return false }
+                return state.screenFingerprint == screen.wallpaperScreenFingerprint
+            }) ?? NSScreen.screens.first(where: { screen in
+                // state 键可能已随 relink 换新：按进程内记录的旧 screenID 找 state
+                guard let state = screenRenderStates.values.first(where: { $0.screenID == oldID })
+                else { return false }
+                return state.screenFingerprint == screen.wallpaperScreenFingerprint
+            }) else { continue }
+            let newID = matchedScreen.wallpaperScreenIdentifier
+            guard newID != oldID, screenProcesses[newID] == nil else { continue }
+
+            info.screenID = newID
+            screenProcesses[newID] = info
+            screenProcesses.removeValue(forKey: oldID)
+            if let oldState = screenRenderStates[oldID] {
+                screenRenderStates[newID] = ScreenRenderState(
+                    screenID: newID,
+                    screenFingerprint: oldState.screenFingerprint,
+                    path: oldState.path,
+                    renderKind: oldState.renderKind,
+                    userProperties: oldState.userProperties,
+                    cliScreenIndex: oldState.cliScreenIndex
+                )
+                screenRenderStates.removeValue(forKey: oldID)
+            }
+            if perScreenPausedScreenIDs.contains(oldID) {
+                perScreenPausedScreenIDs.remove(oldID)
+                perScreenPausedScreenIDs.insert(newID)
+            }
+            targetScreenIDs.remove(oldID)
+            targetScreenIDs.insert(newID)
+            rekeyedScreens.append("\(oldID)->\(newID)")
+        }
+        if !rekeyedScreens.isEmpty {
+            AppLogger.error(.wallpaper, "WallpaperEngineX rekeyed renderers after screen renumbering", metadata: [
+                "rekeyed": rekeyedScreens.sorted().joined(separator: ","),
+                "currentScreens": currentScreenIDs.sorted().joined(separator: ",")
+            ])
+        }
+
         var orphanStates: [ScreenRenderState] = []
         var seenKeys = Set<String>()
         for state in screenRenderStates.values {
@@ -4425,8 +4526,15 @@ final class WallpaperEngineXBridge: ObservableObject {
             orphanStates.append(state)
         }
 
-        // 进程字典里也可能残留已断屏的 scene 进程（state 已丢但进程还在）
-        let orphanProcessIDs = screenProcesses.keys.filter { !currentScreenIDs.contains($0) }
+        // 进程字典里也可能残留已断屏的 scene 进程（state 已丢但进程还在）。
+        // 保守兜底：state 丢失无法做指纹复核时，再退回纯 screenID 判定。
+        let orphanProcessIDs = screenProcesses.keys.filter { screenID in
+            guard !currentScreenIDs.contains(screenID) else { return false }
+            let fingerprintsInStates = screenRenderStates.values
+                .filter { $0.screenID == screenID }
+                .map(\.screenFingerprint)
+            return fingerprintsInStates.allSatisfy { !currentFingerprints.contains($0) }
+        }
 
         guard !orphanStates.isEmpty || !orphanProcessIDs.isEmpty else { return false }
 
@@ -5315,13 +5423,25 @@ final class WallpaperEngineXBridge: ObservableObject {
             || !screenProcesses.isEmpty
         guard hasManagedState else { return }
 
-        AppLogger.error(.wallpaper, "WallpaperEngineX screen parameters changed", metadata: [
-            "isSettingWallpaper": isSettingWallpaper,
-            "processScreens": screenProcesses.keys.sorted().joined(separator: ","),
-            "stateScreens": screenRenderStates.keys.sorted().joined(separator: ","),
-            "targetIDs": targetScreenIDs.sorted().joined(separator: ","),
-            "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
-        ])
+        // 系统通知风暴去抖：同签名（屏幕列表+设置态）15s 内只打一次 ERROR，
+        // 其余降级 debug，避免唤醒期刷爆日志并加剧主线程压力。
+        let logSignature = "\(isSettingWallpaper)|\(screenProcesses.keys.sorted().joined(separator: ","))|\(NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ","))"
+        if logSignature == lastScreenChangeLogSignature,
+           Date().timeIntervalSince(lastScreenChangeLogSignatureAt) < 15 {
+            AppLogger.debug(.wallpaper, "WallpaperEngineX screen parameters changed (重复通知已合并)", metadata: [
+                "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
+            ])
+        } else {
+            lastScreenChangeLogSignature = logSignature
+            lastScreenChangeLogSignatureAt = Date()
+            AppLogger.error(.wallpaper, "WallpaperEngineX screen parameters changed", metadata: [
+                "isSettingWallpaper": isSettingWallpaper,
+                "processScreens": screenProcesses.keys.sorted().joined(separator: ","),
+                "stateScreens": screenRenderStates.keys.sorted().joined(separator: ","),
+                "targetIDs": targetScreenIDs.sorted().joined(separator: ","),
+                "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
+            ])
+        }
         guard !isSettingWallpaper else {
             print("[WallpaperEngineXBridge] 忽略屏幕参数通知：壁纸正在设置中")
             return

@@ -234,196 +234,6 @@ class WorkshopService: ObservableObject {
     private var steamCommunityUserAgent: String {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     }
-
-    /// 从 Steam 订阅页面抓取用户已订阅的壁纸列表
-    /// - Parameters:
-    ///   - steamID: Steam 64位数字 ID
-    ///   - page: 页码（从 1 开始）
-    /// - Returns: 壁纸列表
-    func fetchSubscriptions(steamID: String, page: Int = 1) async throws -> [WorkshopWallpaper] {
-        let profilePath = steamProfilePath(for: steamID)
-        var components = URLComponents(string: "https://steamcommunity.com\(profilePath)/myworkshopfiles/")
-        components?.queryItems = [
-            URLQueryItem(name: "appid", value: wallpaperEngineAppID),
-            URLQueryItem(name: "sort", value: "score"),
-            URLQueryItem(name: "browsefilter", value: "mysubscriptions"),
-            URLQueryItem(name: "view", value: "imagewall"),
-            URLQueryItem(name: "p", value: String(page)),
-            URLQueryItem(name: "numperpage", value: String(authorPageSize))
-        ]
-        guard let url = components?.url else {
-            throw WorkshopError.invalidURL
-        }
-
-        var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue(steamCommunityUserAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        request.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
-        // 直接从 WKWebsiteDataStore 读取 cookie（绕过 HTTPCookieStorage.shared 同步链路，避免同步失败）
-        if let cookies = await steamCookiesFromWKDataStore(), !cookies.isEmpty {
-            let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-            if let cookieHeader, !cookieHeader.isEmpty {
-                request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-                AppLogger.info(.media, "Applied Steam cookies from WKWebsiteDataStore", metadata: ["count": "\(cookies.count)"])
-            }
-        } else {
-            // 降级：从 HTTPCookieStorage.shared 读（兼容无 WKWebView 的场景）
-            applySteamCookies(to: &request)
-        }
-
-        let data = try await NetworkService.shared.fetchData(request: request)
-        guard let html = String(data: data, encoding: .utf8) else {
-            throw WorkshopError.apiError("无法解析 HTML 响应")
-        }
-
-        // 先尝试从 SSR JSON 提取
-        var wallpapers = extractFromJSON(html)
-        if !wallpapers.isEmpty {
-            AppLogger.info(.media, "fetchSubscriptions used JSON/SSR extraction: \(wallpapers.count) items")
-            do {
-                wallpapers = try await enrichWithAPIDetails(wallpapers)
-            } catch {
-                AppLogger.error(.media, "fetchSubscriptions API enrichment failed", metadata: ["steamID": steamID, "error": "\(error)"])
-            }
-            return wallpapers
-        }
-
-        // 降级：从 HTML DOM 解析
-        AppLogger.info(.media, "fetchSubscriptions falling back to HTML DOM parsing")
-        let doc = try SwiftSoup.parse(html)
-        try validateSteamSubscriptionHTML(doc, html: html, steamID: steamID, page: page)
-        let items = try doc.select(".workshopItem, .workshopItemWrapper, [id*='sharedfiles_']")
-        var parsed = try items.compactMap { try parseWorkshopItem($0) }
-        if parsed.isEmpty {
-            parsed = try parseModernWorkshopHTML(doc)
-        }
-        // 如果还为空，尝试解析当前 Steam 订阅页面格式（workshopItemSubscription）
-        if parsed.isEmpty {
-            parsed = try parseSubscriptionPageHTML(doc)
-        }
-        // HTML 解析可能因 CSS 选择器匹配到同一项的多个元素而产生重复，按 id 去重
-        var seenIDs = Set<String>()
-        parsed = parsed.filter { seenIDs.insert($0.id).inserted }
-        do {
-            parsed = try await enrichWithAPIDetails(parsed)
-        } catch {
-            AppLogger.error(.media, "fetchSubscriptions HTML API enrichment failed", metadata: ["steamID": steamID, "error": "\(error)"])
-        }
-        return parsed
-    }
-
-    /// 从 WKWebsiteDataStore（WKWebView 的持久 cookie 存储）获取 Steam 域名下的 cookie
-    /// 这是最可靠的 cookie 来源——WKWebView 中的 Steam 登录会话始终在此存储中，
-    /// 不需要经过 WebViewCookieSync 的中转同步步骤。
-    private func steamCookiesFromWKDataStore() async -> [HTTPCookie]? {
-        await withCheckedContinuation { continuation in
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                let filtered = cookies.filter { cookie in
-                    ["steamcommunity.com", "steampowered.com", "steamcdn.com"].contains(where: { domain in
-                        cookie.domain.contains(domain)
-                    })
-                }
-                continuation.resume(returning: filtered.isEmpty ? nil : filtered)
-            }
-        }
-    }
-
-    private func applySteamCookies(to request: inout URLRequest) {
-        guard let url = request.url,
-              let cookies = HTTPCookieStorage.shared.cookies(for: url),
-              !cookies.isEmpty else { return }
-        let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-        if let cookieHeader, !cookieHeader.isEmpty {
-            request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-            AppLogger.info(.media, "Applied Steam cookies to subscription request", metadata: ["count": "\(cookies.count)"])
-        }
-    }
-
-    private func validateSteamSubscriptionHTML(_ document: Document, html: String, steamID: String, page: Int) throws {
-        let lowercaseHTML = html.lowercased()
-        let loginForm = try document.select("form[action*='login'], form[action*='steampowered.com/login'], input[name='openid.identity']").first()
-        let globalLoginAction = try document.select("#global_action_menu a[href*='login'], a.global_action_link[href*='login']").first()
-        if loginForm != nil
-            || globalLoginAction != nil
-            || lowercaseHTML.contains("g_steamid = false")
-            || lowercaseHTML.contains("sign in through steam") {
-            throw WorkshopError.sessionExpired
-        }
-
-        if lowercaseHTML.contains("there was a problem accessing the item")
-            || lowercaseHTML.contains("specified profile could not be found")
-            || lowercaseHTML.contains("无法找到指定的个人资料")
-            || lowercaseHTML.contains("该个人资料是私密的") {
-            throw WorkshopError.apiError("无法访问 Steam 订阅页，请确认 SteamID 正确且订阅列表可见")
-        }
-
-        if page == 1,
-           lowercaseHTML.contains("mysubscriptions"),
-           !lowercaseHTML.contains("workshopitem")
-            && !lowercaseHTML.contains("publishedfileid")
-            && !lowercaseHTML.contains("sharedfiles/filedetails") {
-            AppLogger.info(.media, "Steam subscription page has no parseable item markers", metadata: ["steamID": steamID])
-        }
-    }
-
-    // MARK: - Web 登录相关
-
-    /// 检查当前是否已通过 Web 登录
-    /// - Parameter steamID: Steam 64位数字 ID
-    /// - Returns: 登录状态
-    func checkWebLoginStatus(steamID: String) async -> Bool {
-        let profilePath = steamProfilePath(for: steamID)
-        let urlString = "https://steamcommunity.com\(profilePath)/myworkshopfiles/?appid=431960&browsefilter=mysubscriptions"
-
-        guard let url = URL(string: urlString) else { return false }
-
-        var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        // 带上 WebView 会话 cookie 才能正确检测登录状态
-        if let cookies = await steamCookiesFromWKDataStore(), !cookies.isEmpty {
-            let cookieHeader = HTTPCookie.requestHeaderFields(with: cookies)["Cookie"]
-            if let cookieHeader, !cookieHeader.isEmpty {
-                request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-            }
-        }
-
-        do {
-            let data = try await NetworkService.shared.fetchData(request: request)
-            guard let html = String(data: data, encoding: .utf8) else { return false }
-
-            // 检查页面是否包含登录表单（未登录状态）
-            let doc = try SwiftSoup.parse(html)
-            let loginForm = try doc.select("form[action*='login']").first()
-            let loginLink = try doc.select("a[href*='login']").first()
-
-            // 如果有登录表单或登录链接，说明未登录
-            if loginForm != nil || loginLink != nil {
-                AppLogger.info(.media, "checkWebLoginStatus: 未登录", metadata: ["steamID": steamID])
-                return false
-            }
-
-            // 检查页面是否包含订阅内容
-            let workshopItems = try doc.select(".workshopItem, .workshopItemWrapper, [id*='sharedfiles_']")
-            if !workshopItems.isEmpty() {
-                AppLogger.info(.media, "checkWebLoginStatus: 已登录且有订阅内容", metadata: ["steamID": steamID, "items": "\(workshopItems.size())"])
-                return true
-            }
-
-            // 检查页面是否包含用户信息（即使没有订阅）
-            let userInfo = try doc.select(".playerAvatar, .persona .actual_persona_name").first()
-            if userInfo != nil {
-                AppLogger.info(.media, "checkWebLoginStatus: 已登录但可能没有订阅", metadata: ["steamID": steamID])
-                return true
-            }
-
-            return false
-        } catch {
-            AppLogger.error(.media, "checkWebLoginStatus failed", metadata: ["steamID": steamID, "error": "\(error)"])
-            return false
-        }
-    }
-
     /// Mirage 式订阅同步：走 WaifuX Steam 服务（SteamKit2 协议层）精确分页拉订阅，
     /// 再用公开 Web API 富化详情。不需要 WebView cookie，也不受 steamcommunity
     /// 页面改版影响。仅在 Steam 服务已登录时可用。
@@ -479,53 +289,14 @@ class WorkshopService: ObservableObject {
     }
 
     /// 获取用户所有已订阅的壁纸（自动翻页）
-    /// - Parameter steamID: Steam 64位数字 ID
+    /// 只走 Steam 服务协议层同步：下载本身依赖服务登录会话，
+    /// 网页爬取即使拿到列表也无法下载，回退没有意义。
+    /// - Parameter steamID: Steam 64位数字 ID（服务已登录时不依赖，用会话自身 SteamId）
     /// - Returns: 所有已订阅壁纸
     func fetchAllSubscriptions(steamID: String) async throws -> [WorkshopWallpaper] {
-        // 优先走 Steam 服务协议层同步（免 cookie、免爬页面、精确分页）；
-        // 服务未登录或失败时回退到原有的 steamcommunity 网页爬取路径。
-        if SteamServiceManager.shared.isLoggedIn {
-            do {
-                return try await fetchAllSubscriptionsViaSteamService()
-            } catch {
-                AppLogger.error(.media, "Steam 服务订阅同步失败，回退网页爬取", metadata: [
-                    "steamID": steamID,
-                    "error": "\(error)"
-                ])
-            }
-        }
-
-        var allItems: [WorkshopWallpaper] = []
-        var seenIDs = Set<String>()
-        var page = 1
-        var hasMore = true
-        var emptyPageCount = 0
-
-        while hasMore {
-            let items = try await fetchSubscriptions(steamID: steamID, page: page)
-            for item in items {
-                if seenIDs.insert(item.id).inserted {
-                    allItems.append(item)
-                }
-            }
-            // Steam 订阅页面固定每页最多返回 10 条（忽略 numperpage），
-            // 不能用 authorPageSize(30) 来判断是否有下一页。
-            // 改用：如果当前页有数据就继续翻页，连续两页为空则停止。
-            if items.isEmpty {
-                emptyPageCount += 1
-                if emptyPageCount >= 2 {
-                    hasMore = false
-                }
-            } else {
-                emptyPageCount = 0
-            }
-            page += 1
-            // 避免无限循环，最多 50 页（1500 条）
-            if page > 50 { break }
-        }
-
-        AppLogger.info(.media, "fetchAllSubscriptions total: \(allItems.count) unique items across \(page - 1) pages")
-        return allItems
+        let items = try await fetchAllSubscriptionsViaSteamService()
+        AppLogger.info(.media, "fetchAllSubscriptions total: \(items.count) items (Steam service)")
+        return items
     }
 
     // MARK: - Search
@@ -995,85 +766,6 @@ class WorkshopService: ObservableObject {
         return URL(string: raw)
     }
 
-    /// 解析当前 Steam 订阅页面格式（2025+）
-    /// 选择器：div.workshopItemSubscription（每个订阅项）
-    private func parseSubscriptionPageHTML(_ document: Document) throws -> [WorkshopWallpaper] {
-        let containers = try document.select("div.workshopItemSubscription")
-        guard !containers.isEmpty() else { return [] }
-
-        var wallpapers: [WorkshopWallpaper] = []
-        var seenIDs = Set<String>()
-
-        for container in containers {
-            let containerID = try container.attr("id")
-
-            // Steam 页面为每个订阅项生成两个容器：
-            //   <div id="Subscription3579766653">   — 已订阅状态（可见）
-            //   <div id="Unsubscribed3579766653">   — 未订阅状态（隐藏，无预览图）
-            // 必须跳过 Unsubscribed 容器，否则会提取出 "scribed3579766653" 这样的错误 ID。
-            guard !containerID.hasPrefix("Unsubscribed") else { continue }
-
-            // 优先从容器内的详情链接 URL 提取 publishedfileid（最可靠）
-            var id: String?
-            if let link = try container.select("a[href*=\"/sharedfiles/filedetails/?id=\"]").first() {
-                let href = try link.attr("href")
-                id = href.components(separatedBy: "id=").last?.components(separatedBy: "&").first
-            }
-            // 降级：从容器 ID "Subscription{id}" 提取
-            if id == nil || id!.isEmpty {
-                id = containerID.components(separatedBy: "Subscription").last
-            }
-            guard let resolvedID = id, !resolvedID.isEmpty, !seenIDs.contains(resolvedID) else { continue }
-            seenIDs.insert(resolvedID)
-
-            // 标题
-            let titleEl = try container.select(".workshopItemTitle").first()
-            let title = (try titleEl?.text())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Untitled"
-
-            // 预览图
-            let previewImg = try container.select(".workshopItemPreviewImage").first()
-            let previewSrc = try (previewImg?.attr("src") ?? "")
-            let previewURL = previewSrc.isEmpty ? nil : URL(string: previewSrc)
-
-            // 应用名
-            let appEl = try container.select(".workshopItemApp").first()
-            let _ = (try appEl?.text())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-            // 日期
-            let dateEls = try container.select(".workshopItemDate")
-            if dateEls.size() >= 1 {
-                let _ = try dateEls.get(0).text()
-            }
-            if dateEls.size() >= 2 {
-                let _ = try dateEls.get(1).text()
-            }
-
-            let isAnimatedImage = previewSrc.lowercased().contains(".gif")
-
-            wallpapers.append(WorkshopWallpaper(
-                id: resolvedID,
-                title: title,
-                description: nil,
-                previewURL: previewURL,
-                author: WorkshopAuthor(steamID: "", name: "Unknown", avatarURL: nil),
-                fileSize: nil,
-                fileURL: nil,
-                steamAppID: wallpaperEngineAppID,
-                subscriptions: nil,
-                favorites: nil,
-                views: nil,
-                rating: nil,
-                type: .unknown,
-                tags: [],
-                isAnimatedImage: isAnimatedImage,
-                createdAt: nil,
-                updatedAt: nil
-            ))
-        }
-
-        return wallpapers
-    }
-
     private func parseWorkshopItem(_ element: Element) throws -> WorkshopWallpaper? {
         do {
             var id = try element.attr("data-publishedfileid")
@@ -1481,8 +1173,36 @@ class WorkshopService: ObservableObject {
 
         let data = try await NetworkService.shared.fetchData(request: request)
 
+        // Steam 对已删除/下架/转私密的条目只返回 {"publishedfileid","result":9} 骨架
+        // （无 title/creator 字段），一条坏数据曾让整批 JSONDecoder 失败，
+        // 进而被上层误判为会话失效。先剔除骨架条目再解码。
+        let cleanedData: Data
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           var response = root["response"] as? [String: Any],
+           let details = response["publishedfiledetails"] as? [[String: Any]] {
+            let unavailableIDs = details
+                .filter { ($0["result"] as? Int ?? 0) != 1 || $0["title"] == nil }
+                .compactMap { $0["publishedfileid"] as? String }
+            if !unavailableIDs.isEmpty {
+                AppLogger.info(.media, "Skipped unavailable Workshop entries in API details", metadata: [
+                    "count": "\(unavailableIDs.count)",
+                    "ids": unavailableIDs.joined(separator: ",")
+                ])
+                response["publishedfiledetails"] = details.filter {
+                    ($0["result"] as? Int ?? 0) == 1 && $0["title"] != nil
+                }
+                var root = root
+                root["response"] = response
+                cleanedData = try JSONSerialization.data(withJSONObject: root)
+            } else {
+                cleanedData = data
+            }
+        } else {
+            cleanedData = data
+        }
+
         do {
-            let result = try JSONDecoder().decode(SteamPublishedFileResponse.self, from: data)
+            let result = try JSONDecoder().decode(SteamPublishedFileResponse.self, from: cleanedData)
             let details = result.response.publishedfiledetails ?? []
             if let first = details.first {
                 AppLogger.info(.media, "API detail sample", metadata: ["id": first.publishedfileid, "subs": first.subscriptions ?? -1, "fav": first.favorited ?? -1, "views": first.views ?? -1, "vote": first.vote_data?.score ?? first.score ?? -1])

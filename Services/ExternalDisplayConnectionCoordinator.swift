@@ -26,6 +26,8 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     private var pendingWorkItem: DispatchWorkItem?
     private var pendingDisplays: [PendingDisplay] = []
     private var isPresentingPrompt = false
+    private var lastLoggedScreenSignature: String?
+    private var lastLoggedScreenSignatureAt = Date.distantPast
 
     private override init() {
         super.init()
@@ -46,10 +48,23 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
     }
 
     @objc private func handleScreenParametersChanged() {
-        AppLogger.error(.wallpaper, "ExternalDisplay screen parameters changed", metadata: [
-            "previousExternalFingerprints": previousExternalDisplays.count,
-            "currentScreens": NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
-        ])
+        // 系统在唤醒/显示器热插拔时会在 1 秒内连发同一通知几十次，直接每次
+        // 打 ERROR 会刷爆日志并加剧主线程压力；签名相同且 15s 内已打过则降级 debug。
+        let signature = NSScreen.screens.map(\.wallpaperScreenIdentifier).joined(separator: ",")
+        if signature == lastLoggedScreenSignature,
+           Date().timeIntervalSince(lastLoggedScreenSignatureAt) < 15 {
+            AppLogger.debug(.wallpaper, "ExternalDisplay screen parameters changed (重复通知已合并)", metadata: [
+                "previousExternalFingerprints": previousExternalDisplays.count,
+                "currentScreens": signature
+            ])
+        } else {
+            lastLoggedScreenSignature = signature
+            lastLoggedScreenSignatureAt = Date()
+            AppLogger.error(.wallpaper, "ExternalDisplay screen parameters changed", metadata: [
+                "previousExternalFingerprints": previousExternalDisplays.count,
+                "currentScreens": signature
+            ])
+        }
         pendingWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             Task { @MainActor in
@@ -143,8 +158,6 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         isPresentingPrompt = true
         let display = pendingDisplays.removeFirst()
 
-        // 保留系统 NSAlert：显示器热插拔可能在托盘/后台模式触发，主窗口不可见时
-        // 应用内玻璃 alert 没有宿主窗口。玻璃化前置条件：GlassAlertCenter 独立悬浮窗宿主。
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = t("externalDisplay.connected.title")
@@ -154,8 +167,34 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
         alert.addButton(withTitle: t("externalDisplay.openLibraryWithoutAuto"))
         alert.addButton(withTitle: t("externalDisplay.doNotUseAnyWallpaper"))
 
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
+        // 绝不在主线程 runModal：显示器热插拔可能连发多次触发，同步模态会把
+        // 主线程卡住数秒到数分钟（日志实锤 stall 148s/459s，栈顶即 runModal），
+        // 期间壁纸设置点击全部无响应。有可见宿主窗口时用 sheet 异步呈现；
+        // 托盘/无窗口时采用默认「不使用壁纸」静默处理，不打扰后台。
+        let hostWindow = NSApp.mainWindow
+            ?? NSApp.keyWindow
+            ?? NSApp.windows.first { $0.isVisible && $0.canBecomeMain && !$0.isSheet }
+
+        if let hostWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            alert.beginSheetModal(for: hostWindow) { [weak self] response in
+                guard let self else { return }
+                self.handleExternalDisplayPromptResponse(response, display: display)
+                self.isPresentingPrompt = false
+                self.presentNextPromptIfNeeded()
+            }
+        } else {
+            AppLogger.info(.wallpaper, "外接显示器连接但无可见窗口，跳过弹窗按默认不使用壁纸处理", metadata: [
+                "screenID": display.screenID,
+                "fingerprint": display.fingerprint
+            ])
+            handleExternalDisplayPromptResponse(nil, display: display)
+            isPresentingPrompt = false
+            presentNextPromptIfNeeded()
+        }
+    }
+
+    private func handleExternalDisplayPromptResponse(_ response: NSApplication.ModalResponse?, display: PendingDisplay) {
         markDisplayAsKnown(display.fingerprint)
 
         if let screen = NSScreen.screens.first(where: {
@@ -172,12 +211,10 @@ final class ExternalDisplayConnectionCoordinator: NSObject {
                 WallpaperSchedulerService.shared.configureExternalDisplayWithoutAutoSwitch(screen)
                 openLibrary()
             default:
+                // nil（无窗口静默路径）与「不使用壁纸」同义：不自动换壁纸
                 WallpaperSchedulerService.shared.configureExternalDisplayWithoutAutoSwitch(screen)
             }
         }
-
-        isPresentingPrompt = false
-        presentNextPromptIfNeeded()
     }
 
     private var knownDisplayFingerprints: Set<String> {
