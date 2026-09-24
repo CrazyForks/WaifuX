@@ -17,6 +17,8 @@ final class LocalWallpaperScanner {
     
     private let downloadPathManager = DownloadPathManager.shared
     private let fileManager = FileManager.default
+    /// 启动兜底抽查用：走缓存，避免主线程对慢卷反复 stat
+    private let fileExistenceCache = FileExistenceCache.shared
     /// 旧版本仅把扫描结果留在内存。首次升级到持久化下载记录模型时，
     /// 用该迁移标记确保用户现有内容会被补登一次，而不是每次启动都扫盘。
     private static let persistentIndexMigrationKey = "managedLibraryPersistentIndexMigration"
@@ -32,6 +34,9 @@ final class LocalWallpaperScanner {
     private var scannedMediaItems: [LocalMediaItem] = []
     private var lastScanTime: Date?
     private var scanTask: Task<Void, Never>?
+    /// 本次扫描在受管目录顶层发现的 Workshop 工程目录（含 project.json）。
+    /// 它们是目录、不是白名单里的媒体文件，需要走 `ImportService` 的补建通路。
+    private var discoveredWorkshopDirectories: [URL] = []
     
     /// 扫描版本号，扫描完成后递增，供 ViewModel 监听以重建缓存
     @Published private(set) var scanRevision: UInt = 0
@@ -91,16 +96,33 @@ final class LocalWallpaperScanner {
         return result
     }
 
-    /// 兜底自愈：壁纸/媒体记录全空，但受管根目录确实存在时，说明记录丢了
-    /// （38.0.14x 之前「只信持久化记录、不再扫盘」的版本把一次性迁移标记写早了，
-    /// 或用户跨 bundle id 升级/清过数据），此时补建一次记录，避免「我的库」永久空白。
+    /// 兜底自愈：记录丢失（空记录，或只剩指向已消失文件的僵尸记录）而受管根目录
+    /// 确实存在时，按磁盘内容补建一次记录。
+    ///
+    /// 38.0.14x 之前「只信持久化记录、不再扫盘」的版本把一次性迁移标记写早了，
+    /// 这批用户的「我的库」会永久空白。实测反馈形态：`CachePersistence/Records` 只有
+    /// 2 个文件、`Media/` 里躺着 10 个视频、`Wallpapers/` 为空 —— 所以不能只判「记录数组
+    /// 为空」，必须放宽到「抽查不到任何一条活记录」，否则留下 1~2 条僵尸记录的设备
+    /// 依旧空白。
     ///
     /// 与「修复数据」的区别：`repairBrokenRecords()` 是手动入口且还会停用找不到文件的
-    /// 记录；这里只在**记录完全为空**时自动跑一次，属于异常态兜底，不影响常规路径。
-    /// - Returns: 补建结果；不需要补建（已有记录、根目录不可用）时返回 nil。
-    func rebuildManagedLibraryIndexIfRecordsAreEmpty() async -> ReindexResult? {
-        guard WallpaperLibraryService.shared.downloadedWallpapers.isEmpty,
-              MediaLibraryService.shared.downloadedItems.isEmpty else {
+    /// 记录；这里只在异常态自动跑一次，不影响常规路径。
+    /// - Returns: 补建结果；不需要补建（存在活记录、根目录不可用）时返回 nil。
+    func rebuildManagedLibraryIndexIfNoLiveRecords() async -> ReindexResult? {
+        // 记录数组为空：必然要补。非空时抽查前 20 条是否有文件仍在磁盘上
+        // （走 FileExistenceCache，扫描/导入路径已预热），避免主线程逐条 stat 慢卷。
+        let wallpaperRecords = WallpaperLibraryService.shared.downloadedWallpapers
+        if !wallpaperRecords.isEmpty,
+           wallpaperRecords.prefix(20).contains(where: {
+               fileExistenceCache.fileExists(atPath: $0.localFilePath)
+           }) {
+            return nil
+        }
+        let mediaRecords = MediaLibraryService.shared.downloadedItems
+        if !mediaRecords.isEmpty,
+           mediaRecords.prefix(20).contains(where: {
+               fileExistenceCache.fileExists(atPath: $0.localFilePath)
+           }) {
             return nil
         }
 
@@ -152,6 +174,13 @@ final class LocalWallpaperScanner {
                 localFileURL: item.fileURL
             )
             indexedMedia += 1
+        }
+
+        // 受管目录里的 Workshop 工程目录（`Media/workshop_<id>/`、含 project.json）：
+        // 它们是「目录」而不是白名单里的媒体文件，只按文件扫描永远命中不了 ——
+        // 记录丢失后这条通路是唯一能把它们补回来的地方（只重建记录，不动文件）。
+        if !discoveredWorkshopDirectories.isEmpty {
+            indexedMedia += ImportService.shared.reindexWorkshopDirectories(discoveredWorkshopDirectories)
         }
 
         if indexedWallpapers > 0 || indexedMedia > 0 {
@@ -245,9 +274,10 @@ final class LocalWallpaperScanner {
         let mediaFolder = downloadPathManager.mediaFolderURL
         let libraryRootFolder = downloadPathManager.rootFolderURL
 
-        let (wallpapers, mediaItems) = await Task.detached(priority: .utility) {
+        let (wallpapers, mediaItems, workshopDirectories) = await Task.detached(priority: .utility) {
             var wallpapers: [LocalWallpaperItem] = []
             var mediaItems: [LocalMediaItem] = []
+            var workshopDirectories: [URL] = []
             let fm = FileManager.default
 
             if fm.fileExists(atPath: wallpapersFolder.path) {
@@ -287,6 +317,20 @@ final class LocalWallpaperScanner {
                             mediaItems.append(item)
                         }
                     }
+                    // Workshop 工程目录（`Media/workshop_<id>/`）：是「目录」不是媒体文件，
+                    // 扩展名白名单判定永远命中不了，记录一旦丢失就再也补不回来。
+                    // 这里只按目录名收集、不判断工程是否可解析 —— Steam 下载的工程是
+                    // `workshop_<id>/steamapps/workshop/content/431960/<id>/project.json`
+                    // 这种壳目录，顶层并没有 project.json，解析交给 ImportService。
+                    for fileURL in contents {
+                        var isDir: ObjCBool = false
+                        guard fm.fileExists(atPath: fileURL.path, isDirectory: &isDir),
+                              isDir.boolValue,
+                              fileURL.lastPathComponent.hasPrefix("workshop_") else {
+                            continue
+                        }
+                        workshopDirectories.append(fileURL)
+                    }
                 } catch {
                     print("[LocalWallpaperScanner] Failed to scan media folder: \(error)")
                 }
@@ -307,7 +351,12 @@ final class LocalWallpaperScanner {
                    options: .skipsHiddenFiles
                ) {
                 for fileURL in rootContents {
-                    guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
+                    var isDir: ObjCBool = false
+                    if fm.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
+                        // 库根下的工程目录（老版本可能直接放在 root）；同样只按前缀收集
+                        if fileURL.lastPathComponent.hasPrefix("workshop_") {
+                            workshopDirectories.append(fileURL)
+                        }
                         continue
                     }
                     if Self.isImageFileStatic(fileURL) {
@@ -322,7 +371,7 @@ final class LocalWallpaperScanner {
                 }
             }
 
-            return (wallpapers, mediaItems)
+            return (wallpapers, mediaItems, workshopDirectories)
         }.value
 
         // 预热存在性缓存，列表 isDownloaded / localFileURL 不再 stat 外置卷
@@ -335,10 +384,15 @@ final class LocalWallpaperScanner {
 
         scannedWallpapers = wallpapers
         scannedMediaItems = mediaItems
+        discoveredWorkshopDirectories = workshopDirectories
         lastScanTime = Date()
         scanRevision &+= 1
 
-        print("[LocalWallpaperScanner] Scan completed in \(Date().timeIntervalSince(startTime))s, found \(wallpapers.count) wallpapers, \(mediaItems.count) media files")
+        print(
+            "[LocalWallpaperScanner] Scan completed in \(Date().timeIntervalSince(startTime))s, "
+                + "found \(wallpapers.count) wallpapers, \(mediaItems.count) media files, "
+                + "\(workshopDirectories.count) workshop project folders"
+        )
 
         // 列表缩略图在可见卡片 onAppear 时按需生成；扫描阶段不读全图、不抽视频帧
     }

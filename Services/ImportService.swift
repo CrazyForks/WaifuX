@@ -1048,6 +1048,78 @@ final class ImportService: ObservableObject {
         }
     }
 
+    // MARK: - 已入库工程目录的记录补建
+
+    /// 为「已经躺在受管目录里的 Workshop 工程目录」补建媒体库记录。
+    ///
+    /// 只给扫描/修复路径用：记录丢失（索引被清空、迁移中断、换 bundle id、清理工具误删）
+    /// 时 `Media/workshop_<id>/` 目录仍在磁盘上，但它是个**目录**、不是扩展名白名单里的
+    /// 媒体文件 —— 老的扫描只看顶层文件，永远命中不了，于是「修复数据」也会报
+    /// 「所有数据正常，无需修复」，用户看到的就是我的库永久空白。
+    ///
+    /// 不移动、不拷贝任何文件，只按现有目录重建记录（`resolveDestinationURL` 对
+    /// 「源 == 目标」会直接跳过，所以用户自己重新拖入是救不回来的）。
+    /// - Parameter directoryURLs: 受管目录下的 Workshop 工程目录（含 project.json）
+    /// - Returns: 实际补建的记录数
+    @discardableResult
+    func reindexWorkshopDirectories(_ directoryURLs: [URL]) -> Int {
+        var indexed = 0
+        for dir in directoryURLs {
+            let folderName = dir.lastPathComponent
+            let localSlug = folderName.hasPrefix("workshop_")
+                ? String(folderName.dropFirst("workshop_".count))
+                : folderName
+
+            // 已有记录不动：避免覆盖用户改过的标题 / 文件夹归属等状态
+            guard mediaLibrary.downloadRecord(for: "workshop_\(localSlug)") == nil else { continue }
+
+            // 顶层不一定有 project.json：Steam 下载的工程结构是
+            // `workshop_<id>/steamapps/workshop/content/431960/<id>/project.json`，
+            // 顶层只有一层壳（`ls` 的 link count = 3 就是这种）。
+            // 复用导入路径同一套工程根解析（findWorkshopItems →
+            // WorkshopService.resolveWallpaperEngineProjectRoot），不再写第二份形态判断。
+            guard case .workshop(_, _, let json)? = findWorkshopItems(in: dir).first?.type else {
+                continue
+            }
+
+            let item = makeImportedWorkshopItem(
+                localSlug: localSlug,
+                steamID: Self.resolveWorkshopSteamID(from: json, folderName: folderName),
+                title: (json["title"] as? String) ?? localSlug,
+                projectJSON: json,
+                destDir: dir,
+                previewURL: findPreview(in: dir)
+            )
+            mediaLibrary.recordDownload(item: item, localFileURL: dir)
+            indexed += 1
+        }
+        return indexed
+    }
+
+    /// 从 project.json 解析真实 Steam Workshop ID（只认纯数字）。
+    /// 优先级与 `importWorkshop` 一致：workshopid → publishedfileid → id →
+    /// workshopurl 里的 ID → 文件夹名里的数字。
+    private static func resolveWorkshopSteamID(from json: [String: Any], folderName: String) -> String? {
+        var candidate = (json["workshopid"] as? String)
+            ?? (json["publishedfileid"] as? String)
+            ?? (json["id"] as? String)
+        candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if candidate?.isEmpty != false,
+           let rawURL = json["workshopurl"] as? String,
+           let extracted = Self.extractSteamID(from: rawURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+           !extracted.isEmpty {
+            candidate = extracted
+        }
+        if candidate?.isEmpty != false {
+            let numeric = folderName.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+            if !numeric.isEmpty { candidate = numeric }
+        }
+
+        guard let id = candidate, !id.isEmpty, id.allSatisfy(\.isNumber) else { return nil }
+        return id
+    }
+
     /// 在指定目录中递归查找预览图
     private func findPreview(in dir: URL) -> URL? {
         guard let enumerator = fileManager.enumerator(

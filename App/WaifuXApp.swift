@@ -656,11 +656,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                     Task(priority: .utility) {
                         _ = await LocalWallpaperScanner.shared
                             .rebuildManagedLibraryIndexForUpgradeIfNeeded()
-                        // 兜底：升级迁移之后记录仍然全空、但磁盘上还有文件时补建一次。
+                        // 兜底：升级迁移之后仍然找不到任何一条活记录、磁盘上却还有文件时补建一次。
                         // 38.0.14x 之前「只信持久化记录」的版本把迁移标记写早了，
                         // 这批用户的「我的库」会永久空白（文件其实都还在）。
                         _ = await LocalWallpaperScanner.shared
-                            .rebuildManagedLibraryIndexIfRecordsAreEmpty()
+                            .rebuildManagedLibraryIndexIfNoLiveRecords()
                     }
 
                     // 第4帧：动漫数据
