@@ -177,6 +177,18 @@ final class DirectoryMigrationService {
         )
 
         // ── 阶段 C：删除旧文件（后台 I/O）──
+        // 只有在复制零失败时才允许删源：外置盘掉线/空间不足/权限不足导致复制失败时
+        // 仍继续删源会直接丢数据，这正是「迁移后我的库变空白」的另一条路径
+        // （默认路径下 oldRoot 就是 ~/Library/Application Support/WaifuX）。
+        if failCount > 0 {
+            clearMigrationState()
+            print(
+                "[DirectoryMigrationService] Deletion skipped: "
+                    + "\(failCount)/\(totalCount) file(s) failed to copy; source left intact"
+            )
+            return .partial(successCount: successCount, failCount: failCount, errors: errors)
+        }
+
         saveMigrationState(MigrationStateRecord(
             phase: .deleting,
             oldPath: oldPath, newPath: newPath,

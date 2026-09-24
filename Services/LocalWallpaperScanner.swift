@@ -20,7 +20,12 @@ final class LocalWallpaperScanner {
     /// 旧版本仅把扫描结果留在内存。首次升级到持久化下载记录模型时，
     /// 用该迁移标记确保用户现有内容会被补登一次，而不是每次启动都扫盘。
     private static let persistentIndexMigrationKey = "managedLibraryPersistentIndexMigration"
-    private static let persistentIndexMigrationVersion = 1
+    /// v2：v1 的扫描范围只有 `Wallpapers/` 与 `Media/` 两个子目录，而历史版本会把媒体
+    /// 文件直接落在库根顶层（`DownloadPathManager.inferDefaultLocation` 的兜底分支就返回
+    /// root）。默认路径（`~/Library/Application Support/WaifuX`）用户的整库可能都在那一层：
+    /// v1 扫不到任何文件，却照样把完成标记写掉，之后永不扫盘 → 「我的库」永久空白
+    /// （38.0.14x 用户反馈）。bump 到 2 让这批设备再补扫一次，同时把库根顶层纳入扫描。
+    private static let persistentIndexMigrationVersion = 2
     
     // 缓存扫描结果
     private var scannedWallpapers: [LocalWallpaperItem] = []
@@ -83,6 +88,35 @@ final class LocalWallpaperScanner {
             "[LocalWallpaperScanner] Persistent-index migration completed: "
                 + "indexed=\(result.totalIndexed)"
         )
+        return result
+    }
+
+    /// 兜底自愈：壁纸/媒体记录全空，但受管根目录确实存在时，说明记录丢了
+    /// （38.0.14x 之前「只信持久化记录、不再扫盘」的版本把一次性迁移标记写早了，
+    /// 或用户跨 bundle id 升级/清过数据），此时补建一次记录，避免「我的库」永久空白。
+    ///
+    /// 与「修复数据」的区别：`repairBrokenRecords()` 是手动入口且还会停用找不到文件的
+    /// 记录；这里只在**记录完全为空**时自动跑一次，属于异常态兜底，不影响常规路径。
+    /// - Returns: 补建结果；不需要补建（已有记录、根目录不可用）时返回 nil。
+    func rebuildManagedLibraryIndexIfRecordsAreEmpty() async -> ReindexResult? {
+        guard WallpaperLibraryService.shared.downloadedWallpapers.isEmpty,
+              MediaLibraryService.shared.downloadedItems.isEmpty else {
+            return nil
+        }
+
+        let rootURL = downloadPathManager.rootFolderURL.standardizedFileURL
+        guard fileManager.fileExists(atPath: rootURL.path),
+              fileManager.isReadableFile(atPath: rootURL.path) else {
+            return nil
+        }
+
+        let result = await rebuildManagedLibraryIndex()
+        if result.totalIndexed > 0 {
+            print(
+                "[LocalWallpaperScanner] Rebuilt empty library index from disk: "
+                    + "wallpapers=\(result.indexedWallpapers), media=\(result.indexedMedia)"
+            )
+        }
         return result
     }
 
@@ -209,6 +243,7 @@ final class LocalWallpaperScanner {
         // 路径在 MainActor 解析（security-scoped）；目录枚举/轻量元数据放到后台，避免卡 UI。
         let wallpapersFolder = downloadPathManager.wallpapersFolderURL
         let mediaFolder = downloadPathManager.mediaFolderURL
+        let libraryRootFolder = downloadPathManager.rootFolderURL
 
         let (wallpapers, mediaItems) = await Task.detached(priority: .utility) {
             var wallpapers: [LocalWallpaperItem] = []
@@ -254,6 +289,36 @@ final class LocalWallpaperScanner {
                     }
                 } catch {
                     print("[LocalWallpaperScanner] Failed to scan media folder: \(error)")
+                }
+            }
+
+            // 库根顶层的散装媒体文件：历史版本（以及 inferDefaultLocation 的兜底分支）
+            // 会把文件直接放在 root 下，只扫两个子目录会永久漏掉这批内容。
+            // 只取顶层常规文件、不下钻子目录，避免把 Cache/、SceneBakes/ 之类卷进来。
+            if fm.fileExists(atPath: libraryRootFolder.path),
+               let rootContents = try? fm.contentsOfDirectory(
+                   at: libraryRootFolder,
+                   includingPropertiesForKeys: [
+                       .fileSizeKey,
+                       .creationDateKey,
+                       .contentModificationDateKey,
+                       .isRegularFileKey
+                   ],
+                   options: .skipsHiddenFiles
+               ) {
+                for fileURL in rootContents {
+                    guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
+                        continue
+                    }
+                    if Self.isImageFileStatic(fileURL) {
+                        if let item = Self.createWallpaperItemLightweight(from: fileURL) {
+                            wallpapers.append(item)
+                        }
+                    } else if Self.isVideoFileStatic(fileURL) {
+                        if let item = Self.createMediaItemLightweight(from: fileURL) {
+                            mediaItems.append(item)
+                        }
+                    }
                 }
             }
 

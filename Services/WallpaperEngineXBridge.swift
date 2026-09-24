@@ -3136,6 +3136,9 @@ final class WallpaperEngineXBridge: ObservableObject {
             environment["DYLD_LIBRARY_PATH"] ?? ""
         ].filter { !$0.isEmpty }.joined(separator: ":")
         environment["LSUIElement"] = "1"
+        // 渲染器用 env_logger，默认 info。27.2 上窗口「AppKit 可见、WindowServer 不合成」
+        // 的证据在 wallpaper-wgpu 自己的 [windiag] 里，不设这个就只有启动头，没有窗口状态。
+        environment["RUST_LOG"] = environment["RUST_LOG"] ?? "info"
         return environment
     }
 
@@ -4734,24 +4737,81 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// - Returns: true = 无需处理或已拉回；false = 窗口尚未创建/无 AX 权限
     @discardableResult
     private static func raiseRendererProcessWindowsIfNeeded(pid: pid_t) -> Bool {
+        // 27.2 的桌面层会把窗口留在别的 Space，而 AppKit 自己仍报 isVisible。
+        // 这里把「不在 onscreen 列表」的原始窗口快照留下，AXRaise 之后再读一次，
+        // 才能区分：AX 没权限 / 窗口还没创建 / raise 了但 WindowServer 没把它带回当前 Space。
+        let before = desktopWindows(ownedBy: pid)
+        let onscreenBefore = before.contains { $0.onScreen }
+        guard !onscreenBefore else { return true }
+
+        let snapshot = before
+            .map { "id=\($0.windowID) layer=\($0.layer) alpha=\($0.alpha) onScreen=\($0.onScreen) \($0.bounds)" }
+            .joined(separator: " | ")
+        AppLogger.error(.wallpaper, "Renderer window absent from current Space", metadata: [
+            "pid": pid,
+            "axTrusted": AXIsProcessTrusted(),
+            "windowCount": before.count,
+            "windows": snapshot.isEmpty ? "none" : snapshot
+        ])
+
         guard AXIsProcessTrusted() else { return false }
-        guard !rendererProcessHasOnscreenWindow(pid: pid) else { return true }
         let appEl = AXUIElementCreateApplication(pid)
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
               let windows = value as? [AXUIElement], !windows.isEmpty else {
+            AppLogger.error(.wallpaper, "Renderer window AXRaise unavailable", metadata: [
+                "pid": pid,
+                "axWindowCount": 0
+            ])
             return false
         }
-        var raised = false
-        for window in windows {
-            if AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success {
-                raised = true
-            }
+        var raised = 0
+        for window in windows where AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success {
+            raised += 1
         }
-        if raised {
-            print("[WallpaperEngineXBridge] 🪟 已将离屏的 wallpaper-wgpu 窗口拉回当前 Space (pid=\(pid))")
+        let after = desktopWindows(ownedBy: pid)
+        let onscreenAfter = after.contains { $0.onScreen }
+        AppLogger.error(.wallpaper, "Renderer window AXRaise result", metadata: [
+            "pid": pid,
+            "axWindowCount": windows.count,
+            "raised": raised,
+            "onscreenAfter": onscreenAfter
+        ])
+        if raised > 0 {
+            print("[WallpaperEngineXBridge] 🪟 已将离屏的 wallpaper-wgpu 窗口拉回当前 Space (pid=\(pid) onscreenAfter=\(onscreenAfter))")
         }
-        return raised
+        return onscreenAfter
+    }
+
+    private struct DesktopWindowSnapshot {
+        let windowID: Int
+        let layer: Int
+        let alpha: Double
+        let onScreen: Bool
+        let bounds: String
+    }
+
+    /// CGWindowList 里该进程的全部顶层窗口。optionAll 才能看到不在当前 Space 的窗口；
+    /// optionOnScreenOnly 在 27.2 上会把「AppKit 认为可见、WindowServer 不合成」的窗口直接漏掉。
+    private static func desktopWindows(ownedBy pid: pid_t) -> [DesktopWindowSnapshot] {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        return list.compactMap { window in
+            guard window[kCGWindowOwnerPID as String] as? Int == Int(pid) else { return nil }
+            let bounds = window[kCGWindowBounds as String] as? [String: Any]
+            let x = (bounds?["X"] as? NSNumber)?.intValue ?? 0
+            let y = (bounds?["Y"] as? NSNumber)?.intValue ?? 0
+            let width = (bounds?["Width"] as? NSNumber)?.intValue ?? 0
+            let height = (bounds?["Height"] as? NSNumber)?.intValue ?? 0
+            return DesktopWindowSnapshot(
+                windowID: window[kCGWindowNumber as String] as? Int ?? 0,
+                layer: window[kCGWindowLayer as String] as? Int ?? 0,
+                alpha: window[kCGWindowAlpha as String] as? Double ?? -1,
+                onScreen: window[kCGWindowIsOnscreen as String] as? Bool ?? false,
+                bounds: "\(x),\(y),\(width)x\(height)"
+            )
+        }
     }
 
     /// 指定进程是否有至少一个窗口位于当前 Space
@@ -4766,7 +4826,21 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// Space 切换、唤醒重建、热切换成功后调用；幂等（已可见时不动作）。
     func reassertRendererWindowsOnCurrentSpace() {
         guard isControllingExternalEngine else { return }
+        let screenCount = NSScreen.screens.count
+        // com.apple.spaces spans-displays：true = 各屏共享 Space，false = 每块显示器独立 Space。
+        // 27.2 公开的多屏桌面层回归集中在后者，所以只在窗口确实不在当前 Space 时记下这个开关。
+        let separateSpaces = UserDefaults.standard.bool(forKey: "spans-displays") == false
         for info in screenProcesses.values {
+            let visible = Self.rendererProcessHasOnscreenWindow(pid: info.pid)
+            if !visible {
+                AppLogger.error(.wallpaper, "Renderer reassert on space change", metadata: [
+                    "pid": info.pid,
+                    "screenID": info.screenID,
+                    "screenCount": screenCount,
+                    "displaysHaveSeparateSpaces": separateSpaces,
+                    "onscreen": visible
+                ])
+            }
             Self.raiseRendererProcessWindowsIfNeeded(pid: info.pid)
         }
     }
