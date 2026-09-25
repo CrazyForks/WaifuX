@@ -470,12 +470,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         // 直接读 UserDefaults 是安全的（非 @AppStorage、非 init 读取，与已存在的 line 316/399 一致）。
         ModuleAvailability.shared.refreshFromUserDefaults()
 
-        // 壁纸扩展守护：按持久化开关对齐 LaunchAgent 状态（默认开启）。
-        // 文件被清理工具移除时补装、用户关闭时移除；放后台避免 launchctl 阻塞启动。
+        // 壁纸扩展守护（旧 keeper LaunchAgent）：运行期保活已迁移到 App 内置的
+        // WallpaperExtensionAgentHealer（参考 Phosphene 的 agent 重启自愈），
+        // 不再依赖独立常驻服务。此处默认改为关闭，仅当用户显式开过才对齐；
+        // 放后台避免 launchctl 阻塞启动。
         Task.detached(priority: .utility) {
             let enabled = UserDefaults.standard.object(
                 forKey: WallpaperExtensionKeeper.launchAgentDefaultsKey
-            ) as? Bool ?? true
+            ) as? Bool ?? false
             WallpaperExtensionKeeper.syncLaunchAgentWithEnabledFlag(enabled)
         }
 
@@ -628,6 +630,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
                 // ⚠️ 延迟到窗口显示后执行，避免启动卡死；在主线程执行避免后台线程调用
                 // Bundle/FileManager/NSWorkspace 等非线程安全 API 触发崩溃
                 self?.repairWallpaperExtensionRegistration()
+
+                // 扩展保活（App 内置，无额外服务）：pkd 杀扩展 / agent 空连接螺旋
+                // 时 killall WallpaperAgent 自愈。参考 Phosphene 的实现。
+                WallpaperExtensionAgentHealer.shared.start()
             }
 
             LocalizationService.shared.restoreSavedSettings()

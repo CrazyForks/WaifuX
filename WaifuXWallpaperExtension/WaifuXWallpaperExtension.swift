@@ -102,6 +102,14 @@ struct WallpaperExtensionConfiguration: AppExtensionConfiguration {
             extLog("XPC interrupted from PID=\(connection.processIdentifier)")
         }
         connection.invalidationHandler = { [weak handler] in
+            // SpiralRecovery：区分「agent 空转的空连接」（被接受但没调用任何方法就
+            // 断开）与「服务过方法的正常断开」。连续空连接达到阈值时发 Darwin 通知
+            // 让主 App killall WallpaperAgent（见 WallpaperExtensionAgentHealer）。
+            if let handler, !handler.servedAnyMethod {
+                SpiralRecovery.noteEmptyConnection(pid: connection.processIdentifier)
+            } else {
+                SpiralRecovery.noteHealthyConnection()
+            }
             handler?.stopObservingPrefs()
             handler?.agentProxy = nil
             let ownedContextIDs = handler?.takeOwnedContextIDs() ?? []

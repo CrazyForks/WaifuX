@@ -95,6 +95,24 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     /// DistributedNotification 偶发丢失导致 isScreenLocked 永久卡死。
     private var lastLockedUpdate: Date = .distantPast
 
+    /// 本连接是否服务过至少一个 XPC 方法。SpiralRecovery 用它区分
+    /// 「agent 空转的空连接」与「服务过方法的正常断开」。
+    private let servedStateLock = NSLock()
+    private var _servedAnyMethod = false
+    var servedAnyMethod: Bool {
+        servedStateLock.lock()
+        defer { servedStateLock.unlock() }
+        return _servedAnyMethod
+    }
+
+    /// XPC 方法入口统一打点：标记本连接健康 + 清零空连接螺旋计数。
+    func noteServed() {
+        servedStateLock.lock()
+        _servedAnyMethod = true
+        servedStateLock.unlock()
+        SpiralRecovery.noteHealthyConnection()
+    }
+
     func registerOwnedContext(_ contextID: UInt32) {
         ownedContextLock.lock()
         ownedContextIDs.insert(contextID)
@@ -329,6 +347,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     // MARK: - Lifecycle
 
     func acquire(withId id: Any?, request: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+        noteServed()
         extLog("=== ACQUIRE ===")
 
         let wallpaperIDString = Self.extractWallpaperContextIdentifier(from: id)
@@ -976,6 +995,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     }
 
     func update(withId id: Any?, request: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+        noteServed()
         let wallpaperIDString = Self.extractWallpaperContextIdentifier(from: id)
         let geometry = Self.requestDisplayGeometry(from: request)
         Self.applyDisplayGeometryUpdate(
@@ -1063,6 +1083,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     }
 
     func invalidate(withId id: Any?, reply: @escaping @Sendable ((any Error)?) -> Void) {
+        noteServed()
         let identifier = Self.extractWallpaperContextIdentifier(from: id)
         var cleanedCount = 0
         if let identifier {
@@ -1084,6 +1105,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     }
 
     func snapshot(withId _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+        noteServed()
         extLog("=== SNAPSHOT ===")
         var currentTime: CMTime?
         WallpaperState.shared.forEachRenderer { renderer in
@@ -1201,6 +1223,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     // MARK: - Stubs
 
     func provideSettingsViewModels(withContentTypes _: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
+        noteServed()
         Task {
             let result = await buildSettingsViewModelsXPC()
             reply(result ?? makeEmptyGroupsResponse(), nil)
