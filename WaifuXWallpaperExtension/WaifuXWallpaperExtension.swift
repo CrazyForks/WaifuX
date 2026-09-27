@@ -755,9 +755,11 @@ final class WaifuXWallpaperExtension: NSObject, AppExtension {
             effectiveMode = "active"
             effectiveActivity = "active"
         } else {
-            effectiveMode = state.isScreenLocked && state.presentationMode != "locked"
-                ? "locked"
-                : state.presentationMode
+            effectiveMode = PlaybackPolicy.effectivePresentationMode(
+                agentMode: state.presentationMode,
+                isScreenLocked: state.isScreenLocked,
+                hostUnavailable: false
+            )
             effectiveActivity = state.activityState
         }
 

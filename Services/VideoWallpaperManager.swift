@@ -1668,13 +1668,16 @@ final class VideoWallpaperManager: ObservableObject {
             guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
                 continue
             }
-            guard let videoURL = videoURL(for: screen), FileManager.default.fileExists(atPath: videoURL.path) else {
+            guard let videoURL = assignedVideoURL(for: screen), FileManager.default.fileExists(atPath: videoURL.path) else {
                 continue
             }
             displayVideoPairs.append((displayID: screenNumber.uint32Value, videoURL: videoURL))
         }
 
-        if displayVideoPairs.isEmpty, let globalURL = currentVideoURL,
+        // The legacy global URL is ambiguous with multiple displays. Use it
+        // only for a single-screen installation that has no per-screen record.
+        if displayVideoPairs.isEmpty, NSScreen.screens.count == 1,
+           let globalURL = currentVideoURL,
            FileManager.default.fileExists(atPath: globalURL.path) {
             for screen in NSScreen.screens {
                 guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
@@ -1693,7 +1696,7 @@ final class VideoWallpaperManager: ObservableObject {
 
         // 递增世代号并清空旧命令，防止前一次异步 Task 入队的过期命令被扩展执行
         let generation = WallpaperExtensionSocketServer.nextVideoSyncGeneration()
-        WallpaperExtensionSocketServer.shared.clearCommands()
+        WallpaperExtensionSocketServer.shared.clearVideoCommands()
 
         // ⚠️ 关键时序修复：先不同步实例到 Socket（不同步也就不会发 prefsChanged 通知），
         // 等视频缓存+注册完成后，在 switchActiveInstancesToLocalDecode 末尾统一发通知。

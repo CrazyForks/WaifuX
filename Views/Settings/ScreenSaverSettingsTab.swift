@@ -94,7 +94,16 @@ struct ScreenSaverSettingsTab: View {
                 showDivider: false
             ) {
                 Button(t("screensaver.syncNow")) {
-                    perform { try service.syncNow() }
+                    isWorking = true
+                    Task {
+                        defer { isWorking = false }
+                        do {
+                            try await service.syncNow()
+                            service.refreshConfiguredState()
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                    }
                 }
                 .disabled(isWorking)
             }
@@ -119,7 +128,7 @@ struct ScreenSaverSettingsTab: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
 
-            Text(t("screensaver.fullDiskAccess"))
+            Text(t("screensaver.mediaCacheInfo"))
                 .font(.system(size: 11.5))
                 .foregroundStyle(Color.white.opacity(0.4))
                 .fixedSize(horizontal: false, vertical: true)

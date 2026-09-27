@@ -198,16 +198,15 @@ final class WallpaperPrefs: @unchecked Sendable {
         let power = PowerMonitor.shared.currentState
         let displayIDs = state.uniqueDisplayIDs()
         let currentPausedDisplays = pausedDisplayIDs
-        let effectiveMode = isAppHostTerminated
+        let hostUnavailable = isAppHostTerminated
             && !state.isScreenLocked
             && !state.isDisplayAsleep
-            ? "active"
-            : state.presentationMode
-        let effectiveActivity = isAppHostTerminated
-            && !state.isScreenLocked
-            && !state.isDisplayAsleep
-            ? "active"
-            : state.activityState
+        let effectiveMode = PlaybackPolicy.effectivePresentationMode(
+            agentMode: state.presentationMode,
+            isScreenLocked: state.isScreenLocked,
+            hostUnavailable: hostUnavailable
+        )
+        let effectiveActivity = hostUnavailable ? "active" : state.activityState
 
         if displayIDs.isEmpty {
             let policy = PlaybackPolicy.compute(

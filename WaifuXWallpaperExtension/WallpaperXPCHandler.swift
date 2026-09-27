@@ -441,13 +441,11 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             }
         }
 
-        // 回退：如果 request 没带配置，使用上一次实例 ID。
-        if choiceConfiguration == nil || choiceConfiguration?.isEmpty == true {
-            let fallbackID = WallpaperState.shared.currentVideoID
-            if let fallbackID, !fallbackID.isEmpty {
-                extLog("[acquire] ⚠️ choiceConfiguration 为 nil，回退使用 currentVideoID: \(fallbackID)")
-                choiceConfiguration = fallbackID
-            }
+        // Some request variants expose directDisplayID only in their nested
+        // description. Do not infer a display from process-wide currentVideoID:
+        // it belongs to whichever monitor was selected most recently.
+        if displayID == nil {
+            displayID = Self.requestDisplayGeometry(from: request).displayID
         }
 
         // 回退：如果 displayID 仍为 nil，尝试从 choiceConfiguration 提取
@@ -460,19 +458,18 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             extLog("[acquire] ⚠️ 从 choiceConfiguration 提取 displayID: \(parsed) (config: \(config))")
         }
 
-        // 最终回退：如果 displayID 为 nil，尝试从系统获取
-        if displayID == nil {
-            // 尝试 NSScreen（可能受限于沙箱）
+        // A system-wide first screen is safe only when there is exactly one.
+        if displayID == nil, NSScreen.screens.count == 1 {
             if let mainScreen = NSScreen.screens.first,
                let screenNumber = mainScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
                 displayID = screenNumber.uint32Value
                 extLog("[acquire] ⚠️ 从 NSScreen 获取 displayID: \(displayID!)")
             }
         }
-        // 最后手段：CGGetActiveDisplayList（不依赖 AppKit，沙箱安全）
+        // Last resort when AppKit cannot enumerate the sole active display.
         if displayID == nil {
             var count: UInt32 = 0
-            if CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 {
+            if CGGetActiveDisplayList(0, nil, &count) == .success, count == 1 {
                 var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
                 if CGGetActiveDisplayList(count, &displays, &count) == .success {
                     displayID = displays[0]
@@ -762,7 +759,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         }
 
         // prefs 无有效设置 → 最后的回退：查 findImageURL（兼容旧状态）
-        if let imageURL = findImageURL(sourceID: instanceID) {
+        if let imageURL = findImageURL(sourceID: "display-\(displayID)") {
             renderStaticImage(
                 imageURL: imageURL,
                 displayID: displayID,
@@ -781,51 +778,11 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         doReply("fallback no resource")
     }
 
-    /// 从共享 prefs 读取视频 URL。多显示器场景下优先按 displayID 取 per-display 路径，
-    /// 没有则回退到 legacy 全局 `currentVideoPath`（向后兼容）。
-    /// - Parameter displayID: 可选。提供时优先查 `currentVideoPaths["display-<id>"]`。
-    private static func prefsVideoURL(for displayID: UInt32? = nil) -> URL? {
+    /// 从共享 prefs 读取此显示器的视频；仅旧版无按屏记录时使用全局路径。
+    private static func prefsVideoURL(for displayID: UInt32) -> URL? {
         struct MirroringPrefs: Decodable {
             let currentVideoPath: String?
             let currentVideoPaths: [String: String]?
-        }
-        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.waifux.app") else {
-            return nil
-        }
-        let prefsURL = container.appendingPathComponent("waifux-wallpaper-prefs.json")
-        guard let data = try? Data(contentsOf: prefsURL),
-              let prefs = try? JSONDecoder().decode(MirroringPrefs.self, from: data) else {
-            return nil
-        }
-        // 优先：per-display 路径
-        if let displayID, let perDisplay = prefs.currentVideoPaths?["display-\(displayID)"],
-           !perDisplay.isEmpty {
-            let url = URL(fileURLWithPath: perDisplay)
-            if FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-            extLog("[prefsVideoURL] ⚠️ per-display 路径不存在: display=\(displayID) path=\(perDisplay)")
-            // 多显示器模式下（currentVideoPaths 有条目），不回退到 legacy 全局路径，
-            // 否则会把另一个显示器的视频错放到当前显示器。
-            if let paths = prefs.currentVideoPaths, !paths.isEmpty {
-                return nil
-            }
-        }
-        // 回退：legacy 全局路径（仅在单显示器/旧模式下）
-        guard let path = prefs.currentVideoPath, !path.isEmpty else {
-            return nil
-        }
-        let url = URL(fileURLWithPath: path)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            extLog("[prefsVideoURL] ⚠️ legacy currentVideoPath 不存在: \(path)")
-            return nil
-        }
-        return url
-    }
-
-    /// 从共享 prefs 读取图片 URL。同 prefsVideoURL(for:)，优先 per-display 路径。
-    private static func prefsImageURL(for displayID: UInt32? = nil) -> URL? {
-        struct MirroringPrefs: Decodable {
             let currentImagePath: String?
             let currentImagePaths: [String: String]?
         }
@@ -837,26 +794,53 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
               let prefs = try? JSONDecoder().decode(MirroringPrefs.self, from: data) else {
             return nil
         }
-        // 优先：per-display 路径
-        if let displayID, let perDisplay = prefs.currentImagePaths?["display-\(displayID)"],
-           !perDisplay.isEmpty {
-            let url = URL(fileURLWithPath: perDisplay)
-            if FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-            extLog("[prefsImageURL] ⚠️ per-display 路径不存在: display=\(displayID) path=\(perDisplay)")
-            // 多显示器模式下（currentImagePaths 有条目），不回退到 legacy 全局路径。
-            if let paths = prefs.currentImagePaths, !paths.isEmpty {
-                return nil
-            }
-        }
-        // 回退：legacy 全局路径（仅在单显示器/旧模式下）
-        guard let path = prefs.currentImagePath, !path.isEmpty else {
+        guard let path = LockScreenSourceSelection.path(
+            for: .video,
+            displayID: displayID,
+            videoPaths: prefs.currentVideoPaths,
+            imagePaths: prefs.currentImagePaths,
+            legacyVideoPath: prefs.currentVideoPath,
+            legacyImagePath: prefs.currentImagePath
+        ) else {
             return nil
         }
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            extLog("[prefsImageURL] ⚠️ legacy currentImagePath 不存在: \(path)")
+            extLog("[prefsVideoURL] ⚠️ 视频路径不存在: display=\(displayID) path=\(path)")
+            return nil
+        }
+        return url
+    }
+
+    /// 从共享 prefs 读取图片 URL。同 prefsVideoURL(for:)，优先 per-display 路径。
+    private static func prefsImageURL(for displayID: UInt32) -> URL? {
+        struct MirroringPrefs: Decodable {
+            let currentVideoPath: String?
+            let currentVideoPaths: [String: String]?
+            let currentImagePath: String?
+            let currentImagePaths: [String: String]?
+        }
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.waifux.app") else {
+            return nil
+        }
+        let prefsURL = container.appendingPathComponent("waifux-wallpaper-prefs.json")
+        guard let data = try? Data(contentsOf: prefsURL),
+              let prefs = try? JSONDecoder().decode(MirroringPrefs.self, from: data) else {
+            return nil
+        }
+        guard let path = LockScreenSourceSelection.path(
+            for: .image,
+            displayID: displayID,
+            videoPaths: prefs.currentVideoPaths,
+            imagePaths: prefs.currentImagePaths,
+            legacyVideoPath: prefs.currentVideoPath,
+            legacyImagePath: prefs.currentImagePath
+        ) else {
+            return nil
+        }
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            extLog("[prefsImageURL] ⚠️ 图片路径不存在: display=\(displayID) path=\(path)")
             return nil
         }
         return url
@@ -1046,10 +1030,16 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         let hostUnavailable = prefs.isAppHostTerminated
             && !WallpaperState.shared.isScreenLocked
             && !WallpaperState.shared.isDisplayAsleep
-        let effectivePresentationMode = hostUnavailable ? "active" : presentationMode
+        let effectivePresentationMode = PlaybackPolicy.effectivePresentationMode(
+            agentMode: presentationMode,
+            isScreenLocked: WallpaperState.shared.isScreenLocked,
+            hostUnavailable: hostUnavailable
+        )
         let effectiveActivityState = hostUnavailable ? "active" : activityState
-        WallpaperState.shared.presentationMode = effectivePresentationMode
-        WallpaperState.shared.activityState = effectiveActivityState
+        // Preserve the agent's raw mode so the unlock notification can remove
+        // the lock override without waiting for another XPC update.
+        WallpaperState.shared.presentationMode = presentationMode
+        WallpaperState.shared.activityState = activityState
 
         let power = PowerMonitor.shared.currentState
         let basePolicy = PlaybackPolicy.compute(

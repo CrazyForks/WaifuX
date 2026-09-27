@@ -7,7 +7,7 @@ import Foundation
 /// 屏保集成。
 ///
 /// 结构对齐 MirageWallpaper 的 `ScreenSaverManager`：
-/// - 组件安装在 `~/Library/Screen Savers/WaifuXScreenSaver.saver`（系统只从该目录加载用户屏保）；
+/// - 组件以本地化文件名安装在 `~/Library/Screen Savers`（系统只从该目录加载用户屏保）；
 /// - 配置写在 `~/Library/Application Support/WaifuX/screensaver.json`，屏保自己读，主程序不必常驻；
 /// - 替换组件前后终止系统屏保宿主进程，否则旧二进制会一直留在内存里。
 ///
@@ -20,9 +20,21 @@ final class ScreenSaverService: ObservableObject {
 
     /// 与 `WaifuXScreenSaver/SaverConfiguration.swift` 的 `supportedVersion` 保持一致。
     static let configurationVersion = 1
+    /// 构建产物和内部可执行文件沿用稳定名称；系统列表可见的安装文件名按语言选择。
     static let saverBundleName = "WaifuXScreenSaver.saver"
     static let saverExecutableName = "WaifuXScreenSaver"
     static let saverBundleIdentifier = "com.waifux.app.screensaver"
+    private static let installedBundleNames = [
+        "WaifuX屏保服务.saver",
+        "WaifuX Screen Saver Service.saver",
+        "WaifuXスクリーンセーバーサービス.saver"
+    ]
+    private static var localizedInstalledBundleName: String {
+        let language = Locale.preferredLanguages.first?.lowercased() ?? "en"
+        if language.hasPrefix("zh") { return installedBundleNames[0] }
+        if language.hasPrefix("ja") { return installedBundleNames[2] }
+        return installedBundleNames[1]
+    }
     /// 配置写入后广播，让正在运行的屏保热重载。
     static let configurationChangedNotification = Notification.Name("com.waifux.app.screensaver.configurationChanged")
 
@@ -53,8 +65,8 @@ final class ScreenSaverService: ObservableObject {
     }
 
     /// 可以作为屏保的壁纸。
-    struct Candidate: Identifiable, Hashable {
-        enum Kind: String, Hashable {
+    struct Candidate: Identifiable, Hashable, Sendable {
+        enum Kind: String, Hashable, Sendable {
             case video
             case scene
             case web
@@ -93,9 +105,12 @@ final class ScreenSaverService: ObservableObject {
 
     private let fm = FileManager.default
     private var cancellables = Set<AnyCancellable>()
+    private var syncTask: Task<Void, Never>?
+    private var pendingCandidate: Candidate?
+    private var syncGeneration = UUID()
 
     private init() {
-        isInstalled = fm.fileExists(atPath: installedURL.path)
+        isInstalled = !installedManagedSaverURLs.isEmpty
         refreshConfiguredState()
         installFollowObservers()
     }
@@ -132,26 +147,59 @@ final class ScreenSaverService: ObservableObject {
     @discardableResult
     func syncFromDesktop(reason: String, force: Bool = false) -> Bool {
         guard let candidate = desktopCandidate() else {
+            syncTask?.cancel()
+            syncTask = nil
+            pendingCandidate = nil
+            syncGeneration = UUID()
             print("[ScreenSaverService] 当前没有可用作屏保的桌面壁纸 (\(reason))，保留现有配置")
             return false
         }
-        if !force, isConfigured(as: candidate) { return true }
-        do {
-            try apply(candidate)
-            print("[ScreenSaverService] 屏保已跟随桌面壁纸 (\(reason)): \(candidate.title)")
+        if !force, isConfigured(as: candidate) {
+            syncTask?.cancel()
+            syncTask = nil
+            pendingCandidate = nil
+            syncGeneration = UUID()
             return true
-        } catch {
-            print("[ScreenSaverService] 屏保同步失败 (\(reason)): \(error.localizedDescription)")
-            return false
         }
+        if !force, pendingCandidate == candidate { return true }
+        syncTask?.cancel()
+        pendingCandidate = candidate
+        let generation = UUID()
+        syncGeneration = generation
+        syncTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if syncGeneration == generation {
+                    pendingCandidate = nil
+                    syncTask = nil
+                }
+            }
+            do {
+                try await apply(candidate, generation: generation)
+                print("[ScreenSaverService] 屏保已跟随桌面壁纸 (\(reason)): \(candidate.title)")
+            } catch is CancellationError {
+                // 桌面壁纸已经再次变化；新任务负责写入最终配置。
+            } catch {
+                print("[ScreenSaverService] 屏保同步失败 (\(reason)): \(error.localizedDescription)")
+            }
+        }
+        return true
     }
 
     /// 设置页「立即同步」：强制重写配置，用于修复被手动改动/损坏的 screensaver.json。
-    func syncNow() throws {
+    func syncNow() async throws {
         guard let candidate = desktopCandidate() else {
             throw ScreenSaverError.noDesktopWallpaper
         }
-        try apply(candidate)
+        syncTask?.cancel()
+        syncTask = nil
+        pendingCandidate = candidate
+        let generation = UUID()
+        syncGeneration = generation
+        defer {
+            if syncGeneration == generation { pendingCandidate = nil }
+        }
+        try await apply(candidate, generation: generation)
     }
 
     /// 当前桌面壁纸 → 屏保候选。主屏优先，其次任意活跃屏。
@@ -205,9 +253,14 @@ final class ScreenSaverService: ObservableObject {
     private func isConfigured(as candidate: Candidate) -> Bool {
         guard let data = try? Data(contentsOf: configurationURL),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (object["version"] as? Int) == Self.configurationVersion else { return false }
+              (object["version"] as? Int) == Self.configurationVersion,
+              let stagedURL = try? ScreenSaverMediaCache.stagedURL(
+                for: candidate.renderURL, in: mediaCacheURL
+              ) else { return false }
         return (object["itemID"] as? String) == candidate.id
-            && (object["renderPath"] as? String) == candidate.renderURL.path
+            && (object["renderSourcePath"] as? String) == candidate.renderURL.path
+            && (object["renderPath"] as? String) == stagedURL.path
+            && fm.fileExists(atPath: stagedURL.path)
     }
 
     // MARK: - 路径
@@ -215,7 +268,14 @@ final class ScreenSaverService: ObservableObject {
     var installedURL: URL {
         fm.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Screen Savers", isDirectory: true)
-            .appendingPathComponent(Self.saverBundleName)
+            .appendingPathComponent(Self.localizedInstalledBundleName)
+    }
+
+    private var installedManagedSaverURLs: [URL] {
+        let directory = installedURL.deletingLastPathComponent()
+        let names = [Self.saverBundleName] + Self.installedBundleNames
+        return names.map { directory.appendingPathComponent($0) }
+            .filter { fm.fileExists(atPath: $0.path) }
     }
 
     var configurationURL: URL {
@@ -224,7 +284,12 @@ final class ScreenSaverService: ObservableObject {
             .appendingPathComponent("screensaver.json")
     }
 
-    /// App 内随包分发的屏保组件（由 project.yml 的 Run Script 放进资源目录）。
+    private var mediaCacheURL: URL {
+        configurationURL.deletingLastPathComponent()
+            .appendingPathComponent("ScreenSaverMedia", isDirectory: true)
+    }
+
+    /// App 内随包分发的屏保组件（由 project.yml 的 Copy Files 阶段放进资源目录）。
     var bundledSaverURL: URL? {
         let candidates = [
             Bundle.main.resourceURL?.appendingPathComponent("Screen Savers/\(Self.saverBundleName)"),
@@ -261,6 +326,13 @@ final class ScreenSaverService: ObservableObject {
             throw ScreenSaverError.installationVerificationFailed
         }
 
+        // 旧的内部文件名与其他语言的安装文件名不能留在系统扫描目录中，
+        // 否则选择列表会出现两个 WaifuX 条目。只清理相同 bundle ID 的旧副本。
+        for obsoleteURL in installedManagedSaverURLs where obsoleteURL != installedURL {
+            guard Bundle(url: obsoleteURL)?.bundleIdentifier == Self.saverBundleIdentifier else { continue }
+            try fm.removeItem(at: obsoleteURL)
+        }
+
         // 替换完成后可能已有宿主被系统拉起并映射了新二进制，这里再停一次，
         // 保证下一次启动的宿主一定加载完整的新组件。
         try terminateScreenSaverHosts()
@@ -270,8 +342,9 @@ final class ScreenSaverService: ObservableObject {
     }
 
     func uninstall() throws {
-        if fm.fileExists(atPath: installedURL.path) {
-            try fm.removeItem(at: installedURL)
+        for url in installedManagedSaverURLs {
+            guard Bundle(url: url)?.bundleIdentifier == Self.saverBundleIdentifier else { continue }
+            try fm.removeItem(at: url)
         }
         try terminateScreenSaverHosts()
         isInstalled = false
@@ -281,9 +354,11 @@ final class ScreenSaverService: ObservableObject {
     /// 只替换 App 不会更新用户目录里的那份；版本号在开发期不变，
     /// 所以像 Mirage 一样比对组件指纹（Info.plist + 可执行文件 + CodeResources）而不是版本号。
     func refreshInstalledVersionIfNeeded() {
-        isInstalled = fm.fileExists(atPath: installedURL.path)
+        let existingURLs = installedManagedSaverURLs
+        isInstalled = !existingURLs.isEmpty
         guard isInstalled, let bundledURL = bundledSaverURL else { return }
         let needsRefresh: Bool = {
+            if existingURLs.contains(where: { $0 != installedURL }) { return true }
             guard let installedFingerprint = try? fingerprint(of: installedURL),
                   let bundledFingerprint = try? fingerprint(of: bundledURL) else {
                 // 指纹算不出来（组件损坏/被删）时按版本号兜底判断
@@ -307,10 +382,26 @@ final class ScreenSaverService: ObservableObject {
 
     /// 把一张壁纸写成屏保配置。屏保立即热重载；未安装组件时也会写，
     /// 用户之后安装组件即生效。
-    func apply(_ candidate: Candidate) throws {
+    private func apply(_ candidate: Candidate, generation: UUID) async throws {
         guard fm.fileExists(atPath: candidate.renderURL.path) else {
             throw ScreenSaverError.mediaMissing(candidate.title)
         }
+        // macOS 27 的 legacyScreenSaver 可以读配置，却可能无权让 AVPlayer 打开
+        // /Volumes 下的原视频（NSCocoaErrorDomain 257）。复制到配置旁的可读目录。
+        // 大视频的复制放后台，避免换壁纸时卡住 App 主线程。
+        let cacheURL = mediaCacheURL
+        let sourceURL = candidate.renderURL
+        let stagedURL = try await Task.detached(priority: .utility) {
+            try ScreenSaverMediaCache.stage(sourceURL, in: cacheURL)
+        }.value
+        try Task.checkCancellation()
+        guard syncGeneration == generation else { throw CancellationError() }
+        let previousRenderURL: URL? = {
+            guard let data = try? Data(contentsOf: configurationURL),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = object["renderPath"] as? String else { return nil }
+            return URL(fileURLWithPath: path)
+        }()
         var object: [String: Any] = [
             "version": Self.configurationVersion,
             "configuredAt": Date().timeIntervalSince1970,
@@ -319,7 +410,8 @@ final class ScreenSaverService: ObservableObject {
             "kind": candidate.kind.isStillImage ? "image" : "video",
             "sourceKind": candidate.kind.rawValue,
             "sourcePath": candidate.sourceURL.path,
-            "renderPath": candidate.renderURL.path,
+            "renderSourcePath": candidate.renderURL.path,
+            "renderPath": stagedURL.path,
             "fps": Self.animationFrameRate,
             "muted": true,
             "playbackRate": 1.0,
@@ -338,6 +430,7 @@ final class ScreenSaverService: ObservableObject {
         try data.write(to: configurationURL, options: .atomic)
         refreshConfiguredState()
         notifyConfigurationChanged()
+        ScreenSaverMediaCache.removeUnusedFiles(in: cacheURL, keeping: [stagedURL, previousRenderURL].compactMap { $0 })
     }
 
     /// 实时裁剪由 App Group 的 waifux-crop-prefs.json 承担（屏保按秒轮询），
@@ -363,8 +456,8 @@ final class ScreenSaverService: ObservableObject {
         )
     }
 
-    /// 屏保端动画回调频率。视频由 AVPlayer 自己驱动，
-    /// 这个值只决定裁剪热更新的轮询粒度，所以固定 30 即可。
+    /// 配置协议保留的帧率字段。视频由 AVPlayer 自己驱动，屏保端的
+    /// animateOneFrame 仅按秒检查裁剪，不能以这个值启动逐帧计时器。
     private static let animationFrameRate = 30
 
     private func cropPayload() throws -> [String: Any] {
@@ -549,6 +642,61 @@ final class ScreenSaverService: ObservableObject {
         // macOS 14 起「屏保」是墙纸设置里的一个区块，独立 ScreenSaver 面板会跳错页。
         if let url = URL(string: "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension") {
             NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+/// 系统 legacyScreenSaver 可以读取 WaifuX 的配置目录，但 AVFoundation 读取外置卷
+/// 或受保护目录中的原文件会被宿主沙盒拒绝。缓存按路径、大小和修改时间命名，
+/// 同一份媒体只复制一次；先写临时文件，再公布最终路径。
+private enum ScreenSaverMediaCache {
+    static func stagedURL(for sourceURL: URL, in directory: URL) throws -> URL {
+        let attributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+        guard let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date,
+              size.int64Value > 0 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let identity = "\(sourceURL.standardizedFileURL.path)\n\(size.int64Value)\n\(modified.timeIntervalSince1970.bitPattern)"
+        let digest = SHA256.hash(data: Data(identity.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent(digest)
+            .appendingPathExtension(sourceURL.pathExtension.lowercased())
+    }
+
+    static func stage(_ sourceURL: URL, in directory: URL) throws -> URL {
+        let fm = FileManager.default
+        let destination = try stagedURL(for: sourceURL, in: directory)
+        let sourceSize = try fm.attributesOfItem(atPath: sourceURL.path)[.size] as? NSNumber
+        if let cachedSize = try? fm.attributesOfItem(atPath: destination.path)[.size] as? NSNumber,
+           cachedSize == sourceSize {
+            return destination
+        }
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let temporary = directory.appendingPathComponent(".\(UUID().uuidString).partial")
+        defer { try? fm.removeItem(at: temporary) }
+        try fm.copyItem(at: sourceURL, to: temporary)
+        let copiedSize = try fm.attributesOfItem(atPath: temporary.path)[.size] as? NSNumber
+        guard copiedSize == sourceSize,
+              try stagedURL(for: sourceURL, in: directory) == destination else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        if fm.fileExists(atPath: destination.path) {
+            try fm.removeItem(at: destination)
+        }
+        try fm.moveItem(at: temporary, to: destination)
+        return destination
+    }
+
+    static func removeUnusedFiles(in directory: URL, keeping urls: [URL]) {
+        let fm = FileManager.default
+        let kept = Set(urls.map(\.standardizedFileURL))
+        guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+        for url in files where !kept.contains(url.standardizedFileURL) {
+            let name = url.deletingPathExtension().lastPathComponent
+            guard name.utf8.count == 64,
+                  name.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) }) else { continue }
+            try? fm.removeItem(at: url)
         }
     }
 }

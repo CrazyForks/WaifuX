@@ -17,6 +17,20 @@ enum PlaybackPolicy: Int, Sendable, Comparable {
         lhs.rawValue < rhs.rawValue
     }
 
+    /// WallpaperAgent updates the desktop and lock-screen instances separately.
+    /// A covered desktop update must not replace the visible lock-screen policy.
+    static func effectivePresentationMode(
+        agentMode: String,
+        isScreenLocked: Bool,
+        hostUnavailable: Bool
+    ) -> String {
+        if hostUnavailable { return "active" }
+        if isScreenLocked { return "locked" }
+        // Unlock notifications can arrive before the agent updates its last
+        // locked instance; do not keep playing that stale lock-screen mode.
+        return agentMode == "locked" ? "default" : agentMode
+    }
+
     /// 综合评估所有条件并返回最严格的适用策略。
     ///
     /// `alwaysPauseDesktop`: 为 true 时壁纸仅在锁屏播放。

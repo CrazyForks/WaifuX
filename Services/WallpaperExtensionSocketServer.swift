@@ -138,6 +138,13 @@ final class WallpaperExtensionSocketServer: @unchecked Sendable {
         os_log(.info, log: appLog, "已清空所有挂起命令")
     }
 
+    /// 视频全量重同步时只淘汰旧视频切换。另一块屏刚入队的静态图
+    /// 切换仍需交给扩展处理，不能被全局清空。
+    func clearVideoCommands() {
+        cmdLock.withLock { $0.removeAll { $0.action == "switch_video" } }
+        os_log(.info, log: appLog, "已清空挂起的视频切换命令")
+    }
+
     /// 注册扩展本地解码可直接读取的视频路径。
     func registerLocalDecodeVideo(videoID: String, videoURL: URL) {
         localDecodeVideoLock.withLock { $0[videoID] = videoURL }

@@ -300,7 +300,12 @@ final class VideoRenderer: @unchecked Sendable {
     }
 
     func resume() {
-        guard isPaused else { return }
+        // A ramp-down can be cancelled before it sets isPaused. Restore the
+        // timebase even then, or playback stays at the ramp's last slow rate.
+        guard isPaused else {
+            CMTimebaseSetRate(timebase, rate: 1.0)
+            return
+        }
         isPaused = false
         cancelDeepPauseTimer()
         stillFrameLayer.opacity = 0

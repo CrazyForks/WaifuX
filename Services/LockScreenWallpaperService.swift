@@ -8,6 +8,7 @@
 
 import AVFoundation
 import Combine
+import CryptoKit
 import Foundation
 import AppKit
 import CoreGraphics
@@ -593,16 +594,21 @@ final class LockScreenWallpaperService: ObservableObject {
             return
         }
 
+        // Different library items can have the same filename (for example, two
+        // Workshop bake outputs named video.mp4). Keep their shared-cache paths distinct.
+        let digest = SHA256.hash(data: Data(videoURL.standardizedFileURL.path.utf8))
+        let sourceID = "\(videoID)-\(digest.prefix(12).map { String(format: "%02x", $0) }.joined())"
+
         do {
             // 把 displayIDs 传给 cacheMirroringSource，写入 per-display 路径映射，
             // 使扩展在冷启动 acquire 时能按屏各自选到正确的视频。
-            try await cacheMirroringSource(videoURL: videoURL, videoID: videoID, displayIDs: displayIDs, notify: false)
+            try await cacheMirroringSource(videoURL: videoURL, videoID: sourceID, displayIDs: displayIDs, notify: false)
         } catch {
             print("[LockScreenWallpaper] ❌ 本地解码视频缓存失败: \(error.localizedDescription)")
             return
         }
 
-        copyVideoThumbnailToDisplayThumbnails(videoID: videoID, displayIDs: displayIDs)
+        copyVideoThumbnailToDisplayThumbnails(videoID: sourceID, displayIDs: displayIDs)
         syncInstanceCatalogToSocketServer(notify: false)
 
         // 再次检查世代（file I/O 期间可能又有新切换）
@@ -613,12 +619,12 @@ final class LockScreenWallpaperService: ObservableObject {
 
         for displayID in displayIDs {
             WallpaperExtensionSocketServer.shared.enqueueCommand(
-                IPCCommand(action: "switch_video", videoID: videoID, displayID: displayID),
+                IPCCommand(action: "switch_video", videoID: sourceID, displayID: displayID),
                 generation: generation
             )
         }
         notifyExtensionPrefsChanged()
-        print("[LockScreenWallpaper] 🔁 已请求扩展自解码切换 display=\(displayIDs) video=\(videoID) gen=\(generation)")
+        print("[LockScreenWallpaper] 🔁 已请求扩展自解码切换 display=\(displayIDs) video=\(sourceID) gen=\(generation)")
     }
 
     /// 清掉历史版本写入的实时帧源标记。当前 Web 锁屏只走静态图链路。

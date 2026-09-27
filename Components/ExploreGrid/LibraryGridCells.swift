@@ -32,8 +32,8 @@ enum LibraryCoverImageCache {
         cache.memoryStorage.config.expiration = .seconds(30 * 60)    // 30 min
         cache.memoryStorage.config.cleanInterval = 60
         // 磁盘独立小缓存：512 降采样 JPEG 体积很小；远程 thumb 首次迁移会重下一次。
-        cache.diskStorage.config.sizeLimit = 300 * 1024 * 1024
-        cache.diskStorage.config.expiration = .days(7)
+        cache.diskStorage.config.sizeLimit = 500 * 1024 * 1024
+        cache.diskStorage.config.expiration = .days(30)
         return cache
     }()
 
@@ -384,6 +384,9 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
     /// 需要自己记住当前源，避免详情返回/状态刷新时重复 setImage 造成闪屏。
     private var coverSourceKey: String?
     private var coverLoadGeneration = 0
+    private var coverRetryCount = 0
+    private var coverRetrySourceKey: String?
+    private var coverRetryTask: Task<Void, Never>?
 
     private let bottomBar: NSView = {
         let view = NSView()
@@ -446,8 +449,12 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
         currentModel = nil
         titleLabel.stringValue = ""
         coverImageView.kf.cancelDownloadTask()
+        coverRetryTask?.cancel()
+        coverRetryTask = nil
         coverSourceKey = nil
         coverLoadGeneration &+= 1
+        coverRetryCount = 0
+        coverRetrySourceKey = nil
         localThumbEnsureTask?.cancel()
         localThumbEnsureTask = nil
         if let token = localThumbIdleToken {
@@ -463,6 +470,22 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
 
     override func configure(with item: Any, isFavorite: Bool) {
         guard let model = item as? LibraryWallpaperCellModel else { return }
+        if currentModel?.wallpaper.id != model.wallpaper.id {
+            localThumbEnsureTask?.cancel()
+            localThumbEnsureTask = nil
+            if let token = localThumbIdleToken {
+                LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+                localThumbIdleToken = nil
+            }
+            coverImageView.kf.cancelDownloadTask()
+            coverRetryTask?.cancel()
+            coverRetryTask = nil
+            coverSourceKey = nil
+            coverLoadGeneration &+= 1
+            coverRetryCount = 0
+            coverRetrySourceKey = nil
+            coverImageView.image = LibraryCoverImageCache.snapshot(forKey: model.wallpaper.id)
+        }
         currentModel = model
         if model.isEditing {
             clearHover(animated: false)
@@ -671,6 +694,11 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
         guard currentModel?.wallpaper.id == model.wallpaper.id else { return }
         let sourceKey = candidates.first?.absoluteString ?? "<empty>"
         guard sourceKey != coverSourceKey else { return }
+        if sourceKey != coverRetrySourceKey {
+            coverRetryTask?.cancel()
+            coverRetryCount = 0
+            coverRetrySourceKey = sourceKey
+        }
 
         coverSourceKey = sourceKey
         coverLoadGeneration &+= 1
@@ -695,6 +723,8 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
             if index == 0 {
                 // 无任何候选：保留现有图，避免详情返回或后台刷新时出现黑闪。
                 coverSourceKey = nil
+            } else if coverLoadGeneration == generation {
+                retryCoverAfterFailure(model: model)
             }
             return
         }
@@ -710,6 +740,10 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
                 switch result {
                 case .success(let value):
                     LibraryCoverImageCache.storeSnapshot(value.image, forKey: model.wallpaper.id)
+                    if self?.coverLoadGeneration == generation {
+                        self?.coverRetryTask?.cancel()
+                        self?.coverRetryTask = nil
+                    }
                 case .failure:
                     guard let self,
                           self.coverLoadGeneration == generation,
@@ -723,6 +757,22 @@ final class LibraryWallpaperGridCell: ExploreGridItem {
                 }
             }
         )
+    }
+
+    private func retryCoverAfterFailure(model: LibraryWallpaperCellModel) {
+        guard coverRetryCount < 2 else { return }
+        coverRetryCount += 1
+        let generation = coverLoadGeneration
+        let delay = coverRetryCount == 1 ? 1.0 : 3.0
+        coverRetryTask?.cancel()
+        coverRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self,
+                  self.coverLoadGeneration == generation,
+                  self.currentModel?.wallpaper.id == model.wallpaper.id else { return }
+            self.coverSourceKey = nil
+            self.loadCoverImages(model: model)
+        }
     }
 
     /// 外置原图 → 本机 SSD 512 列表缩略图；有远程 thumb 时列表先显示远程，滚停后再补本地缓存。
@@ -874,6 +924,9 @@ final class LibraryMediaGridCell: ExploreGridItem {
     private var coverSourceKey: String?
     private var coverLoadGeneration = 0
     private var shouldRestoreHoverAfterConfigure = false
+    private var coverRetryCount = 0
+    private var coverRetrySourceKey: String?
+    private var coverRetryTask: Task<Void, Never>?
 
     private let bottomBar: NSView = {
         let view = NSView()
@@ -978,8 +1031,12 @@ final class LibraryMediaGridCell: ExploreGridItem {
         currentModel = nil
         titleLabel.stringValue = ""
         coverImageView.kf.cancelDownloadTask()
+        coverRetryTask?.cancel()
+        coverRetryTask = nil
         coverSourceKey = nil
         coverLoadGeneration &+= 1
+        coverRetryCount = 0
+        coverRetrySourceKey = nil
         resolvedThumbnailURL = nil
         thumbnailRefreshTask?.cancel()
         thumbnailRefreshTask = nil
@@ -1005,6 +1062,20 @@ final class LibraryMediaGridCell: ExploreGridItem {
             // 复用时不能把旧卡的 hover 直接带给新项目；滚动中的 hover
             // 由 coordinator 在滚停后根据真实鼠标位置统一恢复。
             shouldRestoreHoverAfterConfigure = !LibraryScrollHoverGate.shared.isScrolling && isHovered
+            coverImageView.kf.cancelDownloadTask()
+            coverRetryTask?.cancel()
+            coverRetryTask = nil
+            coverSourceKey = nil
+            coverLoadGeneration &+= 1
+            coverRetryCount = 0
+            coverRetrySourceKey = nil
+            coverImageView.image = LibraryCoverImageCache.snapshot(forKey: model.itemID)
+            thumbnailRefreshTask?.cancel()
+            thumbnailRefreshTask = nil
+            if let token = thumbnailIdleToken {
+                LibraryScrollHoverGate.shared.cancelIdleWork(token: token)
+                thumbnailIdleToken = nil
+            }
             teardownHoverGIFPlayback()
             resolvedGIFURL = nil
             resolvedGIFItemID = nil
@@ -1144,6 +1215,11 @@ final class LibraryMediaGridCell: ExploreGridItem {
         guard currentModel?.itemID == model.itemID else { return }
         let sourceKey = candidates.first?.absoluteString ?? "<empty>"
         guard sourceKey != coverSourceKey else { return }
+        if sourceKey != coverRetrySourceKey {
+            coverRetryTask?.cancel()
+            coverRetryCount = 0
+            coverRetrySourceKey = sourceKey
+        }
 
         coverSourceKey = sourceKey
         coverLoadGeneration &+= 1
@@ -1171,6 +1247,8 @@ final class LibraryMediaGridCell: ExploreGridItem {
             if index == 0 {
                 // 保留已有封面，失败时不要在详情返回/后台刷新期间闪成空白。
                 coverSourceKey = nil
+            } else if coverLoadGeneration == generation {
+                retryCoverAfterFailure(model: model)
             }
             return
         }
@@ -1201,6 +1279,10 @@ final class LibraryMediaGridCell: ExploreGridItem {
                 switch result {
                 case .success(let value):
                     LibraryCoverImageCache.storeSnapshot(value.image, forKey: model.itemID)
+                    if self?.coverLoadGeneration == generation {
+                        self?.coverRetryTask?.cancel()
+                        self?.coverRetryTask = nil
+                    }
                 case .failure:
                     guard let self,
                           self.coverLoadGeneration == generation,
@@ -1214,6 +1296,22 @@ final class LibraryMediaGridCell: ExploreGridItem {
                 }
             }
         )
+    }
+
+    private func retryCoverAfterFailure(model: LibraryMediaCellModel) {
+        guard coverRetryCount < 2 else { return }
+        coverRetryCount += 1
+        let generation = coverLoadGeneration
+        let delay = coverRetryCount == 1 ? 1.0 : 3.0
+        coverRetryTask?.cancel()
+        coverRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self,
+                  self.coverLoadGeneration == generation,
+                  self.currentModel?.itemID == model.itemID else { return }
+            self.coverSourceKey = nil
+            self.loadCoverImages(preferredURL: self.resolvedThumbnailURL, model: model)
+        }
     }
 
     // MARK: hover GIF
@@ -1590,6 +1688,9 @@ final class LibraryFolderGridCell: ExploreGridItem {
     /// 各叠图槽位当前已加载的 URL key：reload token 变化会高频 reconfigure 可见 cell，
     /// 重复 kf.setImage（即使命中内存缓存也会异步重设图层）是文件夹卡闪动的主因。
     private var previewLoadedKeys: [String?] = [nil, nil, nil, nil]
+    private var previewRetryKeys: [String?] = [nil, nil, nil, nil]
+    private var previewRetryCounts = [0, 0, 0, 0]
+    private var previewRetryTasks: [Task<Void, Never>?] = [nil, nil, nil, nil]
     private var previewTargetSize: CGSize = .zero
 
     /// 当前是否处于「锁定且未解锁」的模糊展示态
@@ -1784,6 +1885,10 @@ final class LibraryFolderGridCell: ExploreGridItem {
         }
         for index in previewLoadedKeys.indices {
             previewLoadedKeys[index] = nil
+            previewRetryKeys[index] = nil
+            previewRetryCounts[index] = 0
+            previewRetryTasks[index]?.cancel()
+            previewRetryTasks[index] = nil
         }
         previewCanvasView.layer?.filters = nil
         previewTargetSize = .zero
@@ -1824,10 +1929,9 @@ final class LibraryFolderGridCell: ExploreGridItem {
             self?.isDropTarget = isTargeted
         }
 
-        configureStackPreviews(urls: model.previewURLs)
-
         if containerView.bounds.width > 0, containerView.bounds.height > 0 {
             layoutContentFrames()
+            configureStackPreviews(urls: model.previewURLs)
         } else {
             view.needsLayout = true
             containerView.needsLayout = true
@@ -1856,6 +1960,10 @@ final class LibraryFolderGridCell: ExploreGridItem {
 
         for (index, preview) in stackPreviewViews.enumerated() {
             guard index < activeURLs.count else {
+                previewRetryTasks[index]?.cancel()
+                previewRetryTasks[index] = nil
+                previewRetryKeys[index] = nil
+                previewRetryCounts[index] = 0
                 preview.isHidden = true
                 preview.image = nil
                 previewLoadedKeys[index] = nil
@@ -1866,11 +1974,15 @@ final class LibraryFolderGridCell: ExploreGridItem {
             let snapshotKey = "folder|\(activeURLs[index].absoluteString)"
             let key = "\(activeURLs[index].absoluteString)|\(Int(targetSize.width))x\(Int(targetSize.height))"
             guard previewLoadedKeys[index] != key else { continue }
-            previewLoadedKeys[index] = key
-            // 网格重建后的新 cell 叠图从 nil 起步：先同步回填快照再走异步加载。
-            if preview.image == nil {
-                preview.image = LibraryCoverImageCache.snapshot(forKey: snapshotKey)
+            if previewRetryKeys[index] != key {
+                previewRetryTasks[index]?.cancel()
+                previewRetryTasks[index] = nil
+                previewRetryCounts[index] = 0
+                previewRetryKeys[index] = key
             }
+            previewLoadedKeys[index] = key
+            // URL 切换时先回填对应快照，不能让复用槽位暂时显示上一张图。
+            preview.image = LibraryCoverImageCache.snapshot(forKey: snapshotKey)
             preview.kf.setImage(
                 with: activeURLs[index],
                 options: [
@@ -1878,14 +1990,35 @@ final class LibraryFolderGridCell: ExploreGridItem {
                     .targetCache(LibraryCoverImageCache.imageCache),
                     .backgroundDecode,
                     .keepCurrentImageWhileLoading,
+                    .retryStrategy(DelayRetryStrategy(maxRetryCount: 1, retryInterval: .seconds(0.5))),
                     .transition(.none)
                 ],
-                completionHandler: { result in
-                    if case .success(let value) = result {
+                completionHandler: { [weak self] result in
+                    switch result {
+                    case .success(let value):
                         LibraryCoverImageCache.storeSnapshot(value.image, forKey: snapshotKey)
+                    case .failure:
+                        self?.retryPreviewAfterFailure(index: index, key: key)
                     }
                 }
             )
+        }
+    }
+
+    private func retryPreviewAfterFailure(index: Int, key: String) {
+        guard previewLoadedKeys[index] == key,
+              previewRetryCounts[index] < 2 else { return }
+        previewRetryCounts[index] += 1
+        let delay = previewRetryCounts[index] == 1 ? 1.0 : 3.0
+        previewRetryTasks[index]?.cancel()
+        previewRetryTasks[index] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self,
+                  self.previewLoadedKeys[index] == key,
+                  let urls = self.currentModel?.previewURLs,
+                  urls.indices.contains(index) else { return }
+            self.previewLoadedKeys[index] = nil
+            self.configureStackPreviews(urls: urls)
         }
     }
 

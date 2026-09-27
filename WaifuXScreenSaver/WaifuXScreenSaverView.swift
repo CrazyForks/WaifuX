@@ -26,12 +26,13 @@ final class WaifuXScreenSaverView: ScreenSaverView {
     private var configuration: SaverConfiguration?
     private var didLoadWallpaper = false
     private var isAnimatingWallpaper = false
+    private var resumeAfterReattach = false
     private var isWaitingForLayout = false
     private var wallpaperLoadWorkItem: DispatchWorkItem?
     private var configurationReload: DispatchWorkItem?
     private var configurationRequestID = UUID()
     private var configurationObserver: NSObjectProtocol?
-    private var hostReportedSize = CGSize.zero
+    private var lastNormalizedScreenSize = CGSize.zero
 
     // MARK: - 渲染层
 
@@ -47,24 +48,27 @@ final class WaifuXScreenSaverView: ScreenSaverView {
     private var readyObservation: NSKeyValueObservation?
     private var statusObservation: NSKeyValueObservation?
     private var messageLabel: NSTextField?
+    private var playbackStarted = false
+    private var phaseSeekInFlight = false
     /// 下一次多屏相位核对的时间戳（挂钟秒）。
     private var nextPhaseCheckAt: TimeInterval = 0
 
     /// 媒体原始像素尺寸；未知时退化为"铺满屏幕"。
     private var mediaSize: CGSize = .zero
-    /// 上一次实际应用过的裁剪，用于按帧检测 App 侧改动。
+    /// 上一次实际应用过的裁剪，用于按秒检测 App 侧改动。
     private var appliedCrop: SaverCropSettings?
-    private var cropRefreshTick = 0
-
     // MARK: - 生命周期
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
+        // AVPlayerLayer 自己驱动视频帧；此计时器只负责裁剪热更新与低频相位核对。
+        animationTimeInterval = 1
         setUpLayers()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        animationTimeInterval = 1
         setUpLayers()
     }
 
@@ -86,22 +90,38 @@ final class WaifuXScreenSaverView: ScreenSaverView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { releaseWallpaper() } else { scheduleWallpaperLoad() }
+        if window == nil {
+            lastNormalizedScreenSize = .zero
+            if isAnimatingWallpaper {
+                stopAnimation()
+                resumeAfterReattach = true
+            } else {
+                releaseWallpaper()
+            }
+        } else if resumeAfterReattach {
+            // 只恢复曾经真正启动过的视图；系统设置创建的未启动缩略图不能自行播视频。
+            resumeAfterReattach = false
+            startAnimation()
+        } else {
+            scheduleWallpaperLoad()
+        }
     }
 
     override func startAnimation() {
+        guard !isAnimatingWallpaper else { return }
         super.startAnimation()
         isAnimatingWallpaper = true
         observeConfiguration()
         scheduleWallpaperLoad()
-        player?.playImmediately(atRate: configuration?.playbackRate ?? 1)
     }
 
     override func stopAnimation() {
+        resumeAfterReattach = false
+        guard isAnimatingWallpaper else { return }
+        isAnimatingWallpaper = false
         configurationRequestID = UUID()
         configurationReload?.cancel()
         configurationReload = nil
-        isAnimatingWallpaper = false
         releaseWallpaper()
         super.stopAnimation()
     }
@@ -136,14 +156,10 @@ final class WaifuXScreenSaverView: ScreenSaverView {
     }
 
     override func animateOneFrame() {
-        normalizeFullScreenBoundsIfNeeded()
+        guard isAnimatingWallpaper, window != nil else { return }
         // 裁剪是用户在 App 里随手拖的，改完不一定触发配置通知；
-        // 这里按秒轮询一次 App Group 里的实时值，做到不重启屏保就生效。
-        cropRefreshTick += 1
-        let fps = max(10, configuration?.fps ?? 30)
-        if cropRefreshTick % fps == 0 {
-            refreshCropIfNeeded()
-        }
+        // 屏保计时器每秒触发一次；视频帧由 AVPlayerLayer 独立驱动。
+        refreshCropIfNeeded()
         syncPlaybackPhaseIfNeeded()
     }
 
@@ -179,7 +195,6 @@ final class WaifuXScreenSaverView: ScreenSaverView {
             return
         }
         self.configuration = configuration
-        animationTimeInterval = 1.0 / Double(configuration.fps)
         Self.logger.info("Loading wallpaper title=\(configuration.title) kind=\(configuration.kind.rawValue) path=\(configuration.renderURL.path)")
         switch configuration.kind {
         case .video: loadVideo(configuration)
@@ -238,6 +253,7 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         player.isMuted = configuration.muted
         player.preventsDisplaySleepDuringVideoPlayback = false
         let looper = AVPlayerLooper(player: player, templateItem: item)
+        let playbackItem = player.currentItem ?? item
 
         let playerLayer = AVPlayerLayer(player: player)
         playerLayer.videoGravity = .resizeAspectFill
@@ -251,30 +267,32 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         self.looper = looper
         self.playerLayer = playerLayer
 
+        // AVQueuePlayer 对本地文件也可能等到 play 请求后才把首个循环 item
+        // 推进到 readyToPlay；先启动解码，随后在就绪回调中至多锁相一次。
+        player.playImmediately(atRate: configuration.playbackRate)
+
         readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
             guard layer.isReadyForDisplay else { return }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.playerLayer?.isReadyForDisplay == true else { return }
                 self.updateMediaSize()
                 self.hideMessage()
-                if self.isAnimatingWallpaper {
-                    self.playInSync(rate: configuration.playbackRate)
-                }
             }
         }
-        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+        statusObservation = playbackItem.observe(\.status, options: [.initial, .new]) { [weak self, weak player] item, _ in
             switch item.status {
             case .readyToPlay:
                 // readiness 回调（isReadyForDisplay）在部分宿主/预览场景下会迟到甚至不来，
                 // 所以解码器一就绪就补上媒体尺寸，避免首帧先按屏幕比例铺满再跳一下。
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, let player, self.player === player else { return }
                     self.updateMediaSize()
+                    self.startVideoPlaybackIfNeeded(rate: configuration.playbackRate)
                 }
             case .failed:
                 let reason = item.error?.localizedDescription ?? "unknown"
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self, let player, self.player === player else { return }
                     Self.logger.error("Screen saver video failed: \(reason)")
                     self.showMessage(self.localized("unplayableVideo"))
                 }
@@ -283,8 +301,8 @@ final class WaifuXScreenSaverView: ScreenSaverView {
             }
         }
 
-        if isAnimatingWallpaper {
-            playInSync(rate: configuration.playbackRate)
+        if playbackItem.status == .readyToPlay {
+            startVideoPlaybackIfNeeded(rate: configuration.playbackRate)
         }
     }
 
@@ -302,9 +320,11 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         return phase
     }
 
-    /// 起播前先 seek 到当前共享相位，抹掉各屏引擎启动时刻差。
-    private func playInSync(rate: Float) {
+    /// 首次就绪时只 seek 一次；重复的 readiness 回调不能打断已播放的视频。
+    private func startVideoPlaybackIfNeeded(rate: Float) {
+        guard isAnimatingWallpaper, !playbackStarted else { return }
         guard let player else { return }
+        playbackStarted = true
         let duration = player.currentItem?.duration.seconds ?? 0
         guard duration.isFinite, duration > 0 else {
             // 时长未知（流式/探测失败）时无从锁相，退回直接起播。
@@ -316,29 +336,41 @@ final class WaifuXScreenSaverView: ScreenSaverView {
             to: target,
             toleranceBefore: CMTime(seconds: 0.1, preferredTimescale: 600),
             toleranceAfter: CMTime(seconds: 0.1, preferredTimescale: 600)
-        ) { [weak player] _ in
-            player?.playImmediately(atRate: rate)
+        ) { [weak self, weak player] _ in
+            DispatchQueue.main.async {
+                guard let self, let player, self.player === player, self.isAnimatingWallpaper else { return }
+                player.playImmediately(atRate: rate)
+            }
         }
     }
 
-    /// 起播后按 2s 周期核对相位，偏差超过 0.35s 就轻推回共享相位，
-    /// 吸收各屏循环缝隙、解码停顿造成的慢漂移；阈值以下不动，避免可见跳动。
+    /// 仅在多屏实际播放且明显失步时校正。正常播放不做周期性 seek，
+    /// 否则解码器会反复丢弃缓冲帧，表现为每隔几秒卡一下。
     private func syncPlaybackPhaseIfNeeded() {
-        guard isAnimatingWallpaper, let player, player.rate > 0 else { return }
+        guard isAnimatingWallpaper, NSScreen.screens.count > 1, isFullScreenHostWindow,
+              !phaseSeekInFlight, let player, player.timeControlStatus == .playing else { return }
         let now = Date().timeIntervalSinceReferenceDate
         guard now >= nextPhaseCheckAt else { return }
-        nextPhaseCheckAt = now + 2
+        nextPhaseCheckAt = now + 30
         let duration = player.currentItem?.duration.seconds ?? 0
         guard duration.isFinite, duration > 0 else { return }
         let expected = synchronizedPhase(forDuration: duration)
-        var delta = player.currentTime().seconds - expected
+        let current = player.currentTime().seconds
+        guard current.isFinite, expected > 1, duration - expected > 1 else { return }
+        var delta = current - expected
         delta -= duration * (delta / duration).rounded()
-        if abs(delta) > 0.35 {
+        if abs(delta) > 1.5 {
+            phaseSeekInFlight = true
             player.seek(
                 to: CMTime(seconds: expected, preferredTimescale: 600),
-                toleranceBefore: CMTime(seconds: 0.08, preferredTimescale: 600),
-                toleranceAfter: CMTime(seconds: 0.08, preferredTimescale: 600)
-            )
+                toleranceBefore: CMTime(seconds: 0.25, preferredTimescale: 600),
+                toleranceAfter: CMTime(seconds: 0.25, preferredTimescale: 600)
+            ) { [weak self, weak player] _ in
+                DispatchQueue.main.async {
+                    guard let self, let player, self.player === player else { return }
+                    self.phaseSeekInFlight = false
+                }
+            }
         }
     }
 
@@ -444,6 +476,9 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         imageLayer = nil
         mediaSize = .zero
         appliedCrop = nil
+        playbackStarted = false
+        phaseSeekInFlight = false
+        nextPhaseCheckAt = 0
     }
 
     private func releaseWallpaper() {
@@ -462,7 +497,6 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         hideMessage()
         configuration = nil
         didLoadWallpaper = false
-        hostReportedSize = .zero
     }
 
     // MARK: - 布局兜底
@@ -470,10 +504,9 @@ final class WaifuXScreenSaverView: ScreenSaverView {
     /// 屏保宿主首帧可能给出与实际显示器不一致的 bounds（起屏动画期间尤其明显），
     /// 这里把 frame/bounds 归一到当前屏幕的逻辑尺寸，避免画面被拉伸或留边。
     private func normalizeFullScreenBoundsIfNeeded() {
-        if hostReportedSize == .zero {
-            hostReportedSize = bounds.size
-        }
-        guard !isPreview else { return }
+        // Tahoe/27 的 legacyScreenSaver 有时把预览错报为非预览；先验证宿主窗口
+        // 真的覆盖了显示器，避免把设置页中的小预览放大到全屏并反复触发布局。
+        guard isFullScreenHostWindow else { return }
         guard let screen = window?.screen ?? NSScreen.main else { return }
         guard screen.backingScaleFactor.isFinite, screen.backingScaleFactor > 0 else { return }
         let backingSize = screen.convertRectToBacking(screen.frame).size
@@ -483,6 +516,8 @@ final class WaifuXScreenSaverView: ScreenSaverView {
         )
         guard logicalSize.width.isFinite, logicalSize.height.isFinite,
               logicalSize.width > 0, logicalSize.height > 0 else { return }
+        guard !approximatelyEqual(lastNormalizedScreenSize, logicalSize) else { return }
+        lastNormalizedScreenSize = logicalSize
         if !approximatelyEqual(bounds.size, logicalSize) {
             var normalizedBounds = bounds
             normalizedBounds.size = logicalSize
@@ -505,13 +540,22 @@ final class WaifuXScreenSaverView: ScreenSaverView {
 
     private func displayPixelSize() -> CGSize? {
         guard let screen = window?.screen ?? NSScreen.main else { return nil }
-        let size = screen.convertRectToBacking(screen.frame).size
+        let size = isFullScreenHostWindow
+            ? screen.convertRectToBacking(screen.frame).size
+            : screen.convertRectToBacking(bounds).size
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return nil }
         return size
     }
 
+    private var isFullScreenHostWindow: Bool {
+        guard let window, let screen = window.screen else { return false }
+        let visible = window.frame.intersection(screen.frame)
+        return visible.width >= screen.frame.width * 0.9
+            && visible.height >= screen.frame.height * 0.9
+    }
+
     private var currentDisplayKey: String? {
-        guard !isPreview, let screen = window?.screen,
+        guard isFullScreenHostWindow, let screen = window?.screen,
               let displayID = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
         else { return nil }
         return saverDisplayKey(displayID)

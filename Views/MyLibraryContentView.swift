@@ -1074,10 +1074,12 @@ struct MyLibraryContentView: View {
         _ indexPaths: Set<IndexPath>,
         entries: [LibraryGridEntry<AnyWallpaperItem>]
     ) {
-        guard let maxIdx = indexPaths.map(\.item).max(), maxIdx < entries.count else { return }
-        guard case .item(let item) = entries[maxIdx] else { return }
+        guard let index = indexPaths.map(\.item).filter({ entries.indices.contains($0) }).sorted(by: >).first(where: {
+            if case .item = entries[$0] { return true }
+            return false
+        }), case .item(let item) = entries[index] else { return }
         libraryScrollRuntimeState.lastWallpaperItemID = item.id
-        preloadNearbyWallpapers(around: item)
+        preloadNearbyWallpapers(in: entries, at: index)
     }
 
     @MainActor
@@ -1873,10 +1875,12 @@ struct MyLibraryContentView: View {
         _ indexPaths: Set<IndexPath>,
         entries: [LibraryGridEntry<AnyMediaItem>]
     ) {
-        guard let maxIdx = indexPaths.map(\.item).max(), maxIdx < entries.count else { return }
-        guard case .item(let item) = entries[maxIdx] else { return }
+        guard let index = indexPaths.map(\.item).filter({ entries.indices.contains($0) }).sorted(by: >).first(where: {
+            if case .item = entries[$0] { return true }
+            return false
+        }), case .item(let item) = entries[index] else { return }
         libraryScrollRuntimeState.lastMediaItemID = item.id
-        preloadNearbyMedia(around: item)
+        preloadNearbyMedia(in: entries, at: index)
     }
 
     @MainActor
@@ -2207,13 +2211,15 @@ struct MyLibraryContentView: View {
     private func resumeLibraryPrefetchAfterScroll() {
         switch selectedContentType {
         case .wallpaper:
+            let entries = orderedWallpaperGridItems
             guard let id = libraryScrollRuntimeState.lastWallpaperItemID,
-                  let index = wallpaperIDIndexCache[id] else { return }
-            preloadNearbyWallpapers(at: index)
+                  let index = entries.firstIndex(where: { $0.id == id }) else { return }
+            preloadNearbyWallpapers(in: entries, at: index)
         case .video:
+            let entries = orderedMediaGridItems
             guard let id = libraryScrollRuntimeState.lastMediaItemID,
-                  let index = mediaIDIndexCache[id] else { return }
-            preloadNearbyMedia(at: index)
+                  let index = entries.firstIndex(where: { $0.id == id }) else { return }
+            preloadNearbyMedia(in: entries, at: index)
         case .anime:
             guard let id = libraryScrollRuntimeState.lastAnimeItemID,
                   let index = animeIDIndexCache[id] else { return }
@@ -2221,26 +2227,23 @@ struct MyLibraryContentView: View {
         }
     }
 
-    private func preloadNearbyWallpapers(around item: AnyWallpaperItem) {
-        guard let index = wallpaperIDIndexCache[item.id] else { return }
-        preloadNearbyWallpapers(at: index)
-    }
-
-    private func preloadNearbyWallpapers(at index: Int) {
+    private func preloadNearbyWallpapers(
+        in entries: [LibraryGridEntry<AnyWallpaperItem>], at index: Int
+    ) {
         // 快速滚动时跳过预取/SSD 生成，避免与滚动抢 I/O 与主线程
         guard !LibraryScrollHoverGate.shared.isScrolling,
-              wallpaperItems.indices.contains(index) else { return }
+              entries.indices.contains(index) else { return }
         let bucket = prefetchBucket(for: index)
         guard lastWallpaperPrefetchBucket != bucket else { return }
         lastWallpaperPrefetchBucket = bucket
 
         let targetSize = CGSize(width: 512, height: 512)
-        let range = prefetchRange(around: index, totalCount: wallpaperItems.count)
+        let range = prefetchRange(around: index, totalCount: entries.count)
         // 优先本机 SSD 列表缩略图 / 站点 thumb，绝不 prefetch 外置原图路径
         let urls = range
             .filter { $0 != index }
             .compactMap { idx -> URL? in
-                let entry = wallpaperItems[idx]
+                guard case .item(let entry) = entries[idx] else { return nil }
                 if let local = entry.localFileURL,
                    LocalImageThumbnailCache.isRasterImageFile(local),
                    let cached = LocalImageThumbnailCache.shared.cachedThumbnailURLIfExists(forLocalFile: local) {
@@ -2252,12 +2255,18 @@ struct MyLibraryContentView: View {
         ForegroundPrefetchManager.shared.stop(namespace: wallpaperPrefetchNamespace)
         ForegroundPrefetchManager.shared.start(
             urls: urls,
-            options: [.processor(DownsamplingImageProcessor(size: targetSize))],
+            options: [
+                .processor(DownsamplingImageProcessor(size: targetSize)),
+                .targetCache(LibraryCoverImageCache.imageCache)
+            ],
             namespace: wallpaperPrefetchNamespace
         )
 
         // 后台为附近静图生成 SSD 缩略图；滚动中不启动，滚停后由卡片 ensure 补齐
-        let nearbyLocals = range.compactMap { wallpaperItems[$0].localFileURL }
+        let nearbyLocals = range.compactMap { idx -> URL? in
+            guard case .item(let entry) = entries[idx] else { return nil }
+            return entry.localFileURL
+        }
             .filter { LocalImageThumbnailCache.isRasterImageFile($0) }
         if !nearbyLocals.isEmpty {
             Task { @MainActor in
@@ -2270,29 +2279,31 @@ struct MyLibraryContentView: View {
         }
     }
 
-    private func preloadNearbyMedia(around item: AnyMediaItem) {
-        guard let index = mediaIDIndexCache[item.id] else { return }
-        preloadNearbyMedia(at: index)
-    }
-
-    private func preloadNearbyMedia(at index: Int) {
+    private func preloadNearbyMedia(
+        in entries: [LibraryGridEntry<AnyMediaItem>], at index: Int
+    ) {
         guard !LibraryScrollHoverGate.shared.isScrolling,
-              currentMediaItems.indices.contains(index) else { return }
+              entries.indices.contains(index) else { return }
         let bucket = prefetchBucket(for: index)
         guard lastMediaPrefetchBucket != bucket else { return }
         lastMediaPrefetchBucket = bucket
 
         let targetSize = CGSize(width: 512, height: 512)
-        let range = prefetchRange(around: index, totalCount: currentMediaItems.count)
+        let range = prefetchRange(around: index, totalCount: entries.count)
         let urls = range
             .filter { $0 != index }
-            .map { currentMediaItems[$0] }
-            .map(\.thumbnailURL)
+            .compactMap { idx -> URL? in
+                guard case .item(let item) = entries[idx] else { return nil }
+                return item.thumbnailURL
+            }
 
         ForegroundPrefetchManager.shared.stop(namespace: mediaPrefetchNamespace)
         ForegroundPrefetchManager.shared.start(
             urls: urls,
-            options: [.processor(DownsamplingImageProcessor(size: targetSize))],
+            options: [
+                .processor(GIFAwareMiddleFrameImageProcessor(targetSize: targetSize, scaleFactor: 2)),
+                .targetCache(LibraryCoverImageCache.imageCache)
+            ],
             namespace: mediaPrefetchNamespace
         )
     }

@@ -1959,6 +1959,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         /// 仅裁切容器裁掉超出 viewport 的区域，WebView 本身始终保留完整逻辑尺寸。
         var cropContainer: NSView?
         var webView: WKWebView?
+        /// Keep the current Web wallpaper visible while its page is paused.
+        var pauseOverlay: NSImageView?
+        var isPaused: Bool = false
+        var pauseGeneration: UInt64 = 0
         var cropLayout: WebCropLayout = .full
         /// 乱序 socket 消息只允许前进，避免拖拽结束后被旧位置覆盖。
         var lastCropRevision: UInt64 = 0
@@ -2344,8 +2348,10 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     func pause(screen: Int = 0) {
-        guard let state = screenStates[screen] else { return }
-        state.window?.orderOut(nil)
+        guard let state = screenStates[screen], !state.isPaused else { return }
+        let pauseGeneration = state.pauseGeneration &+ 1
+        screenStates[screen]?.isPaused = true
+        screenStates[screen]?.pauseGeneration = pauseGeneration
         state.webView?.evaluateJavaScript("""
             document.querySelectorAll('video, audio').forEach(m => m.pause());
             document.querySelectorAll('*').forEach(el => {
@@ -2353,12 +2359,40 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 if (st.animationName !== 'none') el.style.animationPlayState = 'paused';
             });
         """) { _, _ in }
+        // Hiding the desktop window reveals the system poster, which can still
+        // belong to the previous item in an automatic rotation. Snapshot the
+        // current page instead and let WebKit throttle the hidden WebView.
+        guard state.isLoaded else { return }
+        let generation = state.firstFrameSettleGeneration
+        snapshotWebView(screen: screen) { [weak self] image in
+            guard let self,
+                  let image,
+                  let current = self.screenStates[screen],
+                  current.isPaused,
+                  current.firstFrameSettleGeneration == generation,
+                  current.pauseGeneration == pauseGeneration,
+                  let webView = current.webView,
+                  let cropContainer = current.cropContainer else { return }
+            let overlay = NSImageView(frame: webView.frame)
+            overlay.image = image
+            overlay.imageScaling = .scaleAxesIndependently
+            cropContainer.addSubview(overlay, positioned: .above, relativeTo: webView)
+            self.screenStates[screen]?.pauseOverlay?.removeFromSuperview()
+            self.screenStates[screen]?.pauseOverlay = overlay
+            webView.isHidden = true
+        }
     }
 
     func pauseAll() { for s in screenStates.keys { pause(screen: s) } }
 
     func resume(screen: Int = 0) {
-        guard let state = screenStates[screen], state.isLoaded else { return }
+        guard let state = screenStates[screen] else { return }
+        screenStates[screen]?.isPaused = false
+        screenStates[screen]?.pauseGeneration &+= 1
+        state.webView?.isHidden = false
+        state.pauseOverlay?.removeFromSuperview()
+        screenStates[screen]?.pauseOverlay = nil
+        guard state.isLoaded else { return }
         // 与首次加载保持一致：WebGL 壁纸在 desktop 层内必须前置才会持续合成。
         state.window?.orderFront(nil)
         state.webView?.evaluateJavaScript("""
@@ -2638,6 +2672,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             width: targetSize.width,
             height: targetSize.height
         )
+        state.pauseOverlay?.frame = webView.frame
 
         let transform = webRootTransform(
             targetSize: targetSize,
@@ -2670,6 +2705,9 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     func stop(screen: Int = 0) {
         guard var state = screenStates[screen] else { return }
         state.firstFrameSettleGeneration &+= 1
+        state.pauseOverlay?.removeFromSuperview()
+        state.pauseOverlay = nil
+        state.isPaused = false
         // 必须先调用 pendingCompletion 再置 nil，否则 IPC 响应永远不会发回给 CLI client
         // （CLI client 的 recv() 会一直阻塞直到 35s 超时）
         state.pendingCompletion?(false)
@@ -2738,7 +2776,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         let mouseLocation = NSEvent.mouseLocation
         for (_, state) in screenStates {
             // Offline bake uses a full-screen transparent window; never inject into it.
-            guard !state.isOffscreen, state.mouseCaptureSuppressionDepth == 0 else { continue }
+            guard !state.isOffscreen, !state.isPaused,
+                  state.mouseCaptureSuppressionDepth == 0 else { continue }
             guard state.isLoaded, let window = state.window, let webView = state.webView else { continue }
             guard window.frame.contains(mouseLocation) else { continue }
             let relX = mouseLocation.x - window.frame.origin.x

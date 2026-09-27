@@ -280,6 +280,28 @@ final class AppLogger: @unchecked Sendable {
             sequence += 1
         }
         try FileManager.default.copyItem(at: sourceURL, to: destination)
+        // 锁屏视频由独立的 Wallpaper Extension 播放。主 App 的日志没有
+        // reader 循环、解码失败和 WallpaperAgent update，诊断时需要同一份导出。
+        if let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.com.waifux.app"
+        ) {
+            let extensionLog = container.appendingPathComponent("waifux-extension.log")
+            if let input = try? FileHandle(forReadingFrom: extensionLog) {
+                defer { try? input.close() }
+                let end = input.seekToEndOfFile()
+                let maxBytes: UInt64 = 2 * 1024 * 1024
+                input.seek(toFileOffset: end > maxBytes ? end - maxBytes : 0)
+                let data = input.readData(ofLength: Int(min(end, maxBytes)))
+                if !data.isEmpty,
+                   let output = try? FileHandle(forWritingTo: destination) {
+                    defer { try? output.close() }
+                    output.seekToEndOfFile()
+                    let header = "\n--- WALLPAPER EXTENSION LOG (last 2 MiB) ---\n"
+                    output.write(Data(header.utf8))
+                    output.write(Data(String(decoding: data, as: UTF8.self).utf8))
+                }
+            }
+        }
         // wgpu 渲染器自身的 stdout/stderr 落在 Caches/com.waifux.wallpaperengine/renderer-logs
         // （每屏一个文件，GPU init 失败/panic/事件循环异常只在这里）。一并 zip 到桌面，
         // wgpu 内部问题才能随「导出日志」送达，否则排查渲染器只能看到宿主侧观测。
