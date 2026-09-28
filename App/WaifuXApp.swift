@@ -42,6 +42,7 @@ enum WindowSpaceCoordinator {
 
         prepare(window)
         window.makeKeyAndOrderFront(nil)
+        MainWindowVisibility.shared.refresh()
         if activate {
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -365,7 +366,7 @@ struct WaifuXApp {
 }
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency SPUStandardUserDriverDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcurrency SPUStandardUserDriverDelegate, @preconcurrency SPUUpdaterDelegate {
     var window: NSWindow?
     // ⚠️ 延迟初始化 SettingsViewModel，不在 AppDelegate 属性初始化阶段创建
     // 避免其 @Published didSet 在 applicationDidFinishLaunching 之前写 UserDefaults
@@ -445,9 +446,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         setupLayoutExceptionHandler()
 
         // 初始化 Sparkle 自动更新（检测 + 内置弹窗 + 自动安装）
+        // 拆架构分发：appcast 每个版本有 arm64 / x86_64 两个 item（sparkle:channel），
+        // 这里按当前包架构声明 allowedChannels，Sparkle 只会选中对应架构的更新包。
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
-            updaterDelegate: nil,
+            updaterDelegate: self,
             userDriverDelegate: self
         )
 
@@ -583,6 +586,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
         updaterController.checkForUpdates(nil)
     }
 
+    /// Sparkle 按架构分发：只接受与当前包架构一致的 channel。
+    /// appcast 中每个版本的 item 带 <sparkle:channel>arm64|x86_64</sparkle:channel>，
+    /// 旧版 universal 客户端未声明 channel，会自动忽略所有带 channel 的 item（不会误装错架构包）。
+    func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        [WallpaperEngineAvailability.currentArchitecture]
+    }
+
     func standardUserDriverWillShowModalAlert() {
         hideSettingsWindowForUpdateCheck()
     }
@@ -638,6 +648,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
 
             LocalizationService.shared.restoreSavedSettings()
             ThemeManager.shared.restoreSavedSettings()
+            // DeepSeek Harness 在线观察：装了才轮询；在线时「设为壁纸」弹窗多出 Harness 目标
+            DSHHarnessBridge.shared.startAvailabilityMonitor()
             // 探索排序需尽早恢复，赶在 ContentView 首次 initialLoad 之前
             self?.wallpaperViewModel.restoreExploreSortPreferences()
             self?.mediaViewModel.restoreExploreSortPreferences()
@@ -902,6 +914,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, @preconcur
     func hideMainWindow() {
         DynamicWallpaperAutoPauseManager.shared.suppressForegroundPauseForMainWindowHide()
         window?.orderOut(nil)
+        MainWindowVisibility.shared.refresh()
         AppResponsivenessMonitor.noteWindowVisible(false)
         AppResponsivenessMonitor.noteScenePhase("hideMainWindow")
         enterBackgroundModeIfNoForegroundInterface(hideDockIcon: true)
@@ -1642,6 +1655,7 @@ extension AppDelegate {
 
     func windowDidMiniaturize(_ notification: Notification) {
         guard let minimizedWindow = notification.object as? NSWindow else { return }
+        MainWindowVisibility.shared.refresh()
         if minimizedWindow === window {
             DynamicWallpaperAutoPauseManager.shared.suppressForegroundPauseForMainWindowHide()
             AppResponsivenessMonitor.noteWindowVisible(false)
@@ -1655,6 +1669,7 @@ extension AppDelegate {
               restoredWindow === window else {
             return
         }
+        MainWindowVisibility.shared.refresh()
         AppResponsivenessMonitor.noteWindowVisible(true)
         AppResponsivenessMonitor.noteScenePhase("mainWindowDeminiaturized")
     }

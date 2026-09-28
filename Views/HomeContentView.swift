@@ -126,7 +126,9 @@ struct HomeContentView: View {
     /// 为 false 时不挂载重 UI（非当前 Tab），避免五 Tab 同时跑 ScrollView/轮播
     var isTabActive: Bool = true
     @ObservedObject private var arcSettings = ArcBackgroundSettings.shared
+    @ObservedObject private var windowVisibility = MainWindowVisibility.shared
 
+    @State private var isViewVisible = false
     @State private var currentCarouselIndex = 0
     @State private var currentCarouselDisplayIndex = 0
     @State private var currentHeroID: String?
@@ -168,6 +170,10 @@ struct HomeContentView: View {
     private let carouselDragThresholdRatio: CGFloat = 0.18
     private let contentHorizontalInset: CGFloat = 26
     private let sectionTopSpacing: CGFloat = 8
+
+    private var shouldPlayHero: Bool {
+        isViewVisible && isTabActive && windowVisibility.allowContinuousAnimation
+    }
 
     /// 使用缓存的调色板，减少重复计算
     private var heroPalette: HeroDrivenPalette {
@@ -276,8 +282,9 @@ struct HomeContentView: View {
             handleScroll(offset: offset)
         }
         .onAppear {
-            syncCarouselState(with: heroItems)
-            if isTabActive {
+            isViewVisible = true
+            if shouldPlayHero {
+                syncCarouselState(with: heroItems)
                 startCarouselAutoPlay()
             }
 
@@ -298,6 +305,11 @@ struct HomeContentView: View {
             startHomeRetryLoop()
         }
         .onDisappear {
+            isViewVisible = false
+            stopCarouselAutoPlay()
+            cancelCarouselLoopReset()
+            cancelCarouselInteractionReset()
+            atmosphereController.pause()
             initialLoadTask?.cancel()
             initialLoadTask = nil
             homeSkeletonDeadlineTask?.cancel()
@@ -320,8 +332,10 @@ struct HomeContentView: View {
         }
         .onChange(of: isTabActive) { _, active in
             if active {
-                syncCarouselState(with: heroItems)
-                startCarouselAutoPlay()
+                if shouldPlayHero {
+                    syncCarouselState(with: heroItems)
+                    startCarouselAutoPlay()
+                }
             } else {
                 stopCarouselAutoPlay()
                 cancelCarouselLoopReset()
@@ -333,8 +347,19 @@ struct HomeContentView: View {
                 ForegroundPrefetchManager.shared.stop(namespace: HomePrefetchNamespace.mediaShelf)
             }
         }
+        .onChange(of: windowVisibility.allowContinuousAnimation) { _, _ in
+            if shouldPlayHero {
+                syncCarouselState(with: heroItems)
+                startCarouselAutoPlay()
+            } else {
+                stopCarouselAutoPlay()
+                cancelCarouselLoopReset()
+                cancelCarouselInteractionReset()
+                atmosphereController.pause()
+            }
+        }
         .onChange(of: heroItemIDs) { _, _ in
-            guard isTabActive else { return }
+            guard shouldPlayHero else { return }
             syncCarouselState(with: heroItems)
             stopCarouselAutoPlay()
             startCarouselAutoPlay()
@@ -347,16 +372,18 @@ struct HomeContentView: View {
     }
 
     // MARK: - 骨架屏超时与重试
-    /// 首页骨架最多展示 6 秒；超时仍未出数据即视为数据源不可达，切静态占位，
-    /// 避免 19 个 shimmer repeatForever 永挂、每帧驱动主窗口全量重排（后台 CPU 空烧根因）。
+    /// 首页骨架最多展示 6 秒；轮播或任一内容区仍为空时切静态占位。
+    /// 即使轮播已加载成功，其他数据源失败也不能让 shimmer 永久运行。
     private func startHomeSkeletonDeadlineMonitor() {
         homeSkeletonDeadlineTask?.cancel()
         homeSkeletonTimedOut = false
         homeSkeletonDeadlineTask = Task {
             try? await Task.sleep(nanoseconds: 6_000_000_000)
             guard !Task.isCancelled else { return }
-            if heroItems.isEmpty {
-                homeSkeletonTimedOut = true
+            homeSkeletonTimedOut = true
+            if heroItems.isEmpty ||
+                (ModuleAvailability.shared.wallpaperEnabled && recentWallpapers.isEmpty) ||
+                (ModuleAvailability.shared.mediaEnabled && mediaViewModel.homeItems.isEmpty) {
                 AppLogger.error(.general, "[AnimTracker] home skeleton timeout: 数据 6s 未到达，骨架切静态占位")
             }
         }
@@ -470,7 +497,7 @@ struct HomeContentView: View {
                     HeroSlide(
                         item: slide.item,
                         // 克隆项与真实项共享 HeroItem.id；用 display index 才能保证同一时刻只有一个视频/占位动画。
-                        isCurrent: displayIndex == currentCarouselDisplayIndex && isTabActive,
+                        isCurrent: displayIndex == currentCarouselDisplayIndex && shouldPlayHero,
                         width: width,
                         height: height
                     )
@@ -713,12 +740,14 @@ struct HomeContentView: View {
     }
 
     private func startCarouselAutoPlay() {
-        guard timerManager.timer == nil, heroItems.count > 1 else { return }
+        guard shouldPlayHero, timerManager.timer == nil, heroItems.count > 1 else { return }
 
         Task { @MainActor in
+            guard shouldPlayHero, timerManager.timer == nil else { return }
             timerManager.timer = Timer.scheduledTimer(withTimeInterval: carouselAutoPlayInterval, repeats: true) { _ in
                 Task { @MainActor in
-                    guard !isCarouselInteracting, !isCarouselAnimating, heroItems.count > 1 else { return }
+                    guard shouldPlayHero, !isCarouselInteracting, !isCarouselAnimating,
+                          heroItems.count > 1 else { return }
                     advanceCarousel(by: 1)
                 }
             }

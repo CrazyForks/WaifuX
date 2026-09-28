@@ -3,6 +3,10 @@ import CryptoKit
 
 // MARK: - 通过汇编 .incbin 嵌入在 WaifuX 主二进制中的 ZIP 材质包
 //（运行时解压后传给 wallpaper-wgpu --assets）
+//
+// zip_data.o / zip_accessor.o 是 universal object（含 arm64 + x86_64 切片），
+// arm64 与 x86_64 包都在链接命令里传入（见 scripts/package.sh），两个架构共用同一份
+// 材质数据（assets 与架构无关）。
 
 @_silgen_name("get_zip_data_ptr")
 func getZipDataPtr() -> UnsafePointer<UInt8>

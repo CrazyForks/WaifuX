@@ -358,6 +358,9 @@ final class WallpaperEngineXBridge: ObservableObject {
     /// 都可能在深度睡眠后保持进程存活却不再出帧，不能只依赖 AutoPause 的 resume。
     private var wakeRecoveryTask: Task<Void, Never>?
     private var wakeRecoveryGeneration: UInt64 = 0
+    /// 仅记录息屏时仍在播放的屏幕，唤醒后不能恢复用户原本手动暂停的屏幕。
+    private var displaySleepPausedScreenIDs: Set<String> = []
+    private var isDisplayAsleep = false
 
     // MARK: - 初始化
 
@@ -397,11 +400,27 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
         .store(in: &self.cancellables)
 
+        // 息屏与系统睡眠是两种事件：前者系统仍可能运行，需主动暂停 WE renderer。
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { @MainActor [weak self] _ in
+                self?.handleDisplaySleep()
+            }
+            .store(in: &self.cancellables)
+
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { @MainActor [weak self] _ in
+                self?.handleDisplaySleep()
+            }
+            .store(in: &self.cancellables)
+
         // 合盖后的系统唤醒有时只发 didWake，有时还会补发 screensDidWake。
         // 两者统一防抖到一次 renderer 重建，避免 scene Metal / WebView 保留失效表面而黑屏。
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
             .receive(on: DispatchQueue.main)
             .sink { @MainActor [weak self] _ in
+                self?.isDisplayAsleep = false
                 self?.scheduleWakeRecovery(reason: "systemWake")
             }
             .store(in: &self.cancellables)
@@ -409,6 +428,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
             .receive(on: DispatchQueue.main)
             .sink { @MainActor [weak self] _ in
+                self?.isDisplayAsleep = false
                 self?.scheduleWakeRecovery(reason: "screensWake")
             }
             .store(in: &self.cancellables)
@@ -528,6 +548,12 @@ final class WallpaperEngineXBridge: ObservableObject {
         preserveExistingRendererUntilReady: Bool = false,
         requireAllTargetScreens: Bool = false
     ) async throws {
+        // 拆架构占位：x86_64 包不含 wallpaper-wgpu / 内嵌 assets，scene 渲染入口直接短路，
+        // 给出明确的用户可读错误，而不是等到 spawn 阶段才报 EBADARCH。
+        if !WallpaperEngineAvailability.sceneRenderingSupported {
+            AppLogger.error(.wallpaper, "setWallpaper 被拒绝：x86_64 包不包含 scene 渲染器")
+            throw WallpaperEngineError.sceneRendererUnavailable
+        }
         VideoWallpaperManager.shared.cancelPendingExternalVideoTransition(
             reason: "WallpaperEngineXBridge.setWallpaper"
         )
@@ -811,6 +837,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             ensureAudioRelayMatchesActiveWallpaper(projectRoot: resolvedPath)
+            pauseForDisplaySleepIfNeeded()
             // poster 的桌面写入/菜单栏采样必须晚于旧视频交接结束；否则会在
             // crossfade 中间触发一次 WindowServer 重合成。
             scheduleWebPosterCapture(path: resolvedPath, targetScreens: effectiveScreens)
@@ -1345,6 +1372,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             DynamicWallpaperAutoPauseManager.shared.clearForegroundPauseForWallpaperSwitch()
         }
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
+        pauseForDisplaySleepIfNeeded()
 
         // 真实渲染已经启动，UI 可立即结束“设置中”状态。
         // 已有烘焙资源立即同步；关闭自动烘焙时的临时静帧由 companion bake
@@ -1829,6 +1857,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         perScreenPausedScreenIDs.remove(screenID)
+        displaySleepPausedScreenIDs.remove(screenID)
         renderStateChangeCount &+= 1
         updateExternalPausedStateFromPerScreenPauses()
 
@@ -2170,6 +2199,13 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
         }
 
+        // 息屏/全局暂停时 WebView 不需要系统音频捕获与媒体轮询。
+        if isExternalPaused || (isDisplayAsleep
+            && DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy == .pause) {
+            needsAudio = false
+            needsMedia = false
+        }
+
         if needsAudio && !audioRelayActiveForCurrentWallpaper {
             WallpaperWebAudioRelay.shared.start()
             audioRelayActiveForCurrentWallpaper = true
@@ -2238,6 +2274,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         isControllingExternalEngine = false
         isExternalPaused = false
         perScreenPausedScreenIDs.removeAll()
+        displaySleepPausedScreenIDs.removeAll()
         closeRendererLogs()
         screenProcesses.removeAll()
         _deinitPIDs.removeAll()
@@ -2267,6 +2304,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         isControllingExternalEngine = false
         isExternalPaused = false
         perScreenPausedScreenIDs.removeAll()
+        displaySleepPausedScreenIDs.removeAll()
         closeRendererLogs()
         screenProcesses.removeAll()
         _deinitPIDs.removeAll()
@@ -2343,6 +2381,7 @@ final class WallpaperEngineXBridge: ObservableObject {
 
         removeRenderState(for: targetScreen)
         perScreenPausedScreenIDs.remove(screenID)
+        displaySleepPausedScreenIDs.remove(screenID)
         updateControlStateFromScreenStates()
         // 这块屏被切走后，全局可能不再有需要音频的 web 壁纸了
         ensureAudioRelayMatchesActiveWallpaper()
@@ -4495,6 +4534,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         targetScreenIDs.remove(screenID)
         targetScreenFingerprints.remove(fingerprint)
         perScreenPausedScreenIDs.remove(screenID)
+        displaySleepPausedScreenIDs.remove(screenID)
         updateControlStateFromScreenStates()
         ensureAudioRelayMatchesActiveWallpaper()
         persistState()
@@ -4543,6 +4583,9 @@ final class WallpaperEngineXBridge: ObservableObject {
             if perScreenPausedScreenIDs.contains(oldID) {
                 perScreenPausedScreenIDs.remove(oldID)
                 perScreenPausedScreenIDs.insert(newID)
+            }
+            if displaySleepPausedScreenIDs.remove(oldID) != nil {
+                displaySleepPausedScreenIDs.insert(newID)
             }
             targetScreenIDs.remove(oldID)
             targetScreenIDs.insert(newID)
@@ -5235,13 +5278,78 @@ final class WallpaperEngineXBridge: ObservableObject {
 
     // MARK: - System Wake Recovery
 
+    private var activeSleepRendererScreenIDs: Set<String> {
+        let webScreenIDs = Self.isLegacyDaemonRunning ? webRenderScreenIDs : []
+        return Set(screenProcesses.keys).union(webScreenIDs)
+    }
+
+    private func handleDisplaySleep() {
+        isDisplayAsleep = true
+        wakeRecoveryGeneration &+= 1
+        wakeRecoveryTask?.cancel()
+        wakeRecoveryTask = nil
+        pauseForDisplaySleepIfNeeded()
+    }
+
+    /// 不复用全局手动暂停状态；只给当时正在播放的屏幕增加息屏暂停。
+    private func pauseForDisplaySleepIfNeeded() {
+        guard isDisplayAsleep,
+              DynamicWallpaperAutoPauseManager.shared.displaySleepPolicy == .pause,
+              isControllingExternalEngine else { return }
+
+        // 先取快照：逐屏 pause 后 isExternalPaused 可能变为 true。
+        let managedScreenIDs = activeSleepRendererScreenIDs
+        let screensToPause = managedScreenIDs.filter { !isPaused(screenID: $0) }
+        displaySleepPausedScreenIDs.formUnion(screensToPause)
+        // Web 的 set 会新建 WKWebView；即使本地暂停标记已存在，也要向新实例重发 pause。
+        for screenID in managedScreenIDs {
+            pauseWallpaper(for: screenID)
+        }
+        if !screensToPause.isEmpty {
+            AppLogger.info(.wallpaper, "WE renderers paused for display sleep", metadata: [
+                "screens": screensToPause.sorted().joined(separator: ",")
+            ])
+        }
+    }
+
+    /// renderer 可能已在唤醒流程中换代，因此对当前屏重施原有暂停，
+    /// 再仅恢复息屏时由本逻辑新增暂停的屏幕。
+    private func restoreDisplaySleepPausesAfterWake() {
+        guard !isDisplayAsleep else { return }
+        guard isControllingExternalEngine else {
+            displaySleepPausedScreenIDs.removeAll()
+            return
+        }
+        let managedScreenIDs = activeSleepRendererScreenIDs
+        let screensToResume = displaySleepPausedScreenIDs.intersection(managedScreenIDs)
+        let screensToKeepPaused = perScreenPausedScreenIDs
+            .subtracting(displaySleepPausedScreenIDs)
+            .intersection(managedScreenIDs)
+
+        for screenID in screensToResume {
+            resumeWallpaper(for: screenID)
+        }
+        displaySleepPausedScreenIDs.removeAll()
+        for screenID in screensToKeepPaused {
+            pauseWallpaper(for: screenID)
+        }
+        if !screensToResume.isEmpty {
+            AppLogger.info(.wallpaper, "WE renderers resumed after display wake", metadata: [
+                "screens": screensToResume.sorted().joined(separator: ",")
+            ])
+        }
+    }
+
     /// scene 进程和 Web daemon 在长睡眠后都可能仍存活，但其图形上下文已经失效。
     /// 因此不把“PID 还在”当成健康信号；在显示器恢复稳定后按屏重新创建运行时。
     private func scheduleWakeRecovery(reason: String) {
         let hasManagedState = isControllingExternalEngine
             || !screenRenderStates.isEmpty
             || !screenProcesses.isEmpty
-        guard hasManagedState else { return }
+        guard hasManagedState else {
+            displaySleepPausedScreenIDs.removeAll()
+            return
+        }
 
         wakeRecoveryGeneration &+= 1
         let generation = wakeRecoveryGeneration
@@ -5257,6 +5365,19 @@ final class WallpaperEngineXBridge: ObservableObject {
 
             guard let self, !Task.isCancelled,
                   self.wakeRecoveryGeneration == generation else {
+                return
+            }
+            // 息屏期间可能恰好在切换壁纸。等设置事务结束再重建，
+            // 否则 rebuild 的 isSettingWallpaper 闸门会直接跳过恢复。
+            for _ in 0..<120 {
+                guard self.isSettingWallpaper else { break }
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled,
+                      self.wakeRecoveryGeneration == generation else { return }
+            }
+            if self.isSettingWallpaper {
+                self.restoreDisplaySleepPausesAfterWake()
+                self.wakeRecoveryTask = nil
                 return
             }
             await self.rebuildRenderersAfterSystemWake(reason: reason, generation: generation)
@@ -5315,6 +5436,7 @@ final class WallpaperEngineXBridge: ObservableObject {
         }
 
         guard !targets.isEmpty else {
+            restoreDisplaySleepPausesAfterWake()
             DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
             return
         }
@@ -5355,6 +5477,7 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
         }
 
+        restoreDisplaySleepPausesAfterWake()
         DynamicWallpaperAutoPauseManager.shared.reevaluateCurrentState()
     }
 
@@ -5419,6 +5542,9 @@ final class WallpaperEngineXBridge: ObservableObject {
             }
             if perScreenPausedScreenIDs.remove(oldID) != nil {
                 perScreenPausedScreenIDs.insert(newID)
+            }
+            if displaySleepPausedScreenIDs.remove(oldID) != nil {
+                displaySleepPausedScreenIDs.insert(newID)
             }
             if let canvasSize = lastCanvasSizeByScreenID.removeValue(forKey: oldID) {
                 lastCanvasSizeByScreenID[newID] = canvasSize
@@ -5764,6 +5890,8 @@ enum WallpaperEngineError: LocalizedError {
     case legacyCliNotFound
     case screenCaptureDenied
     case executionFailed(String)
+    /// x86_64 包不携带 scene 渲染器（wgpu 生态 arm64-only），入口占位短路。
+    case sceneRendererUnavailable
 
     /// CPU 架构不匹配时的用户可见文案。wallpaper-wgpu 只发布 arm64 版本，Intel
     /// Mac 上必然启动失败，而系统原文案是「未能完成该操作。可执行文件中CPU类型不正确」，
@@ -5793,6 +5921,7 @@ enum WallpaperEngineError: LocalizedError {
         case .legacyCliNotFound: return "未找到 wallpaperengine-cli 二进制文件"
         case .screenCaptureDenied: return "屏幕录制权限被拒绝，请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许本应用后重试"
         case .executionFailed(let msg): return msg
+        case .sceneRendererUnavailable: return WallpaperEngineAvailability.sceneUnsupportedReason
         }
     }
 }

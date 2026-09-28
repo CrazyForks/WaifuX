@@ -1827,7 +1827,7 @@ private struct AboutSettingsTab: View {
                             .font(.system(size: 17, weight: .bold))
                             .foregroundStyle(Color.white.opacity(0.92))
 
-                        Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                        Text("\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") · \(WallpaperEngineAvailability.currentArchitecture)版")
                             .font(.system(size: 11.5, weight: .regular))
                             .foregroundStyle(Color.white.opacity(0.4))
                     }

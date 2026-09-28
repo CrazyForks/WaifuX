@@ -216,9 +216,24 @@ jobs:
       - name: Build & Package
         env:
           WAIFUX_SKIP_DMG: "1"
+          # 仓库 variable：设为任意非空值时，本次发版额外构建 universal 过渡包
+          # （default channel 桥接件，让旧版 universal 客户端能收到拆架构后的新代码）。
+          WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
         run: |
           chmod +x ./scripts/package.sh
-          ./scripts/package.sh
+          # 拆架构分发：arm64 包含 scene 渲染器全家桶，x86_64 包裁剪 wgpu/dxc/lib/ffmpeg
+          ARCH_LIST="arm64 x86_64"
+          if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
+            echo "🌉 universal 过渡包构建已开启（WAIFUX_UNIVERSAL_BRIDGE）"
+            ARCH_LIST="$ARCH_LIST universal"
+          fi
+          for ARCH in $ARCH_LIST; do
+            echo "🔨 构建 $ARCH 包..."
+            WAIFUX_ARCH=$ARCH ./scripts/package.sh
+            mv build/WaifuX.app "build/WaifuX-$ARCH.app"
+            lipo -info "build/WaifuX-$ARCH.app/Contents/MacOS/WaifuX"
+          done
+          ls -lh build/
 
       - name: Sign & Notarize
         env:
@@ -228,10 +243,21 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
         run: |
           # keychain 已在 Sign Extension 步骤中设置
           KEYCHAIN_PATH="$RUNNER_TEMP/sign.keychain-db"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # 拆架构：各架构 .app 各自签名 + 公证 + DMG（universal 过渡包仅 bridge 时构建）
+          ARCH_LIST="arm64 x86_64"
+          if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
+            ARCH_LIST="$ARCH_LIST universal"
+          fi
+          for ARCH in $ARCH_LIST; do
+          echo "===== Sign & Notarize ($ARCH) ====="
+          rm -rf build/WaifuX.app
+          cp -R "build/WaifuX-$ARCH.app" build/WaifuX.app
 
           echo "Signing embedded binaries..."
           strip_unsupported_slices() {
@@ -437,7 +463,7 @@ jobs:
 
           for i in {1..5}; do
             if xcrun stapler staple build/WaifuX.dmg; then
-              echo "✅ 签名+公证完成"
+              echo "✅ 签名+公证完成 ($ARCH)"
               break
             fi
             if [ $i -eq 5 ]; then
@@ -445,6 +471,16 @@ jobs:
             fi
             sleep 30
           done
+
+          if [ "$ARCH" = "universal" ]; then
+            echo "✅ universal DMG 就绪: build/WaifuX.dmg"
+          else
+            mv build/WaifuX.dmg "build/WaifuX-$ARCH.dmg"
+            echo "✅ $ARCH DMG 就绪: build/WaifuX-$ARCH.dmg"
+          fi
+          done
+
+          ls -lh build/WaifuX*.dmg
 
       - name: Setup Sparkle tools
         run: |
@@ -479,30 +515,92 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          DMG_PATH="build/WaifuX.dmg"
 
-          # 签名 DMG 获取 Ed25519 签名
-          ED_SIG=$(sign_update -s "$SPARKLE_PRIVATE_KEY" "$DMG_PATH" 2>&1 | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
-          if [ -z "$ED_SIG" ]; then
-            echo "❌ Failed to sign DMG with Sparkle"
+          # 拆架构分发 + default channel 桥接：
+          # - arm64 / x86_64 item 带 sparkle:channel，客户端按 allowedChannels 只匹配本架构包
+          # - default item（无 channel，对旧客户端恒可见）指向 universal 过渡包：
+          #   bridge 版本用真实签名；之后的版本复用固化的 Docs/appcast-default-item.xml
+          sign_one() {
+            local DMG_PATH="$1"
+            if [ ! -f "$DMG_PATH" ]; then
+              echo "❌ 缺少 $DMG_PATH"
+              exit 1
+            fi
+            local ED_SIG
+            ED_SIG=$(sign_update -s "$SPARKLE_PRIVATE_KEY" "$DMG_PATH" 2>&1 | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
+            if [ -z "$ED_SIG" ]; then
+              echo "❌ Failed to sign $DMG_PATH with Sparkle"
+              exit 1
+            fi
+            echo "✅ $DMG_PATH signed: $ED_SIG"
+            echo "$ED_SIG $(stat -f%z "$DMG_PATH")"
+          }
+
+          read -r SIG_ARM SIZE_ARM <<< "$(sign_one build/WaifuX-arm64.dmg)"
+          read -r SIG_X86 SIZE_X86 <<< "$(sign_one build/WaifuX-x86_64.dmg)"
+
+          SIG_UNI=""
+          SIZE_UNI=""
+          if [ -f build/WaifuX.dmg ]; then
+            read -r SIG_UNI SIZE_UNI <<< "$(sign_one build/WaifuX.dmg)"
+          elif [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
+            echo "❌ bridge 开启但缺少 build/WaifuX.dmg"
             exit 1
           fi
-          echo "✅ DMG signed: $ED_SIG"
 
-          # 获取文件大小
-          DMG_SIZE=$(stat -f%z "$DMG_PATH")
           PUB_DATE=$(date -R)
 
           # 用 Python 生成 appcast.xml（避免 sed 正则元字符问题：base64 签名含 + / 等）
           CHANGELOG="${{ steps.changelog.outputs.changelog }}"
           python3 -c "
           import sys
-          changelog = sys.argv[5].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          changelog = sys.argv[9].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
           lines = changelog.split('\n')
           items = ''.join('<li>{}</li>'.format(l.lstrip('- ')) for l in lines if l.strip().startswith('- '))
           description = '<h3>WaifuX {}</h3><ul>{}</ul>'.format(sys.argv[1], items) if items else '<p>WaifuX {}</p>'.format(sys.argv[1])
+
+          item_template = '''          <item>
+            <title>Version {version}</title>
+            <sparkle:version>{version}</sparkle:version>
+            <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+            {extra}
+            <pubDate>{pub_date}</pubDate>
+            <description><![CDATA[{desc}]]></description>
+            <enclosure
+              url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/{dmg}\"
+              type=\"application/octet-stream\"
+              length=\"{size}\"
+              sparkle:edSignature=\"{sig}\"
+            />
+          </item>'''
+
+          def make_item(dmg, sig, size, extra=''):
+              return item_template.format(version=sys.argv[1], pub_date=sys.argv[2],
+                                          size=size, sig=sig, desc=description,
+                                          dmg=dmg, extra=extra)
+
+          arch_items = [
+              make_item('WaifuX-arm64.dmg', sys.argv[4], sys.argv[3],
+                        extra='<sparkle:channel>arm64</sparkle:channel>\\n            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>'),
+              make_item('WaifuX-x86_64.dmg', sys.argv[6], sys.argv[5],
+                        extra='<sparkle:channel>x86_64</sparkle:channel>'),
+          ]
+
+          default_item = ''
+          if sys.argv[8]:
+              # bridge 版本：default item = 本次 universal 过渡包
+              default_item = make_item('WaifuX.dmg', sys.argv[8], sys.argv[7])
+          else:
+              try:
+                  with open(sys.argv[10], encoding='utf-8') as f:
+                      default_item = f.read().strip()
+              except OSError:
+                  print('⚠️ 无 default channel item（缺少固化片段），旧版 universal 客户端本次收不到更新', file=sys.stderr)
+
+          all_items = '\\n'.join(([default_item] if default_item else []) + arch_items)
 
           template = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
           <rss version=\"2.0\" xmlns:sparkle=\"http://www.andymatuschak.org/xml-namespaces/sparkle\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
@@ -511,41 +609,30 @@ jobs:
               <link>https://jipika.github.io/WaifuX/appcast.xml</link>
               <description>WaifuX Updates</description>
               <language>zh</language>
-              <item>
-                <title>Version {version}</title>
-                <sparkle:version>{version}</sparkle:version>
-                <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
-                <pubDate>{pub_date}</pubDate>
-                <description><![CDATA[{desc}]]></description>
-                <enclosure
-                  url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
-                  type=\"application/octet-stream\"
-                  length=\"{size}\"
-                  sparkle:edSignature=\"{sig}\"
-                />
-              </item>
+          {arch_items}
             </channel>
           </rss>'''
-          xml = template.format(
-            version=sys.argv[1],
-            pub_date=sys.argv[2],
-            size=sys.argv[3],
-            sig=sys.argv[4],
-            desc=description
-          )
+          xml = template.format(arch_items=all_items)
           with open('Docs/appcast.xml', 'w') as f:
-            f.write(xml)
-          " "$VERSION" "$PUB_DATE" "$DMG_SIZE" "$ED_SIG" "$CHANGELOG"
+              f.write(xml)
+          if default_item:
+              with open('Docs/appcast-default-item.xml', 'w') as f:
+                  f.write(default_item + '\n')
+          " "$VERSION" "$PUB_DATE" "$SIZE_ARM" "$SIG_ARM" "$SIZE_X86" "$SIG_X86" "$SIZE_UNI" "$SIG_UNI" "$CHANGELOG" "Docs/appcast-default-item.xml"
 
           echo "✅ Generated Docs/appcast.xml:"
           cat Docs/appcast.xml
+          if [ -f Docs/appcast-default-item.xml ]; then
+            echo "✅ default channel item（固化/新生成）:"
+            cat Docs/appcast-default-item.xml
+          fi
 
       - name: Upload Release Asset
         # workflow_dispatch 仅用于测试构建/签名，不发布 release
         if: github.event_name != 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          files: build/WaifuX.dmg
+          files: build/WaifuX*.dmg
           name: WaifuX ${{ steps.version.outputs.version }}
           body: |
             ## 更新内容
@@ -556,6 +643,12 @@ jobs:
 
             - 版本号: ${{ steps.version.outputs.version }}
             - Commit: ${{ github.sha }}
+
+            ## 下载说明（按架构分发）
+
+            - **Apple Silicon (M 系列)**: 下载 `WaifuX-arm64.dmg`，包含场景壁纸渲染器
+            - **Intel (x86_64)**: 下载 `WaifuX-x86_64.dmg`，暂不包含场景壁纸渲染器（Scene 类型壁纸不可用，静态/视频/Web 壁纸不受影响）
+            - 应用内更新会自动检测当前架构并只推送对应安装包
 
             ---
 
@@ -583,7 +676,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WaifuX-test-${{ github.sha }}
-          path: build/WaifuX.dmg
+          path: |
+            build/WaifuX-arm64.dmg
+            build/WaifuX-x86_64.dmg
           retention-days: 3
 
       # 提交更新后的 appcast.xml 到 GitHub Pages
@@ -592,7 +687,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Docs/appcast.xml
+          git add Docs/appcast.xml Docs/appcast-default-item.xml
           if git diff --cached --quiet; then
             echo "appcast.xml unchanged, skipping commit"
           else

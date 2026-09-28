@@ -245,9 +245,24 @@ jobs:
               if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
               env:
                   WAIFUX_SKIP_DMG: "1"
+                  # 仓库 variable：设为任意非空值时，本次发版额外构建 universal 过渡包
+                  # （default channel 桥接件，让旧版 universal 客户端能收到拆架构后的新代码）。
+                  WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
               run: |
                   chmod +x ./scripts/package.sh
-                  ./scripts/package.sh
+                  # 拆架构分发：arm64 包含 scene 渲染器全家桶，x86_64 包裁剪 wgpu/dxc/lib/ffmpeg
+                  ARCH_LIST="arm64 x86_64"
+                  if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
+                    echo "🌉 universal 过渡包构建已开启（WAIFUX_UNIVERSAL_BRIDGE）"
+                    ARCH_LIST="$ARCH_LIST universal"
+                  fi
+                  for ARCH in $ARCH_LIST; do
+                    echo "🔨 构建 $ARCH 包..."
+                    WAIFUX_ARCH=$ARCH ./scripts/package.sh
+                    mv build/WaifuX.app "build/WaifuX-$ARCH.app"
+                    lipo -info "build/WaifuX-$ARCH.app/Contents/MacOS/WaifuX"
+                  done
+                  ls -lh build/
 
             - name: Sign & Notarize
               if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
@@ -258,11 +273,22 @@ jobs:
                   APPLE_ID: ${{ secrets.APPLE_ID }}
                   APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
                   APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+                  WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
               run: |
                   # keychain 已在 Sign Extension 步骤中设置，直接使用
                   KEYCHAIN_PATH="$RUNNER_TEMP/sign.keychain-db"
                   security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
                   security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" 2>/dev/null || true
+
+                  # 拆架构：各架构 .app 各自签名 + 公证 + DMG（universal 过渡包仅 bridge 时构建）
+                  ARCH_LIST="arm64 x86_64"
+                  if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
+                    ARCH_LIST="$ARCH_LIST universal"
+                  fi
+                  for ARCH in $ARCH_LIST; do
+                  echo "===== Sign & Notarize ($ARCH) ====="
+                  rm -rf build/WaifuX.app
+                  cp -R "build/WaifuX-$ARCH.app" build/WaifuX.app
 
                   # 验证证书
                   echo "=== 证书列表 ==="
@@ -514,7 +540,7 @@ jobs:
                   for i in {1..5}; do
                     echo "Attempt $i: stapling notarization ticket..."
                     if xcrun stapler staple build/WaifuX.dmg; then
-                      echo "✅ 签名+公证完成"
+                      echo "✅ 签名+公证完成 ($ARCH)"
                       break
                     fi
                     if [ $i -eq 5 ]; then
@@ -523,6 +549,16 @@ jobs:
                     fi
                     sleep 30
                   done
+
+                  if [ "$ARCH" = "universal" ]; then
+                    echo "✅ universal DMG 就绪: build/WaifuX.dmg"
+                  else
+                    mv build/WaifuX.dmg "build/WaifuX-$ARCH.dmg"
+                    echo "✅ $ARCH DMG 就绪: build/WaifuX-$ARCH.dmg"
+                  fi
+                  done
+
+                  ls -lh build/WaifuX*.dmg
 
             - name: Generate Changelog
               if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
@@ -567,6 +603,12 @@ jobs:
                       - 版本号: ${{ steps.version.outputs.version }}
                       - Commit: ${{ github.sha }}
 
+                      ## 下载说明（按架构分发）
+
+                      - **Apple Silicon (M 系列)**: 下载 `WaifuX-arm64.dmg`，包含场景壁纸渲染器
+                      - **Intel (x86_64)**: 下载 `WaifuX-x86_64.dmg`，暂不包含场景壁纸渲染器（Scene 类型壁纸不可用，静态/视频/Web 壁纸不受影响）
+                      - 应用内更新会自动检测当前架构并只推送对应安装包
+
                       ---
 
                       ## ☕ 支持开源
@@ -582,11 +624,66 @@ jobs:
                       </p>
 
                       **给项目点个 Star ⭐️** 同样是对开发者最大的鼓励！每一份支持都是我继续维护和迭代这款应用的动力。感谢使用 WaifuX 💜
-                  files: build/WaifuX.dmg
+                  files: build/WaifuX*.dmg
                   draft: false
                   prerelease: false
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # bridge 版本发版后，把 default channel item（universal 过渡包的 Sparkle 签名）
+            # 固化提交回仓库；之后的非 bridge 发版由 release.yml 直接复用该片段，
+            # 旧版 universal 客户端不至于断更。Ed25519 签名是确定性的，固化后永久有效。
+            - name: Persist default-channel appcast item
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false' && vars.WAIFUX_UNIVERSAL_BRIDGE != ''
+              env:
+                  SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+              run: |
+                  if [ ! -f build/WaifuX.dmg ]; then
+                    echo "❌ bridge 开启但 build/WaifuX.dmg 不存在"
+                    exit 1
+                  fi
+                  curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/2.6.4/Sparkle-2.6.4.tar.xz" -o /tmp/Sparkle.tar.xz
+                  (cd /tmp && tar xJf Sparkle.tar.xz)
+                  ED_SIG=$(/tmp/Sparkle/bin/sign_update -s "$SPARKLE_PRIVATE_KEY" build/WaifuX.dmg 2>&1 | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
+                  if [ -z "$ED_SIG" ]; then
+                    echo "❌ Failed to sign build/WaifuX.dmg with Sparkle"
+                    exit 1
+                  fi
+                  SIZE=$(stat -f%z build/WaifuX.dmg)
+                  VERSION="${{ steps.version.outputs.version }}"
+                  PUB_DATE=$(date -R)
+
+                  python3 -c "
+                  import sys
+                  version, pub_date, size, sig = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+                  item = '''  <item>
+                    <title>Version {version}</title>
+                    <sparkle:version>{version}</sparkle:version>
+                    <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
+                    <pubDate>{pub_date}</pubDate>
+                    <description><![CDATA[<p>WaifuX {version}（universal 过渡版本，供旧版本客户端升级到按架构分发的新版本）</p>]]></description>
+                    <enclosure
+                      url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
+                      type=\"application/octet-stream\"
+                      length=\"{size}\"
+                      sparkle:edSignature=\"{sig}\"
+                    />
+                  </item>'''.format(version=version, pub_date=pub_date, size=size, sig=sig)
+                  with open('Docs/appcast-default-item.xml', 'w') as f:
+                      f.write(item + '\n')
+                  " "$VERSION" "$PUB_DATE" "$SIZE" "$ED_SIG"
+                  cat Docs/appcast-default-item.xml
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add Docs/appcast-default-item.xml
+                  if git diff --cached --quiet; then
+                    echo "default item unchanged, skipping commit"
+                  else
+                    git commit -m "chore: persist default-channel appcast item for v${VERSION}"
+                    git push
+                    echo "✅ default-channel appcast item committed"
+                  fi
 
             # Release 创建后同步更新 homebrew tap 仓库的 Casks/waifux.rb。
             # 跨仓库写入需要 PAT（GITHUB_TOKEN 无权写 homebrew-waifux），
@@ -598,29 +695,37 @@ jobs:
                   TAP_REPO_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
               run: |
                   VERSION="${{ steps.version.outputs.version }}"
-                  DMG_URL="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX.dmg"
 
-                  # 等待 Release 资产可下载（刚创建的 Release 偶尔有几秒传播延迟）
-                  echo "等待 DMG 可下载: $DMG_URL"
-                  for i in {1..6}; do
-                    if curl --fail --silent --show-error --location --retry 2 \
-                      --output /tmp/WaifuX.dmg "$DMG_URL" && \
-                      [ -s /tmp/WaifuX.dmg ] && \
-                      [ "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576 ]; then
-                      echo "✅ DMG 下载成功"
-                      break
-                    fi
-                    echo "attempt $i: 尚未就绪，10s 后重试..."
-                    rm -f /tmp/WaifuX.dmg
-                    sleep 10
-                  done
-                  if [ ! -s /tmp/WaifuX.dmg ] || [ "$(wc -c < /tmp/WaifuX.dmg)" -le 1048576 ]; then
-                    echo "❌ DMG 下载失败，tap 更新失败"
-                    exit 1
-                  fi
+                  # 拆架构分发：两个架构 DMG 都要下载并计算 SHA256
+                  download_dmg() {
+                    local arch="$1"
+                    local url="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX-${arch}.dmg"
+                    # 等待 Release 资产可下载（刚创建的 Release 偶尔有几秒传播延迟）
+                    echo "等待 DMG 可下载: $url"
+                    for i in {1..6}; do
+                      if curl --fail --silent --show-error --location --retry 2 \
+                        --output "/tmp/WaifuX-${arch}.dmg" "$url" && \
+                        [ -s "/tmp/WaifuX-${arch}.dmg" ] && \
+                        [ "$(wc -c < "/tmp/WaifuX-${arch}.dmg")" -gt 1048576 ]; then
+                        echo "✅ WaifuX-${arch}.dmg 下载成功"
+                        return 0
+                      fi
+                      echo "attempt $i: 尚未就绪，10s 后重试..."
+                      rm -f "/tmp/WaifuX-${arch}.dmg"
+                      sleep 10
+                    done
+                    echo "❌ WaifuX-${arch}.dmg 下载失败，tap 更新失败"
+                    return 1
+                  }
+                  download_dmg arm64
+                  download_dmg x86_64
 
-                  SHA256=$(python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' /tmp/WaifuX.dmg)
-                  echo "版本: $VERSION  SHA256: $SHA256"
+                  sha256_of() {
+                    python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' "$1"
+                  }
+                  SHA256_ARM=$(sha256_of /tmp/WaifuX-arm64.dmg)
+                  SHA256_INTEL=$(sha256_of /tmp/WaifuX-x86_64.dmg)
+                  echo "版本: $VERSION  arm64 SHA256: $SHA256_ARM  x86_64 SHA256: $SHA256_INTEL"
 
                   # 克隆 tap 仓库（用 PAT 认证）
                   git clone --depth 1 "https://x-access-token:${TAP_REPO_TOKEN}@github.com/jipika/homebrew-waifux.git" /tmp/tap
@@ -631,12 +736,14 @@ jobs:
                     --check
                   python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
                     --version "$VERSION" \
-                    --sha256 "$SHA256" \
+                    --sha256-arm "$SHA256_ARM" \
+                    --sha256-intel "$SHA256_INTEL" \
                     --output Casks/waifux.rb
                   python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
                     --check-file Casks/waifux.rb \
                     --version "$VERSION" \
-                    --sha256 "$SHA256"
+                    --sha256-arm "$SHA256_ARM" \
+                    --sha256-intel "$SHA256_INTEL"
                   ruby -c Casks/waifux.rb
 
                   git config user.name "github-actions[bot]"
@@ -657,7 +764,8 @@ jobs:
                   python3 "$GITHUB_WORKSPACE/scripts/generate-homebrew-cask.py" \
                     --check-file /tmp/waifux-cask-pushed.rb \
                     --version "$VERSION" \
-                    --sha256 "$SHA256"
+                    --sha256-arm "$SHA256_ARM" \
+                    --sha256-intel "$SHA256_INTEL"
                   ruby -c /tmp/waifux-cask-pushed.rb
 
             - name: Build (PRs)

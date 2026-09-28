@@ -1282,6 +1282,29 @@ final class MediaExploreViewModel: ObservableObject {
         mediaLibrary.ensureDownloadRecord(item: item, localFileURL: localFileURL)
     }
 
+    /// 为「推送到 DeepSeek Harness 背景」解析本地媒体文件（只取材，不碰桌面壁纸）。
+    /// 取材口径与 `applyDynamicWallpaper` 一致：Workshop 先看本地视频，本地项直接用原文件，
+    /// 网络项才走下载队列。
+    func localMediaFileURLForHarness(_ item: MediaItem) async throws -> URL {
+        if item.id.hasPrefix("workshop_"),
+           let localVideoURL = findLocalWorkshopVideo(for: item) {
+            return localVideoURL
+        }
+        if item.id.hasPrefix("local_") {
+            let localURL = item.previewVideoURL ?? item.pageURL
+            if localURL.isFileURL, FileManager.default.fileExists(atPath: localURL.path) {
+                return localURL
+            }
+        }
+        return try await PersistentDownloadQueueService.shared.enqueueMediaAndWait(
+            item,
+            option: preferredWallpaperOption(for: item),
+            saveToLibrary: true,
+            folderID: nil,
+            using: self
+        )
+    }
+
     /// Workshop 内容类型
     private enum WorkshopContentType {
         case video        // 纯视频类型，WaifuX 可直接播放

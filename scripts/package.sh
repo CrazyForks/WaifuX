@@ -1,15 +1,31 @@
 #!/bin/bash
 # WaifuX 打包脚本
-# 用法: ./scripts/package.sh
+# 用法: ./scripts/package.sh            # 按本机架构打包
+#       WAIFUX_ARCH=x86_64 ./scripts/package.sh
+#
+# 拆架构分发（38.0.154+）：
+#   - WaifuX-arm64.dmg   内置 wallpaper-wgpu + DXC + ffmpeg/lib 全家桶（scene 渲染可用）
+#   - WaifuX-x86_64.dmg  不携带 scene 渲染器（wgpu 生态 arm64-only），web daemon 用 x86_64 CLI，
+#                        主 App 内 scene 入口由 WallpaperEngineAvailability 占位短路
+# 扩展（.appex）与屏保（.saver）保持 universal，两个包共用。
 
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 ARCHIVE_NAME="WaifuX.xcarchive"
-DMG_NAME="WaifuX.dmg"
 APP_NAME="WaifuX.app"
 RENDERER_ENTITLEMENTS="$PROJECT_DIR/WallpaperRenderer.entitlements"
+
+# ---- 目标架构 ----
+# WAIFUX_ARCH=universal 构建过渡 universal 包（default channel 桥接件，供旧版
+# universal 客户端收到本次拆架构后的新代码；新客户端再经 Sparkle channel 转到单架构包）。
+PKG_ARCH="${WAIFUX_ARCH:-$(uname -m)}"
+case "$PKG_ARCH" in
+  arm64|x86_64|universal) ;;
+  *) echo "❌ 不支持的 WAIFUX_ARCH: $PKG_ARCH（可选 arm64 | x86_64 | universal）"; exit 1 ;;
+esac
+echo "🏗️ 目标架构: $PKG_ARCH"
 
 echo "📦 WaifuX 打包开始..."
 echo "项目目录: $PROJECT_DIR"
@@ -66,10 +82,17 @@ verify_packaged_ffmpeg() {
   fi
 }
 
-# wallpaper-wgpu + DXC 部署。
+# wallpaper-wgpu + DXC 部署（仅 arm64 包需要）。
 # CI / GitHub 打包默认使用仓库里已提交的二进制与内嵌 assets object；
 # 只有本地缺文件或显式设置 WAIFUX_FORCE_WGPU_REBUILD=1 时才重建，避免 CI 在
 # 没有 Resources/assets 的环境里生成空资源占位。
+if [[ "$PKG_ARCH" == "x86_64" ]]; then
+  echo "⏭️ x86_64 包：使用已提交的 x86_64 渲染器组件（跳过 arm64 wgpu/ffmpeg 部署链）"
+  require_packaged_file "$PROJECT_DIR/Resources/wallpaper-wgpu-x86_64" "wallpaper-wgpu (x86_64)"
+  require_packaged_file "$PROJECT_DIR/Resources/dxc-x86_64" "dxc (x86_64)"
+  require_packaged_file "$PROJECT_DIR/Resources/libdxcompiler-x86_64.dylib" "libdxcompiler.dylib (x86_64)"
+  require_packaged_file "$PROJECT_DIR/Resources/ffmpeg-x86_64" "ffmpeg (x86_64)"
+else
 WGPU_BIN="$PROJECT_DIR/Resources/wallpaper-wgpu"
 WGPU_REBUILD_REASON=""
 
@@ -98,9 +121,18 @@ require_packaged_file "$PROJECT_DIR/Resources/zip_data.o" "wallpaper-wgpu embedd
 require_packaged_file "$PROJECT_DIR/Resources/zip_accessor.o" "wallpaper-wgpu embedded assets accessor object"
 fix_ffmpeg_install_names "$PROJECT_DIR/Resources/ffmpeg" "$PROJECT_DIR/Resources/lib"
 verify_packaged_ffmpeg "$PROJECT_DIR/Resources/ffmpeg"
+fi
 
 # wallpaperengine-cli 仅作为 web 壁纸 daemon 保留（不嵌入 assets，体积约 640KB）。
-CLI_BIN="$PROJECT_DIR/Resources/wallpaperengine-cli"
+# 拆架构后每个包带各自架构的 CLI：arm64 用已提交的 Resources/wallpaperengine-cli，
+# x86_64 用 Resources/wallpaperengine-cli-x86_64（swiftc 交叉编译产物，提交进仓库）。
+if [[ "$PKG_ARCH" == "x86_64" ]]; then
+  CLI_BIN="$PROJECT_DIR/Resources/wallpaperengine-cli-x86_64"
+elif [[ "$PKG_ARCH" == "universal" ]]; then
+  CLI_BIN="$PROJECT_DIR/build/wallpaperengine-cli-universal"
+else
+  CLI_BIN="$PROJECT_DIR/Resources/wallpaperengine-cli"
+fi
 CLI_REBUILD_REASON=""
 
 # CI 环境下若 CLI 二进制已存在且非强制重建，直接跳过（避免因时间戳差异误触发重建）
@@ -115,22 +147,22 @@ elif [[ "$PROJECT_DIR/wallpaperengine-cli.swift" -nt "$CLI_BIN" ]]; then
 fi
 
 if [[ -n "$CLI_REBUILD_REASON" ]]; then
-  echo "🔧 构建 wallpaperengine-cli（web 壁纸 daemon 用，原因：$CLI_REBUILD_REASON）..."
+  echo "🔧 构建 wallpaperengine-cli（web 壁纸 daemon 用，$PKG_ARCH，原因：$CLI_REBUILD_REASON）..."
   if [[ -f "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh" ]]; then
-    echo "🔧 构建 wallpaperengine-cli（web 壁纸 daemon 用）..."
     chmod +x "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh"
-    "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh"
+    "$PROJECT_DIR/scripts/build-wallpaperengine-cli.sh" "$PKG_ARCH"
   fi
 else
-  echo "🔧 使用已提交的 $CLI_BIN（跳过旧 CLI 构建）。若需重编请设 WAIFUX_FORCE_CLI_REBUILD=1"
+  echo "🔧 使用已提交的 $CLI_BIN（跳过 CLI 构建）。若需重编请设 WAIFUX_FORCE_CLI_REBUILD=1"
 fi
 
-require_packaged_file "$PROJECT_DIR/Resources/wallpaperengine-cli" "wallpaperengine-cli"
+require_packaged_file "$CLI_BIN" "wallpaperengine-cli ($PKG_ARCH)"
 
-# 签名 wallpaper-wgpu、CLI、dxc 及依赖
+# 签名 wallpaper-wgpu、CLI、dxc 及依赖（仓库层；bundle 内在导出后会重签）
 echo "🔏 签名渲染器二进制..."
 for f in "$PROJECT_DIR"/Resources/wallpaper-wgpu \
          "$PROJECT_DIR"/Resources/wallpaperengine-cli \
+         "$PROJECT_DIR"/Resources/wallpaperengine-cli-x86_64 \
          "$PROJECT_DIR"/wallpaperengine-cli \
          "$PROJECT_DIR"/Resources/ffmpeg \
          "$PROJECT_DIR"/Resources/dxc \
@@ -155,14 +187,22 @@ if [[ -f "$STEAM_SERVICE_ENTITLEMENTS" && -d "$PROJECT_DIR/SteamService/prebuilt
 fi
 echo "✅ 签名完成"
 
-# 清理旧构建
+# 清理旧构建（保留 build/ 下其它产物，例如双架构流程里另一个架构已导出的 .app）
 echo "🧹 清理旧构建..."
-rm -rf "$BUILD_DIR"
+rm -rf "$BUILD_DIR/$ARCHIVE_NAME" "$BUILD_DIR/$APP_NAME" "$BUILD_DIR/exportOptions.plist"
 mkdir -p "$BUILD_DIR"
 
 # Archive
-echo "🔨 正在 Archive..."
+echo "🔨 正在 Archive ($PKG_ARCH)..."
+if [[ "$PKG_ARCH" == "universal" ]]; then
+  ARCH_OVERRIDES=(ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO)
+else
+  ARCH_OVERRIDES=(ARCHS="$PKG_ARCH" ONLY_ACTIVE_ARCH=NO)
+fi
+# 内嵌 assets 的 zip_data.o / zip_accessor.o 是 universal（含双架构切片），两个架构都正常链接。
 xcodebuild -scheme WaifuX -configuration Release clean archive \
+  "${ARCH_OVERRIDES[@]}" \
+  -derivedDataPath "$BUILD_DIR" \
   CODE_SIGN_IDENTITY="-" \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO \
@@ -209,6 +249,111 @@ if [ $EXPORT_STATUS -ne 0 ]; then
 fi
 
 echo "✅ 导出成功"
+
+# ---- x86_64 包换装渲染器组件（签名前）----
+# folder reference 会把仓库 Resources/ 原样拷进 bundle（含 arm64 组件与带 -x86_64 后缀的
+# 提交件），这里按架构重排：x86_64 包换成 x86_64 的渲染器三件套 + 静态 ffmpeg。
+# wgpu 静态链接 ffmpeg，运行时不需要 lib/ 里的 ffmpeg 闭包（lib/ 只保留 libdxcompiler）。
+if [[ "$PKG_ARCH" == "x86_64" ]]; then
+  echo "🔁 x86_64 包换装渲染器组件..."
+  APP_RES="$BUILD_DIR/$APP_NAME/Contents/Resources"
+  # 移除 folder reference 拷进来的 arm64 组件
+  rm -f  "$APP_RES/wallpaper-wgpu" "$APP_RES/dxc" "$APP_RES/ffmpeg"
+  rm -rf "$APP_RES/lib"
+  # 移除带后缀的提交件本体（紧接着会用它们换装到扁名位置）
+  rm -f  "$APP_RES/wallpaper-wgpu-x86_64" "$APP_RES/dxc-x86_64" "$APP_RES/libdxcompiler-x86_64.dylib" "$APP_RES/ffmpeg-x86_64"
+  if [[ -d "$APP_RES/Resources" ]]; then
+    rm -f  "$APP_RES/Resources/wallpaper-wgpu" "$APP_RES/Resources/dxc" "$APP_RES/Resources/ffmpeg"
+    rm -rf "$APP_RES/Resources/lib"
+    rm -f  "$APP_RES/Resources/wallpaper-wgpu-x86_64" "$APP_RES/Resources/dxc-x86_64" \
+           "$APP_RES/Resources/libdxcompiler-x86_64.dylib" "$APP_RES/Resources/ffmpeg-x86_64"
+    # 嵌套布局下的 arm64 CLI 一并移除，避免双 CLI 共存
+    rm -f  "$APP_RES/Resources/wallpaperengine-cli" "$APP_RES/Resources/wallpaperengine-cli-x86_64"
+  fi
+  # 换装 x86_64 三件套 + ffmpeg 到扁平位置（XBridge 第一查找路径）
+  cp -f "$PROJECT_DIR/Resources/wallpaper-wgpu-x86_64" "$APP_RES/wallpaper-wgpu"
+  cp -f "$PROJECT_DIR/Resources/dxc-x86_64" "$APP_RES/dxc"
+  mkdir -p "$APP_RES/lib"
+  cp -f "$PROJECT_DIR/Resources/libdxcompiler-x86_64.dylib" "$APP_RES/lib/libdxcompiler.dylib"
+  cp -f "$PROJECT_DIR/Resources/ffmpeg-x86_64" "$APP_RES/ffmpeg"
+  chmod +x "$APP_RES/wallpaper-wgpu" "$APP_RES/dxc" "$APP_RES/ffmpeg"
+  echo "  🔎 换装结果:"
+  lipo -info "$APP_RES/wallpaper-wgpu" "$APP_RES/dxc" "$APP_RES/lib/libdxcompiler.dylib" "$APP_RES/ffmpeg"
+  echo "🔁 替换 web 壁纸 daemon 为 x86_64 版..."
+  cp -f "$PROJECT_DIR/Resources/wallpaperengine-cli-x86_64" "$APP_RES/wallpaperengine-cli"
+  chmod +x "$APP_RES/wallpaperengine-cli"
+  lipo -info "$APP_RES/wallpaperengine-cli"
+  echo "✅ x86_64 包换装完成"
+fi
+
+# ---- arm64 / universal 包：清掉 folder reference 拷进来的 x86_64 提交件 ----
+if [[ "$PKG_ARCH" != "x86_64" ]]; then
+  APP_RES="$BUILD_DIR/$APP_NAME/Contents/Resources"
+  rm -f "$APP_RES/wallpaper-wgpu-x86_64" "$APP_RES/dxc-x86_64" "$APP_RES/libdxcompiler-x86_64.dylib" "$APP_RES/ffmpeg-x86_64"
+  rm -f "$APP_RES/wallpaperengine-cli-x86_64"
+  if [[ -d "$APP_RES/Resources" ]]; then
+    rm -f "$APP_RES/Resources/wallpaper-wgpu-x86_64" "$APP_RES/Resources/dxc-x86_64" \
+          "$APP_RES/Resources/libdxcompiler-x86_64.dylib" "$APP_RES/Resources/ffmpeg-x86_64"
+    rm -f "$APP_RES/Resources/wallpaperengine-cli-x86_64"
+  fi
+fi
+
+# ---- universal 过渡包：CLI + 渲染器组件合并为双架构 ----
+if [[ "$PKG_ARCH" == "universal" ]]; then
+  echo "🔁 合并 universal 渲染器组件（两端都要能跑，避免过渡版功能回退）..."
+  APP_RES="$BUILD_DIR/$APP_NAME/Contents/Resources"
+  NESTED_RES="$APP_RES/Resources"
+  # CLI
+  cp -f "$PROJECT_DIR/build/wallpaperengine-cli-universal" "$APP_RES/wallpaperengine-cli"
+  chmod +x "$APP_RES/wallpaperengine-cli"
+  lipo -info "$APP_RES/wallpaperengine-cli"
+  if [[ -d "$NESTED_RES" ]]; then
+    # 渲染器三件套 + ffmpeg 合并（嵌套层是运行时实际命中位置）
+    lipo -create "$PROJECT_DIR/Resources/wallpaper-wgpu" "$PROJECT_DIR/Resources/wallpaper-wgpu-x86_64" \
+      -output "$NESTED_RES/wallpaper-wgpu"
+    lipo -create "$PROJECT_DIR/Resources/dxc" "$PROJECT_DIR/Resources/dxc-x86_64" \
+      -output "$NESTED_RES/dxc"
+    lipo -create "$PROJECT_DIR/Resources/ffmpeg" "$PROJECT_DIR/Resources/ffmpeg-x86_64" \
+      -output "$NESTED_RES/ffmpeg"
+    mkdir -p "$NESTED_RES/lib"
+    lipo -create "$PROJECT_DIR/Resources/lib/libdxcompiler.dylib" "$PROJECT_DIR/Resources/libdxcompiler-x86_64.dylib" \
+      -output "$NESTED_RES/lib/libdxcompiler.dylib"
+    chmod +x "$NESTED_RES/wallpaper-wgpu" "$NESTED_RES/dxc" "$NESTED_RES/ffmpeg"
+    # lipo 合并会破坏原签名，这里重新 ad-hoc 签（后续 sign_exported_app 还会带 entitlements 重签 wgpu）
+    for merged in "$NESTED_RES/wallpaper-wgpu" "$NESTED_RES/dxc" "$NESTED_RES/ffmpeg" "$NESTED_RES/lib/libdxcompiler.dylib" "$APP_RES/wallpaperengine-cli"; do
+      if [[ "$(basename "$merged")" == "wallpaper-wgpu" && -f "$RENDERER_ENTITLEMENTS" ]]; then
+        codesign --force --options runtime --entitlements "$RENDERER_ENTITLEMENTS" -s - "$merged" 2>/dev/null || \
+          codesign --force -s - "$merged" 2>/dev/null || true
+      else
+        codesign --force -s - "$merged" 2>/dev/null || true
+      fi
+    done
+    echo "  🔎 合并结果:"
+    for merged in wallpaper-wgpu dxc ffmpeg lib/libdxcompiler.dylib; do
+      lipo -info "$NESTED_RES/$merged" | sed "s|.*: |    $merged: |"
+    done
+    # 清掉嵌套层两份单架构 CLI 与带后缀提交件，避免多份共存
+    rm -f "$NESTED_RES/wallpaperengine-cli" "$NESTED_RES/wallpaperengine-cli-x86_64" \
+          "$NESTED_RES/wallpaper-wgpu-x86_64" "$NESTED_RES/dxc-x86_64" \
+          "$NESTED_RES/libdxcompiler-x86_64.dylib" "$NESTED_RES/ffmpeg-x86_64"
+  fi
+  rm -f "$APP_RES/wallpaper-wgpu-x86_64" "$APP_RES/dxc-x86_64" \
+        "$APP_RES/libdxcompiler-x86_64.dylib" "$APP_RES/ffmpeg-x86_64" \
+        "$APP_RES/wallpaperengine-cli-x86_64"
+fi
+
+# ---- SteamService：只保留本架构（本地增量构建会残留另一架构的拷贝）----
+# build-steam-service.sh 的 prebuilt 分支不清理 DEST_ROOT，多次不同架构构建后
+# archive 产物可能同时挂着 arm64/ 与 x86_64/，这里按包架构收敛（universal 包保留两套）。
+STEAM_DIR="$BUILD_DIR/$APP_NAME/Contents/Resources/WaifuXSteamService"
+if [[ -d "$STEAM_DIR" ]]; then
+  if [[ "$PKG_ARCH" == "arm64" ]]; then
+    rm -rf "$STEAM_DIR/x86_64"
+  elif [[ "$PKG_ARCH" == "x86_64" ]]; then
+    rm -rf "$STEAM_DIR/arm64"
+  fi
+  echo "  🧩 SteamService 保留: $(ls "$STEAM_DIR" | tr '\n' ' ')"
+fi
 
 find_codesign_identity() {
   if [[ -n "${WAIFUX_CODESIGN_IDENTITY:-}" ]]; then
@@ -287,10 +432,13 @@ sign_exported_app() {
       elif [[ "$identity" != "-" ]]; then
         echo "  签名扩展 (xcodebuild): $(basename "$code_path")"
         local extension_build_log="$BUILD_DIR/extension-build.log"
+        # -target 模式的 SYMROOT 默认是项目 build/，clean 会把 build/ 根下的
+        # 打包日志一并清掉（extension-build.log 自己就在里面）。显式隔离产物目录。
         if [[ -n "${WAIFUX_EXTENSION_PROVISIONING_PROFILE_UUID:-}" ]]; then
           if ! xcodebuild -project "$PROJECT_DIR/WaifuX.xcodeproj" \
             -target WaifuXWallpaperExtension \
             -configuration Release \
+            SYMROOT="$BUILD_DIR/ExtensionBuild" \
             CODE_SIGN_IDENTITY="$identity" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_ENTITLEMENTS="$extension_entitlements" \
@@ -305,6 +453,7 @@ sign_exported_app() {
           if ! xcodebuild -project "$PROJECT_DIR/WaifuX.xcodeproj" \
             -target WaifuXWallpaperExtension \
             -configuration Release \
+            SYMROOT="$BUILD_DIR/ExtensionBuild" \
             CODE_SIGNING_ALLOWED=NO \
             clean build > "$extension_build_log" 2>&1; then
             tail -80 "$extension_build_log"
@@ -346,6 +495,10 @@ sign_exported_app() {
       local ent_check
       ent_check=$(codesign -d --entitlements - "$code_path" 2>/dev/null || true)
       if ! echo "$ent_check" | grep -q "com.apple.security.application-groups"; then
+        if [[ -n "${WAIFUX_ALLOW_MISSING_APPGROUP:-}" ]]; then
+          echo "  ⚠️ WAIFUX_ALLOW_MISSING_APPGROUP=1：跳过扩展 application-groups 校验（本地构建产物，不可对外分发）"
+          return 0
+        fi
         echo "❌ App Extension 签名缺少 application-groups entitlement: $code_path" >&2
         echo "请配置 APPLE_EXTENSION_PROVISIONING_PROFILE / WAIFUX_EXTENSION_PROVISIONING_PROFILE_UUID 后再打包 Developer ID 版本。" >&2
         echo "Debug entitlements:" >&2
@@ -470,8 +623,15 @@ SIGN_IDENTITY="$(find_codesign_identity)"
 sign_exported_app "$BUILD_DIR/$APP_NAME" "$SIGN_IDENTITY"
 
 # 仅在非签名流程时创建 DMG（签名流程由 CI 另行处理）
+# universal 过渡包沿用历史命名 WaifuX.dmg（default channel item 的 URL 保持稳定），
+# 单架构包为 WaifuX-<arch>.dmg。
+if [[ "$PKG_ARCH" == "universal" ]]; then
+  DMG_NAME="WaifuX.dmg"
+else
+  DMG_NAME="WaifuX-$PKG_ARCH.dmg"
+fi
 if [ "${WAIFUX_SKIP_DMG:-}" != "1" ]; then
-  echo "💿 正在创建 DMG..."
+  echo "💿 正在创建 DMG ($DMG_NAME)..."
   if command -v create-dmg &> /dev/null; then
       set +e
       create-dmg \
@@ -510,5 +670,6 @@ if [ "${WAIFUX_SKIP_DMG:-}" != "1" ]; then
 fi
 
 echo ""
-echo "✅ 打包完成！"
+echo "✅ 打包完成！($PKG_ARCH)"
 echo "📍 App 位置: $BUILD_DIR/$APP_NAME"
+[ "${WAIFUX_SKIP_DMG:-}" != "1" ] && echo "📍 DMG 位置: $BUILD_DIR/$DMG_NAME"

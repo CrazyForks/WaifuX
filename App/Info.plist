@@ -50,5 +50,12 @@
     <true/>
     <key>SUScheduledCheckInterval</key>
     <integer>86400</integer>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <!-- 只放行本机回环明文 HTTP：DeepSeek Harness 的插件接口是
+             http://127.0.0.1:<port>/dsh-theme-manager/...（免 token 的 prefix 路由） -->
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>

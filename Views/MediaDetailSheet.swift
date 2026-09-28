@@ -1686,10 +1686,11 @@ struct MediaDetailSheet: View {
 
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
             run(nil)
-        } else if screens.count > 1 {
+        } else if screens.count > 1 || DSHHarnessBridge.shared.availability.isAvailable {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
+                message: screens.count > 1 ? t("multiDisplayDetected") : t("setWallpaper.chooseTarget"),
+                onSelectDSH: { [self] in applyToDeepSeekHarness(localContent: bakedVideoURL) }
             ) { selected in
                 run(selected)
             }
@@ -3216,6 +3217,47 @@ struct MediaDetailSheet: View {
         return "\(t("workshopError.generic"))\n\n\(trimmed)"
     }
 
+    /// 推送到 DeepSeek Harness 作为界面背景（不动桌面壁纸）。
+    /// - Parameter localContent: 已经解析好的本地内容（Workshop / scene 工程目录或媒体文件）。
+    ///   传了就只从它取材（离线烘焙成片优先、工程预览图兜底），不再触发下载。
+    private func applyToDeepSeekHarness(localContent: URL? = nil) {
+        applyingWallpaperStatusKey = "applyingWallpaper.dsh"
+        isSettingWallpaper = true
+        errorMessage = ""
+        Task { @MainActor in
+            do {
+                let bakedVideoPath = SceneOfflineBakeService.usableArtifact(from: currentDownloadRecord)?.videoPath
+                let localURL: URL
+                if let localContent {
+                    localURL = localContent
+                } else {
+                    localURL = try await viewModel.localMediaFileURLForHarness(resolvedItem)
+                }
+                guard let media = DSHMediaResolver.resolve(localURL: localURL, bakedVideoPath: bakedVideoPath) else {
+                    // 工程目录（scene / web）没有成片也没有预览图时给可操作提示，而不是笼统的「格式不支持」
+                    var isDirectory: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: localURL.path, isDirectory: &isDirectory),
+                       isDirectory.boolValue {
+                        throw DSHHarnessBridge.BridgeError.noUsableContent(localURL.lastPathComponent)
+                    }
+                    throw DSHHarnessBridge.BridgeError.unsupported(localURL)
+                }
+                try await DSHHarnessBridge.shared.setBackground(media: media)
+                sceneBakeStatusFlash = t("dshHarness.applied")
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    sceneBakeStatusFlash = nil
+                }
+            } catch {
+                errorMessage = Self.truncateErrorMessage(error.localizedDescription)
+                showError = true
+                AppLogger.error(.wallpaper, "推送到 DeepSeek Harness 失败",
+                                metadata: ["error": error.localizedDescription])
+            }
+            isSettingWallpaper = false
+        }
+    }
+
     private func setAsDesktopWallpaper() {
         // Wallpaper Engine 类内容：Workshop 与本地入库（同一套路径解析）
         if let localURL = findLocalWorkshopFile(for: resolvedItem) {
@@ -3343,10 +3385,11 @@ struct MediaDetailSheet: View {
                 }
                 isSettingWallpaper = false
             }
-        } else if screens.count > 1 {
+        } else if screens.count > 1 || DSHHarnessBridge.shared.availability.isAvailable {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
+                message: screens.count > 1 ? t("multiDisplayDetected") : t("setWallpaper.chooseTarget"),
+                onSelectDSH: { [self] in applyToDeepSeekHarness() }
             ) { [self] selectedScreen in
                 let targetScreens = selectedScreen.map { [$0] } ?? NSScreen.screens
                 let targetScreenIDs = Set(targetScreens.map(\.wallpaperScreenIdentifier))
@@ -3518,10 +3561,11 @@ struct MediaDetailSheet: View {
 
         if WallpaperSchedulerService.shared.isGlobalDisplaySyncEnabled {
             run(nil)
-        } else if screens.count > 1 {
+        } else if screens.count > 1 || DSHHarnessBridge.shared.availability.isAvailable {
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
+                message: screens.count > 1 ? t("multiDisplayDetected") : t("setWallpaper.chooseTarget"),
+                onSelectDSH: { [self] in applyToDeepSeekHarness(localContent: localURL) }
             ) { selected in
                 run(selected)
             }

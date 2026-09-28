@@ -56,43 +56,59 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Download DMG and Compute SHA256
+      - name: Download DMGs and Compute SHA256
         id: download
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          DMG_URL="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX.dmg"
-          for i in {1..6}; do
-            if curl --fail --silent --show-error --location --retry 2 \
-              --output /tmp/WaifuX.dmg "$DMG_URL" && \
-              test -s /tmp/WaifuX.dmg && \
-              test "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576; then
-              break
-            fi
-            echo "attempt $i: DMG not ready, retrying in 10s..."
-            rm -f /tmp/WaifuX.dmg
-            sleep 10
-          done
-          test -s /tmp/WaifuX.dmg
-          test "$(wc -c < /tmp/WaifuX.dmg)" -gt 1048576
-          SHA256=$(python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' /tmp/WaifuX.dmg)
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          # 拆架构分发：arm64 / x86_64 两个 DMG 都要下载并计算 SHA256
+          download_dmg() {
+            local arch="$1"
+            local url="https://github.com/jipika/WaifuX/releases/download/v${VERSION}/WaifuX-${arch}.dmg"
+            for i in {1..6}; do
+              if curl --fail --silent --show-error --location --retry 2 \
+                --output "/tmp/WaifuX-${arch}.dmg" "$url" && \
+                test -s "/tmp/WaifuX-${arch}.dmg" && \
+                test "$(wc -c < /tmp/WaifuX-${arch}.dmg)" -gt 1048576; then
+                return 0
+              fi
+              echo "attempt $i: WaifuX-${arch}.dmg not ready, retrying in 10s..."
+              rm -f "/tmp/WaifuX-${arch}.dmg"
+              sleep 10
+            done
+            echo "❌ Failed to download WaifuX-${arch}.dmg"
+            return 1
+          }
+          download_dmg arm64
+          download_dmg x86_64
+          sha256_of() {
+            python3 -c 'import hashlib, sys; h=hashlib.sha256(); f=open(sys.argv[1], "rb"); [h.update(chunk) for chunk in iter(lambda: f.read(1024 * 1024), b"")]; f.close(); print(h.hexdigest())' "$1"
+          }
+          SHA256_ARM=$(sha256_of /tmp/WaifuX-arm64.dmg)
+          SHA256_INTEL=$(sha256_of /tmp/WaifuX-x86_64.dmg)
+          echo "arm64 SHA256: $SHA256_ARM"
+          echo "x86_64 SHA256: $SHA256_INTEL"
+          echo "sha256-arm=$SHA256_ARM" >> "$GITHUB_OUTPUT"
+          echo "sha256-intel=$SHA256_INTEL" >> "$GITHUB_OUTPUT"
 
       - name: Update Cask
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.download.outputs.sha256 }}
+          SHA256_ARM: ${{ steps.download.outputs.sha256-arm }}
+          SHA256_INTEL: ${{ steps.download.outputs.sha256-intel }}
         run: |
           # Render from the canonical WaifuX source template.
           python3 source/scripts/generate-homebrew-cask.py --check
           python3 source/scripts/generate-homebrew-cask.py \
             --version "$VERSION" \
-            --sha256 "$SHA256" \
+            --sha256-arm "$SHA256_ARM" \
+            --sha256-intel "$SHA256_INTEL" \
             --output tap/Casks/waifux.rb
           python3 source/scripts/generate-homebrew-cask.py \
             --check-file tap/Casks/waifux.rb \
             --version "$VERSION" \
-            --sha256 "$SHA256"
+            --sha256-arm "$SHA256_ARM" \
+            --sha256-intel "$SHA256_INTEL"
           ruby -c tap/Casks/waifux.rb
 
       - name: Push to Tap Repo
@@ -115,5 +131,6 @@ jobs:
           python3 ../source/scripts/generate-homebrew-cask.py \
             --check-file /tmp/waifux-cask-pushed.rb \
             --version "${{ steps.version.outputs.version }}" \
-            --sha256 "${{ steps.download.outputs.sha256 }}"
+            --sha256-arm "${{ steps.download.outputs.sha256-arm }}" \
+            --sha256-intel "${{ steps.download.outputs.sha256-intel }}"
           ruby -c /tmp/waifux-cask-pushed.rb

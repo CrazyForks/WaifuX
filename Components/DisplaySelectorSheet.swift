@@ -6,11 +6,22 @@ struct DisplaySelectorSheet: View {
     let title: String
     let message: String
     let allowsBackgroundDismiss: Bool
+    /// 非 nil 时才多出「DeepSeek Harness」目标（装了 DSH 且接口通才会显示）。
+    let onSelectDSH: (() -> Void)?
     let onSelect: (NSScreen?) -> Void
     let onCancel: () -> Void
 
+    /// DSH 可用性：弹窗出现时探一次，通了才把 Harness 选项画出来。
+    @ObservedObject private var dshBridge = DSHHarnessBridge.shared
+
     @State private var isVisible = false
     @State private var selectedScreenID: String? = nil
+    @State private var isDSHSelected = false
+
+    /// DeepSeek Harness 是否作为目标可选：调用点愿意接管 + DSH 装了且在跑。
+    private var showsDSHTarget: Bool {
+        onSelectDSH != nil && dshBridge.availability.isAvailable
+    }
 
     private var screens: [NSScreen] {
         // 与设置页「显示器 N」编号一致：主屏优先、从左到右，不跟系统枚举顺序。
@@ -60,18 +71,21 @@ struct DisplaySelectorSheet: View {
 
                 // 显示器选择按钮
                 VStack(spacing: 12) {
-                    // 所有显示器选项
-                    DisplayOptionButton(
-                        icon: "display",
-                        title: t("allDisplays"),
-                        subtitle: "\(screens.count) \(t("screensCount"))",
-                        isSelected: selectedScreenID == nil,
-                        action: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                                selectedScreenID = nil
+                    // 所有显示器选项（单屏时与「显示器 1」重复，只留后者）
+                    if hasMultipleDisplays {
+                        DisplayOptionButton(
+                            icon: "display",
+                            title: t("allDisplays"),
+                            subtitle: "\(screens.count) \(t("screensCount"))",
+                            isSelected: !isDSHSelected && selectedScreenID == nil,
+                            action: {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                    selectedScreenID = nil
+                                    isDSHSelected = false
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
 
                     // 单个显示器选项
                     ForEach(Array(screens.enumerated()), id: \.element.screenIdentifier) { index, screen in
@@ -79,16 +93,48 @@ struct DisplaySelectorSheet: View {
                             icon: "display",
                             title: "\(t("display")) \(index + 1)",
                             subtitle: screen.localizedName,
-                            isSelected: selectedScreenID == screen.screenIdentifier,
+                            isSelected: !isDSHSelected && selectedScreenID == screen.screenIdentifier,
                             action: {
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                                     selectedScreenID = screen.screenIdentifier
+                                    isDSHSelected = false
                                 }
                             }
                         )
                     }
+
+                    // DeepSeek Harness（DSH 装了且接口通时才出现）
+                    if showsDSHTarget {
+                        HStack(spacing: 8) {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.08))
+                                .frame(height: 1)
+                            Text(t("dshHarness.orTarget"))
+                                .font(.system(size: 11))
+                                .foregroundStyle(LiquidGlassColors.textQuaternary)
+                                .fixedSize()
+                            Rectangle()
+                                .fill(Color.white.opacity(0.08))
+                                .frame(height: 1)
+                        }
+                        .padding(.vertical, 2)
+
+                        DisplayOptionButton(
+                            icon: "sparkles",
+                            title: "DeepSeek Harness",
+                            subtitle: t("dshHarness.subtitle"),
+                            isSelected: isDSHSelected,
+                            action: {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                    isDSHSelected = true
+                                }
+                            }
+                        )
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
                 }
                 .frame(maxWidth: 320)
+                .animation(.easeInOut(duration: 0.2), value: showsDSHTarget)
 
                 // 操作按钮
                 HStack(spacing: 12) {
@@ -133,6 +179,10 @@ struct DisplaySelectorSheet: View {
             .scaleEffect(isVisible ? 1.0 : 0.88)
             .opacity(isVisible ? 1.0 : 0.0)
             .onAppear {
+                // 单屏弹窗（只有 DSH 在线时才会出现）没有「所有显示器」项，默认选中唯一的屏幕
+                if !hasMultipleDisplays, let onlyScreen = screens.first {
+                    selectedScreenID = onlyScreen.screenIdentifier
+                }
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                     isVisible = true
                 }
@@ -141,6 +191,11 @@ struct DisplaySelectorSheet: View {
         // Esc 关闭兜底：从库/状态栏触发时没有详情页键盘监听接住 Esc，由卡片自己关闭
         .onExitCommand {
             dismiss()
+        }
+        // 弹窗出现时探一次 DSH（毫秒级本机 GET，带 20s 缓存）
+        .task {
+            guard onSelectDSH != nil else { return }
+            await dshBridge.refreshAvailability()
         }
     }
 
@@ -154,10 +209,15 @@ struct DisplaySelectorSheet: View {
     }
 
     private func confirmSelection() {
+        let selectedDSH = isDSHSelected
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
             isVisible = false
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if selectedDSH, let onSelectDSH {
+                onSelectDSH()
+                return
+            }
             onSelect(screen(forID: selectedScreenID))
         }
     }
@@ -242,8 +302,12 @@ class DisplaySelectorManager: ObservableObject {
     @Published private(set) var selectorTitle: String = ""
     @Published private(set) var selectorMessage: String = ""
     @Published private(set) var allowsBackgroundDismiss = false
+    /// 当前这次弹窗是否允许出现「DeepSeek Harness」目标
+    /// （最终可见性还要看 DSH 是否在线，由弹窗自己判断）。
+    private(set) var supportsDSHTarget = false
 
     private var completionHandler: ((NSScreen?) -> Void)?
+    private var dshHandler: (() -> Void)?
 
     private init() {}
 
@@ -251,14 +315,18 @@ class DisplaySelectorManager: ObservableObject {
     /// - Parameters:
     ///   - title: 弹窗标题
     ///   - message: 弹窗消息
+    ///   - onSelectDSH: 传给弹窗的「DeepSeek Harness」目标回调；nil = 这个入口不提供该目标
     ///   - completion: 选择完成回调，参数为选中的屏幕，nil 表示所有屏幕
     func showSelector(
         title: String,
         message: String,
         allowsBackgroundDismiss: Bool = false,
+        onSelectDSH: (() -> Void)? = nil,
         completion: @escaping (NSScreen?) -> Void
     ) {
         self.completionHandler = completion
+        self.dshHandler = onSelectDSH
+        self.supportsDSHTarget = onSelectDSH != nil
         self.selectorTitle = title
         self.selectorMessage = message
         self.allowsBackgroundDismiss = allowsBackgroundDismiss
@@ -269,11 +337,25 @@ class DisplaySelectorManager: ObservableObject {
         isShowingSelector = false
         completionHandler?(screen)
         completionHandler = nil
+        dshHandler = nil
+        supportsDSHTarget = false
+    }
+
+    /// 选中「DeepSeek Harness」：桌面壁纸不动，交给调用点推送到 DSH。
+    func handleDSHSelection() {
+        isShowingSelector = false
+        let handler = dshHandler
+        completionHandler = nil
+        dshHandler = nil
+        supportsDSHTarget = false
+        handler?()
     }
 
     func handleCancel() {
         isShowingSelector = false
         completionHandler = nil
+        dshHandler = nil
+        supportsDSHTarget = false
     }
 
     /// 主窗口进入后台极致释放时清掉待执行闭包，避免闭包继续持有详情页或 ViewModel。
@@ -283,6 +365,8 @@ class DisplaySelectorManager: ObservableObject {
         allowsBackgroundDismiss = false
         isShowingSelector = false
         completionHandler = nil
+        dshHandler = nil
+        supportsDSHTarget = false
     }
 }
 
@@ -307,6 +391,7 @@ public struct DisplaySelectorOverlay: View {
                     title: manager.selectorTitle.isEmpty ? t("selectDisplay") : manager.selectorTitle,
                     message: manager.selectorMessage.isEmpty ? t("selectDisplayMessage") : manager.selectorMessage,
                     allowsBackgroundDismiss: manager.allowsBackgroundDismiss,
+                    onSelectDSH: manager.supportsDSHTarget ? { manager.handleDSHSelection() } : nil,
                     onSelect: { screen in
                         manager.handleSelection(screen)
                     },
@@ -344,6 +429,7 @@ private extension NSScreen {
             title: t("displaySelector.title"),
             message: t("displaySelector.message"),
             allowsBackgroundDismiss: false,
+            onSelectDSH: nil,
             onSelect: { screen in
                 print("Selected screen: \(screen?.localizedName ?? "All")")
             },

@@ -1,8 +1,17 @@
 cask "waifux" do
   version "__VERSION__"
-  sha256 "__SHA256__"
 
-  url "https://github.com/jipika/WaifuX/releases/download/v#{version}/WaifuX.dmg"
+  # 按架构分发：arm64 包含场景渲染器全家桶；x86_64 包不含（wgpu 生态暂为 arm64-only）。
+  on_arm do
+    sha256 "__SHA256_ARM__"
+
+    url "https://github.com/jipika/WaifuX/releases/download/v#{version}/WaifuX-arm64.dmg"
+  end
+  on_intel do
+    sha256 "__SHA256_INTEL__"
+
+    url "https://github.com/jipika/WaifuX/releases/download/v#{version}/WaifuX-x86_64.dmg"
+  end
   name "WaifuX"
   desc "Beautiful anime wallpaper and content browser"
   homepage "https://github.com/jipika/WaifuX"

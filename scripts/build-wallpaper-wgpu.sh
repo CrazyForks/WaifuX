@@ -82,24 +82,70 @@ else
   echo "  ⚠️  wallpaper-wgpu 未找到，跳过复制"
 fi
 
-# ── 1.5 复制 ffmpeg（bake 命令需要） ────────────────────────────
-FFMPEG_SRC="${WAIFUX_FFMPEG_SRC:-/opt/homebrew/bin/ffmpeg}"
-# 如果是符号链接，解析真实路径（macOS readlink 不支持 -f）
-if [[ -L "$FFMPEG_SRC" ]]; then
-  FFMPEG_SRC="$(cd "$(dirname "$FFMPEG_SRC")" && pwd)/$(basename "$FFMPEG_SRC")"
-  # 如果还是链接，用 stat 获取真实路径
-  if [[ -L "$FFMPEG_SRC" ]]; then
-    FFMPEG_SRC="$(stat -f%R "$FFMPEG_SRC" 2>/dev/null || echo "$FFMPEG_SRC")"
-  fi
-fi
-if [[ -f "$FFMPEG_SRC" ]]; then
-  cp "$FFMPEG_SRC" "$DEST_DIR/ffmpeg"
-  chmod +x "$DEST_DIR/ffmpeg"
-  fix_ffmpeg_install_names "$DEST_DIR/ffmpeg" "$DEST_LIB_DIR"
-  echo "  ✅ ffmpeg → $DEST_DIR/ffmpeg"
+# ── 1.1 复制 x86_64 渲染器三件套（拆架构分发：x86_64 包换装用） ──
+# 来源优先渲染器仓库的 dist-x86_64/ 分发目录（wallpaper-wgpu + dxc + libdxcompiler.dylib）。
+# 产出带 -x86_64 后缀的提交件，不覆盖 arm64 扁名文件；package.sh 打 x86 包时换装。
+WGPU_DIST_X86="${WAIFUX_WGPU_DIST_X86:-/Volumes/mac/CodeLibrary/Claude/wallpaper-wgpu/dist-x86_64}"
+if [[ -d "$WGPU_DIST_X86" ]]; then
+  for pair in "wallpaper-wgpu:wallpaper-wgpu-x86_64" "dxc:dxc-x86_64" "libdxcompiler.dylib:libdxcompiler-x86_64.dylib"; do
+    src_name="${pair%%:*}"
+    dst_name="${pair##*:}"
+    if [[ -f "$WGPU_DIST_X86/$src_name" ]]; then
+      cp "$WGPU_DIST_X86/$src_name" "$DEST_DIR/$dst_name"
+      chmod +x "$DEST_DIR/$dst_name"
+      echo "  ✅ $src_name (x86_64) → $DEST_DIR/$dst_name"
+    else
+      echo "  ⚠️  $WGPU_DIST_X86/$src_name 不存在，保留已有 $dst_name"
+    fi
+  done
 else
-  echo "  ⚠️  ffmpeg 未找到($FFMPEG_SRC), bake 功能将不可用"
+  echo "  ⚠️  未找到 $WGPU_DIST_X86，x86_64 渲染器组件跳过部署"
 fi
+
+# ── 1.5 复制 ffmpeg（web 壁纸离线烘焙的音频 mux 用） ────────────
+# 优先使用静态单文件版（无 lib/ 闭包依赖，可随包分发）：
+#   arm64  源：$WAIFUX_FFMPEG_SRC → /tmp/ff-out-arm64/ffmpeg-arm64 → homebrew 动态版兜底
+#   x86_64 源：$WAIFUX_FFMPEG_X86_SRC → /tmp/ff-out-x86_64/ffmpeg-x86_64
+# 静态版能力集：mp4 demux/mux + 内置音频解码 + volume/apad filter + aac 编码（视频走 -c:v copy）。
+deploy_ffmpeg() {
+  local arch="$1" dest="$2" src_env="$3"
+  local candidates=("$src_env")
+  if [[ "$arch" == "arm64" ]]; then
+    candidates+=("/tmp/ff-out-arm64/ffmpeg-arm64" "/opt/homebrew/bin/ffmpeg")
+  else
+    candidates+=("/tmp/ff-out-x86_64/ffmpeg-x86_64")
+  fi
+  local src=""
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    src="$candidate"
+    break
+  done
+  if [[ -z "$src" ]]; then
+    echo "  ⚠️  ffmpeg ($arch) 源未找到，跳过部署"
+    return 0
+  fi
+  # homebrew 路径是符号链接，解析真实路径
+  if [[ -L "$src" ]]; then
+    src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+    if [[ -L "$src" ]]; then
+      src="$(stat -f%R "$src" 2>/dev/null || echo "$src")"
+    fi
+  fi
+  cp "$src" "$dest"
+  chmod +x "$dest"
+  # 仅动态版需要把 /opt/homebrew 依赖改写成 @loader_path/lib
+  if otool -L "$dest" 2>/dev/null | tail -n +2 | grep -q "/opt/homebrew"; then
+    fix_ffmpeg_install_names "$dest" "$DEST_LIB_DIR"
+    echo "  ✅ ffmpeg ($arch, 动态) → $dest（依赖 lib/）"
+  else
+    echo "  ✅ ffmpeg ($arch, 静态) → $dest"
+  fi
+}
+
+deploy_ffmpeg arm64 "$DEST_DIR/ffmpeg" "${WAIFUX_FFMPEG_SRC:-}"
+deploy_ffmpeg x86_64 "$DEST_DIR/ffmpeg-x86_64" "${WAIFUX_FFMPEG_X86_SRC:-}"
 
 # ── 2. 复制 DXC ─────────────────────────────────────────────────
 DXC_SRC="${WAIFUX_DXC_SRC:-}"
@@ -266,6 +312,16 @@ if command -v codesign >/dev/null 2>&1; then
   if [[ -f "$DEST_DIR/ffmpeg" ]]; then
     codesign --force -s - "$DEST_DIR/ffmpeg" 2>/dev/null || true
   fi
+  for x86_file in "$DEST_DIR/wallpaper-wgpu-x86_64" "$DEST_DIR/dxc-x86_64" "$DEST_DIR/libdxcompiler-x86_64.dylib" "$DEST_DIR/ffmpeg-x86_64"; do
+    if [[ -f "$x86_file" ]]; then
+      if [[ "$(basename "$x86_file")" == "wallpaper-wgpu-x86_64" && -f "$RENDERER_ENTITLEMENTS" ]]; then
+        codesign --force --options runtime --entitlements "$RENDERER_ENTITLEMENTS" -s - "$x86_file" 2>/dev/null || \
+          codesign --force -s - "$x86_file" 2>/dev/null || true
+      else
+        codesign --force -s - "$x86_file" 2>/dev/null || true
+      fi
+    fi
+  done
   echo "  ✅ 签名完成"
 fi
 

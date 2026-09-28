@@ -1,12 +1,12 @@
 import SwiftUI
 
 // MARK: - Shimmer 效果（iOS 风格闪光加载动画）
-/// App 没有任何可见窗口（全部被遮挡/隐藏）时返回 false：
+/// App 没有可见的普通窗口（全部被遮挡/隐藏）时返回 false：
 /// 常驻骨架 shimmer 必须暂停，否则 repeatForever 会在后台持续驱动渲染循环空烧 CPU。
 @MainActor
 final class MainWindowVisibility: ObservableObject {
     static let shared = MainWindowVisibility()
-    @Published private(set) var allowContinuousAnimation = true
+    @Published private(set) var allowContinuousAnimation = false
 
     private init() {
         NotificationCenter.default.addObserver(
@@ -15,16 +15,23 @@ final class MainWindowVisibility: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                let anyVisible = NSApp.windows.contains {
-                    $0.isVisible && $0.occlusionState.contains(.visible)
-                }
-                if self.allowContinuousAnimation != anyVisible {
-                    self.allowContinuousAnimation = anyVisible
-                    AppLogger.error(.general, "[AnimTracker] continuous animation \(anyVisible ? "resumed" : "paused") (no visible window)")
-                }
+                self?.refresh()
             }
         }
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func refresh() {
+        // 桌面壁纸/时钟窗口可能常驻可见，但不应让已隐藏的普通界面继续跑动画。
+        let anyVisible = NSApp.windows.contains {
+            $0.level >= .normal && $0.isVisible && !$0.isMiniaturized &&
+                $0.occlusionState.contains(.visible)
+        }
+        guard allowContinuousAnimation != anyVisible else { return }
+        allowContinuousAnimation = anyVisible
+        AppLogger.error(.general, "[AnimTracker] continuous animation \(anyVisible ? "resumed" : "paused") (no visible ordinary window)")
     }
 }
 

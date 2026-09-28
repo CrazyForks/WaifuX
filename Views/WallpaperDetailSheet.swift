@@ -66,6 +66,7 @@ struct WallpaperDetailSheet: View {
     /// 分享面板相对定位用（与分享按钮同几何的锚定 `NSView`）
     @State private var sharePickerAnchorView: NSView?
     @State private var showCopyLinkToast = false
+    @State private var showDSHBackgroundToast = false
     @State private var showMoreOptionsPopover = false
 
     // MARK: - 作者壁纸弹窗相关
@@ -281,6 +282,20 @@ struct WallpaperDetailSheet: View {
                         .padding(.bottom, 48)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showCopyLinkToast)
+                } else if showDSHBackgroundToast {
+                    Text(t("dshHarness.applied"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule()
+                                .fill(.ultraThinMaterial)
+                                .overlay(Capsule().stroke(.white.opacity(0.12), lineWidth: 0.5))
+                        )
+                        .padding(.bottom, 48)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showDSHBackgroundToast)
                 }
             }
         }
@@ -1407,12 +1422,15 @@ struct WallpaperDetailSheet: View {
     private func setAsDesktopWallpaper() {
         // 检测多显示器
         let screens = NSScreen.screens
-        if screens.count > 1 {
+        // DeepSeek Harness 在线时单屏也要弹选择器，否则「推送到 Harness」对单屏用户不可达
+        let dshAvailable = DSHHarnessBridge.shared.availability.isAvailable
+        if screens.count > 1 || dshAvailable {
             // 多显示器环境下显示选择弹窗
             // selectedScreen == nil 表示"所有显示器"，非 nil 表示特定显示器
             DisplaySelectorManager.shared.showSelector(
                 title: t("setWallpaper"),
-                message: t("multiDisplayDetected")
+                message: screens.count > 1 ? t("multiDisplayDetected") : t("setWallpaper.chooseTarget"),
+                onSelectDSH: { [self] in applyToDeepSeekHarness() }
             ) { [self] selectedScreen in
                 isSettingWallpaper = true
                 errorMessage = ""
@@ -1466,6 +1484,29 @@ struct WallpaperDetailSheet: View {
                 }
                 isSettingWallpaper = false
             }
+        }
+    }
+
+    /// 推送到 DeepSeek Harness 作为界面背景（不动桌面壁纸）。
+    private func applyToDeepSeekHarness() {
+        isSettingWallpaper = true
+        errorMessage = ""
+        Task { @MainActor in
+            do {
+                let imageURL = try await getWallpaperImageURLForSetting()
+                let media = DSHMediaResolver.media(for: imageURL) ?? .image(imageURL)
+                try await DSHHarnessBridge.shared.setBackground(media: media)
+                showDSHBackgroundToast = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+                    showDSHBackgroundToast = false
+                }
+            } catch {
+                errorMessage = "\(t("error")): \(error.localizedDescription)"
+                showError = true
+                AppLogger.error(.wallpaper, "推送到 DeepSeek Harness 失败",
+                                metadata: ["error": error.localizedDescription])
+            }
+            isSettingWallpaper = false
         }
     }
 

@@ -58,6 +58,37 @@ xml = '''<?xml version=\"1.0\" encoding=\"utf-8\"?>
         length=\"0\"
       />
     </item>
+    <item>
+      <title>Version @@VERSION@@</title>
+      <sparkle:version>@@VERSION@@</sparkle:version>
+      <sparkle:shortVersionString>@@VERSION@@</sparkle:shortVersionString>
+      <sparkle:channel>arm64</sparkle:channel>
+      <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+      <pubDate>@@PUB_DATE@@</pubDate>
+      <description><![CDATA[
+@@DESC@@
+      ]]></description>
+      <enclosure
+        url=\"https://github.com/jipika/WaifuX/releases/download/v@@VERSION@@/WaifuX-arm64.dmg\"
+        type=\"application/octet-stream\"
+        length=\"0\"
+      />
+    </item>
+    <item>
+      <title>Version @@VERSION@@</title>
+      <sparkle:version>@@VERSION@@</sparkle:version>
+      <sparkle:shortVersionString>@@VERSION@@</sparkle:shortVersionString>
+      <sparkle:channel>x86_64</sparkle:channel>
+      <pubDate>@@PUB_DATE@@</pubDate>
+      <description><![CDATA[
+@@DESC@@
+      ]]></description>
+      <enclosure
+        url=\"https://github.com/jipika/WaifuX/releases/download/v@@VERSION@@/WaifuX-x86_64.dmg\"
+        type=\"application/octet-stream\"
+        length=\"0\"
+      />
+    </item>
   </channel>
 </rss>
 '''
