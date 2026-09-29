@@ -58,11 +58,14 @@ fix_ffmpeg_install_names() {
   fi
 }
 
-# ── 1. 复制 wallpaper-wgpu ──────────────────────────────────────
+# ── 1. 复制 wallpaper-wgpu（arm64）──────────────────────────────
+# 优先渲染器仓库的分发目录 dist-aarch64/（与 dist-x86_64/ 成套，含同批构建的 dxc/ffmpeg）；
+# 其次 target/release 等历史位置。
+DIST_AARCH64="${WAIFUX_WGPU_DIST_AARCH64:-/Volumes/mac/CodeLibrary/Claude/wallpaper-wgpu/dist-aarch64}"
 WGUI_SRC="${WAIFUX_WGPU_SRC:-}"
 if [[ -z "$WGUI_SRC" ]]; then
-  # 手动部署时优先使用 wallpaper-wgpu 项目的最新 release 产物。
   for candidate in \
+    "$DIST_AARCH64/wallpaper-wgpu" \
     "/Volumes/mac/CodeLibrary/Claude/wallpaper-wgpu/target/release/wallpaper-wgpu" \
     "$HOME/Downloads/wallpaper-wgpu" \
     "$ROOT/wallpaper-wgpu"; do
@@ -109,7 +112,11 @@ fi
 # 静态版能力集：mp4 demux/mux + 内置音频解码 + volume/apad filter + aac 编码（视频走 -c:v copy）。
 deploy_ffmpeg() {
   local arch="$1" dest="$2" src_env="$3"
-  local candidates=("$src_env")
+  local dist_arch="x86_64"
+  [[ "$arch" == "arm64" ]] && dist_arch="aarch64"
+  local dist_dir="${WAIFUX_WGPU_DIST_ROOT:-/Volumes/mac/CodeLibrary/Claude/wallpaper-wgpu}/dist-$dist_arch"
+  # 候选顺序：显式 env → 渲染器仓库 dist-<arch>/ffmpeg（与同批 wgpu 配套）→ 本地静态构建 → homebrew（仅 arm64 兜底）
+  local candidates=("$src_env" "$dist_dir/ffmpeg")
   if [[ "$arch" == "arm64" ]]; then
     candidates+=("/tmp/ff-out-arm64/ffmpeg-arm64" "/opt/homebrew/bin/ffmpeg")
   else
@@ -154,6 +161,7 @@ DXC_DYLIB_SRC="${WAIFUX_DXC_DYLIB_SRC:-}"
 # 如果未指定源路径，尝试多个位置
 if [[ -z "$DXC_SRC" ]]; then
   for candidate in \
+    "$DIST_AARCH64/dxc" \
     "$HOME/Desktop/dxc" \
     "$ROOT/Resources/dxc" \
     "/opt/homebrew/bin/dxc"; do
@@ -166,6 +174,7 @@ fi
 
 if [[ -z "$DXC_DYLIB_SRC" ]]; then
   for candidate in \
+    "$DIST_AARCH64/libdxcompiler.dylib" \
     "$HOME/Desktop/libdxcompiler.dylib" \
     "$ROOT/Resources/lib/libdxcompiler.dylib" \
     "/opt/homebrew/lib/libdxcompiler.dylib"; do
@@ -177,7 +186,9 @@ if [[ -z "$DXC_DYLIB_SRC" ]]; then
 fi
 
 # 如果 Resources 下已存在且未指定源，跳过复制
-if [[ -f "$DEST_DIR/dxc" && -z "${WAIFUX_DXC_SRC:-}" ]]; then
+# 分发目录（dist-aarch64）里的组件总是覆盖部署：用户更新分发版后必须同步；
+# 其余来源沿用「已存在则跳过」的增量语义。
+if [[ -f "$DEST_DIR/dxc" && -z "${WAIFUX_DXC_SRC:-}" && "$DXC_SRC" != "$DIST_AARCH64/dxc" ]]; then
   echo "  ✅ dxc 已存在，跳过复制"
 elif [[ -n "$DXC_SRC" && -f "$DXC_SRC" ]]; then
   cp "$DXC_SRC" "$DEST_DIR/dxc"
@@ -195,7 +206,7 @@ else
   echo "  ⚠️  dxc 未找到，跳过复制"
 fi
 
-if [[ -f "$DEST_LIB_DIR/libdxcompiler.dylib" && -z "${WAIFUX_DXC_DYLIB_SRC:-}" ]]; then
+if [[ -f "$DEST_LIB_DIR/libdxcompiler.dylib" && -z "${WAIFUX_DXC_DYLIB_SRC:-}" && "$DXC_DYLIB_SRC" != "$DIST_AARCH64/libdxcompiler.dylib" ]]; then
   echo "  ✅ libdxcompiler.dylib 已存在，跳过复制"
 elif [[ -n "$DXC_DYLIB_SRC" && -f "$DXC_DYLIB_SRC" ]]; then
   cp "$DXC_DYLIB_SRC" "$DEST_LIB_DIR/libdxcompiler.dylib"

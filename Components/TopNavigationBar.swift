@@ -131,26 +131,49 @@ struct TopNavigationBar: View {
 }
 
 // MARK: - 红绿灯按钮组
+
+/// 红绿灯外观代际。
+/// - `legacy`：macOS 26 及更早 —— 13pt 纯色圆 + 黑色描边 + 投影（原实现，保持不变）
+/// - `liquidGlass`：macOS 27 起系统换新样式 —— 14pt、垂直渐变、同色系描边、
+///   窗口失焦时三颗灯统一变灰
+enum WindowControlAppearance {
+    case legacy
+    case liquidGlass
+
+    static var current: WindowControlAppearance {
+        if #available(macOS 27.0, *) { return .liquidGlass }
+        return .legacy
+    }
+
+    /// 实测 macOS 27.0（26A428）系统窗口：按钮 14×14，左原点 x=9/32/55
+    /// → 中心距 23、圆间隙 9；标题栏高 32。
+    var diameter: CGFloat { self == .legacy ? 13 : 14 }
+    var spacing: CGFloat { self == .legacy ? 8 : 9 }
+}
+
 struct CustomWindowControls: View {
     let onClose: () -> Void
     let onMinimize: () -> Void
     let onMaximize: () -> Void
 
+    /// 窗口是否处于 key 状态；新样式据此把三颗灯画成系统那样的失焦灰。
+    @Environment(\.controlActiveState) private var controlActiveState
+
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: WindowControlAppearance.current.spacing) {
             WindowControlButton(
-                fillColor: Color(hex: "FF5F57"),
-                symbol: "xmark",
+                kind: .close,
+                isWindowKey: controlActiveState == .key,
                 action: onClose
             )
             WindowControlButton(
-                fillColor: Color(hex: "FFBD2E"),
-                symbol: "minus",
+                kind: .minimize,
+                isWindowKey: controlActiveState == .key,
                 action: onMinimize
             )
             WindowControlButton(
-                fillColor: Color(hex: "28C840"),
-                symbol: "plus",
+                kind: .zoom,
+                isWindowKey: controlActiveState == .key,
                 action: onMaximize
             )
         }
@@ -204,27 +227,30 @@ struct DetailSheetWindowControls: View {
 }
 
 struct WindowControlButton: View {
-    let fillColor: Color
-    let symbol: String
+    enum Kind { case close, minimize, zoom }
+
+    let kind: Kind
+    /// 仅 macOS 27 新样式使用：false 时按系统的失焦灰态绘制。
+    var isWindowKey: Bool = true
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovered = false
+
+    private var appearance: WindowControlAppearance { .current }
+    private var isDark: Bool { colorScheme == .dark }
 
     var body: some View {
         Button(action: action) {
-            Circle()
-                .fill(fillColor.opacity(isHovered ? 0.95 : 0.88))
-                .frame(width: 13, height: 13)
-                .overlay(
-                    Circle()
-                        .stroke(Color.black.opacity(0.22), lineWidth: 0.5)
-                )
-                .overlay {
-                    Image(systemName: symbol)
-                        .font(.system(size: 7, weight: .bold))
-                        .foregroundStyle(Color.black.opacity(isHovered ? 0.58 : 0.0))
+            Group {
+                switch appearance {
+                case .legacy:
+                    legacyCircle
+                case .liquidGlass:
+                    liquidGlassCircle
                 }
-                .shadow(color: .black.opacity(0.18), radius: 4, y: 2)
+            }
+            .frame(width: appearance.diameter, height: appearance.diameter)
         }
         .buttonStyle(.plain)
         .focusable(false)
@@ -232,6 +258,111 @@ struct WindowControlButton: View {
             withAnimation(.easeInOut(duration: 0.14)) {
                 isHovered = hovering
             }
+        }
+    }
+
+    // MARK: 旧样式（macOS 26 及更早，保持原样）
+
+    /// 原色：红 FF5F57 / 黄 FFBD2E / 绿 28C840。
+    private var legacyFillColor: Color {
+        switch kind {
+        case .close: return Color(hex: "FF5F57")
+        case .minimize: return Color(hex: "FFBD2E")
+        case .zoom: return Color(hex: "28C840")
+        }
+    }
+
+    private var legacyCircle: some View {
+        Circle()
+            .fill(legacyFillColor.opacity(isHovered ? 0.95 : 0.88))
+            .overlay(
+                Circle()
+                    .stroke(Color.black.opacity(0.22), lineWidth: 0.5)
+            )
+            .overlay {
+                Image(systemName: symbolName)
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(Color.black.opacity(isHovered ? 0.58 : 0.0))
+            }
+            .shadow(color: .black.opacity(0.18), radius: 4, y: 2)
+    }
+
+    // MARK: 新样式（macOS 27+）
+
+    /// 垂直渐变（上饱和 → 下浅）+ 顶部高光 + 同色系细描边；失焦统一灰。
+    private var liquidGlassCircle: some View {
+        let palette = currentPalette
+        return Circle()
+            .fill(
+                LinearGradient(
+                    colors: isWindowKey
+                        ? [palette.top, palette.bottom]
+                        : [palette.inactiveTop, palette.inactiveBottom],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            .overlay(
+                Circle().fill(
+                    LinearGradient(
+                        colors: [Color.white.opacity(isWindowKey ? 0.06 : 0.02), .clear],
+                        startPoint: .top,
+                        endPoint: .center
+                    )
+                )
+            )
+            .overlay(
+                Circle().stroke(palette.stroke, lineWidth: 0.5)
+            )
+            .overlay {
+                Image(systemName: symbolName)
+                    .font(.system(size: 7.5, weight: .bold))
+                    .foregroundStyle(Color.black.opacity(isHovered ? 0.55 : 0.0))
+            }
+            .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+    }
+
+    private var symbolName: String {
+        switch kind {
+        case .close: return "xmark"
+        case .minimize: return "minus"
+        case .zoom: return "plus"
+        }
+    }
+
+    /// 实测 macOS 27.0 系统窗口取色（sRGB）：
+    /// 浅色外观 —— 红 #FD6F65→#F69189、黄 #FCBB2D→#FFD347、绿 #64D032→#9EE07F，失焦 #F3F3F7→#F5F5F9；
+    /// 深色外观 —— 红 #F76055→#EF6861、黄 #FAB300→#FECD2C、绿 #38C200→#4EC338，失焦 #515151→#444444。
+    private struct LightPalette {
+        let top: Color
+        let bottom: Color
+        let stroke: Color
+        let inactiveTop: Color
+        let inactiveBottom: Color
+    }
+
+    private var currentPalette: LightPalette {
+        let inactiveLight = (Color(hex: "F3F3F7"), Color(hex: "F5F5F9"))
+        let inactiveDark = (Color(hex: "515151"), Color(hex: "444444"))
+        switch (kind, isDark) {
+        case (.close, false):
+            return LightPalette(top: Color(hex: "FE695F"), bottom: Color(hex: "F69189"), stroke: Color(hex: "C22B1E"),
+                                inactiveTop: inactiveLight.0, inactiveBottom: inactiveLight.1)
+        case (.close, true):
+            return LightPalette(top: Color(hex: "F76055"), bottom: Color(hex: "EF6861"), stroke: Color(hex: "C0362B"),
+                                inactiveTop: inactiveDark.0, inactiveBottom: inactiveDark.1)
+        case (.minimize, false):
+            return LightPalette(top: Color(hex: "FCB729"), bottom: Color(hex: "FFD347"), stroke: Color(hex: "B88300"),
+                                inactiveTop: inactiveLight.0, inactiveBottom: inactiveLight.1)
+        case (.minimize, true):
+            return LightPalette(top: Color(hex: "FAB300"), bottom: Color(hex: "FECD2C"), stroke: Color(hex: "B98200"),
+                                inactiveTop: inactiveDark.0, inactiveBottom: inactiveDark.1)
+        case (.zoom, false):
+            return LightPalette(top: Color(hex: "5ACD25"), bottom: Color(hex: "9EE07F"), stroke: Color(hex: "359112"),
+                                inactiveTop: inactiveLight.0, inactiveBottom: inactiveLight.1)
+        case (.zoom, true):
+            return LightPalette(top: Color(hex: "38C200"), bottom: Color(hex: "4EC338"), stroke: Color(hex: "2C9600"),
+                                inactiveTop: inactiveDark.0, inactiveBottom: inactiveDark.1)
         }
     }
 }
