@@ -676,9 +676,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WaifuX-test-${{ github.sha }}
-          path: |
-            build/WaifuX-arm64.dmg
-            build/WaifuX-x86_64.dmg
+          path: build/WaifuX*.dmg
           retention-days: 3
 
       # 提交更新后的 appcast.xml 到 GitHub Pages

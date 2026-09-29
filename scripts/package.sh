@@ -672,4 +672,9 @@ fi
 echo ""
 echo "✅ 打包完成！($PKG_ARCH)"
 echo "📍 App 位置: $BUILD_DIR/$APP_NAME"
-[ "${WAIFUX_SKIP_DMG:-}" != "1" ] && echo "📍 DMG 位置: $BUILD_DIR/$DMG_NAME"
+# ⚠️ 不要写成 `[ ... ] && echo`：CI 里 WAIFUX_SKIP_DMG=1 时该判断返回 1，
+# 会成为脚本退出码，让设置了 `set -e` 的 workflow 在成功打包后误判失败。
+if [ "${WAIFUX_SKIP_DMG:-}" != "1" ]; then
+  echo "📍 DMG 位置: $BUILD_DIR/$DMG_NAME"
+fi
+exit 0
