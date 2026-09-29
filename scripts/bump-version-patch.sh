@@ -14,7 +14,12 @@ printf '%s\n' "$newv" > "$VFILE"
 bash "$ROOT/scripts/sync-version.sh"
 
 # 同步 Docs/appcast.xml（Sparkle 自动更新 feed）
-# 从 git commit（subject + body）自动生成更新内容（与 CI release.yml 逻辑一致）
+# 从 git commit（subject + body）自动生成更新内容（与 CI 的 scripts/generate-appcast.py 逻辑一致）
+#
+# ⚠️ 这里写出的是**无 Sparkle 签名的占位版**（length=0、无 edSignature），只作 Pages 兜底：
+# 真正生效的 appcast 由发版 CI 生成（签名后作为 release 资产上传 + 部署到 GitHub Pages，
+# 见 ci.yml / release.yml 的 "Generate signed appcast.xml" 与 deploy-pages job）。
+# Pages workflow 部署时会优先用最新 release 的签名版覆盖此文件。
 APPLECAST="$ROOT/Docs/appcast.xml"
 if [ -f "$APPLECAST" ]; then
   PUB_DATE=$(date -R 2>/dev/null || date "+%a, %d %b %Y %H:%M:%S %z")

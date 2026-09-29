@@ -1641,14 +1641,26 @@ final class MediaExploreViewModel: ObservableObject {
                 for: downloadOption.remoteURL,
                 pageURL: resolvedItem.pageURL
             ) ?? [:]
-            let data = try await networkService.fetchData(
-                from: downloadOption.remoteURL,
-                headers: wallsflowHeaders
-            ) { progress in
+            // Wallsflow 的 CDN 与站点同样按出口 IP 下发 Cloudflare 挑战 → 走直连优先路径。
+            let mediaProgress: @Sendable (Double) -> Void = { progress in
                 guard let taskID else { return }
                 Task { @MainActor in
                     DownloadTaskService.shared.updateProgress(id: taskID, progress: min(progress * 0.86, 0.86))
                 }
+            }
+            let data: Data
+            if WallsflowService.isProtectedMediaURL(downloadOption.remoteURL) {
+                data = try await WallsflowService.shared.fetchMediaData(
+                    from: downloadOption.remoteURL,
+                    headers: wallsflowHeaders,
+                    progressHandler: mediaProgress
+                )
+            } else {
+                data = try await networkService.fetchData(
+                    from: downloadOption.remoteURL,
+                    headers: wallsflowHeaders,
+                    progressHandler: mediaProgress
+                )
             }
             // 防御：若仍拿到 HTML（鉴权/跳转失败）或非媒体载荷，勿落盘污染缓存。
             if WallsflowService.isProtectedMediaURL(downloadOption.remoteURL) {

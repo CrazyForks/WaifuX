@@ -185,9 +185,16 @@ class SettingsViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(effectReductionEnabled, forKey: "effect_reduction_enabled") }
     }
 
-    /// 壁纸引擎实时渲染帧率上限 (30 ~ 显示器最大刷新率)
+    /// 壁纸引擎实时渲染帧率上限 (60 ~ 显示器最大刷新率)
     @Published var wallpaperEngineFPS: Double = 60 {
         didSet { UserDefaults.standard.set(wallpaperEngineFPS, forKey: "wallpaper_engine_fps") }
+    }
+
+    /// Web 壁纸画布分辨率比例；100% 保持原画质，降低后减少 WebGL 像素占用。
+    @Published var webWallpaperRenderScalePercent: Double = 100 {
+        didSet {
+            UserDefaults.standard.set(webWallpaperRenderScalePercent, forKey: "web_wallpaper_render_scale_percent")
+        }
     }
 
     /// 壁纸引擎离线烘焙帧率 (15 ~ 显示器最高刷新率)
@@ -601,7 +608,10 @@ class SettingsViewModel: ObservableObject {
             upscalingEnabled = defaults.object(forKey: "upscaling_enabled") as? Bool ?? true
             upscalingPercent = defaults.object(forKey: "upscaling_percent") as? Double ?? 70
             effectReductionEnabled = defaults.object(forKey: "effect_reduction_enabled") as? Bool ?? false
-            wallpaperEngineFPS = defaults.object(forKey: "wallpaper_engine_fps") as? Double ?? 60.0
+            let savedWallpaperFPS = defaults.object(forKey: "wallpaper_engine_fps") as? Double ?? 60.0
+            wallpaperEngineFPS = savedWallpaperFPS.isFinite
+                ? max(60, min(240, savedWallpaperFPS)) : 60.0
+            webWallpaperRenderScalePercent = defaults.object(forKey: "web_wallpaper_render_scale_percent") as? Double ?? 100.0
             sceneBakeFPS = defaults.object(forKey: "scene_bake_fps") as? Double ?? 30.0
             sceneBakeDuration = defaults.object(forKey: "scene_bake_duration") as? Double ?? 15
             autoBakeScene = defaults.object(forKey: "auto_bake_scene") as? Bool ?? true

@@ -40,6 +40,20 @@ jobs:
           mkdir -p Docs
           cp landing/index.html Docs/
 
+      # 仓库里的 Docs/appcast.xml 是本地 merge 钩子写的占位版（length=0、无 Sparkle 签名），
+      # 直接部署会让 Sparkle 拒绝更新。线上必须使用发版时生成的签名版 —— 它作为 release 资产存在，
+      # 优先从最新 release 取；取不到才退回仓库内容（例如尚未发过版）。
+      - name: Prefer signed appcast from latest release
+        run: |
+          if curl -fsSL "https://github.com/jipika/WaifuX/releases/latest/download/appcast.xml" -o Docs/appcast.xml; then
+            echo "✅ 使用最新 release 的签名 appcast"
+            grep -cE "edSignature=" Docs/appcast.xml | xargs echo "  带签名的 item 数:"
+          else
+            echo "⚠️ 未取得 release appcast，退回仓库内的占位版本"
+          fi
+          curl -fsSL "https://github.com/jipika/WaifuX/releases/latest/download/appcast-default-item.xml" \
+            -o Docs/appcast-default-item.xml || true
+
       - name: Setup Pages
         uses: actions/configure-pages@v4
 

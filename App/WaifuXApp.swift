@@ -268,6 +268,10 @@ struct WaifuXApp {
         configuration.httpCookieStorage = HTTPCookieStorage.shared
         configuration.httpCookieAcceptPolicy = .always
         configuration.httpShouldSetCookies = true
+        // Wallsflow 封面图按出口 IP 被 Cloudflare 挑战（系统代理出口 403、直连放行）；
+        // Kingfisher 只有全局 session，无法按 host 配代理 → 用 URLProtocol 给该域名分流。
+        // 其他域名不经过这个 protocol，行为不变。
+        configuration.protocolClasses = [WallsflowDirectURLProtocol.self] + (configuration.protocolClasses ?? [])
         downloader.sessionConfiguration = configuration
         downloader.downloadTimeout = 60.0
         // ⚠️ 不设置全局 .backgroundDecode：

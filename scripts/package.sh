@@ -298,7 +298,7 @@ if [[ "$PKG_ARCH" != "x86_64" ]]; then
   fi
 fi
 
-# ---- universal 过渡包：CLI + 渲染器组件合并为双架构 ----
+# ---- universal 全量包：CLI + 渲染器组件合并为双架构（两个架构都能跑） ----
 if [[ "$PKG_ARCH" == "universal" ]]; then
   echo "🔁 合并 universal 渲染器组件（两端都要能跑，避免过渡版功能回退）..."
   APP_RES="$BUILD_DIR/$APP_NAME/Contents/Resources"
@@ -623,7 +623,7 @@ SIGN_IDENTITY="$(find_codesign_identity)"
 sign_exported_app "$BUILD_DIR/$APP_NAME" "$SIGN_IDENTITY"
 
 # 仅在非签名流程时创建 DMG（签名流程由 CI 另行处理）
-# universal 过渡包沿用历史命名 WaifuX.dmg（default channel item 的 URL 保持稳定），
+# universal 包沿用历史命名 WaifuX.dmg（appcast default item 的 URL 保持稳定），
 # 单架构包为 WaifuX-<arch>.dmg。
 if [[ "$PKG_ARCH" == "universal" ]]; then
   DMG_NAME="WaifuX.dmg"

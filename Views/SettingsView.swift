@@ -1955,7 +1955,7 @@ private struct WorkshopSettingsTab: View {
                 // 渲染帧率上限
                 VStack(alignment: .leading, spacing: 6) {
                     MacSettingsSection {
-                        MacSettingsRow(title: t("workshop.fps"), subtitle: t("workshop.fpsDesc"), showDivider: false) {
+                        MacSettingsRow(title: t("workshop.fps"), subtitle: t("workshop.fpsDesc")) {
                             HStack(spacing: 8) {
                                 Text("\(Int(viewModel.wallpaperEngineFPS)) FPS")
                                     .font(.system(size: 12, weight: .medium))
@@ -1964,13 +1964,32 @@ private struct WorkshopSettingsTab: View {
                                 Slider(
                                     value: snappedSliderBinding(
                                         $viewModel.wallpaperEngineFPS,
-                                        in: 30...maxSliderFPS,
+                                        in: 60...max(60, maxSliderFPS),
                                         step: 5
                                     ),
-                                    in: 30...maxSliderFPS
+                                    in: 60...max(60, maxSliderFPS)
                                 )
                                 .tint(settingsSliderTint)
                                 .accessibilityLabel(t("workshop.fps"))
+                                .frame(width: 120)
+                            }
+                        }
+                        MacSettingsRow(title: t("workshop.webRenderScale"), subtitle: t("workshop.webRenderScaleDesc"), showDivider: false) {
+                            HStack(spacing: 8) {
+                                Text("\(Int(viewModel.webWallpaperRenderScalePercent))%")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 52, alignment: .trailing)
+                                Slider(
+                                    value: snappedSliderBinding(
+                                        $viewModel.webWallpaperRenderScalePercent,
+                                        in: 50...100,
+                                        step: 5
+                                    ),
+                                    in: 50...100
+                                )
+                                .tint(settingsSliderTint)
+                                .accessibilityLabel(t("workshop.webRenderScale"))
                                 .frame(width: 120)
                             }
                         }

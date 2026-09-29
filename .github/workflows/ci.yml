@@ -26,6 +26,9 @@ permissions:
 jobs:
     build:
         runs-on: xcode-27
+        outputs:
+            version: ${{ steps.version.outputs.version }}
+            publish: ${{ steps.check_tag.outputs.publish }}
 
         steps:
             - name: Checkout
@@ -88,9 +91,11 @@ jobs:
               run: |
                   if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
                     echo "exists=true" >> $GITHUB_OUTPUT
+                    echo "publish=false" >> $GITHUB_OUTPUT
                     echo "Tag ${{ steps.version.outputs.tag }} already exists"
                   else
                     echo "exists=false" >> $GITHUB_OUTPUT
+                    echo "publish=true" >> $GITHUB_OUTPUT
                     echo "Tag ${{ steps.version.outputs.tag }} does not exist"
                   fi
 
@@ -245,17 +250,13 @@ jobs:
               if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
               env:
                   WAIFUX_SKIP_DMG: "1"
-                  # 仓库 variable：设为任意非空值时，本次发版额外构建 universal 过渡包
-                  # （default channel 桥接件，让旧版 universal 客户端能收到拆架构后的新代码）。
-                  WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
               run: |
                   chmod +x ./scripts/package.sh
-                  # 拆架构分发：arm64 包含 scene 渲染器全家桶，x86_64 包裁剪 wgpu/dxc/lib/ffmpeg
-                  ARCH_LIST="arm64 x86_64"
-                  if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
-                    echo "🌉 universal 过渡包构建已开启（WAIFUX_UNIVERSAL_BRIDGE）"
-                    ARCH_LIST="$ARCH_LIST universal"
-                  fi
+                  # 每次发版固定三个包：
+                  #   arm64     —— Apple Silicon 专用（含场景渲染器全家桶）
+                  #   x86_64    —— Intel 专用（换装 x86 渲染器组件 + 静态 ffmpeg）
+                  #   universal —— 双架构全量包，同时作为旧版客户端升级通道（appcast default item）
+                  ARCH_LIST="arm64 x86_64 universal"
                   for ARCH in $ARCH_LIST; do
                     echo "🔨 构建 $ARCH 包..."
                     WAIFUX_ARCH=$ARCH ./scripts/package.sh
@@ -273,18 +274,17 @@ jobs:
                   APPLE_ID: ${{ secrets.APPLE_ID }}
                   APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
                   APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-                  WAIFUX_UNIVERSAL_BRIDGE: ${{ vars.WAIFUX_UNIVERSAL_BRIDGE }}
               run: |
                   # keychain 已在 Sign Extension 步骤中设置，直接使用
                   KEYCHAIN_PATH="$RUNNER_TEMP/sign.keychain-db"
                   security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
                   security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" 2>/dev/null || true
 
-                  # 拆架构：各架构 .app 各自签名 + 公证 + DMG（universal 过渡包仅 bridge 时构建）
-                  ARCH_LIST="arm64 x86_64"
-                  if [ -n "$WAIFUX_UNIVERSAL_BRIDGE" ]; then
-                    ARCH_LIST="$ARCH_LIST universal"
-                  fi
+                  # 每次发版固定三个包：
+                  #   arm64     —— Apple Silicon 专用（含场景渲染器全家桶）
+                  #   x86_64    —— Intel 专用（换装 x86 渲染器组件 + 静态 ffmpeg）
+                  #   universal —— 双架构全量包，同时作为旧版客户端升级通道（appcast default item）
+                  ARCH_LIST="arm64 x86_64 universal"
                   for ARCH in $ARCH_LIST; do
                   echo "===== Sign & Notarize ($ARCH) ====="
                   rm -rf build/WaifuX.app
@@ -630,60 +630,59 @@ jobs:
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-            # bridge 版本发版后，把 default channel item（universal 过渡包的 Sparkle 签名）
-            # 固化提交回仓库；之后的非 bridge 发版由 release.yml 直接复用该片段，
-            # 旧版 universal 客户端不至于断更。Ed25519 签名是确定性的，固化后永久有效。
-            - name: Persist default-channel appcast item
-              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false' && vars.WAIFUX_UNIVERSAL_BRIDGE != ''
+            # 生成带 Sparkle 真实签名的 appcast.xml（拆架构：default / arm64 / x86_64 三个 item），
+            # 并上传为本次 release 的资产。
+            #
+            # 为什么不提交回仓库：main 有分支保护（需 PR + 1 审批，bypass 白名单为空），
+            # Actions 的 GITHUB_TOKEN 无法直接 push 回 main。改为：
+            #   ① 作为 release 资产上传 —— pages.yml 与后续发版（固化片段）都从这里取；
+            #   ② 由 deploy-pages job 直接部署到 GitHub Pages（Sparkle 的 SUFeedURL 指向此处）。
+            - name: Generate signed appcast.xml
+              if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
               env:
                   SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+                  CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
-                  if [ ! -f build/WaifuX.dmg ]; then
-                    echo "❌ bridge 开启但 build/WaifuX.dmg 不存在"
-                    exit 1
-                  fi
+                  VERSION="${{ steps.version.outputs.version }}"
+
+                  # Sparkle sign_update：给 DMG 生成 EdDSA 签名
                   curl -sL "https://github.com/sparkle-project/Sparkle/releases/download/2.6.4/Sparkle-2.6.4.tar.xz" -o /tmp/Sparkle.tar.xz
                   (cd /tmp && tar xJf Sparkle.tar.xz)
-                  ED_SIG=$(/tmp/Sparkle/bin/sign_update -s "$SPARKLE_PRIVATE_KEY" build/WaifuX.dmg 2>&1 | grep -o 'sparkle:edSignature="[^"]*"' | sed 's/sparkle:edSignature="//;s/"//')
-                  if [ -z "$ED_SIG" ]; then
-                    echo "❌ Failed to sign build/WaifuX.dmg with Sparkle"
-                    exit 1
-                  fi
-                  SIZE=$(stat -f%z build/WaifuX.dmg)
-                  VERSION="${{ steps.version.outputs.version }}"
-                  PUB_DATE=$(date -R)
 
-                  python3 -c "
-                  import sys
-                  version, pub_date, size, sig = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-                  item = '''  <item>
-                    <title>Version {version}</title>
-                    <sparkle:version>{version}</sparkle:version>
-                    <sparkle:shortVersionString>{version}</sparkle:shortVersionString>
-                    <pubDate>{pub_date}</pubDate>
-                    <description><![CDATA[<p>WaifuX {version}（universal 过渡版本，供旧版本客户端升级到按架构分发的新版本）</p>]]></description>
-                    <enclosure
-                      url=\"https://github.com/jipika/WaifuX/releases/download/v{version}/WaifuX.dmg\"
-                      type=\"application/octet-stream\"
-                      length=\"{size}\"
-                      sparkle:edSignature=\"{sig}\"
-                    />
-                  </item>'''.format(version=version, pub_date=pub_date, size=size, sig=sig)
-                  with open('Docs/appcast-default-item.xml', 'w') as f:
-                      f.write(item + '\n')
-                  " "$VERSION" "$PUB_DATE" "$SIZE" "$ED_SIG"
-                  cat Docs/appcast-default-item.xml
-
-                  git config user.name "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git add Docs/appcast-default-item.xml
-                  if git diff --cached --quiet; then
-                    echo "default item unchanged, skipping commit"
-                  else
-                    git commit -m "chore: persist default-channel appcast item for v${VERSION}"
-                    git push
-                    echo "✅ default-channel appcast item committed"
+                  # 固化片段（旧版 universal 客户端的升级通道）：仓库内没有就从历史 release 资产里找。
+                  # 片段由 bridge 版生成后随每个 release 持续上传，所以总能命中最早的可用版本；
+                  # 不能只看 latest —— 本次 release 已创建，latest 可能正是它自己（还没有该资产）。
+                  if [ ! -f Docs/appcast-default-item.xml ]; then
+                    echo "仓库内无固化片段，从历史 release 中查找..."
+                    FOUND=""
+                    while IFS= read -r TAG; do
+                      [ -n "$TAG" ] || continue
+                      if curl -fsSL "https://github.com/jipika/WaifuX/releases/download/${TAG}/appcast-default-item.xml" -o Docs/appcast-default-item.xml; then
+                        FOUND="$TAG"; break
+                      fi
+                    done < <(gh release list --limit 10 --json tagName --jq '.[].tagName' 2>/dev/null || true)
+                    if [ -n "$FOUND" ]; then
+                      echo "✅ 固化片段来源: $FOUND"
+                    else
+                      rm -f Docs/appcast-default-item.xml
+                      echo "⚠️ 历史 release 中无固化片段（旧版 universal 客户端本次收不到更新）"
+                    fi
                   fi
+
+                  printf '%s\n' "$CHANGELOG" > "$RUNNER_TEMP/changelog.txt"
+                  python3 scripts/generate-appcast.py \
+                    --version "$VERSION" \
+                    --changelog-file "$RUNNER_TEMP/changelog.txt" \
+                    --sign-update /tmp/Sparkle/bin/sign_update
+
+                  echo "=== Docs/appcast.xml ==="
+                  cat Docs/appcast.xml
+
+                  ASSETS=(Docs/appcast.xml)
+                  [ -f Docs/appcast-default-item.xml ] && ASSETS+=(Docs/appcast-default-item.xml)
+                  gh release upload "v$VERSION" "${ASSETS[@]}" --clobber
+                  echo "✅ appcast 已上传为 release 资产：${ASSETS[*]}"
 
             # Release 创建后同步更新 homebrew tap 仓库的 Casks/waifux.rb。
             # 跨仓库写入需要 PAT（GITHUB_TOKEN 无权写 homebrew-waifux），
@@ -797,3 +796,50 @@ jobs:
                     CODE_SIGNING_REQUIRED=NO \
                     CODE_SIGNING_ALLOWED=NO \
                     clean build
+
+    deploy-pages:
+        # 把本次 release 的签名 appcast 部署到 GitHub Pages（Sparkle 的 SUFeedURL 指向此处）。
+        # 独立 job 是为了使用 github-pages environment（actions/deploy-pages 的要求）。
+        # main 有分支保护（需 PR + 审批），所以 appcast 不提交回仓库，直接从 release 资产取。
+        needs: build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.publish == 'true'
+        runs-on: ubuntu-latest
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        permissions:
+            contents: read
+            pages: write
+            id-token: write
+        concurrency:
+            group: pages
+            cancel-in-progress: false
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v5
+
+            - name: Use this release's signed appcast
+              run: |
+                  TAG="v${{ needs.build.outputs.version }}"
+                  curl -fsSL "https://github.com/jipika/WaifuX/releases/download/${TAG}/appcast.xml" -o Docs/appcast.xml
+                  curl -fsSL "https://github.com/jipika/WaifuX/releases/download/${TAG}/appcast-default-item.xml" \
+                    -o Docs/appcast-default-item.xml || true
+                  echo "=== 本次部署的 appcast ==="
+                  grep -E "sparkle:version|sparkle:channel|edSignature=" Docs/appcast.xml | head -12
+
+            - name: Copy landing page to Docs
+              run: |
+                  mkdir -p Docs
+                  cp landing/index.html Docs/
+
+            - name: Setup Pages
+              uses: actions/configure-pages@v4
+
+            - name: Upload artifact
+              uses: actions/upload-pages-artifact@v3
+              with:
+                  path: 'Docs'
+
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4

@@ -103,7 +103,8 @@ actor VideoPreloaderActor {
 
         let headers = WallsflowService.mediaRequestHeaders(for: remoteURL) ?? [:]
         print("[VideoPreloader] 整文件下载预览: \(remoteURL.lastPathComponent)")
-        let data = try await NetworkService.shared.fetchData(from: remoteURL, headers: headers)
+        // 走 WallsflowService 的直连优先路径：CDN 与站点同样按出口 IP 下发 Cloudflare 挑战。
+        let data = try await WallsflowService.shared.fetchMediaData(from: remoteURL, headers: headers)
 
         if Self.looksLikeHTML(data) {
             throw NetworkError.invalidResponse

@@ -95,18 +95,40 @@ actor WallsflowService {
     private var detailCache: [String: MediaItem] = [:]
 
     static let siteOrigin = "https://wallsflow.com/"
-    static let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    /// Cloudflare 按「出口 IP + 请求头特征」决定是否下发托管挑战：缺 Client Hints /
+    /// Sec-Fetch 的稀疏头（旧版是 Safari UA + 四五个头）即使从家宽直连也会被 403 挑战。
+    /// 这里对齐真实 Chrome 的文档请求头。
+    static let browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+
+    /// Chrome 的 UA 客户端提示三件套（浏览器指纹的关键部分）。
+    static let clientHintHeaders: [String: String] = [
+        "sec-ch-ua": "\"Chromium\";v=\"154\", \"Not:A-Brand\";v=\"24\", \"Google Chrome\";v=\"154\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"macOS\"",
+    ]
+
+    /// 文档类请求（列表 / 搜索 / 详情）的 Sec-Fetch 组合。
+    private static let documentFetchHeaders: [String: String] = [
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    ]
 
     private let userAgent = WallsflowService.browserUserAgent
 
     private var defaultHeaders: [String: String] {
-        [
+        var headers: [String: String] = [
             "User-Agent": userAgent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": Self.siteOrigin,
             "Cache-Control": "no-cache",
         ]
+        headers.merge(Self.clientHintHeaders) { _, new in new }
+        headers.merge(Self.documentFetchHeaders) { _, new in new }
+        return headers
     }
 
     private init() {}
@@ -117,7 +139,7 @@ actor WallsflowService {
         return host.contains("wallsflow.com")
     }
 
-    /// 下载 / AVPlayer 请求 `cloud.wallsflow.com` 时必须带上的头。
+    /// 下载 / AVPlayer / 图片请求 `*.wallsflow.com` 时必须带上的头。
     nonisolated static func mediaRequestHeaders(for url: URL, pageURL: URL? = nil) -> [String: String]? {
         guard isProtectedMediaURL(url) else { return nil }
         let referer: String = {
@@ -128,13 +150,22 @@ actor WallsflowService {
             }
             return siteOrigin
         }()
-        return [
+        // 图片与视频各自用对应的 Sec-Fetch-Dest；两者都保留 Client Hints 三件套。
+        let isImage = ["webp", "jpg", "jpeg", "png", "gif", "avif"].contains(url.pathExtension.lowercased())
+        var headers: [String: String] = [
             "User-Agent": browserUserAgent,
             "Referer": referer,
-            "Accept": "*/*",
+            "Accept": isImage
+                ? "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+                : "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": "https://wallsflow.com",
+            "Sec-Fetch-Dest": isImage ? "image" : "video",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site",
         ]
+        headers.merge(clientHintHeaders) { _, new in new }
+        return headers
     }
 
     /// 是否为 Wallsflow 媒体项（slug / source / page host）。
@@ -173,7 +204,7 @@ actor WallsflowService {
             return cached
         }
 
-        let html = try await networkService.fetchString(from: url, headers: defaultHeaders)
+        let html = try await fetchHTML(from: url)
         let page = try parseListPage(html: html, sourceURL: url)
         listCache[cacheKey] = page
         return page
@@ -197,7 +228,7 @@ actor WallsflowService {
             return cached
         }
 
-        let html = try await networkService.fetchString(from: url, headers: defaultHeaders)
+        let html = try await fetchHTML(from: url)
         let page = try parseListPage(html: html, sourceURL: url)
         listCache[cacheKey] = page
         return page
@@ -212,7 +243,7 @@ actor WallsflowService {
             return cached
         }
 
-        let html = try await networkService.fetchString(from: detailURL, headers: defaultHeaders)
+        let html = try await fetchHTML(from: detailURL)
         guard let item = try? parseDetailPage(html: html, pageURL: detailURL) else {
             throw WallsflowError.parseFailed("详情页解析失败")
         }
@@ -227,6 +258,58 @@ actor WallsflowService {
             return item
         }
         return try await fetchDetail(url: item.pageURL)
+    }
+
+    // MARK: - 出口敏感的请求（直连优先）
+
+    /// 抓取 HTML（列表 / 搜索 / 详情）。
+    ///
+    /// Wallsflow 的 Cloudflare 挑战按**出口 IP** 下发：本机全局流量走系统代理
+    /// （FastStunnel）时，任何请求都会被 403 挑战；改为直连则放行。因此这里默认走直连
+    /// 会话，失败（被挑战 / 网络不可达）再回退系统代理，两种网络环境都能工作。
+    func fetchHTML(from url: URL) async throws -> String {
+        do {
+            return try await networkService.fetchString(
+                from: url,
+                headers: defaultHeaders,
+                bypassSystemProxy: true
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            print("[WallsflowService] 直连抓取失败，回退系统代理 | url=\(url.absoluteString) error=\(error.localizedDescription)")
+            return try await networkService.fetchString(
+                from: url,
+                headers: defaultHeaders,
+                bypassSystemProxy: false
+            )
+        }
+    }
+
+    /// 抓取媒体数据（图片 / 视频 CDN 同样按出口挑战，先直连）。
+    func fetchMediaData(
+        from url: URL,
+        headers: [String: String],
+        progressHandler: (@Sendable (Double) -> Void)? = nil
+    ) async throws -> Data {
+        do {
+            return try await networkService.fetchData(
+                from: url,
+                headers: headers,
+                progressHandler: progressHandler,
+                bypassSystemProxy: true
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            print("[WallsflowService] 直连媒体请求失败，回退系统代理 | url=\(url.absoluteString) error=\(error.localizedDescription)")
+            return try await networkService.fetchData(
+                from: url,
+                headers: headers,
+                progressHandler: progressHandler,
+                bypassSystemProxy: false
+            )
+        }
     }
 
     // MARK: - 清除缓存

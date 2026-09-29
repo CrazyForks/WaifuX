@@ -40,6 +40,7 @@
 		1750A0E5F95C9ECD90EAD7F2 /* SceneConfigOverridePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EB8D69CAADE135414C7A5CA /* SceneConfigOverridePanel.swift */; };
 		1750C65FBE57A16BC04699E9 /* GlassSheetShell.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF73A88F9609C0F1FFF6C2EE /* GlassSheetShell.swift */; };
 		176A9DA0A7C0133A4700CE1D /* AnimeCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F37BDF9740FAC2EF2BE6BEB8 /* AnimeCardView.swift */; };
+		17DF93A7AFC12EADB9F28097 /* WallsflowDirectURLProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51297AFB8F5FDA8312BECD8F /* WallsflowDirectURLProtocol.swift */; };
 		186AA69369A725B48BBB9F70 /* AppFluidMotion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A081A86646C339D74FD8840 /* AppFluidMotion.swift */; };
 		18A4D3D665501491CB6A0F14 /* SearchTranslationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15A8B186373E1E4F65348F7 /* SearchTranslationService.swift */; };
 		193E625232EB81113BB0B244 /* MenuBarQuickWallpaperItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99401DC2147AF07CBE96E1C5 /* MenuBarQuickWallpaperItem.swift */; };
@@ -460,6 +461,7 @@
 		4FBE371602391BF36A8714FE /* WallpaperState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperState.swift; sourceTree = "<group>"; };
 		4FDF3284B97C8262C69C0105 /* GlassStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassStyle.swift; sourceTree = "<group>"; };
 		509F88E110E5EC7E70CE7841 /* CaptchaVerificationWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptchaVerificationWebView.swift; sourceTree = "<group>"; };
+		51297AFB8F5FDA8312BECD8F /* WallsflowDirectURLProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallsflowDirectURLProtocol.swift; sourceTree = "<group>"; };
 		515A797DB6CCD82CA6AEF42F /* LibraryCards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryCards.swift; sourceTree = "<group>"; };
 		515C4AEC66B49CF22219FE39 /* SettingsSharedComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSharedComponents.swift; sourceTree = "<group>"; };
 		529BA816ECB669D20AAFD914 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -731,6 +733,7 @@
 				54B454F08F1EDDCF8083FCBB /* WallpaperExtensionAgentHealer.swift */,
 				185404293E2AF79AC924BE40 /* WallpaperExtensionElection.swift */,
 				15CCEA84D7F64CF643F5E971 /* WallpaperExtensionKeeper.swift */,
+				51297AFB8F5FDA8312BECD8F /* WallsflowDirectURLProtocol.swift */,
 				C82778D3A307A22A7032D5B6 /* WebViewCookieSync.swift */,
 			);
 			path = Utilities;
@@ -1633,6 +1636,7 @@
 				3C167FEA842C4C6D02F8CE64 /* WallpaperViewModel.swift in Sources */,
 				12A2B369F54393CDC3D14962 /* WallpaperWebAudioRelay.swift in Sources */,
 				BC06797FEB2684BFCB603F6A /* WallpaperWebMediaRelay.swift in Sources */,
+				17DF93A7AFC12EADB9F28097 /* WallsflowDirectURLProtocol.swift in Sources */,
 				4BF7B91D2CB501146BAA71DD /* WallsflowService.swift in Sources */,
 				1E04CE586233F48EA937AD2A /* WaterfallChunkLayout.swift in Sources */,
 				F9C6D151FC8B8C21B9CF08BD /* WebOfflineBakeService.swift in Sources */,

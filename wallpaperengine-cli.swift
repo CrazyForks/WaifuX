@@ -9,6 +9,7 @@ import IOKit
 import CryptoKit
 import ScreenCaptureKit
 import WebKit
+import ApplicationServices
 
 // MARK: - NSScreen Extension
 extension NSScreen {
@@ -179,6 +180,10 @@ private struct IPCMessage: Codable {
     let path: String?
     let screen: Int?
     let propertiesJSON: String?
+    /// Live Web frame-rate limit. Offline bake uses its own virtual clock.
+    let fps: Int?
+    /// Percent of native Web canvas pixel density; nil preserves original quality.
+    let renderScalePercent: Int?
     /// Web 壁纸裁切参数。均为 0...1 的 [x, y, w, h]，原点左上、y 向下。
     let crop: [Double]?
     let viewport: [Double]?
@@ -225,6 +230,8 @@ private struct IPCMessage: Codable {
         path: String?,
         screen: Int?,
         propertiesJSON: String? = nil,
+        fps: Int? = nil,
+        renderScalePercent: Int? = nil,
         crop: [Double]? = nil,
         viewport: [Double]? = nil,
         letterboxColorHex: String? = nil,
@@ -262,6 +269,8 @@ private struct IPCMessage: Codable {
         self.path = path
         self.screen = screen
         self.propertiesJSON = propertiesJSON
+        self.fps = fps
+        self.renderScalePercent = renderScalePercent
         self.crop = crop
         self.viewport = viewport
         self.letterboxColorHex = letterboxColorHex
@@ -606,8 +615,19 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             var __wxAudioBuf = new Float32Array(128);
             var __wxAudioEnabled = false;
             var __wxLastAudioAt = 0;
+            var __wxAudioTimer = null;
             window.wallpaperRegisterAudioListener = function(cb) {
-              if (typeof cb === 'function') __wxAudioCbs.push(cb);
+              if (typeof cb !== 'function') return;
+              __wxAudioCbs.push(cb);
+              if (__wxAudioTimer !== null) return;
+              __wxAudioTimer = setInterval(function() {
+                if (!__wxAudioEnabled || Date.now() - __wxLastAudioAt > 500) {
+                  for (var i = 0; i < __wxAudioBuf.length; i++) __wxAudioBuf[i] = 0;
+                }
+                for (var j = 0; j < __wxAudioCbs.length; j++) {
+                  try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
+                }
+              }, 33);
             };
             window.__wxUpdateAudioBuf = function(arr) {
               if (arr && arr.length) {
@@ -621,15 +641,6 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
                 }
               }
             };
-            setInterval(function() {
-              if (!__wxAudioEnabled || Date.now() - __wxLastAudioAt > 500) {
-                for (var i = 0; i < __wxAudioBuf.length; i++) __wxAudioBuf[i] = 0;
-              }
-              for (var j = 0; j < __wxAudioCbs.length; j++) {
-                try { __wxAudioCbs[j](__wxAudioBuf); } catch (e) {}
-              }
-            }, 33);
-
             // ---- Media Integration ----
             var __wxMedia = {
               status: [], properties: [], thumbnail: [], playback: [], timeline: [], lyrics: [], lyricsLine: []
@@ -942,6 +953,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
           if (window.__wxMouseBridge) return;
           window.__wxMouseBridge = {
             lastDownTarget: null,
+            cancel: function() { this.lastDownTarget = null; },
             dispatch: function(type, x, y, button, deltaX, deltaY) {
               var el = document.elementFromPoint(x, y);
               if (!el) el = document.documentElement;
@@ -1005,6 +1017,79 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         injectionTime: .atDocumentStart,
         forMainFrameOnly: false
     )
+
+    /// Page scripts can request frames at the display's refresh rate (144 Hz here).
+    /// Keep a single native rAF pending and deliver callbacks at the configured rate.
+    /// This preserves callback timestamps and cancelAnimationFrame semantics while
+    /// leaving offline baking's virtual clock untouched.
+    private static func liveFrameRateScript(fps: Int) -> WKUserScript {
+        let limit = max(60, min(240, fps))
+        return WKUserScript(
+            source: """
+            (function() {
+              var interval = 1000 / \(limit);
+              var nativeRequest = window.requestAnimationFrame.bind(window);
+              var pending = new Map();
+              var nextId = 1;
+              var scheduled = false;
+              var nextDue = 0;
+              function schedule() {
+                if (scheduled || !pending.size) return;
+                scheduled = true;
+                nativeRequest(pump);
+              }
+              function pump(timestamp) {
+                scheduled = false;
+                if (!pending.size) return;
+                if (timestamp + 0.5 < nextDue) { schedule(); return; }
+                nextDue = timestamp - nextDue > interval ? timestamp + interval : nextDue + interval;
+                var callbacks = Array.from(pending.entries());
+                for (var i = 0; i < callbacks.length; i++) {
+                  var id = callbacks[i][0];
+                  if (!pending.has(id)) continue;
+                  pending.delete(id);
+                  try { callbacks[i][1].call(window, timestamp); } catch (error) {
+                    setTimeout(function() { throw error; }, 0);
+                  }
+                }
+                schedule();
+              }
+              window.requestAnimationFrame = function(callback) {
+                if (typeof callback !== 'function') throw new TypeError('Callback must be a function');
+                var id = nextId++;
+                pending.set(id, callback);
+                schedule();
+                return id;
+              };
+              window.cancelAnimationFrame = function(id) { pending.delete(id); };
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
+
+    /// WebGL players commonly size their drawing buffer from devicePixelRatio.
+    /// Override only the page-visible value, leaving WKWebView layout unchanged.
+    private static func liveRenderScaleScript(percent: Int) -> WKUserScript {
+        let scale = max(50, min(100, percent))
+        return WKUserScript(
+            source: """
+            (function() {
+              try {
+                var nativeRatio = window.devicePixelRatio || 1;
+                var scaledRatio = nativeRatio * \(scale) / 100;
+                Object.defineProperty(window, 'devicePixelRatio', {
+                  configurable: true,
+                  get: function() { return scaledRatio; }
+                });
+              } catch (error) {}
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
 
     /// Offline bake 虚拟时钟：把动画时间与墙钟解耦。
     ///
@@ -2004,6 +2089,8 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         height: Int,
         screen: Int? = nil,
         offscreen: Bool = false,
+        fps: Int = 60,
+        renderScalePercent: Int = 100,
         userPropertiesJSON: String? = nil,
         initialCrop: [Double]? = nil,
         initialViewport: [Double]? = nil,
@@ -2184,6 +2271,13 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         let ucc = WKUserContentController()
+        if !offscreen {
+            if renderScalePercent < 100 {
+                ucc.addUserScript(Self.liveRenderScaleScript(percent: renderScalePercent))
+            }
+            ucc.addUserScript(Self.liveFrameRateScript(fps: fps))
+            dlog("[WebRendererBridge] live Web frame limit=\(max(60, min(240, fps))) fps renderScale=\(max(50, min(100, renderScalePercent)))% screen=\(screenIdx)")
+        }
         ucc.addUserScript(Self.wallpaperEngineWebAPIShim)
         ucc.addUserScript(Self.localFileCompatScript)
         ucc.addUserScript(Self.mouseEventBridgeScript)
@@ -2704,6 +2798,7 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     func stop(screen: Int = 0) {
         guard var state = screenStates[screen] else { return }
+        if bridgedMouseDownScreen == screen { cancelBridgedMouseDown() }
         state.firstFrameSettleGeneration &+= 1
         state.pauseOverlay?.removeFromSuperview()
         state.pauseOverlay = nil
@@ -2740,12 +2835,17 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
 
     private var globalMouseMonitors: [Any] = []
     private var lastGlobalMouseMoveTime: TimeInterval = 0
+    private var finderDesktopWindowIDs: Set<Int> = []
+    private var bridgedMouseDownScreen: Int?
+    private var loggedFinderHitTestFailure = false
 
     private func startMouseEventBridge(for screen: Int) {
         guard screenStates[screen]?.window != nil, screenStates[screen]?.webView != nil else { return }
         // Bake / offscreen surfaces must not receive cursor parallax or click injection.
         guard screenStates[screen]?.isOffscreen != true else { return }
         if !globalMouseMonitors.isEmpty { return }
+        refreshFinderDesktopWindowIDs()
+        dlog("[WebRendererBridge] mouse bridge Finder desktop windows=\(finderDesktopWindowIDs.sorted()) accessibility=\(AXIsProcessTrusted())")
         let eventTypes: [(NSEvent.EventTypeMask, String)] = [
             (.leftMouseDown, "mousedown"), (.leftMouseUp, "mouseup"),
             (.mouseMoved, "mousemove"), (.scrollWheel, "wheel")
@@ -2762,24 +2862,98 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
     }
 
     private func stopMouseEventBridge() {
+        cancelBridgedMouseDown()
         for monitor in globalMouseMonitors { NSEvent.removeMonitor(monitor) }
         globalMouseMonitors.removeAll()
+        finderDesktopWindowIDs.removeAll()
         lastGlobalMouseMoveTime = 0
     }
 
+    private func refreshFinderDesktopWindowIDs() {
+        let desktopIconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        finderDesktopWindowIDs = Set(windows.compactMap { info in
+            guard info[kCGWindowLayer as String] as? Int == desktopIconLevel,
+                  let pid = info[kCGWindowOwnerPID as String] as? Int,
+                  NSRunningApplication(processIdentifier: pid_t(pid))?.bundleIdentifier == "com.apple.finder"
+            else { return nil }
+            return info[kCGWindowNumber as String] as? Int
+        })
+    }
+
+    private func isBlankFinderDesktop(at event: NSEvent) -> Bool {
+        guard let finderPID = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.apple.finder"
+        ).first?.processIdentifier else { return false }
+        let point: CGPoint
+        if let cgEvent = event.cgEvent {
+            point = cgEvent.location
+        } else {
+            let mouse = NSEvent.mouseLocation
+            point = CGPoint(x: mouse.x, y: (NSScreen.main?.frame.maxY ?? 0) - mouse.y)
+        }
+        let finder = AXUIElementCreateApplication(finderPID)
+        AXUIElementSetMessagingTimeout(finder, 0.25)
+        var hit: AXUIElement?
+        let error = AXUIElementCopyElementAtPosition(
+            finder, Float(point.x), Float(point.y), &hit
+        )
+        guard error == .success, let hit else {
+            if !loggedFinderHitTestFailure {
+                dlog("[WebRendererBridge] Finder desktop hit test unavailable (AX error=\(error.rawValue)); desktop clicks will not be forwarded")
+                loggedFinderHitTestFailure = true
+            }
+            return false
+        }
+        var subrole: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(hit, kAXSubroleAttribute as CFString, &subrole) == .success
+        else { return false }
+        // Finder icons are AXImage; only the empty AXDesktop group is interactive wallpaper.
+        return (subrole as? String) == "AXDesktop"
+    }
+
+    private func eventTargetsDesktop(_ event: NSEvent, window: NSWindow, requireBlank: Bool) -> Bool {
+        let target = event.windowNumber != 0
+            ? event.windowNumber
+            : Int(event.cgEvent?.getIntegerValueField(
+                .mouseEventWindowUnderMousePointerThatCanHandleThisEvent
+            ) ?? 0)
+        if target == window.windowNumber { return true }
+        guard target > 0 else { return false }
+        if !finderDesktopWindowIDs.contains(target) && requireBlank {
+            // Finder may have recreated its desktop window since the wallpaper loaded.
+            refreshFinderDesktopWindowIDs()
+        }
+        guard finderDesktopWindowIDs.contains(target) else { return false }
+        return !requireBlank || isBlankFinderDesktop(at: event)
+    }
+
+    private func cancelBridgedMouseDown() {
+        guard let screen = bridgedMouseDownScreen else { return }
+        bridgedMouseDownScreen = nil
+        screenStates[screen]?.webView?.evaluateJavaScript("window.__wxMouseBridge && window.__wxMouseBridge.cancel();")
+    }
+
     private func dispatchMouseEvent(_ event: NSEvent, type: String) {
+        if type == "mousedown" { cancelBridgedMouseDown() }
         if type == "mousemove" {
             let now = CFAbsoluteTimeGetCurrent()
             if now - lastGlobalMouseMoveTime < mouseMoveThrottle { return }
             lastGlobalMouseMoveTime = now
         }
         let mouseLocation = NSEvent.mouseLocation
-        for (_, state) in screenStates {
+        var delivered = false
+        for (screen, state) in screenStates {
             // Offline bake uses a full-screen transparent window; never inject into it.
             guard !state.isOffscreen, !state.isPaused,
                   state.mouseCaptureSuppressionDepth == 0 else { continue }
             guard state.isLoaded, let window = state.window, let webView = state.webView else { continue }
             guard window.frame.contains(mouseLocation) else { continue }
+            if type == "mouseup" && bridgedMouseDownScreen != screen { continue }
+            guard eventTargetsDesktop(event, window: window, requireBlank: type != "mousemove") else {
+                continue
+            }
             let relX = mouseLocation.x - window.frame.origin.x
             let relY = mouseLocation.y - window.frame.origin.y
             let sourceX = relX
@@ -2823,8 +2997,12 @@ private final class WebRendererBridge: NSObject, WKNavigationDelegate {
             DispatchQueue.main.async { [weak webView] in
                 webView?.evaluateJavaScript(script)
             }
+            if type == "mousedown" { bridgedMouseDownScreen = screen }
+            if type == "mouseup" { bridgedMouseDownScreen = nil }
+            delivered = true
             break
         }
+        if type == "mouseup" && !delivered { cancelBridgedMouseDown() }
     }
 
     private func applyUserPropertiesJSBody(b64EncodedJSON: String) -> String {
@@ -5030,6 +5208,8 @@ private final class DesktopWallpaperManager {
         width: Int = 1920,
         height: Int = 1080,
         screen: Int? = nil,
+        fps: Int = 60,
+        renderScalePercent: Int = 100,
         initialCrop: [Double]? = nil,
         initialViewport: [Double]? = nil,
         initialLetterboxColorHex: String? = nil,
@@ -5086,6 +5266,8 @@ private final class DesktopWallpaperManager {
                 width: width,
                 height: height,
                 screen: screenIdx,
+                fps: fps,
+                renderScalePercent: renderScalePercent,
                 initialCrop: initialCrop,
                 initialViewport: initialViewport,
                 initialLetterboxColorHex: initialLetterboxColorHex,
@@ -5679,6 +5861,8 @@ private final class Daemon: NSObject, NSApplicationDelegate {
                             width: targetSize.0,
                             height: targetSize.1,
                             screen: msg.screen,
+                            fps: msg.fps ?? 60,
+                            renderScalePercent: msg.renderScalePercent ?? 100,
                             initialCrop: msg.crop,
                             initialViewport: msg.viewport,
                             initialLetterboxColorHex: msg.letterboxColorHex,
@@ -5878,7 +6062,7 @@ struct WallpaperEngineCLI {
             case "set":
                 var setArgs = Array(remainingArgs.dropFirst())
                 guard !setArgs.isEmpty else {
-                    print("Usage: wallpaperengine-cli set <path> [screen_index] [--initial-crop <base64-json>]")
+                    print("Usage: wallpaperengine-cli set <path> [screen_index] [--fps 60...240] [--render-scale 50...100] [--initial-crop <base64-json>]")
                     exit(1)
                 }
                 var initialCrop: InitialWebCropPayload?
@@ -5892,6 +6076,32 @@ struct WallpaperEngineCLI {
                     initialCrop = decoded
                     setArgs.removeSubrange(cropFlagIndex...)
                 }
+                var fps = 60
+                if let fpsFlagIndex = setArgs.lastIndex(of: "--fps") {
+                    guard fpsFlagIndex + 1 < setArgs.count,
+                          let parsed = Int(setArgs[fpsFlagIndex + 1]),
+                          (60...240).contains(parsed) else {
+                        print("Invalid --fps value (expected 60...240)")
+                        exit(1)
+                    }
+                    fps = parsed
+                    setArgs.removeSubrange(fpsFlagIndex...fpsFlagIndex + 1)
+                }
+                var renderScalePercent = 100
+                if let scaleFlagIndex = setArgs.lastIndex(of: "--render-scale") {
+                    guard scaleFlagIndex + 1 < setArgs.count,
+                          let parsed = Int(setArgs[scaleFlagIndex + 1]),
+                          (50...100).contains(parsed) else {
+                        print("Invalid --render-scale value (expected 50...100)")
+                        exit(1)
+                    }
+                    renderScalePercent = parsed
+                    setArgs.removeSubrange(scaleFlagIndex...scaleFlagIndex + 1)
+                }
+                guard !setArgs.isEmpty else {
+                    print("Usage: wallpaperengine-cli set <path> [screen_index] [--fps 60...240] [--render-scale 50...100] [--initial-crop <base64-json>]")
+                    exit(1)
+                }
                 var path = setArgs.joined(separator: " ")
                 var screen: Int? = nil
                 if setArgs.count > 1, let s = Int(setArgs.last!) {
@@ -5902,6 +6112,8 @@ struct WallpaperEngineCLI {
                     command: .set,
                     path: path,
                     screen: screen,
+                    fps: fps,
+                    renderScalePercent: renderScalePercent,
                     crop: initialCrop?.crop,
                     viewport: initialCrop?.viewport,
                     letterboxColorHex: initialCrop?.letterboxColorHex,
@@ -6166,7 +6378,8 @@ struct WallpaperEngineCLI {
         print("""
         Usage: wallpaperengine-cli <command>
         Commands:
-          set <path> [screen_index]   Set wallpaper
+          set <path> [screen_index] [--fps 60...240] [--render-scale 50...100]
+                                     Set a live Web wallpaper
           bake <path> --size WxH --fps auto|N --duration S --out <path>
                                      Export a Web wallpaper as dense H.264 MP4
                                      (auto profiles active video cadence; precise media seek)

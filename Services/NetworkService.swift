@@ -3,18 +3,20 @@ import Foundation
 actor NetworkService {
     static let shared = NetworkService()
 
+    /// 常规会话：未显式设置 connectionProxyDictionary 时跟随系统代理。
     private var session: URLSession
+    /// 直连会话：显式清空 connectionProxyDictionary 覆盖系统代理。
+    /// 只给对出口 IP 敏感的源使用（Wallsflow 的 Cloudflare 挑战按出口下发：
+    /// 走本机 FastStunnel 出口必被挑战，直连则放行）。
+    private let directSession: URLSession
     private let cache: URLCache
 
     // MARK: - Retry Configuration
     private var defaultRetryConfig: RetryConfiguration = .default
     private var networkMonitor: NetworkMonitor? = nil
 
-    private init() {
-        // 使用全局 URLCache.shared（已在 WaifuXApp.swift 中配置），避免重复缓存层
-        self.cache = URLCache.shared
-
-        // 配置 URLSession - 使用缓存以减少重复请求
+    /// 基础配置：所有会话共用（缓存 / 超时 / Cookie / 蜂窝）。
+    private static func makeConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.requestCachePolicy = .returnCacheDataElseLoad  // 使用缓存加快加载
         // 媒体整文件下载可达数十 MB；60s 资源超时会导致 Wallsflow 等大 MP4 中途失败。
@@ -30,24 +32,25 @@ actor NetworkService {
         config.waitsForConnectivity = true
         // 启用后台会话
         config.isDiscretionary = false
+        return config
+    }
 
-        self.session = URLSession(configuration: config)
+    private init() {
+        // 使用全局 URLCache.shared（已在 WaifuXApp.swift 中配置），避免重复缓存层
+        self.cache = URLCache.shared
+
+        self.session = URLSession(configuration: Self.makeConfiguration())
+
+        // 空字典 = 不使用任何代理（覆盖系统代理设置）；不要传 nil，nil 会继续跟随系统设置。
+        let directConfig = Self.makeConfiguration()
+        directConfig.connectionProxyDictionary = [:]
+        self.directSession = URLSession(configuration: directConfig)
     }
 
     // MARK: - Proxy Configuration
 
     func updateProxyConfiguration(enabled: Bool, host: String, port: String) {
-        let config = URLSessionConfiguration.default
-        config.requestCachePolicy = .returnCacheDataElseLoad
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 900
-        config.urlCache = cache
-        config.httpCookieStorage = HTTPCookieStorage.shared
-        config.httpCookieAcceptPolicy = .always
-        config.httpShouldSetCookies = true
-        config.allowsCellularAccess = true
-        config.waitsForConnectivity = true
-        config.isDiscretionary = false
+        let config = Self.makeConfiguration()
 
         if enabled, !host.isEmpty, let portInt = Int(port), portInt > 0 {
             config.connectionProxyDictionary = [
@@ -114,17 +117,19 @@ actor NetworkService {
     // MARK: - Data Fetching with Retry
 
     /// 获取数据（⚠️ 禁用缓存，每次重新请求）
+    /// - Parameter bypassSystemProxy: true 时改用直连会话（显式清空代理，覆盖系统代理设置）。
     func fetchData(
         from url: URL,
         headers: [String: String] = [:],
         progressHandler: (@Sendable (Double) -> Void)? = nil,
-        retryConfig: RetryConfiguration? = nil
+        retryConfig: RetryConfiguration? = nil,
+        bypassSystemProxy: Bool = false
     ) async throws -> Data {
         let config = effectiveRetryConfiguration(retryConfig)
 
         return try await executeWithRetry(config: config) { attempt in
             // ⚠️ 数据请求禁用缓存
-            try await self.fetchDataInternal(from: url, headers: headers, attempt: attempt, progressHandler: progressHandler, useCache: false)
+            try await self.fetchDataInternal(from: url, headers: headers, attempt: attempt, progressHandler: progressHandler, useCache: false, bypassSystemProxy: bypassSystemProxy)
         }
     }
 
@@ -147,8 +152,10 @@ actor NetworkService {
         attempt: Int = 1,
         progressHandler: (@Sendable (Double) -> Void)? = nil,
         useHosts: Bool = true,  // 是否使用 hosts 加速
-        useCache: Bool = true   // 是否使用缓存（图片用 true，API 请求用 false）
+        useCache: Bool = true,   // 是否使用缓存（图片用 true，API 请求用 false）
+        bypassSystemProxy: Bool = false  // 是否走直连会话（覆盖系统代理）
     ) async throws -> Data {
+        let requestSession: URLSession? = bypassSystemProxy ? directSession : nil
 
         // 构建请求
         func buildRequest(for targetURL: URL, withHost host: String?) -> URLRequest {
@@ -175,7 +182,7 @@ actor NetworkService {
                 let request = buildRequest(for: requestURL, withHost: hostHeader)
 
                 do {
-                    let data = try await performRequest(request: request, progressHandler: progressHandler)
+                    let data = try await performRequest(request: request, progressHandler: progressHandler, session: requestSession)
                     return data
                 } catch {
                     // GitHub Hosts 失败，回退到原始域名
@@ -185,14 +192,17 @@ actor NetworkService {
 
         // 使用原始域名请求
         let request = buildRequest(for: url, withHost: nil)
-        return try await performRequest(request: request, progressHandler: progressHandler)
+        return try await performRequest(request: request, progressHandler: progressHandler, session: requestSession)
     }
 
     /// 执行网络请求
+    /// - Parameter session: 指定会话（如直连会话）；nil 时用跟随系统代理的常规会话。
     private func performRequest(
         request: URLRequest,
-        progressHandler: (@Sendable (Double) -> Void)? = nil
+        progressHandler: (@Sendable (Double) -> Void)? = nil,
+        session: URLSession? = nil
     ) async throws -> Data {
+        let session = session ?? self.session
 
         if let progressHandler {
             // 大文件（Wallsflow ~几十 MB）绝不能 `for try await byte` 逐字节挂起，
@@ -254,8 +264,8 @@ actor NetworkService {
         return data
     }
 
-    func fetchString(from url: URL, headers: [String: String] = [:]) async throws -> String {
-        let data = try await fetchData(from: url, headers: headers)
+    func fetchString(from url: URL, headers: [String: String] = [:], bypassSystemProxy: Bool = false) async throws -> String {
+        let data = try await fetchData(from: url, headers: headers, bypassSystemProxy: bypassSystemProxy)
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -263,7 +273,8 @@ actor NetworkService {
         from url: URL,
         headers: [String: String] = [:],
         progressHandler: (@Sendable (Double) -> Void)? = nil,
-        retryConfig: RetryConfiguration? = nil
+        retryConfig: RetryConfiguration? = nil,
+        bypassSystemProxy: Bool = false
     ) async throws -> Data {
         let config = effectiveRetryConfiguration(retryConfig)
 
@@ -272,7 +283,8 @@ actor NetworkService {
                 from: url,
                 headers: headers,
                 attempt: attempt,
-                progressHandler: progressHandler
+                progressHandler: progressHandler,
+                bypassSystemProxy: bypassSystemProxy
             )
             return data
         }

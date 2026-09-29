@@ -1099,7 +1099,7 @@ final class WallpaperEngineXBridge: ObservableObject {
 
             // 渲染帧率
             let userFPS = UserDefaults.standard.double(forKey: "wallpaper_engine_fps")
-            let userFPSClamped = max(30, min(240, userFPS))
+            let userFPSClamped = userFPS.isFinite ? max(60, min(240, userFPS)) : 60
             let screenMaxFPS = screen.maxRefreshRate
             let effectiveFPS = min(Int(userFPSClamped), screenMaxFPS)
             perScreenArgs += ["--fps", String(effectiveFPS)]
@@ -2686,8 +2686,20 @@ final class WallpaperEngineXBridge: ObservableObject {
             guard let cropData = try? JSONEncoder().encode(initialCrop.parameters) else {
                 throw WallpaperEngineError.executionFailed("Web 壁纸裁切参数编码失败")
             }
+            let configuredFPS = UserDefaults.standard.object(forKey: "wallpaper_engine_fps") as? Double ?? 60
+            let safeFPS = configuredFPS.isFinite ? configuredFPS : 60
+            let requestedFPS = Int(max(60, min(240, safeFPS)))
+            let effectiveFPS = max(60, min(requestedFPS, screen.maxRefreshRate))
+            let configuredRenderScale = UserDefaults.standard.object(
+                forKey: "web_wallpaper_render_scale_percent"
+            ) as? Double ?? 100
+            let safeRenderScale = configuredRenderScale.isFinite ? configuredRenderScale : 100
+            let renderScalePercent = Int(max(50, min(100, safeRenderScale)))
             let result = try await Self.runLegacyCLIClientCommandDetailed([
-                "set", path, String(initialCrop.screenIndex), "--initial-crop", cropData.base64EncodedString()
+                "set", path, String(initialCrop.screenIndex),
+                "--fps", String(effectiveFPS),
+                "--render-scale", String(renderScalePercent),
+                "--initial-crop", cropData.base64EncodedString()
             ])
             guard result.status == 0 else {
                 let detail = result.output.isEmpty ? "" : ": \(result.output)"
